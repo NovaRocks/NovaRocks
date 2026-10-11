@@ -59,6 +59,7 @@ struct Counts {
     legacy: AtomicUsize,
     refine: AtomicUsize,
     aggregate: AtomicUsize,
+    window_prepare: AtomicUsize,
     adapter: AtomicUsize,
     window: AtomicUsize,
     table: AtomicUsize,
@@ -117,6 +118,8 @@ struct Owner {
     implementations: Vec<PureImplementationDeclaration>,
     selections: Vec<Arc<FunctionBindingSelection>>,
     counts: Arc<Counts>,
+    window_prepare_failure: Option<KernelFailure>,
+    window_foreign_contract: bool,
 }
 impl Owner {
     fn new(kind: FunctionKind, abis: &[PureKernelAbi]) -> Self {
@@ -173,6 +176,8 @@ impl Owner {
             implementations,
             selections,
             counts: Arc::default(),
+            window_prepare_failure: None,
+            window_foreign_contract: false,
         }
     }
     fn frozen(&self, selected: &FunctionBindingSelection) -> CallEffects {
@@ -550,6 +555,24 @@ impl PreparedAggregateKernel for Sum {
 }
 
 impl PureAggregateWindowImplementation for Owner {
+    fn prepare_aggregate_for_window(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Sum>, KernelFailure> {
+        self.counts.window_prepare.fetch_add(1, Ordering::Relaxed);
+        if let Some(failure) = &self.window_prepare_failure {
+            return Err(failure.clone());
+        }
+        let contract = if self.window_foreign_contract {
+            Arc::new((*contract).clone())
+        } else {
+            contract
+        };
+        self.prepare_aggregate(input, contract, control)
+    }
+
     fn prepare_aggregate_window(
         &self,
         aggregate: Arc<Sum>,
@@ -1327,4 +1350,436 @@ fn aggregate_abi_changes_digest_without_changing_base_or_implementation_identity
     let first = aggregate_catalog(basic);
     let second = aggregate_catalog(window);
     assert_ne!(first.digest(), second.digest());
+}
+
+#[test]
+fn c02_p1_preparation_registered_and_direct_hooks_are_once_per_use_point() {
+    for registered in [false, true] {
+        for frozen in [false, true] {
+            for window_first in [false, true] {
+                let owner = Arc::new(Owner::new(
+                    FunctionKind::Aggregate,
+                    &[PureKernelAbi::AggregateWindowV1],
+                ));
+                let catalog = aggregate_catalog(owner.clone());
+                let call = Call::new(&owner, 0);
+                for (ordinal, window) in [window_first, !window_first].into_iter().enumerate() {
+                    if registered {
+                        let options = if window {
+                            over_prepare(&call)
+                        } else {
+                            aggregate_prepare(&call, AggregateKernelPhase::Single)
+                        };
+                        let result = if frozen {
+                            catalog.prepare_frozen(
+                                call.input(),
+                                call.selected.clone(),
+                                &owner.frozen(&call.selected),
+                                options,
+                                &COMPILE,
+                            )
+                        } else {
+                            catalog.prepare_fresh(
+                                call.input(),
+                                call.selected.clone(),
+                                options,
+                                &COMPILE,
+                            )
+                        }
+                        .unwrap();
+                        assert_eq!(
+                            matches!(result.prepared(), PreparedPureKernel::Window(_)),
+                            window
+                        );
+                        assert_eq!(
+                            matches!(result.prepared(), PreparedPureKernel::Aggregate(_)),
+                            !window
+                        );
+                    } else if window {
+                        let options = AggregateWindowPreparationOptions {
+                            aggregate: aggregate_options(AggregateKernelPhase::Single),
+                            window: window_options(),
+                        };
+                        let result = if frozen {
+                            specialize_frozen_aggregate_window(
+                                owner.as_ref(),
+                                call.input(),
+                                call.selected.clone(),
+                                &owner.frozen(&call.selected),
+                                call.children(),
+                                options,
+                                &COMPILE,
+                            )
+                        } else {
+                            specialize_aggregate_window(
+                                owner.as_ref(),
+                                call.input(),
+                                call.selected.clone(),
+                                call.children(),
+                                options,
+                                &COMPILE,
+                            )
+                        }
+                        .unwrap();
+                        assert_eq!(
+                            result.prepared().contract().aggregate().unwrap().phase(),
+                            AggregateKernelPhase::Single
+                        );
+                    } else {
+                        let result = if frozen {
+                            specialize_frozen_aggregate(
+                                owner.as_ref(),
+                                call.input(),
+                                call.selected.clone(),
+                                &owner.frozen(&call.selected),
+                                call.children(),
+                                aggregate_options(AggregateKernelPhase::Single),
+                                &COMPILE,
+                            )
+                        } else {
+                            specialize_aggregate(
+                                owner.as_ref(),
+                                call.input(),
+                                call.selected.clone(),
+                                call.children(),
+                                aggregate_options(AggregateKernelPhase::Single),
+                                &COMPILE,
+                            )
+                        }
+                        .unwrap();
+                        assert_eq!(
+                            result.prepared().contract().phase(),
+                            AggregateKernelPhase::Single
+                        );
+                    }
+                    assert_eq!(owner.counts.refine.load(Ordering::Relaxed), ordinal + 1);
+                    assert_eq!(owner.counts.aggregate.load(Ordering::Relaxed), ordinal + 1);
+                    let windows = usize::from(window_first || ordinal == 1);
+                    assert_eq!(owner.counts.window_prepare.load(Ordering::Relaxed), windows);
+                    assert_eq!(owner.counts.adapter.load(Ordering::Relaxed), windows);
+                    assert_eq!(owner.counts.resolve.load(Ordering::Relaxed), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn c02_p1_preparation_hook_failure_never_retries_ordinary_or_creates_adapter() {
+    for failure in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+        invalid("window prepare original"),
+        internal("window prepare original"),
+        KernelFailure::Operational(KernelDiagnostic::new("window prepare original")),
+        KernelFailure::InstanceFailed,
+    ] {
+        for frozen in [false, true] {
+            let mut owner =
+                Owner::new(FunctionKind::Aggregate, &[PureKernelAbi::AggregateWindowV1]);
+            owner.window_prepare_failure = Some(failure.clone());
+            let owner = Arc::new(owner);
+            let catalog = aggregate_catalog(owner.clone());
+            let call = Call::new(&owner, 0);
+            let result = if frozen {
+                catalog.prepare_frozen(
+                    call.input(),
+                    call.selected.clone(),
+                    &owner.frozen(&call.selected),
+                    over_prepare(&call),
+                    &COMPILE,
+                )
+            } else {
+                catalog.prepare_fresh(
+                    call.input(),
+                    call.selected.clone(),
+                    over_prepare(&call),
+                    &COMPILE,
+                )
+            };
+            assert!(
+                matches!(result, Err(FunctionSpecializationFailure::Kernel(actual)) if actual == failure)
+            );
+            assert_eq!(owner.counts.refine.load(Ordering::Relaxed), 1);
+            assert_eq!(owner.counts.window_prepare.load(Ordering::Relaxed), 1);
+            assert_eq!(owner.counts.aggregate.load(Ordering::Relaxed), 0);
+            assert_eq!(owner.counts.adapter.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
+#[test]
+fn c02_p1_preparation_hook_cannot_replace_exact_aggregate_contract() {
+    for frozen in [false, true] {
+        let mut owner = Owner::new(FunctionKind::Aggregate, &[PureKernelAbi::AggregateWindowV1]);
+        owner.window_foreign_contract = true;
+        let owner = Arc::new(owner);
+        let catalog = aggregate_catalog(owner.clone());
+        let call = Call::new(&owner, 0);
+        let result = if frozen {
+            catalog.prepare_frozen(
+                call.input(),
+                call.selected.clone(),
+                &owner.frozen(&call.selected),
+                over_prepare(&call),
+                &COMPILE,
+            )
+        } else {
+            catalog.prepare_fresh(
+                call.input(),
+                call.selected.clone(),
+                over_prepare(&call),
+                &COMPILE,
+            )
+        };
+        assert!(matches!(
+            result,
+            Err(FunctionSpecializationFailure::Kernel(
+                KernelFailure::Internal(_)
+            ))
+        ));
+        assert_eq!(owner.counts.refine.load(Ordering::Relaxed), 1);
+        assert_eq!(owner.counts.window_prepare.load(Ordering::Relaxed), 1);
+        assert_eq!(owner.counts.aggregate.load(Ordering::Relaxed), 1);
+        assert_eq!(owner.counts.adapter.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
+    for name in ["max_by", "min_by"] {
+        for frozen in [false, true] {
+            for window_first in [false, true] {
+                let catalog = crate::builtin::catalogue::by_window_private_test_catalog();
+                let arguments = [DataType::LargeUtf8, DataType::Utf8].map(|data_type| {
+                    FunctionArgument::Value {
+                        value_type: FunctionValueType::new(data_type, true),
+                        constant: None,
+                    }
+                });
+                let request = FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 2,
+                    expected_result_type: None,
+                };
+                let bound = catalog
+                    .resolve_bound_user(name, FunctionKind::Aggregate, request, &COMPILE)
+                    .unwrap();
+                let selected = Arc::new(bound.selected);
+                let declaration = catalog
+                    .definition(name, FunctionKind::Aggregate)
+                    .unwrap()
+                    .binding_declaration()
+                    .unwrap()
+                    .effect_declaration(&selected.overload)
+                    .unwrap();
+                let context = ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(7),
+                    domain: EvaluationDomainId::new(11),
+                    demand: EvaluationDemand::Value,
+                };
+                let parameters = SemanticParameters::default();
+                let uses = [Some(ExpressionUseId::new(8)), Some(ExpressionUseId::new(9))];
+                let input = CallEffectInput {
+                    function_id: &bound.function_id,
+                    kind: FunctionKind::Aggregate,
+                    selected: &selected,
+                    request,
+                    argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
+                    context,
+                    parameters: &parameters,
+                    environment: &[],
+                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                    proof_scope: CallProofScope::Domain(context.domain),
+                };
+                let effects = CallEffects {
+                    value_stability: declaration.value_stability,
+                    own_row_error: declaration.own_row_error,
+                    failure_behavior: declaration.failure_behavior,
+                    null_behavior: declaration.null_behavior,
+                    argument_control: declaration.argument_control,
+                    instance_state: declaration.instance_state,
+                    observable_effects: declaration.observable_effects,
+                    environment: Box::default(),
+                    proof_scope: input.proof_scope,
+                };
+                for window in [window_first, !window_first] {
+                    let preparation = if window {
+                        PureCallPreparation::AggregateWindow {
+                            arguments: ScopedExpressionEffects::pure_value(context),
+                            options: AggregateWindowPreparationOptions {
+                                aggregate: aggregate_options(AggregateKernelPhase::Single),
+                                window: window_options(),
+                            },
+                        }
+                    } else {
+                        PureCallPreparation::Aggregate {
+                            arguments: ScopedExpressionEffects::pure_value(context),
+                            options: aggregate_options(AggregateKernelPhase::Single),
+                        }
+                    };
+                    // Exercise the actual registered frozen/fresh author without
+                    // installing this private capability in production.
+                    let result = prepare_selected(
+                        &catalog,
+                        input,
+                        selected.clone(),
+                        frozen.then_some(&effects),
+                        preparation,
+                        &COMPILE,
+                    );
+                    if window {
+                        let result = result.unwrap();
+                        let PreparedPureKernel::Window(prepared) = result.prepared() else {
+                            panic!("window handle");
+                        };
+                        assert_eq!(
+                            prepared.contract().aggregate().unwrap().phase(),
+                            AggregateKernelPhase::Single
+                        );
+                        assert_eq!(prepared.contract().call().selected(), selected.as_ref());
+                    } else {
+                        let expected = format!(
+                            "{} has no installed max_by/min_by input profile for {:?}",
+                            bound.function_id.as_str(),
+                            selected.argument_types
+                        );
+                        assert!(
+                            matches!(result, Err(FunctionSpecializationFailure::Kernel(KernelFailure::InvalidProgram(actual))) if actual.message() == expected)
+                        );
+                    }
+                }
+            }
+        }
+        let public = crate::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+        let arguments = [DataType::Int64, DataType::Int64].map(|ty| FunctionArgument::Value {
+            value_type: value_type(ty),
+            constant: None,
+        });
+        let request = FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: 2,
+            expected_result_type: None,
+        };
+        let bound = public
+            .resolve_bound_user(name, FunctionKind::Aggregate, request, &COMPILE)
+            .unwrap();
+        let profile = public
+            .pure_overload_declaration_observed(
+                &bound.function_id,
+                FunctionKind::Aggregate,
+                &bound.selected.overload,
+                &COMPILE,
+            )
+            .unwrap();
+        assert_eq!(profile.implementation().abi, PureKernelAbi::AggregateV1);
+        assert!(
+            profile
+                .admit_selected_lifecycle_observed(
+                    &bound.selected,
+                    2,
+                    PureCallLifecycle::AggregateWindow,
+                    &COMPILE
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn c02_p1_preparation_frozen_mismatch_never_reaches_override() {
+    let owner = Arc::new(Owner::new(
+        FunctionKind::Aggregate,
+        &[PureKernelAbi::AggregateWindowV1],
+    ));
+    let catalog = aggregate_catalog(owner.clone());
+    let call = Call::new(&owner, 0);
+    let mut effects = owner.frozen(&call.selected);
+    effects.observable_effects.controlled_wait = true;
+    assert!(matches!(
+        catalog.prepare_frozen(
+            call.input(),
+            call.selected.clone(),
+            &effects,
+            over_prepare(&call),
+            &COMPILE
+        ),
+        Err(FunctionSpecializationFailure::InvalidInput(_))
+    ));
+    assert_eq!(owner.counts.refine.load(Ordering::Relaxed), 1);
+    assert_eq!(owner.counts.window_prepare.load(Ordering::Relaxed), 0);
+    assert_eq!(owner.counts.aggregate.load(Ordering::Relaxed), 0);
+    assert_eq!(owner.counts.adapter.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn c02_p1_preparation_controls_stop_before_and_after_override_without_adapter() {
+    struct Stop<'a> {
+        counts: &'a Counts,
+        after_hook: bool,
+        failure: CompileControlError,
+    }
+    impl PureCompileControl for Stop<'_> {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            if !self.after_hook || self.counts.window_prepare.load(Ordering::Relaxed) > 0 {
+                Err(self.failure)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for failure in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for frozen in [false, true] {
+            for after_hook in [false, true] {
+                let owner = Arc::new(Owner::new(
+                    FunctionKind::Aggregate,
+                    &[PureKernelAbi::AggregateWindowV1],
+                ));
+                let catalog = aggregate_catalog(owner.clone());
+                let call = Call::new(&owner, 0);
+                let stop = Stop {
+                    counts: &owner.counts,
+                    after_hook,
+                    failure,
+                };
+                let result = if frozen {
+                    catalog.prepare_frozen(
+                        call.input(),
+                        call.selected.clone(),
+                        &owner.frozen(&call.selected),
+                        over_prepare(&call),
+                        &stop,
+                    )
+                } else {
+                    catalog.prepare_fresh(
+                        call.input(),
+                        call.selected.clone(),
+                        over_prepare(&call),
+                        &stop,
+                    )
+                };
+                assert!(
+                    matches!(result, Err(FunctionSpecializationFailure::Control(actual)) if actual == failure)
+                );
+                assert_eq!(
+                    owner.counts.refine.load(Ordering::Relaxed),
+                    usize::from(after_hook)
+                );
+                assert_eq!(
+                    owner.counts.window_prepare.load(Ordering::Relaxed),
+                    usize::from(after_hook)
+                );
+                assert_eq!(
+                    owner.counts.aggregate.load(Ordering::Relaxed),
+                    usize::from(after_hook)
+                );
+                assert_eq!(owner.counts.adapter.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
 }

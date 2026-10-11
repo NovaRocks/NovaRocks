@@ -345,7 +345,15 @@ pub fn specialize_aggregate<O: PureAggregateImplementation + ?Sized>(
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
-    specialize_aggregate_once(owner, input, selected, None, arguments, options, control)
+    specialize_aggregate_once(
+        (owner, O::prepare_aggregate),
+        input,
+        selected,
+        None,
+        arguments,
+        options,
+        control,
+    )
 }
 pub fn specialize_frozen_aggregate<O: PureAggregateImplementation + ?Sized>(
     owner: &O,
@@ -357,7 +365,7 @@ pub fn specialize_frozen_aggregate<O: PureAggregateImplementation + ?Sized>(
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
     specialize_aggregate_once(
-        owner,
+        (owner, O::prepare_aggregate),
         input,
         selected,
         Some(frozen),
@@ -366,8 +374,17 @@ pub fn specialize_frozen_aggregate<O: PureAggregateImplementation + ?Sized>(
         control,
     )
 }
-fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
-    owner: &O,
+pub(crate) type AggregatePreparationMethod<O> =
+    fn(
+        &O,
+        CallEffectInput<'_>,
+        Arc<AggregateCallContract>,
+        &dyn PureCompileControl,
+    ) -> Result<Arc<<O as PureAggregateImplementation>::Kernel>, KernelFailure>;
+
+/// Both use points retain one refinement, contract and preparation author.
+pub(crate) fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
+    preparation: (&O, AggregatePreparationMethod<O>),
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
@@ -375,6 +392,7 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
+    let (owner, prepare) = preparation;
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
         control,
         CompilePhase::FunctionSpecialization,
@@ -469,8 +487,7 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
         )
         .map_err(FunctionSpecializationFailure::Kernel)?,
     );
-    let prepared = owner
-        .prepare_aggregate(input, contract.clone(), control)
+    let prepared = prepare(owner, input, contract.clone(), control)
         .map_err(FunctionSpecializationFailure::Kernel)?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
         return Err(FunctionSpecializationFailure::Kernel(internal(

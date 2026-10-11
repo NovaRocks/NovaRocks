@@ -350,7 +350,6 @@ impl PreparedAggregateKernel for ByKernel {
 #[derive(Clone, Copy)]
 pub(super) enum ByPreparationDomain {
     InstalledAggregate,
-    #[cfg(any(test, feature = "test-support"))]
     OriginalWindow,
 }
 pub(super) fn validate_contract(
@@ -375,7 +374,6 @@ pub(super) fn validate_contract(
     // neither route changes the catalogue derivation or exact result type.
     let installed_reader_required = match domain {
         ByPreparationDomain::InstalledAggregate => true,
-        #[cfg(any(test, feature = "test-support"))]
         ByPreparationDomain::OriginalWindow => false,
     };
     if installed_reader_required

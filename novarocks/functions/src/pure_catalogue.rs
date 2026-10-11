@@ -774,6 +774,15 @@ impl<O: PureFunctionMetadataOwner + PureAggregateImplementation> PureAggregateIm
 impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation>
     PureAggregateWindowImplementation for RegisteredOwner<O>
 {
+    fn prepare_aggregate_for_window(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, KernelFailure> {
+        self.owner
+            .prepare_aggregate_for_window(input, contract, control)
+    }
     fn prepare_aggregate_window(
         &self,
         aggregate: Arc<Self::Kernel>,

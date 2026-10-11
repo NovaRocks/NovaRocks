@@ -142,6 +142,47 @@ fn kernel_with_catalog(
     phase: AggregateKernelPhase,
     catalog: &EngineFunctionCatalog,
 ) -> ByKernel {
+    let prepared = prepare_with_catalog(name, value, key, phase, catalog, false).unwrap();
+    let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
+        panic!("aggregate handle")
+    };
+    ByKernel {
+        contract: handle.contract().clone(),
+        direction: if name == "max_by" {
+            ByDirection::Maximum
+        } else {
+            ByDirection::Minimum
+        },
+    }
+}
+fn window_kernel_with_catalog(
+    name: &str,
+    value: FunctionValueType,
+    key: FunctionValueType,
+    catalog: &EngineFunctionCatalog,
+) -> Arc<dyn PreparedWindowKernel> {
+    let prepared = prepare_with_catalog(
+        name,
+        value,
+        key,
+        AggregateKernelPhase::Single,
+        catalog,
+        true,
+    )
+    .unwrap();
+    let PreparedPureKernel::Window(handle) = prepared.prepared() else {
+        panic!("window handle")
+    };
+    handle.clone()
+}
+fn prepare_with_catalog(
+    name: &str,
+    value: FunctionValueType,
+    key: FunctionValueType,
+    phase: AggregateKernelPhase,
+    catalog: &EngineFunctionCatalog,
+    window: bool,
+) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
     let args = [
         FunctionArgument::Value {
             value_type: value,
@@ -186,47 +227,46 @@ fn kernel_with_catalog(
         }
     };
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let prepared = catalog
-        .prepare_fresh_selected(
-            CallEffectInput {
-                function_id: &bound.function_id,
-                kind: FunctionKind::Aggregate,
-                selected: &selected,
-                request,
-                argument_uses,
-                context,
-                parameters: &parameters,
-                environment: &[],
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
-            },
-            selected.clone(),
-            PureCallPreparation::Aggregate {
-                arguments: ScopedExpressionEffects::pure_value(context),
-                options: AggregatePreparationOptions {
-                    state_interpretation: None,
-                    phase,
-                    distinct: false,
-                    order_keys: Arc::from([]),
-                    state_input_type: (!phase.consumes_logical_arguments())
-                        .then_some(state_type.clone()),
-                },
-            },
-            &Compile,
-        )
-        .unwrap();
-    let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
-        panic!("aggregate handle")
+    let options = AggregatePreparationOptions {
+        state_interpretation: None,
+        phase,
+        distinct: false,
+        order_keys: Arc::from([]),
+        state_input_type: (!phase.consumes_logical_arguments()).then_some(state_type.clone()),
     };
-    ByKernel {
-        contract: handle.contract().clone(),
-        direction: if name == "max_by" {
-            ByDirection::Maximum
-        } else {
-            ByDirection::Minimum
+    let preparation = if window {
+        PureCallPreparation::AggregateWindow {
+            arguments: ScopedExpressionEffects::pure_value(context),
+            options: AggregateWindowPreparationOptions {
+                aggregate: options,
+                window: WindowCallOptions::try_new(None, false, &Compile).unwrap(),
+            },
+        }
+    } else {
+        PureCallPreparation::Aggregate {
+            arguments: ScopedExpressionEffects::pure_value(context),
+            options,
+        }
+    };
+    catalog.prepare_fresh_selected(
+        CallEffectInput {
+            function_id: &bound.function_id,
+            kind: FunctionKind::Aggregate,
+            selected: &selected,
+            request,
+            argument_uses,
+            context,
+            parameters: &parameters,
+            environment: &[],
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            proof_scope: CallProofScope::Domain(context.domain),
         },
-    }
+        selected.clone(),
+        preparation,
+        &Compile,
+    )
 }
+
 fn text(value: &str) -> ArrayRef {
     Arc::new(StringArray::from(vec![value]))
 }

@@ -58,7 +58,6 @@ pub(super) fn definition(
     )
 }
 struct ByOwner {
-    preparation_domain: ByPreparationDomain,
     resolver: Arc<BuiltinAggregateResolver>,
     declaration: FunctionBindingDeclaration,
     direction: super::aggregate_by_core::ByDirection,
@@ -100,7 +99,6 @@ impl ByOwner {
             })
             .collect();
         Ok(Self {
-            preparation_domain: ByPreparationDomain::InstalledAggregate,
             resolver,
             declaration,
             direction: if name == "max_by" {
@@ -250,13 +248,13 @@ impl FunctionEffectOwner for ByOwner {
         result
     }
 }
-impl PureAggregateImplementation for ByOwner {
-    type Kernel = ByKernel;
-    fn prepare_aggregate(
+impl ByOwner {
+    fn prepare_in_domain(
         &self,
         input: CallEffectInput<'_>,
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
+        domain: ByPreparationDomain,
     ) -> Result<Arc<ByKernel>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
@@ -319,7 +317,7 @@ impl PureAggregateImplementation for ByOwner {
                     ));
                 }
             }
-            validate_contract(&contract, self.preparation_domain, &mut work)?;
+            validate_contract(&contract, domain, &mut work)?;
             work.flush().map_err(compile_failure)?;
             let prepared = Arc::new(ByKernel {
                 contract,
@@ -341,6 +339,23 @@ impl PureAggregateImplementation for ByOwner {
     }
 }
 
+impl PureAggregateImplementation for ByOwner {
+    type Kernel = ByKernel;
+    fn prepare_aggregate(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<ByKernel>, KernelFailure> {
+        self.prepare_in_domain(
+            input,
+            contract,
+            control,
+            ByPreparationDomain::InstalledAggregate,
+        )
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn private_window_definition_for_test(
     name: &str,
@@ -348,7 +363,6 @@ pub(super) fn private_window_definition_for_test(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let mut owner = ByOwner::new(name, declaration, resolver)?;
-    owner.preparation_domain = ByPreparationDomain::OriginalWindow;
     for implementation in &mut owner.implementations {
         implementation.abi = PureKernelAbi::AggregateWindowV1;
     }
@@ -363,6 +377,20 @@ pub(super) fn private_window_definition_for_test(
     })
 }
 impl PureAggregateWindowImplementation for ByOwner {
+    fn prepare_aggregate_for_window(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<ByKernel>, KernelFailure> {
+        self.prepare_in_domain(
+            input,
+            contract,
+            control,
+            ByPreparationDomain::OriginalWindow,
+        )
+    }
+
     fn prepare_aggregate_window(
         &self,
         aggregate: Arc<ByKernel>,

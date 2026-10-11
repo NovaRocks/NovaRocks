@@ -1013,19 +1013,12 @@ fn by_window_tracked_actual_original_large_utf8_data_is_lossless() {
     assert_eq!(raw.to_string(), "unsupported scalar output type: LargeUtf8");
     for name in ["max_by", "min_by"] {
         let catalog = super::super::super::catalogue::by_window_private_test_catalog();
-        let aggregate = Arc::new(kernel_with_catalog(
+        let prepared = window_kernel_with_catalog(
             name,
             FunctionValueType::new(DataType::LargeUtf8, true),
             text_type(),
-            AggregateKernelPhase::Single,
             &catalog,
-        ));
-        let options = WindowCallOptions::try_new(None, false, &Compile).unwrap();
-        let window = Arc::new(
-            WindowCallContract::try_aggregate(Arc::clone(aggregate.contract()), options, &Compile)
-                .unwrap(),
         );
-        let prepared = aggregate_by_window::prepare(aggregate, window, &Compile).unwrap();
         let args = [
             EvaluatedArgument::Column(&values),
             EvaluatedArgument::Column(&keys),
