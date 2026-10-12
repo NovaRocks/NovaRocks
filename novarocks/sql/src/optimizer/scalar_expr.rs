@@ -853,9 +853,10 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
                 novarocks_functions::FunctionKind::Scalar,
                 "a non-row binding cannot be consumed as a scalar function"
             );
-            binding
-                .admitted_execution_abi
-                .is_some_and(|abi| abi.may_raise_invocation_data())
+            binding.declared_scalar_invocation_data
+                || binding
+                    .admitted_execution_abi
+                    .is_some_and(|abi| abi.may_raise_invocation_data())
                 || match binding.semantics.intrinsic_row_error {
                     novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
                     novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
@@ -1145,6 +1146,35 @@ mod intrinsic_error_consumer_tests {
         *name = "parse_json".into();
         let renamed = arena.intern(renamed, arena.value_type(raises).clone());
         assert!(can_fail(&arena, renamed));
+    }
+
+    #[test]
+    fn c16_p1_scalar_invocation_data_controls_can_fail_without_runtime_abi_or_name() {
+        let mut arena = ScalarArena::new();
+        let text = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            FunctionValueType::new(DataType::Utf8, true),
+        );
+        let total = actual_call(&mut arena, "parse_json", vec![text]);
+        assert!(!can_fail(&arena, total));
+        let mut node = arena.node(total).clone();
+        let ScalarNode::FunctionCall { binding, name, .. } = &mut node else {
+            unreachable!()
+        };
+        let mut facts = binding.resolved().clone();
+        facts.declared_scalar_invocation_data = true;
+        facts.admitted_execution_abi = None;
+        assert_eq!(
+            facts.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+        );
+        *binding =
+            crate::binding::SqlFunctionBinding::new(facts, binding.decimal_overflow_policy());
+        *name = "arbitrary_display_name".into();
+        let positive = arena.intern(node, arena.value_type(total).clone());
+        assert_ne!(positive, total);
+        assert!(can_fail(&arena, positive));
+        assert!(!contains_non_deterministic_function(&arena, positive));
     }
 
     #[test]

@@ -34,3 +34,6 @@ pub use dispatch::{eval_object_function, metadata, register};
 pub use hll_hash::eval_hll_hash;
 pub use percentile_functions::eval_percentile_hash;
 pub use to_bitmap::eval_to_bitmap;
+
+#[cfg(test)]
+mod json_object_legacy_contract_tests;

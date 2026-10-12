@@ -1625,3 +1625,131 @@ fn catalog_nonconstant_argument_keeps_concrete_neutral_carrier() {
         .unwrap();
     assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn c16_p1_scalar_invocation_data_declaration_is_positive_checked_and_canonical() {
+    let base = declaration(
+        FunctionKind::Scalar,
+        vec![
+            overload("test/echo/T/v1", "(T)"),
+            overload("test/echo/zero/v1", "()"),
+        ],
+    );
+    let marked = base
+        .clone()
+        .with_scalar_invocation_data_overloads([
+            identity("test/echo/zero/v1"),
+            identity("test/echo/T/v1"),
+        ])
+        .unwrap();
+    let reversed = base
+        .clone()
+        .with_scalar_invocation_data_overloads([
+            identity("test/echo/T/v1"),
+            identity("test/echo/zero/v1"),
+        ])
+        .unwrap();
+    assert_eq!(marked, reversed);
+    assert!(
+        marked
+            .has_scalar_invocation_data(&identity("test/echo/T/v1"))
+            .unwrap()
+    );
+    assert!(
+        !base
+            .has_scalar_invocation_data(&identity("test/echo/T/v1"))
+            .unwrap()
+    );
+    assert!(matches!(
+        base.clone()
+            .with_scalar_invocation_data_overloads([identity("unknown/v1")]),
+        Err(FunctionBindingError::UnknownOverload(_))
+    ));
+    assert!(matches!(
+        base.clone().with_scalar_invocation_data_overloads([
+            identity("test/echo/T/v1"),
+            identity("test/echo/T/v1")
+        ]),
+        Err(FunctionBindingError::DuplicateOverload(_))
+    ));
+    let table = declaration(FunctionKind::Table, vec![overload("test/echo/T/v1", "(T)")]);
+    assert!(matches!(
+        table.with_scalar_invocation_data_overloads([identity("test/echo/T/v1")]),
+        Err(FunctionBindingError::InvalidBinding(_))
+    ));
+    let mut catching = overload("test/echo/T/v1", "(T)");
+    catching.semantics.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+    assert!(matches!(
+        declaration(FunctionKind::Scalar, vec![catching])
+            .with_scalar_invocation_data_overloads([identity("test/echo/T/v1")]),
+        Err(FunctionBindingError::InvalidBinding(_))
+    ));
+    assert_ne!(
+        catalog(Arc::new(EchoResolver::default()), base).digest(),
+        catalog(Arc::new(EchoResolver::default()), marked).digest()
+    );
+}
+
+#[test]
+fn c16_p1_scalar_invocation_data_survives_original_resolution_and_frozen_validation() {
+    let declaration = declaration(
+        FunctionKind::Scalar,
+        vec![overload("test/echo/T/v1", "(T)")],
+    )
+    .with_scalar_invocation_data_overloads([identity("test/echo/T/v1")])
+    .unwrap();
+    let catalog = catalog(Arc::new(EchoResolver::default()), declaration);
+    let arguments = [argument(DataType::Int64, false)];
+    let bound = catalog
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&arguments),
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    assert!(bound.declared_scalar_invocation_data);
+    assert_eq!(bound.admitted_execution_abi, None);
+    assert_eq!(
+        bound.semantics.intrinsic_row_error,
+        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+    );
+    catalog
+        .validate_bound(&bound, request(&arguments), crate::binding_test_control())
+        .unwrap();
+    let mut dropped = bound.clone();
+    dropped.declared_scalar_invocation_data = false;
+    assert_ne!(bound, dropped);
+    assert!(
+        matches!(catalog.validate_bound(&dropped, request(&arguments), crate::binding_test_control()), Err(FunctionBindingError::InvalidBinding(message)) if message.as_ref() == "frozen scalar invocation Data fact differs from the declaration")
+    );
+    catalog
+        .validate_legacy_bound_observed(
+            &mut dropped,
+            request(&arguments),
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    assert_eq!(bound, dropped);
+    assert_eq!(dropped.admitted_execution_abi, None);
+    // Reconstruction occupies the original checked identity/semantics point,
+    // before the old count check. A failed later check grants no admission.
+    dropped.declared_scalar_invocation_data = false;
+    dropped.logical_argument_count = 0;
+    assert!(
+        matches!(catalog.validate_legacy_bound_observed(&mut dropped, request(&arguments), crate::binding_test_control()), Err(FunctionBindingError::InvalidBinding(message)) if message.as_ref() == "frozen logical argument count differs from the expression")
+    );
+    assert!(dropped.declared_scalar_invocation_data);
+    assert_eq!(dropped.admitted_execution_abi, None);
+    dropped.function_id = FunctionId::try_new("unknown/function/v1").unwrap();
+    dropped.declared_scalar_invocation_data = false;
+    assert_eq!(
+        catalog.validate_legacy_bound_observed(
+            &mut dropped,
+            request(&arguments),
+            crate::binding_test_control()
+        ),
+        Err(FunctionBindingError::UnknownFunction)
+    );
+    assert!(!dropped.declared_scalar_invocation_data);
+}

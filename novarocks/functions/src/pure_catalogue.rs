@@ -1185,6 +1185,8 @@ fn register_owner<O: PureFunctionMetadataOwner + 'static>(
             ));
         }
         if !allowed.contains(&implementation.abi)
+            || (declaration.has_scalar_invocation_data(&overload.identity)?
+                && implementation.abi != PureKernelAbi::ScalarInvocationV1)
             || !implementation.abi.accepts(
                 declaration.kind(),
                 declaration.effect_declaration(&overload.identity)?,
@@ -1404,7 +1406,12 @@ impl EngineFunctionCatalogBuilder {
                 let base = binding
                     .declaration
                     .effect_declaration(&implementation.overload)?;
-                if !implementation.abi.accepts(binding.declaration.kind(), base) {
+                if !implementation.abi.accepts(binding.declaration.kind(), base)
+                    || (binding
+                        .declaration
+                        .has_scalar_invocation_data(&overload.identity)?
+                        && implementation.abi != PureKernelAbi::ScalarInvocationV1)
+                {
                     return Err(PureCatalogError::InvalidAbi {
                         function: binding.declaration.function_id().clone(),
                         overload: implementation.overload.clone(),

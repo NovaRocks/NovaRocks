@@ -42,6 +42,19 @@ pub enum ParseJsonFailure<E> {
 }
 use ParseJsonFailure::{Control, Data};
 
+/// Static original diagnostic projections. They select error text, never the
+/// parser, renderer or a function implementation.
+pub struct JsonRenderMessages {
+    pub stringify: &'static str,
+    pub stringify_key: &'static str,
+    pub missing_key: &'static str,
+}
+const PARSE_JSON_MESSAGES: JsonRenderMessages = JsonRenderMessages {
+    stringify: "parse_json stringify failed: ",
+    stringify_key: "parse_json stringify key failed: ",
+    missing_key: "parse_json missing object key",
+};
+
 fn append<O: ParseJsonObserver>(
     out: &mut String,
     text: &str,
@@ -52,10 +65,11 @@ fn append<O: ParseJsonObserver>(
     observer.boundary().map_err(Control)
 }
 
-fn format_json_value<O: ParseJsonObserver>(
+pub fn format_json_value<O: ParseJsonObserver>(
     value: &JsonValue,
     out: &mut String,
     observer: &mut O,
+    messages: &JsonRenderMessages,
 ) -> Result<(), ParseJsonFailure<O::Error>> {
     observer.step().map_err(Control)?;
     match value {
@@ -69,8 +83,8 @@ fn format_json_value<O: ParseJsonObserver>(
         }
         JsonValue::String(v) => {
             observer.boundary().map_err(Control)?;
-            let escaped = serde_json::to_string(v)
-                .map_err(|e| Data(format!("parse_json stringify failed: {e}")))?;
+            let escaped =
+                serde_json::to_string(v).map_err(|e| Data(format!("{}{e}", messages.stringify)))?;
             observer.boundary().map_err(Control)?;
             append(out, &escaped, observer)?;
         }
@@ -81,7 +95,7 @@ fn format_json_value<O: ParseJsonObserver>(
                 if idx > 0 {
                     append(out, ", ", observer)?;
                 }
-                format_json_value(item, out, observer)?;
+                format_json_value(item, out, observer, messages)?;
             }
             append(out, "]", observer)?;
         }
@@ -99,16 +113,16 @@ fn format_json_value<O: ParseJsonObserver>(
                 }
                 observer.boundary().map_err(Control)?;
                 let escaped_key = serde_json::to_string(key)
-                    .map_err(|e| Data(format!("parse_json stringify key failed: {e}")))?;
+                    .map_err(|e| Data(format!("{}{e}", messages.stringify_key)))?;
                 observer.boundary().map_err(Control)?;
                 append(out, &escaped_key, observer)?;
                 append(out, ": ", observer)?;
                 observer.boundary().map_err(Control)?;
                 let child = map
                     .get(*key)
-                    .ok_or_else(|| Data("parse_json missing object key".to_string()))?;
+                    .ok_or_else(|| Data(messages.missing_key.to_string()))?;
                 observer.boundary().map_err(Control)?;
-                format_json_value(child, out, observer)?;
+                format_json_value(child, out, observer, messages)?;
             }
             append(out, "}", observer)?;
         }
@@ -124,7 +138,7 @@ fn normalize_json_text<O: ParseJsonObserver>(
     let value = parse_value(raw).map_err(|e| Data(format!("parse_json invalid input: {e}")))?;
     observer.boundary().map_err(Control)?;
     let mut out = String::new();
-    format_json_value(&value, &mut out, observer)?;
+    format_json_value(&value, &mut out, observer, &PARSE_JSON_MESSAGES)?;
     Ok(out)
 }
 

@@ -1342,38 +1342,11 @@ fn decimal_digits(digits: &[u8], negative: bool, scale: usize) -> Result<Atom, R
     Ok(a)
 }
 fn decimal256(raw: [u8; 32], scale: usize, precision: u8) -> Result<Atom, RenderError> {
-    let mut limbs = [0u64; 4];
-    for (i, l) in limbs.iter_mut().enumerate() {
-        *l = u64::from_le_bytes(raw[i * 8..(i + 1) * 8].try_into().map_err(|_| invalid())?);
-    }
-    let negative = raw[31] & 128 != 0;
-    if negative {
-        let mut carry = true;
-        for l in &mut limbs {
-            let (n, c) = (!*l).overflowing_add(u64::from(carry));
-            *l = n;
-            carry = c;
-        }
-    }
-    let mut digits = [0u8; 78];
-    let mut at = digits.len();
-    loop {
-        let mut rem = 0u128;
-        for l in limbs.iter_mut().rev() {
-            let n = (rem << 64) | u128::from(*l);
-            *l = (n / 10) as u64;
-            rem = n % 10;
-        }
-        at -= 1;
-        digits[at] = b'0' + rem as u8;
-        if limbs.iter().all(|l| *l == 0) {
-            break;
-        }
-    }
-    if digits.len() - at > precision as usize {
+    let digits = novarocks_functions::decimal256_digits::original_digits(raw);
+    if digits.digits().len() > precision as usize {
         return Err(invalid());
     }
-    decimal_digits(&digits[at..], negative, scale)
+    decimal_digits(digits.digits(), digits.negative(), scale)
 }
 fn time_raw(array: &ArrayRef, row: usize) -> Result<i64, RenderError> {
     match array.data_type() {
@@ -2168,3 +2141,7 @@ impl BoundedMysqlTextEncoder for ArrowMysqlTextEncoder {
 #[cfg(test)]
 #[path = "encoder_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "decimal256_legacy_contract_tests.rs"]
+mod decimal256_legacy_contract_tests;

@@ -1796,7 +1796,8 @@ fn validate_table_binding(
         .iter()
         .map(|argument| physical_function_argument(constants, fragment, *argument, control))
         .collect::<Result<Vec<_>, _>>()?;
-    let bound = ResolvedFunctionBinding {
+    let mut bound = ResolvedFunctionBinding {
+        declared_scalar_invocation_data: false,
         admitted_execution_abi: None,
         function_id: function.function_id.clone(),
         kind: novarocks_functions::FunctionKind::Table,
@@ -1815,8 +1816,8 @@ fn validate_table_binding(
         },
     };
     catalog
-        .validate_bound(
-            &bound,
+        .validate_legacy_bound_observed(
+            &mut bound,
             FunctionBindingRequest {
                 expected_result_type: None,
                 arguments: &request_arguments,
@@ -1925,7 +1926,8 @@ fn validate_bound_function(
         validate_v1_value_type(&aggregate.intermediate_type)
             .map_err(|reason| format!("aggregate intermediate: {reason}"))?;
     }
-    let bound = ResolvedFunctionBinding {
+    let mut bound = ResolvedFunctionBinding {
+        declared_scalar_invocation_data: false,
         admitted_execution_abi: None,
         function_id: function.function_id.clone(),
         kind: function.kind,
@@ -1944,8 +1946,8 @@ fn validate_bound_function(
         },
     };
     catalog
-        .validate_bound(
-            &bound,
+        .validate_legacy_bound_observed(
+            &mut bound,
             FunctionBindingRequest {
                 expected_result_type: None,
                 arguments,
@@ -9355,3 +9357,7 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "c16_p1_json_object_binding_tests.rs"]
+mod c16_p1_json_object_binding_tests;

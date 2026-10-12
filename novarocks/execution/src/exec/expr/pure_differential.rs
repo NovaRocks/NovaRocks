@@ -1981,3 +1981,7 @@ mod concat_shared_core_tests;
 
 #[cfg(test)]
 mod substring_index_shared_core_tests;
+
+mod json_object_legacy_native_oracle_tests;
+
+mod json_object_shared_owner_tests;

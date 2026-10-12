@@ -120,6 +120,7 @@ pub struct FunctionBindingDeclaration {
     function_id: FunctionId,
     kind: FunctionKind,
     overloads: Box<[FunctionOverloadDeclaration]>,
+    scalar_invocation_data: Box<[FunctionOverloadId]>,
 }
 
 impl FunctionBindingDeclaration {
@@ -217,7 +218,41 @@ impl FunctionBindingDeclaration {
             function_id,
             kind,
             overloads: overloads.into_boxed_slice(),
+            scalar_invocation_data: Box::new([]),
         })
+    }
+
+    /// A positive original whole-call Data fact, independent of whether this
+    /// catalogue admits an installed runtime ABI. Absence proves no safety.
+    pub(crate) fn with_scalar_invocation_data_overloads(
+        mut self,
+        identities: impl IntoIterator<Item = FunctionOverloadId>,
+    ) -> Result<Self, FunctionBindingError> {
+        let mut identities: Vec<_> = identities.into_iter().collect();
+        identities.sort_unstable();
+        for (index, identity) in identities.iter().enumerate() {
+            let overload = self.overload(identity)?;
+            if index > 0 && identities[index - 1] == *identity {
+                return Err(FunctionBindingError::DuplicateOverload(identity.clone()));
+            }
+            if self.kind != FunctionKind::Scalar
+                || overload.semantics.failure_behavior != FunctionFailureBehavior::Propagate
+            {
+                return Err(invalid(
+                    "scalar invocation Data requires a propagating scalar overload",
+                ));
+            }
+        }
+        self.scalar_invocation_data = identities.into_boxed_slice();
+        Ok(self)
+    }
+
+    pub fn has_scalar_invocation_data(
+        &self,
+        identity: &FunctionOverloadId,
+    ) -> Result<bool, FunctionBindingError> {
+        self.overload(identity)?;
+        Ok(self.scalar_invocation_data.binary_search(identity).is_ok())
     }
 
     pub fn function_id(&self) -> &FunctionId {
@@ -319,6 +354,9 @@ pub trait FunctionBindingResolver: Send + Sync {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ResolvedFunctionBinding {
+    /// The selected owner's positive whole-call Data declaration. This is
+    /// neither a row-error fact nor permission to execute a pure ABI.
+    pub declared_scalar_invocation_data: bool,
     /// Positive execution-scope fact from the actual Exact catalogue's
     /// admitted installed declaration. Original metadata binding publishes
     /// None; absence is never evidence of a kernel-only implementation.
@@ -335,6 +373,19 @@ pub(crate) struct FunctionBindingDefinition {
     pub(crate) declaration: Arc<FunctionBindingDeclaration>,
     resolver: Arc<dyn FunctionBindingResolver>,
     pub(crate) pure: Option<crate::pure_catalogue::PureFunctionAttachment>,
+}
+
+enum BoundValidation<'a> {
+    Frozen(&'a ResolvedFunctionBinding),
+    Legacy(&'a mut ResolvedFunctionBinding),
+}
+impl BoundValidation<'_> {
+    fn binding(&self) -> &ResolvedFunctionBinding {
+        match self {
+            Self::Frozen(bound) => bound,
+            Self::Legacy(bound) => bound,
+        }
+    }
 }
 
 impl FunctionBindingDefinition {
@@ -888,9 +939,31 @@ impl EngineFunctionCatalog {
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
+        self.validate_bound_common(BoundValidation::Frozen(bound), request, control)
+    }
+
+    /// Reconstruct only the positive declaration on a legacy codec scratch
+    /// binding, at the same observed identity/semantics validation position.
+    /// This never changes its admitted ABI or grants runtime admission.
+    pub fn validate_legacy_bound_observed(
+        &self,
+        bound: &mut ResolvedFunctionBinding,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.validate_bound_common(BoundValidation::Legacy(bound), request, control)
+    }
+
+    fn validate_bound_common(
+        &self,
+        mut target: BoundValidation<'_>,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let result = (|| {
             work.step()?;
+            let bound = target.binding();
             let definition = self
                 .definition_by_id(&bound.function_id)
                 .ok_or(FunctionBindingError::UnknownFunction)?;
@@ -901,6 +974,21 @@ impl EngineFunctionCatalog {
                     "frozen function kind or semantics differ from the declaration",
                 ));
             }
+            let declared = binding
+                .declaration
+                .has_scalar_invocation_data(&bound.selected.overload)?;
+            match &mut target {
+                BoundValidation::Frozen(bound)
+                    if bound.declared_scalar_invocation_data != declared =>
+                {
+                    return Err(invalid(
+                        "frozen scalar invocation Data fact differs from the declaration",
+                    ));
+                }
+                BoundValidation::Legacy(bound) => bound.declared_scalar_invocation_data = declared,
+                BoundValidation::Frozen(_) => {}
+            }
+            let bound = target.binding();
             if bound.logical_argument_count != request.logical_argument_count {
                 return Err(invalid(
                     "frozen logical argument count differs from the expression",
@@ -955,6 +1043,9 @@ fn resolve_definition(
     let selected = binding.resolver.resolve(request, work.control())?;
     validate_selection(&binding.declaration, &selected, request, work)?;
     Ok(ResolvedFunctionBinding {
+        declared_scalar_invocation_data: binding
+            .declaration
+            .has_scalar_invocation_data(&selected.overload)?,
         admitted_execution_abi: None,
         function_id: binding.declaration.function_id.clone(),
         kind: binding.declaration.kind,
@@ -1176,6 +1267,13 @@ pub(crate) fn digest_binding_definition(
     );
     for overload in &declaration.overloads {
         digest_text(hasher, overload.identity.as_str());
+        if declaration
+            .scalar_invocation_data
+            .binary_search(&overload.identity)
+            .is_ok()
+        {
+            hasher.update([0xd8, 1]);
+        }
         hasher.update([match overload.semantics.volatility {
             FunctionVolatility::Immutable => 1,
             FunctionVolatility::Stable => 2,

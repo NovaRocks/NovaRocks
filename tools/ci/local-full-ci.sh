@@ -504,6 +504,10 @@ run_cargo_gates() {
     cargo deny --locked check advisories bans licenses sources
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
     tools/ci/check-generated-artifacts.sh
+  run_fail_fast_stage "JSONObject resource profiles" "json-object-resource-profile.log" \
+    python3 tools/ci/check-json-object-resource-profile.py
+  run_fail_fast_stage "JSONObject resource profile mutations" "json-object-resource-profile-test.log" \
+    python3 tools/ci/tests/json-object-resource-profile-test.py
   run_fail_fast_stage "DataSketches resolved source" "datasketches-source.log" \
     python3 tools/ci/check-datasketches-source.py
   run_fail_fast_stage "DataSketches source mutations" "datasketches-source-test.log" \

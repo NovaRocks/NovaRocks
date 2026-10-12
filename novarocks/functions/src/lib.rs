@@ -37,6 +37,7 @@ mod aggregate_host_allocator;
 mod aggregate_invocation_backing;
 mod aggregate_kernel;
 pub mod aggregate_scalar;
+pub mod aggregate_scalar_debug;
 pub mod aggregate_scalar_fingerprint;
 mod aggregate_state_column;
 pub mod aggregate_types;
@@ -62,6 +63,7 @@ pub mod control_values;
 pub mod datasketches_hll;
 pub mod datasketches_hll_failure;
 pub mod datetime_value;
+pub mod decimal256_digits;
 pub mod decimal_text;
 mod effect_metadata;
 mod effect_refinement;
@@ -78,6 +80,8 @@ mod higher_order_call;
 mod higher_order_kernel;
 pub mod hll;
 pub mod invocation_arity;
+pub mod json_object_core;
+mod json_object_resources;
 mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
@@ -2762,3 +2766,9 @@ pub mod approx_top_k_core;
 
 #[cfg(test)]
 mod common_type_m07_contract_tests;
+
+#[cfg(test)]
+mod parse_json_renderer_trace_tests;
+
+#[cfg(test)]
+mod aggregate_scalar_debug_legacy_contract_tests;

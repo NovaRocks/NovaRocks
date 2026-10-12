@@ -284,3 +284,37 @@ fn binding_observation_preserves_every_original_control_prefix_and_false_success
         }
     }
 }
+
+#[test]
+fn c16_p1_scalar_invocation_data_is_part_of_observed_binding_without_abi_admission() {
+    let baseline = actual();
+    let positive = changed(&baseline, |b| b.declared_scalar_invocation_data = true);
+    assert_ne!(baseline.resolved(), positive.resolved());
+    assert!(!exact(&baseline, &positive));
+    assert_ne!(
+        baseline
+            .fingerprint_observed(CompilePhase::Encode, &control())
+            .unwrap(),
+        positive
+            .fingerprint_observed(CompilePhase::Encode, &control())
+            .unwrap()
+    );
+    assert!(exact(&positive, &positive.clone()));
+    assert_eq!(
+        baseline.admitted_execution_abi,
+        positive.admitted_execution_abi
+    );
+    let mut count = 0;
+    visit_fields(&baseline, |_| {
+        count += 1;
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .unwrap();
+    let mut positive_count = 0;
+    visit_fields(&positive, |_| {
+        positive_count += 1;
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .unwrap();
+    assert_eq!(positive_count, count + 1);
+}

@@ -2606,6 +2606,7 @@ pub(super) fn scalar_definition_parts(
                     "crc32" => Some(super::crc32_owner::effects()),
                     "bitmap_to_string" => Some(super::bitmap_to_string_owner::effects()),
                     "parse_json" => Some(super::parse_json_owner::effects()),
+                    "json_object" => Some(super::json_object_owner::effects()),
                     "percentile_hash" => Some(super::percentile_hash_owner::effects()),
                     "hll_hash" => Some(super::hll_hash_owner::effects()),
                     name if super::string_measure_owner::operation(name).is_some() => {
@@ -2957,6 +2958,7 @@ pub fn contribute_builtin_functions(
             "crc32" => super::crc32_owner::definition(declaration, resolver)?,
             "bitmap_to_string" => super::bitmap_to_string_owner::definition(declaration, resolver)?,
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
+            "json_object" => super::json_object_owner::definition(declaration, resolver)?,
             "percentile_hash" => super::percentile_hash_owner::definition(declaration, resolver)?,
             "hll_hash" => super::hll_hash_owner::definition(declaration, resolver)?,
             name if super::string_measure_owner::operation(name).is_some() => {

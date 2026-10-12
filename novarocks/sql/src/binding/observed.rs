@@ -85,6 +85,11 @@ pub(crate) fn visit_fields<'a, E>(
         visit(ValueType(&aggregate.intermediate_type))?;
         visit(Bytes(aggregate.state_format.as_str().as_bytes()))?;
     }
+    if binding.declared_scalar_invocation_data {
+        // Positive facts append a token; old undeclared bindings retain their
+        // exact original traversal and callback sequence.
+        visit(Number(u128::MAX))?;
+    }
     Ok(())
 }
 

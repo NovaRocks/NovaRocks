@@ -120,6 +120,8 @@ mod date_owner;
 mod dround;
 pub mod dround_core;
 mod dround_owner;
+mod json_object_owner;
+mod json_object_selected;
 mod makedate;
 mod makedate_owner;
 pub mod map_entries_core;

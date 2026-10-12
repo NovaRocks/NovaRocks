@@ -105,7 +105,7 @@ pub fn scalar_bytes<A: ScalarStateAllocator>(
     }
     Ok(value)
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum AggScalarValue {
     Bool(bool),
     Int64(i64),
@@ -119,6 +119,12 @@ pub enum AggScalarValue {
     Struct(Vec<Option<AggScalarValue>>),
     Map(Vec<(Option<AggScalarValue>, Option<AggScalarValue>)>),
     List(Vec<Option<AggScalarValue>>),
+}
+
+impl std::fmt::Debug for AggScalarValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::aggregate_scalar_debug::fmt_scalar(self, f)
+    }
 }
 
 /// Aggregate-state-owned scalar whose complete recursive heap graph uses the

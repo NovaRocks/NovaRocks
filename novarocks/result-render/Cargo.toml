@@ -13,6 +13,7 @@ doctest = false
 [dependencies]
 arrow.workspace = true
 chrono.workspace = true
+novarocks-functions.workspace = true
 novarocks-result-contract.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-types.workspace = true

@@ -4359,6 +4359,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "chrono",
+ "novarocks-functions",
  "novarocks-result-contract",
  "novarocks-type-contract",
  "novarocks-types",

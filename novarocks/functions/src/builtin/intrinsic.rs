@@ -822,7 +822,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "json_object",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "json_query",

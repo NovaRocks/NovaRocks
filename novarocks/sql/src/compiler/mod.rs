@@ -3557,3 +3557,6 @@ pub use crate::planner::distributed::build::state_source_fixture::ordinary_extre
 
 #[cfg(feature = "test-support")]
 pub use crate::planner::distributed::build::state_source_fixture::ordered_array_state_source_for_test;
+
+#[cfg(test)]
+mod c16_p1_json_object_error_effect_tests;
