@@ -299,7 +299,7 @@ fn narrow_shift_requests(
     })
 }
 
-fn require_arrow_model() -> Result<(), ScalarResourceError> {
+pub(crate) fn require_arrow_model() -> Result<(), ScalarResourceError> {
     // The locked source and pinned compiler fix the private enum layout
     // algorithm. Public actual types also reject an unreviewed target/pool
     // profile; dependency features cannot be read from this crate's cfg.

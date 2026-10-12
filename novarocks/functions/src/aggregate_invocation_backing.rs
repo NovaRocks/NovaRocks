@@ -39,6 +39,12 @@ pub(crate) struct HostShared<T> {
 unsafe impl<T: Send + Sync> Send for HostShared<T> {}
 unsafe impl<T: Send + Sync> Sync for HostShared<T> {}
 impl<T> HostShared<T> {
+    /// The actual private block's request layout, before creating an owner.
+    /// This fact neither allocates nor grants capacity.
+    pub(crate) const fn allocation_layout() -> Layout {
+        Layout::new::<SharedBlock<T>>()
+    }
+
     pub(crate) fn try_new(
         value: T,
         allocator: HostAggregateAllocator,

@@ -2751,7 +2751,16 @@ pub mod window_input_order;
 pub use window_invocation_data::WindowInvocationScope;
 
 mod array_backing_geometry;
-pub use arrow_result_custody::{SourceBackingOwner, retain_source_backing};
+#[cfg(test)]
+mod source_custody_direct_tests;
+mod source_custody_resources;
+#[cfg(test)]
+mod source_custody_resources_tests;
+pub use arrow_result_custody::{PreparedSourceCustody, SourceBackingOwner, retain_source_backing};
+pub use source_custody_resources::{
+    SourceCustodyAllocationFacts, SourceCustodyPrefixFacts, SourceCustodyRequestFacts,
+    source_custody_prefix_facts,
+};
 
 pub mod string_repeat_pad_core;
 

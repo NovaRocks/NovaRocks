@@ -28,7 +28,12 @@ use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use std::{alloc::Layout, marker::PhantomData};
 use std::{any::Any, panic::RefUnwindSafe, sync::Arc};
+
+use crate::source_custody_resources::{
+    SourceCustodyRequestFacts, SourceRequestPricing, model_failure,
+};
 
 /// Declaration order is significant: all original buffers die before their
 /// host charge. Keeping the whole original group alive also prevents releasing
@@ -672,6 +677,38 @@ impl<C: Send + Sync + 'static> Clone for SourceBackingOwner<C> {
     }
 }
 impl<C: Send + Sync + 'static> SourceBackingOwner<C> {
+    /// Fresh typed holder requests, without allocating or granting capacity.
+    pub fn owned_request_facts() -> Result<SourceCustodyRequestFacts, crate::ScalarResourceError> {
+        crate::scalar_resources::require_arrow_model()?;
+        SourceCustodyRequestFacts::owned(
+            HostShared::<C>::allocation_layout(),
+            HostAggregateAllocator::metadata_allocation_bytes(),
+        )
+    }
+
+    /// Move an already-paid source into a dedicated cold direct allocator.
+    /// The caller funds the prefix before entry and qualifies its callbacks.
+    /// Failure drops C: surviving raw aliases still need their original owner.
+    pub fn try_from_owned_direct(
+        backing: C,
+        host: Arc<dyn crate::AggregateStateAllocator>,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Self, KernelFailure> {
+        work.flush()?;
+        crate::scalar_resources::require_arrow_model().map_err(model_failure)?;
+        let capability = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
+        drop(capability);
+        work.flush()?;
+        let allocator = HostAggregateAllocator::try_new(Arc::clone(&host))?;
+        work.flush()?;
+        let backing = HostShared::try_new_direct(backing, allocator.clone(), work)?;
+        Ok(Self {
+            backing,
+            allocator,
+            host,
+        })
+    }
+
     pub fn try_from_owned(
         backing: C,
         host: Arc<dyn crate::AggregateStateAllocator>,
@@ -714,6 +751,90 @@ impl<C: Send + Sync + 'static> SourceBackingOwner<C> {
 struct SourceCustody<C: Send + Sync + 'static> {
     source: SourceBackingOwner<C>,
     metadata: OpaqueRetainedCharge,
+}
+
+fn source_request_pricing<C: Send + Sync + 'static>() -> SourceRequestPricing {
+    SourceRequestPricing {
+        group: HostShared::<OriginalBacking<SourceCustody<C>>>::allocation_layout(),
+        custodian: Layout::new::<BufferCustodian<SourceCustody<C>>>(),
+        bufferless: Layout::new::<BufferlessResult<SourceCustody<C>>>(),
+    }
+}
+
+/// A sealed request packet borrowing the exact audited source continuation.
+/// The caller supplies the original source premise and its actual paid owner;
+/// neither schema nor as_any alone certifies an arbitrary Array implementation.
+pub struct PreparedSourceCustody<'source, C: Send + Sync + 'static> {
+    original: &'source ArrayRef,
+    facts: SourceCustodyRequestFacts,
+    identity: PhantomData<C>,
+}
+impl<'source, C: Send + Sync + 'static> PreparedSourceCustody<'source, C> {
+    /// No ArrayData, ArrayRef clone, Field clone, or grant is created here.
+    /// The caller has already funded the preparation prefix and callbacks.
+    pub fn prepare(
+        original: &'source ArrayRef,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Self, KernelFailure> {
+        work.flush()?;
+        crate::scalar_resources::require_arrow_model().map_err(model_failure)?;
+        let pricing = source_request_pricing::<C>();
+        let facts =
+            crate::array_backing_geometry::source_request_facts(original.as_ref(), &pricing, work)?;
+        Ok(Self {
+            original,
+            facts,
+            identity: PhantomData,
+        })
+    }
+    pub const fn request_facts(&self) -> SourceCustodyRequestFacts {
+        self.facts
+    }
+
+    /// Consume the same source loan under an already-paid complete operation.
+    /// Only GLOBAL metadata is transferred from this same-host reservation;
+    /// typed blocks have separate host grants. The original source is not paid
+    /// again. This path borrows work and owns neither completion nor a journal.
+    ///
+    /// The caller's qualified GLOBAL physical owner must survive real free,
+    /// including outer Arc/Weak tails after the opaque charge has exited.
+    pub fn retain(
+        self,
+        source: &SourceBackingOwner<C>,
+        reservation: &mut OpaqueReservation,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<ArrayRef, KernelFailure> {
+        work.flush()?;
+        if !reservation.belongs_to_allocator(&source.allocator) {
+            return Err(invalid(
+                "source custody uses a different actual reservation host",
+            ));
+        }
+        if self.facts.global_peak_upper() > reservation.remaining_bytes() {
+            return Err(invalid(
+                "source custody exceeds its complete operation reservation",
+            ));
+        }
+        let mut metadata = OpaqueRetainedCharge::try_new(Arc::clone(&source.host))?;
+        metadata.reconcile_under_reservation(self.facts.global_retained_upper(), reservation)?;
+        work.flush()?;
+        let data = self.original.to_data();
+        work.flush()?;
+        let owner = HostShared::try_new_direct(
+            OriginalBacking {
+                original: Arc::clone(self.original),
+                data,
+                custody: SourceCustody {
+                    source: source.clone(),
+                    metadata,
+                },
+            },
+            source.allocator.clone(),
+            work,
+        )?;
+        // Same original buffer transform, rebox, refcounts, and destruction.
+        wrap_original_group(owner, work)
+    }
 }
 
 /// Alias one original source array while transferring its ACTUAL input owner
