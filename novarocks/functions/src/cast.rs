@@ -156,6 +156,19 @@ impl UnsignedWidth {
     }
 }
 
+/// Whether an exact primitive signed integer cast can return successful NULL.
+/// This policy-independent fact covers only signed narrowing; false outside
+/// that domain does not declare a cast supported or safe from other failures.
+pub fn signed_integer_cast_can_produce_null(source: &DataType, target: &DataType) -> bool {
+    match (
+        SignedWidth::from_type(source),
+        SignedWidth::from_type(target),
+    ) {
+        (Some(source), Some(target)) => target < source,
+        _ => false,
+    }
+}
+
 /// Successful-NULL obligations of exact primitive carrier casts. This is a
 /// static semantic fact, not an installed runtime capability whitelist.
 pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow: bool) -> bool {
@@ -222,6 +235,7 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
         );
     }
     match (integer(source), integer(target)) {
+        (Some((true, _)), Some((true, _))) => signed_integer_cast_can_produce_null(source, target),
         (Some((true, _)), Some((false, _))) => true,
         (Some((false, source)), Some((true, target))) => target <= source,
         (Some((_, source)), Some((_, target))) => target < source,

@@ -70,7 +70,7 @@ novarocks-local-compiler.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
-novarocks-plan-codec.workspace = true
+novarocks-plan-codec = { workspace = true, features = ["test-support"] }
 novarocks-sql = { workspace = true, features = ["test-support"] }
 novarocks-parser.workspace = true
 

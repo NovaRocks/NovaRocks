@@ -4997,7 +4997,11 @@ pub(super) fn cast_null_preserving_target_type(
     if expr.value_type.data_type == *target {
         return expr;
     }
-    let nullable = expr.value_type.nullable;
+    let nullable = expr.value_type.nullable
+        || novarocks_functions::signed_integer_cast_can_produce_null(
+            &expr.value_type.data_type,
+            target,
+        );
     TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(expr),
@@ -5416,7 +5420,10 @@ fn coerce_function_argument(
         });
     }
     let nullable = expr.value_type.nullable
-        || narrowing_integer_cast_can_return_null(&expr.value_type.data_type, target)
+        || novarocks_functions::signed_integer_cast_can_produce_null(
+            &expr.value_type.data_type,
+            target,
+        )
         || timestamp_unit_cast_can_return_null(&expr.value_type.data_type, target);
     Ok(TypedExpr {
         kind: ExprKind::Cast {
@@ -5446,7 +5453,10 @@ fn coerce_selected_function_argument(
         return Ok(coerced);
     }
     let nullable = expr.value_type.nullable
-        || narrowing_integer_cast_can_return_null(&expr.value_type.data_type, &target.data_type)
+        || novarocks_functions::signed_integer_cast_can_produce_null(
+            &expr.value_type.data_type,
+            &target.data_type,
+        )
         || timestamp_unit_cast_can_return_null(&expr.value_type.data_type, &target.data_type)
         || (expr.value_type.logical_type == novarocks_type_contract::ValueLogicalType::LargeInt
             && target.logical_type == novarocks_type_contract::ValueLogicalType::Physical
@@ -5497,18 +5507,6 @@ fn timestamp_unit_cast_can_return_null(source: &DataType, target: &DataType) -> 
             DataType::Timestamp(TimeUnit::Millisecond, _),
             DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _)
         )
-    )
-}
-
-fn narrowing_integer_cast_can_return_null(source: &DataType, target: &DataType) -> bool {
-    matches!(
-        (source, target),
-        (DataType::Int16, DataType::Int8)
-            | (DataType::Int32, DataType::Int8 | DataType::Int16)
-            | (
-                DataType::Int64,
-                DataType::Int8 | DataType::Int16 | DataType::Int32
-            )
     )
 }
 
@@ -10514,3 +10512,7 @@ mod tests {
 #[cfg(test)]
 #[path = "group_concat_source_tests.rs"]
 mod group_concat_source_tests;
+
+#[cfg(test)]
+#[path = "resolve_expr/signed_cast_nullability_tests.rs"]
+mod signed_cast_nullability_tests;

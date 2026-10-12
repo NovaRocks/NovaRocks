@@ -26,7 +26,9 @@ use arrow::{
 };
 use novarocks_connector_contract::*;
 use novarocks_functions::*;
-use novarocks_local_compiler::{LocalCompileOptions, compile_fragment, validate_fragment_providers};
+use novarocks_local_compiler::{
+    LocalCompileOptions, compile_fragment, validate_fragment_providers,
+};
 use novarocks_local_program::{
     KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
     ProgramNodeKind, ProgramUseRef, StaticExprKind,
@@ -35,7 +37,9 @@ use novarocks_physical_plan::*;
 use novarocks_sql::compiler::{
     SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode, author_fragment_package_semantics,
 };
-use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+};
 use std::{
     collections::BTreeMap,
     num::{NonZeroU64, NonZeroUsize},
@@ -155,7 +159,7 @@ fn frozen_reads_with_residual_mode(
 ) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
     frozen_reads_with_explicit_source_shape(source, admit_original_scan_residuals, false)
 }
-fn frozen_reads_with_explicit_source_shape(
+pub(super) fn frozen_reads_with_explicit_source_shape(
     source: &SqlAuthoredPhysicalPlan,
     admit_original_scan_residuals: bool,
     admit_required_inlist_shape: bool,

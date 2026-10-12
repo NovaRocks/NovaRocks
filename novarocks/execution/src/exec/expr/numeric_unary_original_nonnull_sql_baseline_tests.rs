@@ -144,6 +144,43 @@ fn sql_source_with_explicit_fields(
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    try_sql_source_with_explicit_fields(
+        sql,
+        fields,
+        emission_mode,
+        sql_semantics,
+        static_predicate_offer,
+    )
+    .unwrap()
+}
+
+pub(super) fn try_sql_source_with_declared_fields(
+    sql: &str,
+    fields: &[Field],
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+) -> Result<
+    novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+    novarocks_sql::compiler::SqlCompileProgressError,
+> {
+    try_sql_source_with_explicit_fields(
+        sql,
+        fields,
+        emission_mode,
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        None,
+    )
+}
+
+fn try_sql_source_with_explicit_fields(
+    sql: &str,
+    fields: &[Field],
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+    static_predicate_offer: Option<bool>,
+) -> Result<
+    novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+    novarocks_sql::compiler::SqlCompileProgressError,
+> {
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
@@ -189,12 +226,11 @@ fn sql_source_with_explicit_fields(
         },
         DEFAULT_COMPLETION_LIMITS,
     );
-    let mut progress =
-        SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap();
+    let mut progress = SqlCompiler::start(request.try_into_completion().unwrap(), &control)?;
     let mut bindings = SqlTableBindingAllocator::new_unique().unwrap();
     loop {
         let compilation = match progress {
-            SqlCompileProgress::Complete(completed) => return completed.into_plan(),
+            SqlCompileProgress::Complete(completed) => return Ok(completed.into_plan()),
             SqlCompileProgress::Incomplete(compilation) => compilation,
         };
         let facts = match compilation.needs() {
@@ -266,7 +302,7 @@ fn sql_source_with_explicit_fields(
             ),
             other => panic!("unexpected original nonnull fixture needs: {other:?}"),
         };
-        progress = SqlCompiler::finish(compilation, facts, &control).unwrap();
+        progress = SqlCompiler::finish(compilation, facts, &control)?;
     }
 }
 

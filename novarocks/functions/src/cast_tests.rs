@@ -830,3 +830,68 @@ fn same_carrier_without_a_kernel_prepares_an_identity_with_no_row_operation() {
         Err(CastPrepareError::Unsupported)
     ));
 }
+
+#[test]
+fn signed_successful_null_fact_matches_exact_carriers_independently_of_policy_and_allow() {
+    let signed = carriers();
+    for (source_width, source) in signed.iter().enumerate() {
+        for (target_width, target) in signed.iter().enumerate() {
+            let expected = target_width < source_width;
+            assert_eq!(
+                signed_integer_cast_can_produce_null(source, target),
+                expected
+            );
+            for allow in [false, true] {
+                assert_eq!(
+                    carrier_cast_can_produce_null(source, target, allow),
+                    expected
+                );
+                for policy in [
+                    DecimalOverflowPolicy::OutputNull,
+                    DecimalOverflowPolicy::ReportError,
+                ] {
+                    assert_eq!(
+                        carrier_cast_can_produce_null_with_policy(source, target, policy, allow),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+    for (source, target) in [
+        (DataType::UInt64, DataType::Int32),
+        (DataType::Int64, DataType::UInt64),
+        (DataType::Float64, DataType::Int32),
+        (DataType::Utf8, DataType::Int32),
+        (DataType::Boolean, DataType::Int8),
+        (DataType::Date32, DataType::Int32),
+        (DataType::FixedSizeBinary(16), DataType::Int64),
+    ] {
+        assert!(!signed_integer_cast_can_produce_null(&source, &target));
+    }
+    assert!(carrier_cast_can_produce_null(
+        &DataType::UInt64,
+        &DataType::Int32,
+        true
+    ));
+    assert!(carrier_cast_can_produce_null(
+        &DataType::Int64,
+        &DataType::UInt64,
+        true
+    ));
+    assert!(carrier_cast_can_produce_null(
+        &DataType::Float64,
+        &DataType::Int32,
+        false
+    ));
+    assert!(!carrier_cast_can_produce_null(
+        &DataType::Float64,
+        &DataType::Int32,
+        true
+    ));
+    assert!(carrier_cast_can_produce_null(
+        &DataType::Utf8,
+        &DataType::Int32,
+        true
+    ));
+}
