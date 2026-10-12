@@ -16,25 +16,10 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, Int64Array, ListArray, make_array, new_null_array};
-use arrow::compute::cast;
+use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field};
-use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
-use arrow_data::transform::MutableArrayData;
+use novarocks_functions::builtin::array_repeat_core::{cast_repeat_count, repeat_values};
 use std::sync::Arc;
-
-fn cast_repeat_count(array: ArrayRef) -> Result<ArrayRef, String> {
-    if array.data_type() == &DataType::Int64 {
-        return Ok(array);
-    }
-    cast(&array, &DataType::Int64).map_err(|e| {
-        format!(
-            "array_repeat failed to cast repeat count {:?} -> BIGINT: {}",
-            array.data_type(),
-            e
-        )
-    })
-}
 
 pub fn eval_array_repeat(
     arena: &ExprArena,
@@ -53,62 +38,5 @@ pub fn eval_array_repeat(
         Some(DataType::List(field)) => field.clone(),
         _ => Arc::new(Field::new("item", source.data_type().clone(), true)),
     };
-    let item_type = output_field.data_type().clone();
-    let mut values = if source.data_type() == &DataType::Null && item_type != DataType::Null {
-        new_null_array(&item_type, source.len())
-    } else if source.data_type() == &item_type {
-        source
-    } else {
-        cast(&source, &item_type).map_err(|e| {
-            format!(
-                "array_repeat failed to cast source type {:?} -> {:?}: {}",
-                source.data_type(),
-                item_type,
-                e
-            )
-        })?
-    };
-    if values.is_empty() && !chunk.is_empty() {
-        values = new_null_array(&item_type, chunk.len());
-    }
-
-    let values_data = values.to_data();
-    let mut mutable = MutableArrayData::new(vec![&values_data], false, 0);
-    let mut offsets = Vec::with_capacity(chunk.len() + 1);
-    offsets.push(0_i32);
-    let mut null_builder = NullBufferBuilder::new(chunk.len());
-    let mut current: i64 = 0;
-
-    for row in 0..chunk.len() {
-        let source_row = super::common::row_index(row, values.len());
-        let count_row = super::common::row_index(row, counts.len());
-        if counts.is_null(count_row) {
-            null_builder.append_null();
-            offsets.push(current as i32);
-            continue;
-        }
-
-        let repeat_count = counts.value(count_row);
-        if repeat_count > 0 {
-            for _ in 0..repeat_count {
-                mutable.extend(0, source_row, source_row + 1);
-            }
-            current = current
-                .checked_add(repeat_count)
-                .ok_or_else(|| "array_repeat offset overflow".to_string())?;
-            if current > i32::MAX as i64 {
-                return Err("array_repeat offset overflow".to_string());
-            }
-        }
-        null_builder.append_non_null();
-        offsets.push(current as i32);
-    }
-
-    let out = ListArray::new(
-        output_field,
-        OffsetBuffer::new(offsets.into()),
-        make_array(mutable.freeze()),
-        null_builder.finish(),
-    );
-    Ok(Arc::new(out) as ArrayRef)
+    repeat_values(source, counts, chunk.len(), output_field)
 }

@@ -1,0 +1,107 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//! Shared ARRAY_REPEAT computation over already evaluated Arrow arguments.
+use arrow_array::{Array, ArrayRef, Int64Array, ListArray, make_array, new_null_array};
+use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
+use arrow_cast::cast;
+use arrow_data::transform::MutableArrayData;
+use arrow_schema::{DataType, FieldRef};
+use std::sync::Arc;
+
+pub fn cast_repeat_count(array: ArrayRef) -> Result<ArrayRef, String> {
+    if array.data_type() == &DataType::Int64 {
+        return Ok(array);
+    }
+    cast(&array, &DataType::Int64).map_err(|e| {
+        format!(
+            "array_repeat failed to cast repeat count {:?} -> BIGINT: {}",
+            array.data_type(),
+            e
+        )
+    })
+}
+
+/// Repeats the original materialized invocation rows using the supplied result field.
+pub fn repeat_values(
+    source: ArrayRef,
+    counts: &Int64Array,
+    rows: usize,
+    output_field: FieldRef,
+) -> Result<ArrayRef, String> {
+    let item_type = output_field.data_type().clone();
+    let mut values = if source.data_type() == &DataType::Null && item_type != DataType::Null {
+        new_null_array(&item_type, source.len())
+    } else if source.data_type() == &item_type {
+        source
+    } else {
+        cast(&source, &item_type).map_err(|e| {
+            format!(
+                "array_repeat failed to cast source type {:?} -> {:?}: {}",
+                source.data_type(),
+                item_type,
+                e
+            )
+        })?
+    };
+    if values.is_empty() && rows != 0 {
+        values = new_null_array(&item_type, rows);
+    }
+
+    let values_data = values.to_data();
+    let mut mutable = MutableArrayData::new(vec![&values_data], false, 0);
+    let mut offsets = Vec::with_capacity(rows + 1);
+    offsets.push(0_i32);
+    let mut null_builder = NullBufferBuilder::new(rows);
+    let mut current: i64 = 0;
+
+    for row in 0..rows {
+        let source_row = super::map_lookup_core::row_index(row, values.len());
+        let count_row = super::map_lookup_core::row_index(row, counts.len());
+        if counts.is_null(count_row) {
+            null_builder.append_null();
+            offsets.push(current as i32);
+            continue;
+        }
+
+        let repeat_count = counts.value(count_row);
+        if repeat_count > 0 {
+            for _ in 0..repeat_count {
+                mutable.extend(0, source_row, source_row + 1);
+            }
+            current = current
+                .checked_add(repeat_count)
+                .ok_or_else(|| "array_repeat offset overflow".to_string())?;
+            if current > i32::MAX as i64 {
+                return Err("array_repeat offset overflow".to_string());
+            }
+        }
+        null_builder.append_non_null();
+        offsets.push(current as i32);
+    }
+
+    let out = ListArray::new(
+        output_field,
+        OffsetBuffer::new(offsets.into()),
+        make_array(mutable.freeze()),
+        null_builder.finish(),
+    );
+    Ok(Arc::new(out) as ArrayRef)
+}
+
+#[cfg(test)]
+#[path = "array_repeat_core_tests.rs"]
+mod tests;
