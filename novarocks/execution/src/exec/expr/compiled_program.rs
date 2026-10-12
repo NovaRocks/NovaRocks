@@ -21,6 +21,8 @@
 //! it, as required by the neutral kernel ABI. These controls do not mint a
 //! memory grant. Higher-order and encoded guarded-result protocols remain separate.
 
+use input_source::CompiledInputLoan;
+
 use arrow::{
     array::{ArrayRef, UInt64Array, new_empty_array, new_null_array},
     compute::{TakeOptions, take},
@@ -63,6 +65,8 @@ pub struct CompiledExpressionInstance {
     has_invocation_data: bool,
     effects: BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     failed: bool,
+    #[cfg(test)]
+    slot_source_observer: Option<Arc<input_source::SlotSourceObserver>>,
     allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
 }
 
@@ -562,6 +566,8 @@ impl CompiledExpressionInstance {
             has_invocation_data,
             effects,
             failed: false,
+            #[cfg(test)]
+            slot_source_observer: None,
             allocator: None,
         })
     }
@@ -595,7 +601,7 @@ impl CompiledExpressionInstance {
         };
         let result = observed.checkpoint(0).and_then(|()| {
             self.evaluate_once::<KernelFailure>(
-                input,
+                CompiledInputLoan::RecordBatch(input),
                 selection,
                 novarocks_functions::ScalarInvocationActivation::Activated,
                 &mut work,
@@ -631,11 +637,50 @@ impl CompiledExpressionInstance {
         scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
     ) -> Result<SelectedValues<'a>, crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure>
     {
-        self.evaluate_controlled(input, selection, activation, control, Some(scope))
+        self.evaluate_input_runtime(
+            CompiledInputLoan::RecordBatch(input),
+            selection,
+            activation,
+            control,
+            scope,
+        )
+    }
+    /// Borrows one structural input through the original runtime evaluator.
+    /// The input lifetime is independent of the returned Selection lifetime.
+    pub(crate) fn evaluate_input_runtime<'a>(
+        &mut self,
+        input: CompiledInputLoan<'_>,
+        selection: Selection<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+        scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
+    ) -> Result<SelectedValues<'a>, crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure>
+    {
+        self.evaluate_input_controlled(input, selection, activation, control, Some(scope))
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_slot_source(&mut self, observer: Arc<input_source::SlotSourceObserver>) {
+        self.slot_source_observer = Some(observer);
     }
     fn evaluate_controlled<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
         input: &RecordBatch,
+        selection: Selection<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+        scope: Option<&mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope>,
+    ) -> Result<SelectedValues<'a>, E> {
+        self.evaluate_input_controlled(
+            CompiledInputLoan::RecordBatch(input),
+            selection,
+            activation,
+            control,
+            scope,
+        )
+    }
+    fn evaluate_input_controlled<'a, E: scalar_invocation::FrameFailure>(
+        &mut self,
+        input: CompiledInputLoan<'_>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
@@ -649,6 +694,14 @@ impl CompiledExpressionInstance {
             self.failed = true;
             return Err(invalid("nonempty root demand cannot be validation-only").into());
         }
+        #[cfg(test)]
+        let source_observer = self.slot_source_observer.clone();
+        #[cfg(test)]
+        let input = if let Some(observer) = source_observer.as_deref() {
+            input.observed(observer)
+        } else {
+            input
+        };
         let observed = ObservedControl {
             original: control,
             refused: AtomicBool::new(false),
@@ -677,7 +730,7 @@ impl CompiledExpressionInstance {
     }
     fn evaluate_once<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
-        input: &RecordBatch,
+        input: CompiledInputLoan<'_>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         work: &mut Work<'_, '_>,
@@ -750,7 +803,7 @@ impl CompiledExpressionInstance {
     }
     fn evaluate_root<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
-        input: &RecordBatch,
+        input: CompiledInputLoan<'_>,
         input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
@@ -1057,3 +1110,7 @@ pub(crate) use filter_conjunction::CompiledFilterConjunctionInstance;
 
 #[cfg(test)]
 mod runtime_scalar_memory_tests;
+
+pub(crate) mod input_source;
+#[cfg(test)]
+pub(crate) mod input_source_tests;

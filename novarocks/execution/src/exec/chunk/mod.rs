@@ -24,6 +24,9 @@ mod root_chunk_storage;
 mod root_schema_backing;
 mod schema;
 mod slot_layout;
+mod source_authority;
+#[cfg(test)]
+pub(crate) mod source_authority_tests;
 #[cfg(test)]
 mod tests;
 pub mod type_compatibility;
@@ -43,3 +46,4 @@ pub use root_array_storage::{
 pub use root_chunk_storage::{borrowed_root_chunk_schema_storage, borrowed_root_chunk_storage};
 pub use schema::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 pub use slot_layout::SlotLayout;
+pub(crate) use source_authority::ChunkSourceAuthorityRef;

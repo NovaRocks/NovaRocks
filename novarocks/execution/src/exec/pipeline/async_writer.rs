@@ -864,7 +864,7 @@ async fn run_writer_actor<O: Send + 'static>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -905,6 +905,38 @@ mod tests {
 
     struct TrackerLedger {
         tracker: Arc<MemTracker>,
+    }
+
+    pub(crate) fn provider_chunk_with_original_token(
+        batch: RecordBatch,
+        tracker: &Arc<MemTracker>,
+    ) -> (crate::exec::chunk::Chunk, usize) {
+        let bytes = batch
+            .columns()
+            .iter()
+            .map(|array| array.get_array_memory_size())
+            .sum::<usize>();
+        let resources =
+            ConnectorExecutionResources::from_admitted_ledger(Arc::new(TrackerLedger {
+                tracker: Arc::clone(tracker),
+            }));
+        let token = resources
+            .try_reserve(ConnectorResourceClass::ReaderOutput, bytes as u64)
+            .unwrap()
+            .into_output(bytes as u64)
+            .unwrap();
+        let slots = (0..batch.num_columns())
+            .map(|ordinal| novarocks_types::SlotId(ordinal as u32 + 1))
+            .collect::<Vec<_>>();
+        let schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &slots,
+        )
+        .unwrap();
+        let mut chunk =
+            crate::exec::chunk::Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
+        chunk.attach_connector_output_memory(token).unwrap();
+        (chunk, bytes)
     }
 
     impl ConnectorResourceLedger for TrackerLedger {
@@ -1385,6 +1417,81 @@ mod tests {
         owner.request_finish().unwrap();
         wait_until(|| owner.has_output());
         assert!(error.error().is_none());
+    }
+
+    fn compiled_writer_source_loan(provider: bool) {
+        use crate::exec::chunk::{record_batch_additional_bytes, record_batch_shared_owner_bytes};
+        use crate::exec::expr::compiled_program::{
+            input_source_tests::input_chunk,
+            tests::{SeedMode, program},
+        };
+        use crate::exec::operators::compiled_writer::source_loan_test_projector;
+
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let (mut owner, error, tracker, _runtime) = owner(
+            calls,
+            Some(Arc::clone(&gate)),
+            false,
+            false,
+            AsyncWriterQueueConfig {
+                max_batches: 1,
+                max_rows: 4,
+                max_bytes: 4096,
+                max_batch_rows: 4,
+                max_batch_bytes: 4096,
+                abort_timeout: Duration::from_secs(1),
+            },
+        );
+        let program = program(SeedMode::Input, false);
+        let input = input_chunk(&program, vec![Some(42), None, Some(7)]);
+        let mut input = if provider {
+            provider_chunk_with_original_token(input.batch, &tracker).0
+        } else {
+            let mut input = input;
+            input.try_transfer_to(&tracker).unwrap();
+            input
+        };
+        let source_bytes = tracker.current();
+        tracker.install_limit_once(source_bytes).unwrap();
+        let counts = input.source_authority().strong_counts();
+        let mut projector = source_loan_test_projector(program, None);
+        let output = projector.project(&input).unwrap();
+        assert_eq!(input.source_authority().strong_counts(), counts);
+        assert_eq!(tracker.current(), source_bytes);
+        let retained = crate::exec::chunk::record_batch_bytes(&output.batch);
+        let shared = record_batch_shared_owner_bytes(&output.batch, &input.batch);
+        let additional = record_batch_additional_bytes(&output.batch, &input.batch);
+        assert_eq!(additional, 0);
+        assert_eq!(shared, retained);
+        assert!(retained < source_bytes as usize);
+        let lease = input
+            .take_memory_lease()
+            .expect("the source loan must keep the original exclusive lease");
+        let reservation = owner
+            .try_reserve_input(output.len(), retained, Some(lease), shared, additional)
+            .expect("original exclusive reservation avoids a second charge");
+        drop(input);
+        reservation.send(output.batch).unwrap();
+        assert_eq!(tracker.current(), retained as i64);
+        assert_eq!(tracker.peak(), source_bytes);
+        gate.notify_one();
+        wait_until(|| owner.queued_usage() == (0, 0));
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(tracker.allocated(), tracker.deallocated());
+        owner.request_finish().unwrap();
+        wait_until(|| owner.has_output());
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn compiled_writer_source_loan_preserves_native_exclusive_transfer() {
+        compiled_writer_source_loan(false);
+    }
+
+    #[test]
+    fn compiled_writer_source_loan_preserves_provider_shrink_and_release() {
+        compiled_writer_source_loan(true);
     }
 
     #[test]

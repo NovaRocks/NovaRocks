@@ -53,7 +53,9 @@ use crate::exec::node::table_write_relation::{
     RootWriteResultRelationSchema, WriterMultiplexRelationSchema,
 };
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
-use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
+use crate::exec::operators::compiled_expression::{
+    RuntimeKernelControl, evaluate_chunk_all, instances,
+};
 use crate::exec::operators::compiled_writer_statistics::{
     CompiledFinishStatistics, CompiledWriterPartialFactory,
 };
@@ -292,6 +294,45 @@ struct CompiledWriterProjector {
     instances: Option<Vec<CompiledExpressionInstance>>,
 }
 
+#[cfg(test)]
+pub(crate) fn source_loan_test_projector(
+    program: Arc<LocalProgram>,
+    observer: Option<Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>>,
+) -> Box<dyn WriterPageProjection> {
+    use novarocks_local_program::ProgramNodeExpressionRole;
+    // Reuse the original checked Slot fixture, through the actual projector's
+    // project() method. This fixture tests input borrowing and handoff, not
+    // provider recipe construction or WriterProjection root admission.
+    let site = ProgramExpressionRootSite::Node {
+        node: ProgramNodeId::new(3),
+        role: ProgramNodeExpressionRole::ProjectOutput { expression: 1 },
+    };
+    let field = program.graph().nodes()[2]
+        .output_layout()
+        .schema()
+        .field(1)
+        .clone();
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[novarocks_types::SlotId(100)])
+            .unwrap();
+    let control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+    let mut slots = None;
+    instances(&mut slots, &program, &[site], &control).unwrap();
+    if let Some(observer) = observer {
+        slots.as_mut().unwrap()[0].observe_slot_source(observer);
+    }
+    Box::new(CompiledWriterProjector {
+        program,
+        sites: Arc::from([site]),
+        schema,
+        chunk_schema,
+        obligations: Arc::from([]),
+        control,
+        instances: slots,
+    })
+}
+
 impl WriterPageProjection for CompiledWriterProjector {
     fn bind_runtime_state(
         &mut self,
@@ -313,7 +354,7 @@ impl WriterPageProjection for CompiledWriterProjector {
         let instances = self.instances.as_mut().expect("instances were created");
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.sites.len());
         for (instance, site) in instances.iter_mut().zip(self.sites.iter()) {
-            columns.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            columns.push(evaluate_chunk_all(instance, *site, chunk, &self.control)?);
         }
         // The row obligation: a NOT NULL provider field fed a NULL refuses the
         // page before any provider write, at the same failure point and with

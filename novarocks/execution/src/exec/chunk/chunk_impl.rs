@@ -48,6 +48,13 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    pub(crate) fn source_authority(&self) -> super::ChunkSourceAuthorityRef<'_> {
+        super::ChunkSourceAuthorityRef::from_attached(
+            self.accounting.as_ref(),
+            self.connector_output_memory.as_ref(),
+        )
+    }
+
     pub fn try_new_with_columns(
         chunk_schema: ChunkSchemaRef,
         columns: Vec<ArrayRef>,

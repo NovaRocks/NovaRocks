@@ -888,7 +888,7 @@ impl Frame {
 pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     program: &novarocks_local_program::LocalProgram,
     root: ProgramExpressionRootSite,
-    input: &RecordBatch,
+    input: CompiledInputLoan<'_>,
     input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
     selection: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
@@ -1060,12 +1060,14 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                             invalid("slot source differs from actual root input port").into()
                         );
                     }
-                    OwnedValue::Column(Arc::clone(
-                        input
-                            .columns()
-                            .get(*ordinal as usize)
-                            .ok_or_else(|| invalid("slot source ordinal is absent"))?,
-                    ))
+                    let column = input
+                        .checked_column(*ordinal as usize)
+                        .ok_or_else(|| invalid("slot source ordinal is absent"))?;
+                    // Obtain the source at the original checked Slot. Current
+                    // kernels still consume only the evaluated array; this
+                    // synchronous borrow neither captures nor wraps its owner.
+                    let (array, _source) = column.into_parts();
+                    OwnedValue::Column(Arc::clone(array))
                 }
                 StaticExprKind::PreparedLike { negated, .. } => {
                     if frame.children.len() != 2 {

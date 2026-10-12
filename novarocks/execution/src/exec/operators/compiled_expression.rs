@@ -40,7 +40,9 @@ use novarocks_local_program::{
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::{
+    CompiledExpressionInstance, input_source::CompiledInputLoan,
+};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
@@ -131,9 +133,31 @@ pub(crate) fn evaluate_all(
     evaluate_selection(
         instance,
         site,
-        input,
+        CompiledInputLoan::RecordBatch(input),
         Selection::all(input.num_rows()),
         if input.num_rows() == 0 {
+            novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        } else {
+            novarocks_functions::ScalarInvocationActivation::Activated
+        },
+        control,
+    )
+}
+
+/// The actual Chunk callers borrow its original attached authority. No
+/// authority is retained after this synchronous evaluation returns.
+pub(crate) fn evaluate_chunk_all(
+    instance: &mut CompiledExpressionInstance,
+    site: ProgramExpressionRootSite,
+    input: &Chunk,
+    control: &RuntimeKernelControl,
+) -> ExecutionResult<ArrayRef> {
+    evaluate_selection(
+        instance,
+        site,
+        CompiledInputLoan::from_chunk(input),
+        Selection::all(input.batch.num_rows()),
+        if input.batch.num_rows() == 0 {
             novarocks_functions::ScalarInvocationActivation::ValidateOnly
         } else {
             novarocks_functions::ScalarInvocationActivation::Activated
@@ -163,13 +187,20 @@ pub(crate) fn evaluate_selected(
     } else {
         novarocks_functions::ScalarInvocationActivation::Activated
     };
-    evaluate_selection(instance, site, input, selection, activation, control)
+    evaluate_selection(
+        instance,
+        site,
+        CompiledInputLoan::RecordBatch(input),
+        selection,
+        activation,
+        control,
+    )
 }
 
 fn evaluate_selection(
     instance: &mut CompiledExpressionInstance,
     site: ProgramExpressionRootSite,
-    input: &RecordBatch,
+    input: CompiledInputLoan<'_>,
     selection: Selection<'_>,
     activation: novarocks_functions::ScalarInvocationActivation,
     control: &RuntimeKernelControl,
@@ -179,7 +210,8 @@ fn evaluate_selection(
     let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
     let mut scope =
         crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
-    let result = instance.evaluate_runtime(input, selection, activation, control, &mut scope)?;
+    let result =
+        instance.evaluate_input_runtime(input, selection, activation, control, &mut scope)?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
         return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
@@ -452,6 +484,46 @@ struct CompiledProjectProcessor {
     finishing: bool,
     finished: bool,
 }
+
+#[cfg(test)]
+pub(crate) fn project_chunk_with_source_observer(
+    program: Arc<LocalProgram>,
+    chunk: Chunk,
+    observer: Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>,
+) -> ExecutionResult<Chunk> {
+    let factory = CompiledProjectProcessorFactory::try_new(
+        program,
+        ProgramNodeId::new(3),
+        Arc::new(RuntimeErrorState::default()),
+    )?;
+    let mut processor = CompiledProjectProcessor {
+        name: factory.name,
+        program: factory.program,
+        sites: factory.sites,
+        final_identity_slots: factory.final_identity_slots,
+        output: factory.output,
+        control: RuntimeKernelControl::new(factory.error),
+        instances: None,
+        pending: None,
+        finishing: false,
+        finished: false,
+    };
+    assert!(processor.final_identity_slots.is_none());
+    instances(
+        &mut processor.instances,
+        &processor.program,
+        &processor.sites,
+        &processor.control,
+    )?;
+    for instance in processor.instances.as_mut().unwrap() {
+        instance.observe_slot_source(Arc::clone(&observer));
+    }
+    let state = RuntimeState::default();
+    processor.push_chunk(&state, chunk)?;
+    processor
+        .pull_chunk(&state)?
+        .ok_or_else(|| "source fixture Project has no output".into())
+}
 impl Operator for CompiledProjectProcessor {
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
@@ -537,7 +609,7 @@ impl ProcessorOperator for CompiledProjectProcessor {
         let instances = self.instances.as_mut().expect("instances were created");
         let mut columns = Vec::with_capacity(self.sites.len());
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            columns.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            columns.push(evaluate_chunk_all(instance, *site, &chunk, &self.control)?);
         }
         // A Project may publish no column (e.g. under COUNT(*)); its row count
         // is still its input's, which a zero-column batch cannot infer.
