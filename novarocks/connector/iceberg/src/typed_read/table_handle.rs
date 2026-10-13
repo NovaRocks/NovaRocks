@@ -158,6 +158,7 @@ pub struct IcebergTableHandle {
     read_domain: Option<Arc<crate::delete_semantics::ReadDomain>>,
     table_schema_json: Arc<str>,
     scalar_integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
+    nominal_read_domains: crate::nominal_read_domain::NominalReadDomains,
     spec_id: Option<i32>,
     partition_spec_jsons: BTreeMap<i32, String>,
     format_version: i32,
@@ -301,6 +302,7 @@ impl IcebergTableHandle {
             read_domain,
             table_schema_json: Arc::from(table_schema_json.as_str()),
             scalar_integer_domains: BTreeMap::new(),
+            nominal_read_domains: BTreeMap::new(),
             spec_id,
             partition_spec_jsons,
             format_version,
@@ -399,6 +401,41 @@ impl IcebergTableHandle {
         }
         self.scalar_integer_domains = domains;
         Ok(self)
+    }
+
+    pub(crate) fn with_nominal_read_domains(
+        mut self,
+        domains: crate::nominal_read_domain::NominalReadDomains,
+    ) -> Result<Self, ConnectorError> {
+        crate::nominal_read_domain::validate_schema(&self.parse_table_schema()?, &domains)?;
+        for column in self
+            .projected_columns
+            .iter()
+            .chain(
+                self.unenforced_predicate
+                    .domains()
+                    .into_iter()
+                    .flat_map(|map| map.keys()),
+            )
+            .chain(
+                self.enforced_predicate
+                    .domains()
+                    .into_iter()
+                    .flat_map(|map| map.keys()),
+            )
+        {
+            if column.nominal_read_domain() != domains.get(&column.base_field_id()).copied() {
+                return Err(invalid(
+                    "Iceberg column nominal declaration differs from its frozen relation",
+                ));
+            }
+        }
+        self.nominal_read_domains = domains;
+        Ok(self)
+    }
+
+    pub(crate) fn nominal_read_domains(&self) -> &crate::nominal_read_domain::NominalReadDomains {
+        &self.nominal_read_domains
     }
 
     pub(crate) fn scalar_integer_domains(
@@ -528,6 +565,16 @@ impl IcebergTableHandle {
         let mut unenforced: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         let mut remaining: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         for (column, domain) in summary_domains {
+            if column.nominal_read_domain()
+                != self
+                    .nominal_read_domains
+                    .get(&column.base_field_id())
+                    .copied()
+            {
+                return Err(invalid(
+                    "Iceberg filter differs from its frozen nominal declaration",
+                ));
+            }
             if column.scalar_integer_domain()
                 != self
                     .scalar_integer_domains
@@ -591,6 +638,16 @@ impl IcebergTableHandle {
         let mut handle = self.clone();
         handle.projected_columns = assignments.projected_column_set();
         for column in &handle.projected_columns {
+            if column.nominal_read_domain()
+                != handle
+                    .nominal_read_domains
+                    .get(&column.base_field_id())
+                    .copied()
+            {
+                return Err(invalid(
+                    "Iceberg projection differs from its frozen nominal declaration",
+                ));
+            }
             if column.scalar_integer_domain()
                 != handle
                     .scalar_integer_domains
@@ -660,6 +717,11 @@ impl IcebergTableHandle {
                 .map(|value| value.to_string()),
             table_location: self.table_location.to_string(),
             storage_properties: self.storage_properties.clone(),
+            nominal_read_domains: self
+                .nominal_read_domains
+                .iter()
+                .map(|(id, domain)| (*id, domain.name().to_string()))
+                .collect(),
             scalar_integer_domains: self
                 .scalar_integer_domains
                 .iter()
@@ -739,6 +801,17 @@ impl IcebergTableHandle {
                     ))
                 })
                 .collect::<Result<_, novarocks_spi::connector::ConnectorError>>()?,
+        )?
+        .with_nominal_read_domains(
+            raw.nominal_read_domains
+                .iter()
+                .map(|(id, value)| {
+                    Ok((
+                        *id,
+                        crate::nominal_read_domain::NominalReadDomain::parse(value)?,
+                    ))
+                })
+                .collect::<Result<_, ConnectorError>>()?,
         )
     }
 }

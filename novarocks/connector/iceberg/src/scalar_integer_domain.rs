@@ -597,15 +597,13 @@ fn apply_source_logical_schema(
             .validate_carrier(field.data_type())
             .map_err(|error| corrupt(error.to_string()))?;
         if declared.contains_key(&ordinal) {
-            let mut metadata = field.metadata().clone();
-            metadata.insert(
-                NR_LOGICAL_TYPE_KEY.into(),
-                logical
-                    .metadata_value()
-                    .expect("declared domains have labels")
-                    .into(),
-            );
-            fields.push(Arc::new(field.as_ref().clone().with_metadata(metadata)));
+            let domain = crate::nominal_read_domain::NominalReadDomain::from_logical(logical)
+                .expect("only declared opaque domains reach field authoring");
+            fields.push(Arc::new(
+                domain
+                    .annotate(field)
+                    .map_err(|error| corrupt(error.to_string()))?,
+            ));
         } else {
             fields.push(field.clone());
         }

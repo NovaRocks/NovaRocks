@@ -57,6 +57,7 @@ pub mod metadata_batch_reader;
 pub mod metadata_context;
 pub mod metadata_factory;
 pub mod metadata_read;
+pub(crate) mod nominal_read_domain;
 pub mod planning_facts;
 pub mod position_delete;
 pub mod position_delete_descriptor;

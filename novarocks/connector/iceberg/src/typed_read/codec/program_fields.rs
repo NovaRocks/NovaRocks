@@ -109,9 +109,8 @@ pub(super) fn validate_program_columns(
 /// defaults and nested domains included. A metadata relation's fields come from
 /// its frozen system schema instead; see `system_public_read_schema`.
 ///
-/// Legacy table-property declarations of a nominal domain (HLL, BITMAP,
-/// LARGEINT) are not frozen into the read handle, so their columns publish the
-/// physical storage domain the handle proves.
+/// Nominal domains come from the provider's original selected-schema author
+/// and remain frozen independently in the relation and column handles.
 pub(crate) fn public_read_schema(
     relation: &IcebergRuntimeRelation,
     columns: &[IcebergColumnHandle],
@@ -375,6 +374,11 @@ fn source_column_field(
         });
     let expected = opaque_source(work, || IcebergColumnHandle::base_column(source))?;
     let expected = opaque_source(work, || expected.with_scalar_integer_domain(domain))?;
+    let nominal = match table {
+        Some(table) => table.nominal_read_domains().get(&source.id).copied(),
+        None => column.nominal_read_domain(),
+    };
+    let expected = opaque_source(work, || expected.with_nominal_read_domain(nominal))?;
     let expected = opaque_source(work, || expected.dereference(column.field_id_path()))?;
     compare_handle(column, &expected, work)?;
     let mut field = opaque_source(work, || {
@@ -384,6 +388,9 @@ fn source_column_field(
         field = opaque(work, || {
             Arc::new(field.as_ref().clone().with_data_type(domain.data_type()))
         })?;
+    }
+    if let Some(domain) = expected.nominal_read_domain() {
+        field = opaque_source(work, || domain.annotate(&field).map(Arc::new))?;
     }
     Ok((field, expected.nullable()))
 }
@@ -449,6 +456,9 @@ fn projected_field(
             Arc::new(field.as_ref().clone().with_data_type(domain.data_type()))
         })?;
     }
+    if let Some(domain) = column.nominal_read_domain() {
+        field = opaque_source(work, || domain.annotate(&field).map(Arc::new))?;
+    }
     work.step()?;
     Ok(field)
 }
@@ -494,6 +504,13 @@ fn compare_handle(
     if !same {
         return Err(invalid(
             "read column NULL or narrow-integer domain differs from frozen source",
+        ));
+    }
+    let same_nominal = actual.nominal_read_domain() == expected.nominal_read_domain();
+    work.step()?;
+    if !same_nominal {
+        return Err(invalid(
+            "read column nominal domain differs from frozen source",
         ));
     }
     Ok(())
@@ -579,19 +596,7 @@ fn compare_public(
     let source_logical = novarocks_type_contract::field_logical_type(expected)
         .map_err(|_| invalid("source field has invalid logical identity"))?;
     let public_logical = public.logical_types()[ordinal];
-    let compatible_nominal = source_logical == public_logical
-        || matches!(
-            (source_logical, expected.data_type(), public_logical),
-            (
-                ValueLogicalType::Physical,
-                DataType::Binary,
-                ValueLogicalType::Hll | ValueLogicalType::Bitmap
-            ) | (
-                ValueLogicalType::Physical,
-                DataType::FixedSizeBinary(16),
-                ValueLogicalType::LargeInt
-            )
-        );
+    let compatible_nominal = source_logical == public_logical;
     work.step()?;
     if !compatible_nominal {
         return Err(unsupported(
@@ -1057,15 +1062,41 @@ mod tests {
         logical[2] = ValueLogicalType::LargeInt;
         logical[3] = ValueLogicalType::Hll;
         let authored = public(arrow.fields().iter().cloned().collect(), logical.clone());
-        run(&relation, &columns, &authored, &Control::default()).unwrap();
-        logical[3] = ValueLogicalType::Bitmap;
-        run(
-            &relation,
-            &columns,
-            &public(arrow.fields().iter().cloned().collect(), logical),
-            &Control::default(),
-        )
-        .unwrap();
+        rejected(&relation, &columns, &authored);
+        for sketch in [
+            crate::nominal_read_domain::NominalReadDomain::Hll,
+            crate::nominal_read_domain::NominalReadDomain::Bitmap,
+        ] {
+            let domains = BTreeMap::from([
+                (3, crate::nominal_read_domain::NominalReadDomain::LargeInt),
+                (4, sketch),
+            ]);
+            let declared = IcebergRuntimeRelation::Table(
+                table(&schema, BTreeMap::new())
+                    .with_nominal_read_domains(domains.clone())
+                    .unwrap(),
+            );
+            let declared_columns = columns
+                .iter()
+                .map(|column| {
+                    column
+                        .clone()
+                        .with_nominal_read_domain(domains.get(&column.base_field_id()).copied())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            logical[3] = sketch.logical();
+            let published = public(arrow.fields().iter().cloned().collect(), logical.clone());
+            run(
+                &declared,
+                &declared_columns,
+                &published,
+                &Control::default(),
+            )
+            .unwrap();
+            rejected(&declared, &columns, &published);
+            rejected(&declared, &declared_columns, &original);
+        }
         // Erasing the SDK's actual UUID label to Physical cannot pass merely
         // because both values occupy exactly sixteen bytes.
         let uuid_without_label = Arc::new(
@@ -1500,5 +1531,78 @@ mod tests {
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
         }
+    }
+
+    #[test]
+    fn public_nominal_source_preserves_reordered_duplicate_ids_and_storage_identities() {
+        use crate::nominal_read_domain::NominalReadDomain;
+        let schema = schema(vec![
+            NestedField::optional(1, "n", Type::Primitive(PrimitiveType::Fixed(16))),
+            NestedField::required(2, "h", Type::Primitive(PrimitiveType::Binary)),
+            NestedField::optional(3, "b", Type::Primitive(PrimitiveType::Binary)),
+            NestedField::optional(4, "u", Type::Primitive(PrimitiveType::Uuid)),
+            NestedField::optional(5, "v", Type::Primitive(PrimitiveType::Variant)),
+            NestedField::optional(6, "raw", Type::Primitive(PrimitiveType::Fixed(16))),
+        ]);
+        let domains = BTreeMap::from([
+            (1, NominalReadDomain::LargeInt),
+            (2, NominalReadDomain::Hll),
+            (3, NominalReadDomain::Bitmap),
+        ]);
+        let relation = IcebergRuntimeRelation::Table(
+            table(&schema, BTreeMap::new())
+                .with_nominal_read_domains(domains.clone())
+                .unwrap(),
+        );
+        let columns = [3, 1, 1, 4, 6, 2, 5].map(|id| {
+            IcebergColumnHandle::base_column_of(&schema, id)
+                .unwrap()
+                .with_nominal_read_domain(domains.get(&id).copied())
+                .unwrap()
+        });
+        let published = public_read_schema(&relation, &columns).unwrap();
+        assert_eq!(
+            published.logical_types(),
+            &[
+                ValueLogicalType::Bitmap,
+                ValueLogicalType::LargeInt,
+                ValueLogicalType::LargeInt,
+                ValueLogicalType::Uuid,
+                ValueLogicalType::Physical,
+                ValueLogicalType::Hll,
+                ValueLogicalType::Variant,
+            ]
+        );
+        assert_eq!(
+            published
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["b", "n", "n", "u", "raw", "h", "v"]
+        );
+        assert_eq!(
+            published
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.metadata()[PARQUET_FIELD_ID_META_KEY].as_str())
+                .collect::<Vec<_>>(),
+            ["3", "1", "1", "4", "6", "2", "5"]
+        );
+        assert!(published.schema().field(0).is_nullable());
+        assert!(!published.schema().field(5).is_nullable());
+        assert_eq!(
+            published.schema().field(1).metadata()[novarocks_type_contract::NR_LOGICAL_TYPE_KEY],
+            "largeint"
+        );
+        let complete = public(
+            published.schema().fields().iter().cloned().collect(),
+            published.logical_types().to_vec(),
+        );
+        run(&relation, &columns, &complete, &Control::default()).unwrap();
+        let declared_only = IcebergRuntimeRelation::Table(table(&schema, BTreeMap::new()));
+        rejected(&declared_only, &columns, &complete);
     }
 }

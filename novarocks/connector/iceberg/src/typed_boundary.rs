@@ -1181,6 +1181,9 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                         IcebergColumnHandle::base_column(field.as_ref())?
                             .with_scalar_integer_domain(
                                 handle.scalar_integer_domains().get(&field.id).copied(),
+                            )?
+                            .with_nominal_read_domain(
+                                handle.nominal_read_domains().get(&field.id).copied(),
                             )?,
                         false,
                     ));
@@ -2248,6 +2251,8 @@ fn pinned_table_handle_with_schema_and_domain(
         .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
 
     let read_domain = read_domain()?;
+    let authored = crate::scalar_integer_domain::metadata_sql_schema(metadata, &schema)?;
+    let nominal = crate::nominal_read_domain::from_sql_schema(&schema, &authored)?;
     IcebergTableHandle::try_new(IcebergTableHandleParams {
         schema_table_name: name.clone(),
         snapshot_id,
@@ -2270,7 +2275,8 @@ fn pinned_table_handle_with_schema_and_domain(
     .with_scalar_integer_domains(crate::scalar_integer_domain::of_schema(
         &schema,
         &crate::scalar_integer_domain::metadata_declarations(metadata)?,
-    )?)
+    )?)?
+    .with_nominal_read_domains(nominal)
 }
 
 /// Freeze one worker-visible change-window relation handle.
@@ -2335,11 +2341,16 @@ fn pinned_change_window_handle(
             "Iceberg change-window endpoints have different declared scalar integer domains",
         ));
     }
+    let authored = crate::scalar_integer_domain::metadata_sql_schema(metadata, &to_schema)?;
+    let nominal = crate::nominal_read_domain::from_sql_schema(&to_schema, &authored)?;
     let columns = change_window_columns(to_schema.as_ref(), row_lineage_enabled(metadata))?
         .into_iter()
         .map(|column| {
             let domain = to_domains.get(&column.base_field_id()).copied();
-            column.with_scalar_integer_domain(domain)
+            let nominal_domain = nominal.get(&column.base_field_id()).copied();
+            column
+                .with_scalar_integer_domain(domain)?
+                .with_nominal_read_domain(nominal_domain)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let table_schema_json = serde_json::to_string(to_schema.as_ref())
@@ -3627,6 +3638,187 @@ mod public_read_schema_tests {
                 ))
                 .collect::<Vec<_>>(),
             [("id", "1"), ("id", "1")]
+        );
+    }
+
+    /// Component contract: real metadata freezes nominal roots for table,
+    /// pinned-file and change-window reads; the installed public boundary
+    /// publishes literal identities, including carrier-compatible nonnominals.
+    /// Temporary local resources are owned by this test. Run with read-schema
+    /// changes; no external catalog or cluster is needed for this property.
+    #[test]
+    fn installed_read_metadata_keeps_nominal_declarations_from_pinned_metadata() {
+        use crate::nominal_read_domain::NominalReadDomain;
+        use novarocks_type_contract::ValueLogicalType;
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "n",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "h",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "b",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::required(
+                    4,
+                    "u",
+                    Type::Primitive(PrimitiveType::Uuid),
+                )),
+                Arc::new(NestedField::optional(
+                    5,
+                    "p",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let mut builder = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://nominal-read".into(),
+            FormatVersion::V2,
+            HashMap::from([
+                ("novarocks.logical_type.n".into(), "largeint".into()),
+                ("novarocks.logical_type.h".into(), "hll".into()),
+                ("novarocks.logical_type.b".into(), "bitmap".into()),
+            ]),
+        )
+        .unwrap();
+        for (id, parent, sequence) in [(41, None, 1), (42, Some(41), 2)] {
+            let snapshot = crate::iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_parent_snapshot_id(parent)
+                .with_sequence_number(sequence)
+                .with_timestamp_ms(1_700_000_000_000 + sequence)
+                .with_manifest_list(format!("memory://nominal-read/snap-{id}.avro"))
+                .with_summary(crate::iceberg::spec::Summary {
+                    operation: crate::iceberg::spec::Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build();
+            builder = builder.add_snapshot(snapshot).unwrap();
+        }
+        let metadata = builder.build().unwrap().metadata;
+        let name = SchemaTableName::try_new("db", "nominals").unwrap();
+        let expected = BTreeMap::from([
+            (1, NominalReadDomain::LargeInt),
+            (2, NominalReadDomain::Hll),
+            (3, NominalReadDomain::Bitmap),
+        ]);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let warehouse = tempfile::tempdir().unwrap();
+        let adapter = installed_adapter(&runtime, &warehouse);
+        for handle in [
+            pinned_table_handle(&name, &metadata, None).unwrap(),
+            pinned_table_handle(&name, &metadata, Some(41)).unwrap(),
+            pinned_table_handle_with_files(
+                &name,
+                &metadata,
+                Some(42),
+                Some(IcebergPinnedDataFileSet::try_new(Vec::<String>::new()).unwrap()),
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(handle.nominal_read_domains(), &expected);
+            let schema = handle.parse_table_schema().unwrap();
+            let columns = [3, 1, 1, 4, 5, 2].map(|id| {
+                adapter.wrap_column(
+                    IcebergColumnHandle::base_column_of(&schema, id)
+                        .unwrap()
+                        .with_nominal_read_domain(handle.nominal_read_domains().get(&id).copied())
+                        .unwrap(),
+                )
+            });
+            let table =
+                adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::Table(handle));
+            let public =
+                ConnectorReadMetadata::read_public_schema(&adapter, &session(), &table, &columns)
+                    .unwrap();
+            assert_eq!(
+                public.logical_types(),
+                &[
+                    ValueLogicalType::Bitmap,
+                    ValueLogicalType::LargeInt,
+                    ValueLogicalType::LargeInt,
+                    ValueLogicalType::Uuid,
+                    ValueLogicalType::Physical,
+                    ValueLogicalType::Hll,
+                ]
+            );
+            assert_eq!(
+                public
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| (
+                        field.name().as_str(),
+                        field.is_nullable(),
+                        field.metadata()[PARQUET_FIELD_ID_META_KEY].as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    ("b", true, "3"),
+                    ("n", true, "1"),
+                    ("n", true, "1"),
+                    ("u", false, "4"),
+                    ("p", true, "5"),
+                    ("h", false, "2"),
+                ]
+            );
+        }
+        let window =
+            pinned_change_window_handle(&name, &metadata, ConnectorReadChangeWindow::new(41, 42))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            window
+                .columns()
+                .iter()
+                .map(|column| (column.base_field_id(), column.nominal_read_domain(),))
+                .collect::<Vec<_>>(),
+            [
+                (1, Some(NominalReadDomain::LargeInt)),
+                (2, Some(NominalReadDomain::Hll)),
+                (3, Some(NominalReadDomain::Bitmap)),
+                (4, None),
+                (5, None),
+            ]
+        );
+        let table = adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::ChangeWindow(
+            window,
+        ));
+        let columns =
+            ConnectorReadMetadata::get_column_bindings(&adapter, &session(), &table).unwrap();
+        let handles = columns
+            .iter()
+            .map(|binding| binding.column().clone())
+            .collect::<Vec<_>>();
+        let public =
+            ConnectorReadMetadata::read_public_schema(&adapter, &session(), &table, &handles)
+                .unwrap();
+        assert_eq!(
+            &public.logical_types()[..5],
+            &[
+                ValueLogicalType::LargeInt,
+                ValueLogicalType::Hll,
+                ValueLogicalType::Bitmap,
+                ValueLogicalType::Uuid,
+                ValueLogicalType::Physical,
+            ]
+        );
+        assert_eq!(
+            public.schema().fields().last().unwrap().name(),
+            ICEBERG_CHANGE_OP_COLUMN
         );
     }
 

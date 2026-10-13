@@ -396,7 +396,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             2 | 4 | 6 => singular(Scalar),
             3 => repeated(PackedVarint),
             5 => singular(Varint),
-            7 => singular(Scalar),
+            7 | 8 => singular(Scalar),
             _ => return None,
         },
         Transaction => match field {
@@ -427,7 +427,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             1 => singular(Message(SchemaName)),
             2 | 4 | 6 | 9 => singular(Varint),
             3 | 11 | 12 => singular(Scalar),
-            5 | 16 => repeated(MapI32String),
+            5 | 16 | 18 => repeated(MapI32String),
             7 | 8 => singular(Message(TupleDomain)),
             10 => repeated(Message(Column)),
             13 => repeated(MapStringString),
@@ -691,7 +691,7 @@ fn scan_message(
                 )?;
             }
             WireValue::MapI32String | WireValue::MapStringString => {
-                if matches!(schema, Schema::Table) && field == 16 {
+                if matches!(schema, Schema::Table) && matches!(field, 16 | 18) {
                     // A conservative bound covers one field-ID/domain entry,
                     // including a sparsely occupied BTree node, before decode.
                     context.ledger().charge_retained(256)?;
@@ -1235,6 +1235,9 @@ fn encode_column(value: &IcebergColumnHandle) -> dto::IcebergColumnHandle {
         scalar_integer_domain: value
             .scalar_integer_domain()
             .map(|domain| domain.name().to_string()),
+        nominal_read_domain: value
+            .nominal_read_domain()
+            .map(|domain| domain.name().to_string()),
     }
 }
 
@@ -1276,7 +1279,19 @@ fn decode_column(
                 .map_err(|error| domain_error("iceberg_column", error))
             })
             .transpose()?;
-        observe_opaque(context, || column.with_scalar_integer_domain(domain))?
+        let column = observe_opaque(context, || column.with_scalar_integer_domain(domain))?
+            .map_err(|error| domain_error("iceberg_column", error))?;
+        let nominal = raw
+            .nominal_read_domain
+            .as_deref()
+            .map(|value| {
+                observe_opaque(context, || {
+                    crate::nominal_read_domain::NominalReadDomain::parse(value)
+                })?
+                .map_err(|error| domain_error("iceberg_column", error))
+            })
+            .transpose()?;
+        observe_opaque(context, || column.with_nominal_read_domain(nominal))?
             .map_err(|error| domain_error("iceberg_column", error))
     })();
     context.observe_compile_step()?;
@@ -1587,6 +1602,11 @@ fn decode_transaction(
 
 fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
     dto::IcebergTableHandle {
+        nominal_read_domains: value
+            .nominal_read_domains()
+            .iter()
+            .map(|(id, domain)| (*id, domain.name().to_string()))
+            .collect(),
         scalar_integer_domains: value
             .scalar_integer_domains()
             .iter()
@@ -1766,6 +1786,19 @@ fn decode_table(
         }
         let table = observe_opaque(context, || {
             table.with_scalar_integer_domains(scalar_integer_domains)
+        })?
+        .map_err(|error| domain_error("iceberg_table", error))?;
+        let mut nominal_read_domains = BTreeMap::new();
+        for (id, value) in &raw.nominal_read_domains {
+            let domain = observe_opaque(context, || {
+                crate::nominal_read_domain::NominalReadDomain::parse(value)
+            })?
+            .map_err(|error| domain_error("iceberg_table", error))?;
+            nominal_read_domains.insert(*id, domain);
+            context.observe_compile_step()?;
+        }
+        let table = observe_opaque(context, || {
+            table.with_nominal_read_domains(nominal_read_domains)
         })?
         .map_err(|error| domain_error("iceberg_table", error))?;
         let source = raw
@@ -3594,6 +3627,7 @@ mod tests {
             nullable: true,
             comment: None,
             scalar_integer_domain: None,
+            nominal_read_domain: None,
         }
         .encode_to_vec();
         let header = header(ConnectorCodecCategory::ReadColumn);
@@ -3678,6 +3712,108 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn nominal_table_and_column_roundtrips_preserve_independent_frozen_declarations() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+        use crate::nominal_read_domain::NominalReadDomain;
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "n",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "h",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "b",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    4,
+                    "raw",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+                Arc::new(NestedField::optional(
+                    5,
+                    "u",
+                    Type::Primitive(PrimitiveType::Uuid),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let domains = BTreeMap::from([
+            (1, NominalReadDomain::LargeInt),
+            (2, NominalReadDomain::Hll),
+            (3, NominalReadDomain::Bitmap),
+        ]);
+        let table = IcebergTableHandle::try_new(IcebergTableHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "nominal").unwrap(),
+            snapshot_id: None,
+            read_domain: None,
+            table_schema_json: serde_json::to_string(&schema).unwrap(),
+            spec_id: None,
+            partition_spec_jsons: BTreeMap::new(),
+            format_version: 3,
+            unenforced_predicate: TupleDomain::all(),
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: BTreeSet::new(),
+            name_mapping_json: None,
+            table_location: "memory://warehouse/db/nominal".into(),
+            storage_properties: BTreeMap::new(),
+            pinned_data_files: None,
+        })
+        .unwrap()
+        .with_nominal_read_domains(domains.clone())
+        .unwrap();
+        assert_eq!(
+            IcebergTableHandle::from_proto(&table.to_proto()).unwrap(),
+            table
+        );
+        let relation = IcebergRuntimeRelation::Table(table.clone());
+        let payload = IcebergReadWireCodec.encode_private(&relation).unwrap();
+        let decoded: IcebergRuntimeRelation =
+            decode_with(ConnectorCodecCategory::ReadTable, &payload).unwrap();
+        let IcebergRuntimeRelation::Table(decoded_table) = decoded else {
+            panic!("expected nominal table");
+        };
+        assert_eq!(decoded_table, table);
+        for id in 1..=5 {
+            let column = IcebergColumnHandle::base_column_of(&schema, id)
+                .unwrap()
+                .with_nominal_read_domain(domains.get(&id).copied())
+                .unwrap();
+            assert_eq!(
+                IcebergColumnHandle::from_proto(&column.to_proto()).unwrap(),
+                column
+            );
+            let bytes = IcebergReadWireCodec.encode_private(&column).unwrap();
+            let roundtrip: IcebergColumnHandle =
+                decode_with(ConnectorCodecCategory::ReadColumn, &bytes).unwrap();
+            assert_eq!(roundtrip, column);
+            assert_eq!(column.dereference(&[]).unwrap(), column);
+        }
+        let mut wrong = table.to_proto();
+        wrong.nominal_read_domains.insert(5, "largeint".into());
+        assert!(
+            IcebergTableHandle::from_proto(&wrong).is_err(),
+            "UUID cannot receive a width-derived declaration"
+        );
+        let mut ledger = ConnectorDecodeLedger::new(
+            ConnectorDecodeLimits::try_new(1 << 20, 1, 1 << 20, 100_000, 64).unwrap(),
+        );
+        let error = <IcebergReadWireCodec as ConnectorPrivateDecoder<IcebergRuntimeRelation>>::decode_private(
+            &IcebergReadWireCodec, &payload,
+            &mut ConnectorDecodeContext::new(&header(ConnectorCodecCategory::ReadTable), &mut ledger),
+        ).unwrap_err();
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::Capacity);
     }
 }
 
@@ -4388,5 +4524,111 @@ mod compile_control_tests {
                 assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
             }
         }
+    }
+
+    /// A legal wide nominal declaration map uses the existing retained policy
+    /// and preserves typed interruption through actual private decode.
+    /// This owner-local test has no external resources; run on codec changes.
+    #[test]
+    fn actual_nominal_map_decode_accounts_entries_and_preserves_control_causes() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use crate::nominal_read_domain::NominalReadDomain;
+        let schema = Schema::builder()
+            .with_fields(
+                (1..=257)
+                    .map(|id| {
+                        Arc::new(NestedField::optional(
+                            id,
+                            format!("n{id}"),
+                            Type::Primitive(PrimitiveType::Fixed(16)),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .build()
+            .unwrap();
+        let base = IcebergTableHandle::try_new(IcebergTableHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "nominals").unwrap(),
+            snapshot_id: None,
+            read_domain: None,
+            table_schema_json: serde_json::to_string(&schema).unwrap(),
+            spec_id: None,
+            partition_spec_jsons: BTreeMap::new(),
+            format_version: 2,
+            unenforced_predicate: TupleDomain::all(),
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: BTreeSet::new(),
+            name_mapping_json: None,
+            table_location: "memory://nominal-map".into(),
+            storage_properties: BTreeMap::new(),
+            pinned_data_files: None,
+        })
+        .unwrap();
+        let expected = header(ConnectorCodecCategory::ReadTable);
+        let mut base_budget = ledger();
+        let mut context = ConnectorDecodeContext::new(&expected, &mut base_budget);
+        let base_raw = IcebergReadWireCodec
+            .encode_private(&IcebergRuntimeRelation::Table(base.clone()))
+            .unwrap();
+        let _: IcebergRuntimeRelation = IcebergReadWireCodec
+            .decode_private(&base_raw, &mut context)
+            .unwrap();
+
+        let table = base
+            .with_nominal_read_domains(
+                (1..=257)
+                    .map(|id| (id, NominalReadDomain::LargeInt))
+                    .collect(),
+            )
+            .unwrap();
+        let raw = IcebergReadWireCodec
+            .encode_private(&IcebergRuntimeRelation::Table(table.clone()))
+            .unwrap();
+        let baseline = Control::default();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &baseline).unwrap();
+        let decoded: IcebergRuntimeRelation = IcebergReadWireCodec
+            .decode_private(&raw, &mut context)
+            .unwrap();
+        let IcebergRuntimeRelation::Table(decoded) = decoded else {
+            panic!("expected table relation");
+        };
+        assert_eq!(decoded, table);
+        // This is the declared preflight policy, not an allocator/RSS claim.
+        assert!(budget.retained_bytes() >= base_budget.retained_bytes() + 257 * 256);
+        let trace = baseline.trace.lock().unwrap().clone();
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((trace.len(), cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            assert_eq!(
+                <IcebergReadWireCodec as ConnectorPrivateDecoder<IcebergRuntimeRelation>>::decode_private(&IcebergReadWireCodec, &raw, &mut context)
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+        }
+        let mut limited = ConnectorDecodeLedger::new(
+            ConnectorDecodeLimits::try_new(
+                4 << 20,
+                budget.retained_bytes() - 1,
+                4 << 20,
+                100_000,
+                64,
+            )
+            .unwrap(),
+        );
+        let mut context = ConnectorDecodeContext::new(&expected, &mut limited);
+        assert_eq!(
+            <IcebergReadWireCodec as ConnectorPrivateDecoder<IcebergRuntimeRelation>>::decode_private(&IcebergReadWireCodec, &raw, &mut context).unwrap_err().kind(),
+            ConnectorCodecErrorKind::Capacity
+        );
     }
 }

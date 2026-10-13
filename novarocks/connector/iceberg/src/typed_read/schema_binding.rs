@@ -760,6 +760,11 @@ fn bind_one_column(
         None => target,
     };
 
+    let target = match handle.nominal_read_domain() {
+        Some(domain) => Arc::new(domain.annotate(&target)?),
+        None => target,
+    };
+
     // 1. a physical field with the same field id in the file schema.
     if let Some(index) = physical.index_of(base_field_id) {
         let _ = index;
@@ -2153,5 +2158,164 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn nominal_targets_preserve_physical_buffers_nulls_and_repeated_occurrences() {
+        use crate::nominal_read_domain::NominalReadDomain;
+        use arrow::array::{BinaryArray, FixedSizeBinaryArray};
+        use novarocks_type_contract::{ValueLogicalType, field_logical_type};
+        for domain in [
+            NominalReadDomain::LargeInt,
+            NominalReadDomain::Hll,
+            NominalReadDomain::Bitmap,
+        ] {
+            let (primitive, carrier, input): (_, _, ArrayRef) = match domain {
+                NominalReadDomain::LargeInt => {
+                    let first = i128::MIN.to_be_bytes();
+                    let last = i128::MAX.to_be_bytes();
+                    (
+                        PrimitiveType::Fixed(16),
+                        DataType::FixedSizeBinary(16),
+                        Arc::new(
+                            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                                [Some(first.as_slice()), None, Some(last.as_slice())].into_iter(),
+                                16,
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                }
+                _ => (
+                    PrimitiveType::Binary,
+                    DataType::Binary,
+                    Arc::new(BinaryArray::from(vec![
+                        Some(b"first".as_slice()),
+                        None,
+                        Some(b"last".as_slice()),
+                    ])),
+                ),
+            };
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    17,
+                    "declared",
+                    Type::Primitive(primitive),
+                ))])
+                .build()
+                .unwrap();
+            let physical = Arc::new(ArrowSchema::new(vec![
+                Field::new("stored", carrier, true).with_metadata(field_id_metadata(17)),
+            ]));
+            let plain = handle(&schema, 17);
+            let declared = plain
+                .clone()
+                .with_nominal_read_domain(Some(domain))
+                .unwrap();
+            let columns = [declared.clone(), plain, declared];
+            let binding =
+                bind_scan_columns(empty_binding_request(&schema, &physical, &columns)).unwrap();
+            assert_eq!(binding.physical_base_field_ids(), &[17]);
+            for ordinal in [0, 2] {
+                assert_eq!(
+                    field_logical_type(binding.columns()[ordinal].target()).unwrap(),
+                    domain.logical()
+                );
+                assert_eq!(
+                    binding.columns()[ordinal].target().metadata()[PARQUET_FIELD_ID_META_KEY],
+                    "17"
+                );
+            }
+            assert_eq!(
+                field_logical_type(binding.columns()[1].target()).unwrap(),
+                ValueLogicalType::Physical
+            );
+            let batch = RecordBatch::try_new(physical, vec![input.slice(1, 2)]).unwrap();
+            let values = binding
+                .materialize(
+                    &batch,
+                    None,
+                    &IcebergSplitFacts {
+                        path: "memory://nominal",
+                        file_first_row_id: None,
+                        data_sequence_number: None,
+                    },
+                )
+                .unwrap();
+            for output in &values {
+                assert_eq!(output.to_data(), batch.column(0).to_data());
+                assert!(
+                    Arc::ptr_eq(output, batch.column(0)),
+                    "identity metadata does not copy values"
+                );
+                assert!(output.is_null(0));
+            }
+        }
+    }
+
+    #[test]
+    fn nominal_largeint_defaults_keep_original_refusal_and_missing_nulls() {
+        use crate::iceberg::spec::PrimitiveLiteral;
+        use crate::nominal_read_domain::NominalReadDomain;
+        use arrow::array::FixedSizeBinaryArray;
+        for default in [Some(i128::MIN.to_be_bytes()), None] {
+            let mut field =
+                NestedField::optional(23, "n", Type::Primitive(PrimitiveType::Fixed(16)));
+            if let Some(bytes) = default {
+                field = field.with_initial_default(Literal::Primitive(PrimitiveLiteral::Binary(
+                    bytes.to_vec(),
+                )));
+            }
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![Arc::new(field)])
+                .build()
+                .unwrap();
+            let columns = [handle(&schema, 23)
+                .with_nominal_read_domain(Some(NominalReadDomain::LargeInt))
+                .unwrap()];
+            let empty = Arc::new(ArrowSchema::empty());
+            let binding =
+                bind_scan_columns(empty_binding_request(&schema, &empty, &columns)).unwrap();
+            assert_eq!(
+                novarocks_type_contract::field_logical_type(binding.columns()[0].target()).unwrap(),
+                novarocks_type_contract::ValueLogicalType::LargeInt
+            );
+            let batch = RecordBatch::try_new_with_options(
+                empty,
+                vec![],
+                &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(2)),
+            )
+            .unwrap();
+            let facts = IcebergSplitFacts {
+                path: "memory://nominal-default",
+                file_first_row_id: None,
+                data_sequence_number: None,
+            };
+            let result = binding.materialize(&batch, None, &facts);
+            if default.is_some() {
+                let plain_columns = [handle(&schema, 23)];
+                let plain_binding = bind_scan_columns(empty_binding_request(
+                    &schema,
+                    &batch.schema(),
+                    &plain_columns,
+                ))
+                .unwrap();
+                let original = plain_binding.materialize(&batch, None, &facts).unwrap_err();
+                let declared = result.unwrap_err();
+                assert_eq!(declared.kind(), original.kind());
+                assert_eq!(declared.message(), original.message());
+                assert_eq!(
+                    declared.message(),
+                    "iceberg initial default: unsupported initial-default for column n: arrow type FixedSizeBinary(16) cannot carry an iceberg default"
+                );
+            } else {
+                let values = result.unwrap();
+                let values = values[0]
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .unwrap();
+                assert_eq!(values.null_count(), 2);
+            }
+        }
     }
 }

@@ -280,6 +280,7 @@ pub struct IcebergColumnHandle {
     nullable: bool,
     comment: Option<Arc<str>>,
     scalar_integer_domain: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    nominal_read_domain: Option<crate::nominal_read_domain::NominalReadDomain>,
 }
 
 impl IcebergColumnHandle {
@@ -335,6 +336,7 @@ impl IcebergColumnHandle {
             nullable,
             comment: comment.map(|comment| Arc::from(comment.as_str())),
             scalar_integer_domain: None,
+            nominal_read_domain: None,
         })
     }
 
@@ -381,7 +383,12 @@ impl IcebergColumnHandle {
             nullable: self.nullable || optional_on_path,
             comment: None,
         })?
-        .with_scalar_integer_domain(scalar_integer_domain)
+        .with_scalar_integer_domain(scalar_integer_domain)?
+        .with_nominal_read_domain(if field_ids.is_empty() {
+            self.nominal_read_domain
+        } else {
+            None
+        })
     }
 
     pub const fn base_column_identity(&self) -> &ColumnIdentity {
@@ -433,6 +440,28 @@ impl IcebergColumnHandle {
         self.scalar_integer_domain
     }
 
+    pub(crate) fn with_nominal_read_domain(
+        mut self,
+        domain: Option<crate::nominal_read_domain::NominalReadDomain>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(domain) = domain {
+            if !self.is_base_column() {
+                return Err(invalid(
+                    "Iceberg nominal declaration requires a base column",
+                ));
+            }
+            domain.validate_storage(&parse_type(self.type_json(), "type_json")?)?;
+        }
+        self.nominal_read_domain = domain;
+        Ok(self)
+    }
+
+    pub(crate) const fn nominal_read_domain(
+        &self,
+    ) -> Option<crate::nominal_read_domain::NominalReadDomain> {
+        self.nominal_read_domain
+    }
+
     pub const fn nullable(&self) -> bool {
         self.nullable
     }
@@ -451,6 +480,9 @@ impl IcebergColumnHandle {
             comment: self.comment.as_ref().map(|comment| comment.to_string()),
             scalar_integer_domain: self
                 .scalar_integer_domain
+                .map(|domain| domain.name().to_string()),
+            nominal_read_domain: self
+                .nominal_read_domain
                 .map(|domain| domain.name().to_string()),
         }
     }
@@ -472,6 +504,12 @@ impl IcebergColumnHandle {
             raw.scalar_integer_domain
                 .as_deref()
                 .map(crate::scalar_integer_domain::ScalarIntegerDomain::parse)
+                .transpose()?,
+        )?
+        .with_nominal_read_domain(
+            raw.nominal_read_domain
+                .as_deref()
+                .map(crate::nominal_read_domain::NominalReadDomain::parse)
                 .transpose()?,
         )
     }
@@ -496,6 +534,7 @@ impl Ord for IcebergColumnHandle {
             .then_with(|| self.base_type_json.cmp(&other.base_type_json))
             .then_with(|| self.type_json.cmp(&other.type_json))
             .then_with(|| self.scalar_integer_domain.cmp(&other.scalar_integer_domain))
+            .then_with(|| self.nominal_read_domain.cmp(&other.nominal_read_domain))
             .then_with(|| self.nullable.cmp(&other.nullable))
             .then_with(|| self.comment.cmp(&other.comment))
     }
@@ -1136,6 +1175,37 @@ pub(super) mod tests {
         })
         .expect_err("mismatched projected type must be rejected");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    /// Full declarations participate in ordered predicate/projection keys.
+    /// Literal same-carrier handles exercise Eq/Ord without external resources;
+    /// run with handle identity changes.
+    #[test]
+    fn column_order_keeps_distinct_nominal_declarations_in_projection_sets() {
+        use crate::nominal_read_domain::NominalReadDomain;
+        use std::collections::BTreeSet;
+        let physical = IcebergColumnHandle::base_column(&NestedField::optional(
+            17,
+            "sketch",
+            Type::Primitive(PrimitiveType::Binary),
+        ))
+        .unwrap();
+        let hll = physical
+            .clone()
+            .with_nominal_read_domain(Some(NominalReadDomain::Hll))
+            .unwrap();
+        let bitmap = physical
+            .clone()
+            .with_nominal_read_domain(Some(NominalReadDomain::Bitmap))
+            .unwrap();
+        let handles = [physical, hll, bitmap];
+        assert_eq!(handles.iter().cloned().collect::<BTreeSet<_>>().len(), 3);
+        for left in &handles {
+            for right in &handles {
+                assert_eq!(left.cmp(right) == Ordering::Equal, left == right);
+                assert_eq!(left.cmp(right), right.cmp(left).reverse());
+            }
+        }
     }
 
     #[test]
