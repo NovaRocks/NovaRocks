@@ -1,0 +1,2246 @@
+{
+  "profiles": [
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int8"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int8"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int16"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int16"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int32"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int32"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int64"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int64"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int8"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int8"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int16"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int16"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int32"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int32"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int64"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int64"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/min_n/v1",
+      "implementation": "builtin.aggregate/min_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "min_n",
+      "overload": "builtin.aggregate/min_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/min_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int8"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int8"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int16"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int16"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int32"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int32"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int64"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": false
+        },
+        {
+          "carrier": {
+            "kind": "Int64"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int8"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int8"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int16"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int16"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int32"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int32"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int64"
+          },
+          "logical": "Physical",
+          "nullable": false
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    },
+    {
+      "abi": "AggregateV1",
+      "arguments": [
+        {
+          "carrier": {
+            "kind": "FixedSizeBinary(16)"
+          },
+          "logical": "LargeInt",
+          "nullable": true
+        },
+        {
+          "carrier": {
+            "kind": "Int64"
+          },
+          "logical": "Physical",
+          "nullable": true
+        }
+      ],
+      "effects": "FunctionEffectDeclaration { value_stability: Immutable, own_row_error: NotRowEvaluated, failure_behavior: Propagate, null_behavior: CalledOnNull, argument_control: Aggregate, instance_state: AggregateInstance, observable_effects: ObservableEffects { rng_sampling: false, warnings: false, controlled_wait: false }, environment_dependencies: [] }",
+      "function": "builtin.aggregate/max_n/v1",
+      "implementation": "builtin.aggregate/max_n/selected-v1",
+      "intermediate": {
+        "carrier": {
+          "kind": "Binary"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "name": "max_n",
+      "overload": "builtin.aggregate/max_n/derived-v1",
+      "phases": [
+        {
+          "final_result": true,
+          "logical_arguments": true,
+          "phase": "Single"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": true,
+          "phase": "Partial"
+        },
+        {
+          "final_result": false,
+          "logical_arguments": false,
+          "phase": "Intermediate"
+        },
+        {
+          "final_result": true,
+          "logical_arguments": false,
+          "phase": "Final"
+        }
+      ],
+      "result": {
+        "carrier": {
+          "item": {
+            "carrier": "FixedSizeBinary(16)",
+            "metadata": {
+              "nr_logical_type": "largeint"
+            },
+            "name": "item",
+            "nullable": true
+          },
+          "kind": "List"
+        },
+        "logical": "Physical",
+        "nullable": true
+      },
+      "state_arguments": "ExactSignature",
+      "state_format": "novarocks/max_n/state-v1"
+    }
+  ],
+  "schema": 1,
+  "source_commit": "9b13107a266db258cb2807bae22ea188e46ccd2b"
+}

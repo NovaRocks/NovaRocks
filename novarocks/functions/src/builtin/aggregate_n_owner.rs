@@ -19,7 +19,9 @@
 //! DISTINCT and encoded-source aggregate OVER retain separate obligations.
 
 use super::{
-    aggregate_n::{NKernel, validate_contract},
+    aggregate_n::{NKernel as PhysicalKernel, validate_contract},
+    aggregate_n_dispatch::NKernel,
+    aggregate_n_largeint::NLargeIntKernel,
     catalogue::BuiltinAggregateResolver,
 };
 use crate::kernel_control::{compile_failure, invalid};
@@ -311,12 +313,27 @@ impl PureAggregateImplementation for NOwner {
                     ));
                 }
             }
-            validate_contract(&contract, &mut work)?;
-            work.flush().map_err(compile_failure)?;
-            let prepared = Arc::new(NKernel {
-                contract,
-                keep_smallest: self.keep_smallest,
-            });
+            let largeint = matches!(
+                input.selected.argument_types.first(),
+                Some(FunctionArgumentType::Value(value))
+                    if value.logical_type == novarocks_type_contract::ValueLogicalType::LargeInt
+            );
+            let profile = if largeint {
+                work.flush().map_err(compile_failure)?;
+                NKernel::LargeInt(Arc::new(NLargeIntKernel::try_new(
+                    Arc::clone(&contract),
+                    self.keep_smallest,
+                    control,
+                )?))
+            } else {
+                validate_contract(&contract, &mut work)?;
+                work.flush().map_err(compile_failure)?;
+                NKernel::Physical(Arc::new(PhysicalKernel {
+                    contract,
+                    keep_smallest: self.keep_smallest,
+                }))
+            };
+            let prepared = Arc::new(profile);
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();
@@ -332,3 +349,6 @@ impl PureAggregateImplementation for NOwner {
         result
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -479,6 +479,31 @@ pub fn build_scalar_array(
     values: Vec<Option<AggScalarValue>>,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ArrayRef, ScalarStateError> {
+    build_scalar_array_impl(output_type, values, work, false)
+}
+
+/// Explicit selected callers observe the original nested LARGEINT builder.
+/// Evaluation control is required; this interface grants no output memory.
+pub fn build_scalar_array_with_largeint_observation(
+    output_type: &DataType,
+    values: Vec<Option<AggScalarValue>>,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<ArrayRef, ScalarStateError> {
+    if work.work.is_none() {
+        return Err(crate::kernel_control::invalid(
+            "observed LARGEINT scalar builder requires evaluation control",
+        )
+        .into());
+    }
+    build_scalar_array_impl(output_type, values, work, true)
+}
+
+fn build_scalar_array_impl(
+    output_type: &DataType,
+    values: Vec<Option<AggScalarValue>>,
+    work: &mut ScalarWork<'_, '_>,
+    observe_largeint: bool,
+) -> Result<ArrayRef, ScalarStateError> {
     match output_type {
         DataType::Null => Ok(new_null_array(output_type, values.len())),
         DataType::Boolean => {
@@ -729,7 +754,14 @@ pub fn build_scalar_array(
                     }
                 }
             }
-            largeint::array_from_i128(&out).map_err(ScalarStateError::from)
+            if !observe_largeint {
+                return largeint::array_from_i128(&out).map_err(ScalarStateError::from);
+            }
+            let result = largeint::array_from_i128_observed(&out, &mut |event| match event {
+                largeint::LargeIntObservation::Step => work.step(),
+                largeint::LargeIntObservation::OpaqueBoundary => work.flush(),
+            })?;
+            result.map_err(ScalarStateError::from)
         }
         DataType::List(item) => {
             let mut flat_values = Vec::new();
@@ -764,7 +796,8 @@ pub fn build_scalar_array(
                     _ => return Err("scalar output type mismatch for List".to_string().into()),
                 }
             }
-            let child = build_scalar_array(item.data_type(), flat_values, work)?;
+            let child =
+                build_scalar_array_impl(item.data_type(), flat_values, work, observe_largeint)?;
             let out = ListArray::try_new(
                 item.clone(),
                 OffsetBuffer::new(offsets.into()),
@@ -809,7 +842,12 @@ pub fn build_scalar_array(
             let mut columns = Vec::with_capacity(fields.len());
             for (field, values) in fields.iter().zip(field_values.into_iter()) {
                 work.step()?;
-                columns.push(build_scalar_array(field.data_type(), values, work)?);
+                columns.push(build_scalar_array_impl(
+                    field.data_type(),
+                    values,
+                    work,
+                    observe_largeint,
+                )?);
             }
             Ok(Arc::new(StructArray::new(
                 fields.clone(),
@@ -859,8 +897,18 @@ pub fn build_scalar_array(
                 }
             }
 
-            let keys = build_scalar_array(entry_fields[0].data_type(), key_values, work)?;
-            let values = build_scalar_array(entry_fields[1].data_type(), value_values, work)?;
+            let keys = build_scalar_array_impl(
+                entry_fields[0].data_type(),
+                key_values,
+                work,
+                observe_largeint,
+            )?;
+            let values = build_scalar_array_impl(
+                entry_fields[1].data_type(),
+                value_values,
+                work,
+                observe_largeint,
+            )?;
             let entries = StructArray::new(entry_fields.clone(), vec![keys, values], None);
             let out = MapArray::try_new(
                 field.clone(),
@@ -1445,3 +1493,7 @@ pub fn scalar_from_array_with_failure<F: ScalarReadFailureSink>(
         other => Err(sink.read_data(ScalarReadFailure::Unsupported(other))),
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_scalar/largeint_observation_tests.rs"]
+mod largeint_observation_tests;

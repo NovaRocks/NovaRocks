@@ -357,6 +357,85 @@ fn resolve_aggregate_spec(
 pub(crate) fn run_aggregate_differential(
     spec: &AggregateDiffSpec,
 ) -> Result<AggregateDiffSummary, DifferentialFailure> {
+    run_aggregate_with_legacy_spec(spec, None)
+}
+
+/// Test-only accepted split: a full LARGEINT pure request and the original v1
+/// raw16 ABI. This is not full-path v1 equivalence for the logical overload.
+pub(crate) fn run_n_largeint_raw16_differential(
+    spec: &AggregateDiffSpec,
+) -> Result<AggregateDiffSummary, DifferentialFailure> {
+    let legacy = n_raw16_legacy_spec(spec)?;
+    run_aggregate_with_legacy_spec(spec, Some(&legacy))
+}
+fn n_raw16_legacy_spec(spec: &AggregateDiffSpec) -> Result<AggregateDiffSpec, DifferentialFailure> {
+    use novarocks_type_contract::ValueLogicalType;
+    let invalid = || {
+        DifferentialFailure::InvalidSpec(
+            "N split oracle requires exact LARGEINT value and Physical signed limit".into(),
+        )
+    };
+    if !matches!(spec.name.as_str(), "min_n" | "max_n")
+        || spec.arguments.len() != 2
+        || spec.original_state.is_some()
+    {
+        return Err(invalid());
+    }
+    let value = spec.arguments[0].value_type();
+    let limit = spec.arguments[1].value_type();
+    if value.logical_type != ValueLogicalType::LargeInt
+        || value.data_type != DataType::FixedSizeBinary(16)
+        || limit.logical_type != ValueLogicalType::Physical
+        || !matches!(
+            limit.data_type,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        )
+    {
+        return Err(invalid());
+    }
+    let mut legacy = spec.clone();
+    let raw_type = FunctionValueType::new(DataType::FixedSizeBinary(16), value.nullable);
+    legacy.arguments[0] = match &spec.arguments[0] {
+        DiffArgument::Column { values, .. } => DiffArgument::Column {
+            value_type: raw_type,
+            values: Arc::clone(values),
+        },
+        DiffArgument::Constant(value) => {
+            let mut metadata = value.field().metadata().clone();
+            metadata.remove("nr_logical_type");
+            let field = Arc::new(
+                Field::new(
+                    value.field().name(),
+                    DataType::FixedSizeBinary(16),
+                    value.value_type().nullable,
+                )
+                .with_metadata(metadata),
+            );
+            let data = value
+                .pool()
+                .array()
+                .slice(value.ordinal() as usize, 1)
+                .to_data();
+            DiffArgument::Constant(
+                novarocks_functions::ConstantValue::from_scalar_array(
+                    field,
+                    raw_type,
+                    data,
+                    super::constant_policy(),
+                    novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                    &HarnessControl,
+                )
+                .map_err(|error| DifferentialFailure::InvalidSpec(error.to_string()))?,
+            )
+        }
+    };
+    Ok(legacy)
+}
+
+fn run_aggregate_with_legacy_spec(
+    spec: &AggregateDiffSpec,
+    split_legacy: Option<&AggregateDiffSpec>,
+) -> Result<AggregateDiffSummary, DifferentialFailure> {
     let rows = spec.rows()?;
     let catalog = builtin_engine_function_catalog();
     let bound = resolve_aggregate_spec(catalog, spec)?;
@@ -373,7 +452,28 @@ pub(crate) fn run_aggregate_differential(
         .ok_or_else(|| DifferentialFailure::InvalidSpec("aggregate has no state".into()))?;
     let signature = resolved_aggregate_signature_from_binding(bound.clone())
         .map_err(|error| DifferentialFailure::InvalidSpec(error.to_string()))?;
-    let legacy = LegacyAggregate::try_new(spec, &signature);
+    let legacy_spec = split_legacy.unwrap_or(spec);
+    let legacy_bound = if split_legacy.is_some() {
+        resolve_aggregate_spec(catalog, legacy_spec)?
+    } else {
+        bound.clone()
+    };
+    let FunctionResultType::Scalar(legacy_result_type) = legacy_bound.selected.result_type.clone()
+    else {
+        return Err(DifferentialFailure::InvalidSpec(
+            "legacy aggregate selected a relation result".into(),
+        ));
+    };
+    let legacy_signature = if split_legacy.is_some() {
+        resolved_aggregate_signature_from_binding(legacy_bound)
+            .map_err(|error| DifferentialFailure::InvalidSpec(error.to_string()))?
+    } else {
+        signature.clone()
+    };
+    if split_legacy.is_some() {
+        validate_n_split_result_types(&result_type, &legacy_result_type)?;
+    }
+    let legacy = LegacyAggregate::try_new(legacy_spec, &legacy_signature);
     let legacy_status = match &legacy {
         Ok(_) => LegacyStatus::Available,
         Err(error) => LegacyStatus::Unavailable(error.clone()),
@@ -406,7 +506,7 @@ pub(crate) fn run_aggregate_differential(
         overload: bound.selected.overload.clone(),
         result_type: result_type.clone(),
         pure_state_type,
-        legacy_intermediate_type: signature.intermediate_type.clone(),
+        legacy_intermediate_type: legacy_signature.intermediate_type.clone(),
         rows,
         groups: layout.groups,
         partitions: spec.partitions,
@@ -418,15 +518,26 @@ pub(crate) fn run_aggregate_differential(
     for (shape, legacy_result, pure_result) in [
         (
             "single phase",
-            guard_legacy(|| legacy.single(spec, &layout)),
+            guard_legacy(|| legacy.single(legacy_spec, &layout)),
             guard_pure(|| pure.single(spec, &layout)),
         ),
         (
             "partial -> final",
-            guard_legacy(|| legacy.two_phase(spec, &layout)),
+            guard_legacy(|| legacy.two_phase(legacy_spec, &layout)),
             guard_pure(|| pure.two_phase(spec, &layout)),
         ),
     ] {
+        let legacy_result = if split_legacy.is_some() {
+            match project_n_raw16_result(legacy_result, &legacy_result_type, &result_type) {
+                Ok(result) => result,
+                Err(error) => {
+                    details.push(format!("{shape}: {error}"));
+                    continue;
+                }
+            }
+        } else {
+            legacy_result
+        };
         compare_shape(
             spec,
             &result_type,
@@ -447,6 +558,65 @@ pub(crate) fn run_aggregate_differential(
             details,
         })
     }
+}
+
+fn validate_n_split_result_types(
+    full: &FunctionValueType,
+    raw: &FunctionValueType,
+) -> Result<(), DifferentialFailure> {
+    let item = Field::new("item", DataType::FixedSizeBinary(16), true);
+    let raw_expected = FunctionValueType::new(DataType::List(Arc::new(item.clone())), true);
+    let full_expected = FunctionValueType::new(
+        DataType::List(Arc::new(item.with_metadata(
+            std::collections::HashMap::from([(
+                "nr_logical_type".to_owned(),
+                "largeint".to_owned(),
+            )]),
+        ))),
+        true,
+    );
+    if full != &full_expected || raw != &raw_expected {
+        return Err(DifferentialFailure::InvalidSpec(
+            "N split oracle has an unapproved declaration difference".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the original v1 array BEFORE the accepted test-only item marker
+/// projection. Offsets, child buffers, values and NULLs are borrowed unchanged.
+/// Ordinary differential callers never use this projection.
+fn project_n_raw16_result(
+    result: Result<ArrayRef, String>,
+    raw: &FunctionValueType,
+    full: &FunctionValueType,
+) -> Result<Result<ArrayRef, String>, String> {
+    validate_n_split_result_types(full, raw).map_err(|error| error.to_string())?;
+    let values = match result {
+        Ok(values) => values,
+        Err(error) => return Ok(Err(error)),
+    };
+    if values.data_type() != &raw.data_type {
+        return Err(format!(
+            "original raw16 output differs from its exact declaration: {:?}",
+            values.data_type()
+        ));
+    }
+    let list = values
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .ok_or_else(|| "original raw16 output is not ListArray".to_owned())?;
+    let DataType::List(item) = &full.data_type else {
+        return Err("N split oracle requires List result".into());
+    };
+    let projected = arrow::array::ListArray::try_new(
+        Arc::clone(item),
+        list.offsets().clone(),
+        Arc::clone(list.values()),
+        list.nulls().cloned(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Ok(Arc::new(projected)))
 }
 
 fn guard_legacy(run: impl FnOnce() -> Result<ArrayRef, String>) -> Result<ArrayRef, String> {
@@ -1205,6 +1375,19 @@ mod panic_comparison_tests {
 // This test-only port consumes authored encoded states through both actual
 // merge lifecycles; it never decodes or computes the payload in the harness.
 pub(super) fn assert_encoded_aggregate_matches_v1(spec: AggregateDiffSpec, encoded: ArrayRef) {
+    assert_encoded_with_legacy_spec(&spec, None, encoded)
+}
+/// Authored original bytes are consumed by both real merge implementations.
+/// Only the accepted final item marker is projected for comparison.
+pub(super) fn assert_n_largeint_encoded_matches_raw16(spec: AggregateDiffSpec, encoded: ArrayRef) {
+    let legacy = n_raw16_legacy_spec(&spec).unwrap();
+    assert_encoded_with_legacy_spec(&spec, Some(&legacy), encoded)
+}
+fn assert_encoded_with_legacy_spec(
+    spec: &AggregateDiffSpec,
+    split_legacy: Option<&AggregateDiffSpec>,
+    encoded: ArrayRef,
+) {
     let catalog = builtin_engine_function_catalog();
     let bound = resolve_aggregate_spec(catalog, &spec).unwrap();
     let signature = resolved_aggregate_signature_from_binding(bound.clone()).unwrap();
@@ -1218,7 +1401,24 @@ pub(super) fn assert_encoded_aggregate_matches_v1(spec: AggregateDiffSpec, encod
         .unwrap()
         .intermediate_type
         .clone();
-    let legacy = LegacyAggregate::try_new(&spec, &signature).unwrap();
+    let legacy_spec = split_legacy.unwrap_or(spec);
+    let legacy_bound = if split_legacy.is_some() {
+        resolve_aggregate_spec(catalog, legacy_spec).unwrap()
+    } else {
+        bound.clone()
+    };
+    let FunctionResultType::Scalar(raw_type) = legacy_bound.selected.result_type.clone() else {
+        panic!("scalar legacy aggregate result")
+    };
+    let legacy_signature = if split_legacy.is_some() {
+        resolved_aggregate_signature_from_binding(legacy_bound).unwrap()
+    } else {
+        signature.clone()
+    };
+    if split_legacy.is_some() {
+        validate_n_split_result_types(result_type, &raw_type).unwrap();
+    }
+    let legacy = LegacyAggregate::try_new(legacy_spec, &legacy_signature).unwrap();
     let groups = encoded.len();
     for intermediate in [false, true] {
         let phase = if intermediate {
@@ -1259,6 +1459,11 @@ pub(super) fn assert_encoded_aggregate_matches_v1(spec: AggregateDiffSpec, encod
         } else {
             result_type
         };
+        let legacy_result = if split_legacy.is_some() && !intermediate {
+            project_n_raw16_result(legacy_result, &raw_type, result_type).unwrap()
+        } else {
+            legacy_result
+        };
         let mut summary = AggregateDiffSummary {
             function: bound.function_id.clone(),
             overload: bound.selected.overload.clone(),
@@ -1287,5 +1492,145 @@ pub(super) fn assert_encoded_aggregate_matches_v1(spec: AggregateDiffSpec, encod
             details.is_empty(),
             "encoded state phase {phase:?} mismatch: {details:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod n_largeint_split_oracle_contract_tests {
+    use super::*;
+    use arrow::array::ListArray;
+    use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use novarocks_functions::{EvaluationFailure, KernelDiagnostic};
+    fn types() -> (FunctionValueType, FunctionValueType) {
+        let raw = Field::new("item", DataType::FixedSizeBinary(16), true);
+        let full = raw.clone().with_metadata(std::collections::HashMap::from([(
+            "nr_logical_type".into(),
+            "largeint".into(),
+        )]));
+        (
+            FunctionValueType::new(DataType::List(Arc::new(raw)), true),
+            FunctionValueType::new(DataType::List(Arc::new(full)), true),
+        )
+    }
+    fn list(data_type: &DataType, values: &[Option<i128>], null: bool) -> ArrayRef {
+        let DataType::List(item) = data_type else {
+            panic!("List fixture")
+        };
+        Arc::new(
+            ListArray::try_new(
+                Arc::clone(item),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, values.len() as i32])),
+                novarocks_functions::largeint::array_from_i128(values).unwrap(),
+                null.then(|| NullBuffer::from(vec![false])),
+            )
+            .unwrap(),
+        )
+    }
+    fn compare(
+        legacy: Result<ArrayRef, String>,
+        pure: Result<ArrayRef, EvaluationFailure>,
+    ) -> Vec<String> {
+        let (raw, full) = types();
+        let projected = project_n_raw16_result(legacy, &raw, &full).unwrap();
+        let spec = AggregateDiffSpec::new("min_n").invocation_data_errors();
+        let mut summary = AggregateDiffSummary {
+            function: FunctionId::try_new("builtin.aggregate/min_n/v1").unwrap(),
+            overload: FunctionOverloadId::try_new("builtin.aggregate/min_n/derived-v1").unwrap(),
+            result_type: full.clone(),
+            pure_state_type: FunctionValueType::new(DataType::Binary, true),
+            legacy_intermediate_type: DataType::Binary,
+            rows: 1,
+            groups: 1,
+            partitions: 1,
+            matched_failures: 0,
+            matched_panics: 0,
+            null_results: 0,
+        };
+        let mut details = Vec::new();
+        compare_shape(
+            &spec,
+            &full,
+            "split",
+            1,
+            projected,
+            GuardedPureResult::Finished(pure),
+            &mut summary,
+            &mut details,
+        );
+        details
+    }
+    #[test]
+    fn accepted_marker_projection_preserves_values_child_nulls_and_list_nulls() {
+        let (raw, full) = types();
+        assert!(
+            compare(
+                Ok(list(&raw.data_type, &[Some(i128::MIN), Some(9)], false)),
+                Ok(list(&full.data_type, &[Some(i128::MIN), Some(9)], false))
+            )
+            .is_empty()
+        );
+        assert!(
+            !compare(
+                Ok(list(&raw.data_type, &[Some(1)], false)),
+                Ok(list(&full.data_type, &[Some(2)], false))
+            )
+            .is_empty()
+        );
+        assert!(
+            !compare(
+                Ok(list(&raw.data_type, &[Some(1)], false)),
+                Ok(list(&full.data_type, &[None], false))
+            )
+            .is_empty()
+        );
+        assert!(
+            !compare(
+                Ok(list(&raw.data_type, &[], false)),
+                Ok(list(&full.data_type, &[], true))
+            )
+            .is_empty()
+        );
+    }
+    #[test]
+    fn marker_projection_rejects_extra_metadata_and_other_declaration_drift() {
+        let (raw, full) = types();
+        let DataType::List(raw_item) = &raw.data_type else {
+            panic!("List fixture")
+        };
+        let extra = DataType::List(Arc::new(raw_item.as_ref().clone().with_metadata(
+            std::collections::HashMap::from([("unexpected".into(), "value".into())]),
+        )));
+        assert!(project_n_raw16_result(Ok(list(&extra, &[Some(1)], false)), &raw, &full).is_err());
+        let DataType::List(full_item) = &full.data_type else {
+            panic!("List fixture")
+        };
+        let mut metadata = full_item.metadata().clone();
+        metadata.insert("unexpected".into(), "value".into());
+        let extra = DataType::List(Arc::new(full_item.as_ref().clone().with_metadata(metadata)));
+        assert!(
+            !compare(
+                Ok(list(&raw.data_type, &[Some(1)], false)),
+                Ok(list(&extra, &[Some(1)], false))
+            )
+            .is_empty()
+        );
+        let mut changed = full.clone();
+        changed.nullable = false;
+        assert!(validate_n_split_result_types(&changed, &raw).is_err());
+    }
+    #[test]
+    fn operational_and_control_failures_cannot_match_original_data_error_text() {
+        for cause in [
+            KernelFailure::Operational(KernelDiagnostic::new(
+                "update aggregate state: min_n/max_n limit cannot be null",
+            )),
+            KernelFailure::Cancelled,
+        ] {
+            let details = compare(
+                Err("update aggregate state: min_n/max_n limit cannot be null".into()),
+                Err(cause.into()),
+            );
+            assert!(!details.is_empty());
+        }
     }
 }

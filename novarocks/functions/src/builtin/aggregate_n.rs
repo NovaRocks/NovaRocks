@@ -230,12 +230,35 @@ impl PreparedAggregateKernel for NKernel {
     where
         I: ExactSizeIterator<Item = &'s Self::State>,
     {
+        self.build_intermediate_checked(states.map(Ok), control)
+    }
+    fn build_final<'s, I>(
+        &self,
+        states: I,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, KernelFailure>
+    where
+        I: ExactSizeIterator<Item = &'s Self::State>,
+    {
+        self.build_final_checked(states.map(Ok), control)
+    }
+}
+impl NKernel {
+    pub(super) fn build_intermediate_checked<'s, I>(
+        &self,
+        states: I,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, KernelFailure>
+    where
+        I: ExactSizeIterator<Item = Result<&'s NState<HostAggregateAllocator>, KernelFailure>>,
+    {
         observed(control, |work| {
             let expected = states.len();
             let mut count = 0;
             let mut builder = BinaryBuilder::new();
             let mut work = ScalarWork::new(Some(work));
             for state in states {
+                let state = state?;
                 if count == expected {
                     return Err(internal("min_n/max_n state iterator exceeded its extent"));
                 }
@@ -260,13 +283,13 @@ impl PreparedAggregateKernel for NKernel {
             Ok(Arc::new(builder.finish()) as ArrayRef)
         })
     }
-    fn build_final<'s, I>(
+    pub(super) fn build_final_checked<'s, I>(
         &self,
         states: I,
         control: &dyn KernelEvaluationControl,
     ) -> Result<ArrayRef, KernelFailure>
     where
-        I: ExactSizeIterator<Item = &'s Self::State>,
+        I: ExactSizeIterator<Item = Result<&'s NState<HostAggregateAllocator>, KernelFailure>>,
     {
         observed(control, |work| {
             let expected = states.len();
@@ -276,6 +299,7 @@ impl PreparedAggregateKernel for NKernel {
                 .map_err(|_| KernelFailure::ResourceExhausted)?;
             let mut work = ScalarWork::new(Some(work));
             for state in states {
+                let state = state?;
                 if values.len() == expected {
                     return Err(internal("min_n/max_n state iterator exceeded its extent"));
                 }
@@ -298,6 +322,7 @@ impl PreparedAggregateKernel for NKernel {
         })
     }
 }
+
 pub(super) fn validate_contract(
     contract: &AggregateCallContract,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,

@@ -25,6 +25,82 @@ use arrow_array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArr
 use arrow_buffer::i256;
 use arrow_schema::DataType;
 use std::cmp::Ordering;
+
+/// Source-qualified consumers provide an owned scope around the original sort.
+/// This interface does not itself grant memory or cover other N operations.
+pub trait NSortResources {
+    type Lease;
+    fn before_sort(
+        &mut self,
+        len: usize,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Self::Lease, crate::KernelFailure>;
+
+    /// A reached comparator may create one original discarded diagnostic.
+    /// Default callers retain their original unobserved comparison behavior.
+    fn before_comparison(
+        &mut self,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Option<Self::Lease>, crate::KernelFailure> {
+        Ok(None)
+    }
+}
+struct NoopSortResources;
+impl NSortResources for NoopSortResources {
+    type Lease = ();
+    fn before_sort(
+        &mut self,
+        _len: usize,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+}
+/// A reached decimal codec call owns its external scope until the original
+/// call and its temporary output end. Default callers add no observations.
+pub trait NCodecResources {
+    type Lease;
+    fn before_decimal256_format(
+        &mut self,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Self::Lease, crate::KernelFailure>;
+    fn after_decimal256_format(
+        &mut self,
+        _text: &str,
+        _capacity: usize,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+    fn before_decimal256_parse(
+        &mut self,
+        text_bytes: usize,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Self::Lease, crate::KernelFailure>;
+    fn after_decimal256_parse(
+        &mut self,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+}
+struct NoopCodecResources;
+impl NCodecResources for NoopCodecResources {
+    type Lease = ();
+    fn before_decimal256_format(
+        &mut self,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+    fn before_decimal256_parse(
+        &mut self,
+        _text_bytes: usize,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+}
 #[derive(Debug)]
 pub struct NState<A: ScalarStateAllocator> {
     pub allocator: A,
@@ -78,6 +154,26 @@ impl<A: ScalarStateAllocator> NState<A> {
         keep_smallest: bool,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
+        self.update_from_arrays_with_sort_resources(
+            values,
+            value_row,
+            limits,
+            limit_row,
+            keep_smallest,
+            &mut NoopSortResources,
+            work,
+        )
+    }
+    pub fn update_from_arrays_with_sort_resources<R: NSortResources>(
+        &mut self,
+        values: &ArrayRef,
+        value_row: usize,
+        limits: &ArrayRef,
+        limit_row: usize,
+        keep_smallest: bool,
+        resources: &mut R,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
         let limit = parse_limit(limits, limit_row, work)?;
         self.init_limit_if_needed(limit)?;
         let Some(value) =
@@ -85,7 +181,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         else {
             return Ok(());
         };
-        self.push_value(value, keep_smallest, work)
+        self.push_value_with_sort_resources(value, keep_smallest, resources, work)
     }
     pub fn merge_from_array(
         &mut self,
@@ -94,7 +190,48 @@ impl<A: ScalarStateAllocator> NState<A> {
         keep_smallest: bool,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
-        let Some((limit, values)) = decode_payload_at(array, row, &self.allocator, work)? else {
+        self.merge_from_array_with_sort_resources(
+            array,
+            row,
+            keep_smallest,
+            &mut NoopSortResources,
+            work,
+        )
+    }
+    pub fn merge_from_array_with_sort_resources<R: NSortResources>(
+        &mut self,
+        array: &ArrayRef,
+        row: usize,
+        keep_smallest: bool,
+        resources: &mut R,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        self.merge_from_array_with_resources(
+            array,
+            row,
+            keep_smallest,
+            resources,
+            &mut NoopCodecResources,
+            work,
+        )
+    }
+    pub fn merge_from_array_with_resources<S: NSortResources, C: NCodecResources>(
+        &mut self,
+        array: &ArrayRef,
+        row: usize,
+        keep_smallest: bool,
+        sort_resources: &mut S,
+        codec_resources: &mut C,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        let Some((limit, values)) = decode_payload_at_with_codec_resources(
+            array,
+            row,
+            &self.allocator,
+            codec_resources,
+            work,
+        )?
+        else {
             return Ok(());
         };
         if limit == 0 {
@@ -103,12 +240,17 @@ impl<A: ScalarStateAllocator> NState<A> {
         self.init_limit_if_needed(limit)?;
         for value in values {
             work.step()?;
-            self.push_value(value, keep_smallest, work)?;
+            self.push_value_with_sort_resources(value, keep_smallest, sort_resources, work)?;
         }
         Ok(())
     }
-    fn sort_values(&mut self, work: &mut ScalarWork<'_, '_>) -> Result<(), ScalarStateError> {
+    fn sort_values<R: NSortResources>(
+        &mut self,
+        resources: &mut R,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
         work.flush()?;
+        let lease = resources.before_sort(self.values.len(), work)?;
         let mut primary = None;
         // Keep the original library stable sort and its error->Equal rule.
         // Only observed host-control errors remain outer typed failures.
@@ -116,15 +258,27 @@ impl<A: ScalarStateAllocator> NState<A> {
             if primary.is_some() {
                 return Ordering::Equal;
             }
-            match scalar::compare_tracked_scalar_values(left, right, work) {
+            let comparison_lease = match resources.before_comparison(work) {
+                Ok(lease) => lease,
+                Err(cause) => {
+                    primary = Some(ScalarStateError::Kernel(cause));
+                    return Ordering::Equal;
+                }
+            };
+            let ordering = match scalar::compare_tracked_scalar_values(left, right, work) {
                 Ok(order) => order,
                 Err(ScalarStateError::Legacy(_)) => Ordering::Equal,
                 Err(error) => {
                     primary = Some(error);
                     Ordering::Equal
                 }
-            }
+            };
+            // The discarded Legacy String has ended with the match statement.
+            drop(comparison_lease);
+            ordering
         });
+        // The library's scratch has ended before the caller's owned scope.
+        drop(lease);
         if let Some(error) = primary {
             return Err(error);
         }
@@ -135,6 +289,15 @@ impl<A: ScalarStateAllocator> NState<A> {
         &mut self,
         value: TrackedAggScalarValue<A>,
         keep_smallest: bool,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        self.push_value_with_sort_resources(value, keep_smallest, &mut NoopSortResources, work)
+    }
+    pub fn push_value_with_sort_resources<R: NSortResources>(
+        &mut self,
+        value: TrackedAggScalarValue<A>,
+        keep_smallest: bool,
+        resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
         if self.limit == 0 {
@@ -153,7 +316,7 @@ impl<A: ScalarStateAllocator> NState<A> {
             .payload_bytes
             .checked_add(retained)
             .ok_or(crate::KernelFailure::ResourceExhausted)?;
-        self.sort_values(work)?;
+        self.sort_values(resources, work)?;
         if !keep_smallest {
             work.flush()?;
             self.values.reverse();
@@ -168,7 +331,7 @@ impl<A: ScalarStateAllocator> NState<A> {
             self.values.truncate(self.limit);
             work.flush()?;
         }
-        self.sort_values(work)?;
+        self.sort_values(resources, work)?;
         Ok(())
     }
     pub fn serialize<B: ByEncodeBuffer>(
@@ -176,11 +339,19 @@ impl<A: ScalarStateAllocator> NState<A> {
         out: &mut B,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
+        self.serialize_with_codec_resources(out, &mut NoopCodecResources, work)
+    }
+    pub fn serialize_with_codec_resources<B: ByEncodeBuffer, R: NCodecResources>(
+        &self,
+        out: &mut B,
+        resources: &mut R,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
         out.append(&(self.limit as u32).to_le_bytes(), work)?;
         out.append(&(self.values.len() as u32).to_le_bytes(), work)?;
         for value in &self.values {
             work.step()?;
-            encode_scalar(out, value, work)?;
+            encode_scalar(out, value, resources, work)?;
         }
         Ok(())
     }
@@ -216,6 +387,15 @@ pub fn decode_payload_at<A: ScalarStateAllocator>(
     array: &ArrayRef,
     row: usize,
     allocator: &A,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, ScalarStateError> {
+    decode_payload_at_with_codec_resources(array, row, allocator, &mut NoopCodecResources, work)
+}
+pub fn decode_payload_at_with_codec_resources<A: ScalarStateAllocator, R: NCodecResources>(
+    array: &ArrayRef,
+    row: usize,
+    allocator: &A,
+    resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, ScalarStateError> {
     work.step()?;
@@ -271,7 +451,9 @@ pub fn decode_payload_at<A: ScalarStateAllocator>(
     )?;
     for _ in 0..count {
         work.step()?;
-        values.push(decode_scalar(payload, &mut pos, allocator, work)?);
+        values.push(decode_scalar(
+            payload, &mut pos, allocator, resources, work,
+        )?);
     }
     Ok(Some((limit, values)))
 }
@@ -301,9 +483,10 @@ fn need_len(bytes: &[u8], pos: usize, need: usize, label: &str) -> Result<(), Sc
     Ok(())
 }
 
-fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer>(
+fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer, R: NCodecResources>(
     out: &mut B,
     value: &TrackedAggScalarValue<A>,
+    resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), ScalarStateError> {
     work.step()?;
@@ -341,11 +524,17 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer>(
         }
         TrackedAggScalarValue::Decimal256(v) => {
             out.push(11)?;
+            let lease = resources.before_decimal256_format(work)?;
             let text = v.to_string();
+            resources.after_decimal256_format(&text, text.capacity(), work)?;
             let len = u32::try_from(text.len())
                 .map_err(|_| "min_n/max_n decimal256 length overflow".to_string())?;
             out.append(&len.to_le_bytes(), work)?;
             out.append(text.as_bytes(), work)?;
+            // The returned OWN String ends before either reservation.
+            // On an error, reverse declaration order preserves the same rule.
+            drop(text);
+            drop(lease);
         }
         other => {
             return Err(
@@ -356,10 +545,11 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer>(
     Ok(())
 }
 
-fn decode_scalar<A: ScalarStateAllocator>(
+fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
     bytes: &[u8],
     pos: &mut usize,
     allocator: &A,
+    resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<TrackedAggScalarValue<A>, ScalarStateError> {
     work.step()?;
@@ -447,11 +637,22 @@ fn decode_scalar<A: ScalarStateAllocator>(
             let text = std::str::from_utf8(&bytes[*pos..*pos + len])
                 .map_err(|e| format!("min_n/max_n decimal256 decode failed: {}", e))?;
             *pos += len;
+            let lease = resources.before_decimal256_parse(text.len(), work)?;
             let value = text
                 .parse::<i256>()
                 .map_err(|_| "min_n/max_n decimal256 parse failed".to_string())?;
+            resources.after_decimal256_parse(work)?;
+            drop(lease);
             Ok(TrackedAggScalarValue::Decimal256(value))
         }
         other => Err(format!("min_n/max_n decode unknown tag {}", other).into()),
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_n_core/sort_resource_tests.rs"]
+mod sort_resource_tests;
+
+#[cfg(test)]
+#[path = "aggregate_n_core/comparison_resource_tests.rs"]
+mod comparison_resource_tests;
