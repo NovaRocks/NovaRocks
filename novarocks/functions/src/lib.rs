@@ -80,6 +80,7 @@ mod higher_order_call;
 mod higher_order_kernel;
 pub mod hll;
 pub mod invocation_arity;
+mod invocation_scalar_resources;
 pub mod json_object_core;
 mod json_object_resources;
 mod kernel_control;
@@ -121,6 +122,9 @@ pub use evaluation::*;
 pub use evaluation_failure::*;
 pub use higher_order_call::*;
 pub use higher_order_kernel::*;
+pub use invocation_scalar_resources::{
+    InvocationPreparationFailure, WholeInvocationRequestFacts, WholeInvocationResourceProfile,
+};
 pub use kernel_control::*;
 pub use kernel_input::validate_type_observed as validate_function_value_type_observed;
 pub use kernel_input::{

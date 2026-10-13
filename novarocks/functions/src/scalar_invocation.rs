@@ -36,6 +36,11 @@ pub enum ScalarInvocationActivation {
 
 pub trait PreparedInvocationScalarKernel: Send + Sync + fmt::Debug {
     fn contract(&self) -> &Arc<ScalarCallContract>;
+    /// Explicitly uncovered unless this exact prepared owner supplies an
+    /// audited complete request source. No name or ABI selects a profile.
+    fn invocation_resource_profile(&self) -> Option<WholeInvocationResourceProfile> {
+        None
+    }
     fn instance_retained_upper_bound(&self) -> usize;
     /// Exact real Box Layout. New owners have no allocator-free default.
     fn instance_inline_allocation_bytes(&self) -> usize;
@@ -201,6 +206,19 @@ impl InvocationScalarEvaluationInstance {
     }
     pub fn contract(&self) -> &ScalarCallContract {
         &self.contract
+    }
+    /// Original first-cause latch, readable without a diagnostic or callback.
+    pub const fn is_failed(&self) -> bool {
+        self.failed
+    }
+    pub fn invocation_resource_profile(&self) -> Option<WholeInvocationResourceProfile> {
+        self._prepared.invocation_resource_profile()
+    }
+    pub(crate) fn matches_resource_owner(
+        &self,
+        owner: &Arc<dyn PreparedInvocationScalarKernel>,
+    ) -> bool {
+        Arc::ptr_eq(&self._prepared, owner)
     }
     pub fn retained_bytes(&self) -> Result<usize, KernelFailure> {
         let bytes = self.instance.retained_bytes();

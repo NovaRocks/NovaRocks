@@ -999,6 +999,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
         call_selection,
         &arguments,
         activation,
+        allocator,
         work,
     ) {
         Ok(output) => output,
@@ -1108,6 +1109,8 @@ mod nary_tests;
 mod filter_conjunction;
 pub(crate) use filter_conjunction::CompiledFilterConjunctionInstance;
 
+#[cfg(test)]
+mod runtime_invocation_memory_tests;
 #[cfg(test)]
 mod runtime_scalar_memory_tests;
 

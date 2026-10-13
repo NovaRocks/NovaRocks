@@ -425,14 +425,14 @@ pub(crate) struct AllocationGeometry {
     pub(crate) peak_bytes: usize,
 }
 impl AllocationGeometry {
-    fn exact(bytes: usize) -> Self {
+    pub(crate) fn exact(bytes: usize) -> Self {
         Self {
             requests: usize::from(bytes != 0),
             requested_bytes: bytes,
             peak_bytes: bytes,
         }
     }
-    fn plus(self, other: Self) -> Result<Self, KernelFailure> {
+    pub(crate) fn plus(self, other: Self) -> Result<Self, KernelFailure> {
         Ok(Self {
             requests: add(self.requests, other.requests)?,
             requested_bytes: add(self.requested_bytes, other.requested_bytes)?,
@@ -723,6 +723,30 @@ impl JsonObjectBatchResources {
     pub(crate) fn diagnostic_grant(&self) -> Result<usize, KernelFailure> {
         let bytes = self.diagnostic_bytes.max(178);
         mul(add(add(76, mul(bytes, 2)?)?, 8)?, 2)
+    }
+    /// The original computation returns at most one complete Data String.
+    /// Its cumulative growth is separate from the opaque simultaneous stock.
+    pub(crate) fn diagnostic_geometry(&self) -> Result<AllocationGeometry, KernelFailure> {
+        AllocationGeometry::growing(self.diagnostic_bytes.max(178), 76, 8)
+    }
+    /// Body and original Data destination only. Entry validation, the direct
+    /// slot and actual host callbacks must be composed by their own authors.
+    pub(crate) fn body_and_data_geometry(
+        &self,
+        selected_rows: usize,
+    ) -> Result<AllocationGeometry, KernelFailure> {
+        let validation = Layout::array::<arrow_data::BufferSpec>(2)
+            .map_err(|_| KernelFailure::ResourceExhausted)?
+            .size();
+        self.body_geometry(selected_rows)?
+            .plus(self.diagnostic_geometry()?)?
+            // force_validate may be enabled by a dependent crate. The three
+            // original Utf8 builds each allocate this public layout once.
+            .plus(AllocationGeometry {
+                requests: 3,
+                requested_bytes: mul(validation, 3)?,
+                peak_bytes: validation,
+            })
     }
     pub(crate) fn body_grant(&self, selected_rows: usize) -> Result<usize, KernelFailure> {
         Ok(self.body_geometry(selected_rows)?.peak_bytes)

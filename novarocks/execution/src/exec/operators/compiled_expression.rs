@@ -64,7 +64,7 @@ pub(crate) mod runtime_scalar_memory_test_support;
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
-    allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    allocator: Option<Arc<super::compiled_aggregate::TrackedStateAllocator>>,
 }
 impl RuntimeKernelControl {
     pub(crate) fn new(error: Arc<RuntimeErrorState>) -> Self {
@@ -99,7 +99,32 @@ impl RuntimeKernelControl {
     pub(crate) fn allocator(
         &self,
     ) -> Option<Arc<dyn novarocks_functions::AggregateStateAllocator>> {
-        self.allocator.clone()
+        self.allocator.as_ref().map(|host| {
+            let actual: Arc<dyn novarocks_functions::AggregateStateAllocator> = host.clone();
+            actual
+        })
+    }
+    /// Borrow the SAME concrete host whose original dyn Arc created this
+    /// instance. Equality checks existing owners; it grants no new authority.
+    pub(crate) fn invocation_host(
+        &self,
+        original: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<
+        &super::compiled_aggregate::TrackedStateAllocator,
+        novarocks_functions::ScalarResourceError,
+    > {
+        let Some(host) = &self.allocator else {
+            return Err(novarocks_functions::ScalarResourceError::Invariant(
+                "whole-invocation runtime has no concrete allocation host",
+            ));
+        };
+        let actual: Arc<dyn novarocks_functions::AggregateStateAllocator> = host.clone();
+        if !original.is_some_and(|original| Arc::ptr_eq(original, &actual)) {
+            return Err(novarocks_functions::ScalarResourceError::Invariant(
+                "whole-invocation instance allocation host differs from its runtime owner",
+            ));
+        }
+        Ok(host)
     }
 }
 impl KernelEvaluationControl for RuntimeKernelControl {

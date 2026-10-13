@@ -290,15 +290,24 @@ impl PureInvocationScalarImplementation for JsonObjectOwner {
         work.finish().map_err(compile_failure)?;
         // The prepared object retains the same canonical contract. Its body is
         // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedJsonObject { contract }))
+        Ok(Arc::new_cyclic(
+            |prepared: &std::sync::Weak<PreparedJsonObject>| PreparedJsonObject {
+                contract,
+                resources: crate::WholeInvocationResourceProfile::json_object(prepared.clone()),
+            },
+        ))
     }
 }
 
 #[derive(Debug)]
 struct PreparedJsonObject {
     contract: Arc<ScalarCallContract>,
+    resources: crate::WholeInvocationResourceProfile,
 }
 impl PreparedInvocationScalarKernel for PreparedJsonObject {
+    fn invocation_resource_profile(&self) -> Option<crate::WholeInvocationResourceProfile> {
+        Some(self.resources.clone())
+    }
     fn contract(&self) -> &Arc<ScalarCallContract> {
         &self.contract
     }

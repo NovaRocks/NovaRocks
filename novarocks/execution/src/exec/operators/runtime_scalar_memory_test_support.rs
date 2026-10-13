@@ -36,7 +36,10 @@ use crate::runtime::{
 };
 use arrow::{array::ArrayRef, record_batch::RecordBatch};
 use novarocks_execution_contract::TaskIdentity;
-use novarocks_functions::{EvaluatedArgument, ScalarEvaluationInstance, SelectedValues, Selection};
+use novarocks_functions::{
+    AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
+    ScalarEvaluationInstance, ScalarInvocationActivation, SelectedValues, Selection,
+};
 use novarocks_local_program::{LocalProgram, ProgramExpressionRootSite, ProgramStateTemplate};
 use std::sync::Arc;
 
@@ -71,6 +74,36 @@ pub struct RuntimeScalarFrameForTest {
     _state: Arc<RuntimeState>,
 }
 impl RuntimeScalarFrameForTest {
+    /// Borrow the tracker already created by this exact task state. The
+    /// original Frame caches the same host Arc used for instance birth.
+    pub fn try_new_with_allocation_host(
+        program: Arc<LocalProgram>,
+        site: ProgramExpressionRootSite,
+        runtime: Arc<ExecutionRuntime>,
+        task: TaskIdentity,
+        memory: Option<QueryMemoryBinding>,
+    ) -> Result<Self, String> {
+        let state = task_state(runtime, task, memory)?;
+        let mut control = control(&state);
+        control.bind_mem_tracker(
+            state
+                .mem_tracker()
+                .ok_or("task state has no actual allocation tracker")?,
+        );
+        let instance = CompiledExpressionInstance::try_new_with_allocator(
+            program,
+            site,
+            &control,
+            control.allocator(),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            instance,
+            site,
+            control,
+            _state: state,
+        })
+    }
     pub fn try_new(
         program: Arc<LocalProgram>,
         site: ProgramExpressionRootSite,
@@ -95,6 +128,106 @@ impl RuntimeScalarFrameForTest {
     )]
     pub fn evaluate(&mut self, input: &RecordBatch) -> ExecutionResult<ArrayRef> {
         evaluate_all(&mut self.instance, self.site, input, &self.control)
+    }
+}
+
+/// Fixed actual receipts of the two original synchronous operations. These
+/// describe the complete wrapper, excluding Frame gathers and instance birth.
+pub struct RuntimeInvocationWrapperReceiptForTest {
+    pub preparation_workset_bytes: Option<usize>,
+    pub preparation: Option<KernelMemoryJournal>,
+    pub workset_bytes: Option<usize>,
+    pub body: KernelMemoryJournal,
+}
+
+/// The installed whole-invocation occurrence and its original task-owned
+/// allocation host. This borrows the production scope, not a test evaluator.
+pub struct RuntimeInvocationWrapperForTest {
+    instance: InvocationScalarEvaluationInstance,
+    control: RuntimeKernelControl,
+    host: Arc<dyn AggregateStateAllocator>,
+    _state: Arc<RuntimeState>,
+}
+impl RuntimeInvocationWrapperForTest {
+    pub fn try_new(
+        program: &LocalProgram,
+        site: ProgramExpressionRootSite,
+        runtime: Arc<ExecutionRuntime>,
+        task: TaskIdentity,
+        memory: Option<QueryMemoryBinding>,
+    ) -> Result<Self, String> {
+        let state = task_state(runtime, task, memory)?;
+        let mut control = control(&state);
+        control.bind_mem_tracker(
+            state
+                .mem_tracker()
+                .ok_or("task state has no actual allocation tracker")?,
+        );
+        let mut selected = None;
+        for call in program
+            .checked()
+            .channels()
+            .expressions()
+            .resolved_calls()
+            .calls()
+            .values()
+        {
+            if let ProgramStateTemplate::ScalarInvocation { scope, kernel } = call.state_template()
+                && scope.root == site
+                && selected.replace(Arc::clone(kernel)).is_some()
+            {
+                return Err(
+                    "wrapper fixture requires one exact whole-invocation occurrence".into(),
+                );
+            }
+        }
+        let prepared = selected.ok_or("wrapper fixture has no whole-invocation occurrence")?;
+        if prepared.invocation_resource_profile().is_none() {
+            return Err("wrapper fixture whole-invocation source is uncovered".into());
+        }
+        let host = control
+            .allocator()
+            .ok_or("task state has no actual allocation host")?;
+        let instance = InvocationScalarEvaluationInstance::instantiate_with_allocator(
+            prepared,
+            Some(host.clone()),
+        )
+        .map_err(|cause| cause.to_string())?;
+        Ok(Self {
+            instance,
+            control,
+            host,
+            _state: state,
+        })
+    }
+    pub fn evaluate<'a>(
+        &mut self,
+        selection: Selection<'a>,
+        arguments: &'a [EvaluatedArgument<'a>],
+        activation: ScalarInvocationActivation,
+    ) -> (
+        Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure>,
+        RuntimeInvocationWrapperReceiptForTest,
+    ) {
+        let mut journal = RuntimeScalarMemoryJournal::default();
+        let result = RuntimeScalarMemoryScope::new(&self.control, &mut journal)
+            .evaluate_invocation(
+                &mut self.instance,
+                selection,
+                arguments,
+                activation,
+                Some(&self.host),
+                &self.control,
+            );
+        (
+            result,
+            RuntimeInvocationWrapperReceiptForTest {
+                preparation_workset_bytes: journal.preparation_workset_bytes,
+                preparation: journal.preparation,
+                workset_bytes: journal.workset_bytes,
+                body: journal.body,
+            },
+        )
     }
 }
 

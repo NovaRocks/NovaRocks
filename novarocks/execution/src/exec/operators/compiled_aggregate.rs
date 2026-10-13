@@ -84,14 +84,25 @@ fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
 /// State backing charged to the operator's memory tracker. A block is charged
 /// before it is allocated and released after it is returned, so the tracker
 /// never undercounts live backing.
-struct TrackedStateAllocator {
+pub(crate) struct TrackedStateAllocator {
     tracker: Arc<MemTracker>,
 }
 
+impl TrackedStateAllocator {
+    /// Read only the original host's immutable tracker ancestry. The caller
+    /// must establish the actual instance-host loan before consuming facts.
+    pub(crate) fn limit_failure_request_facts(
+        &self,
+    ) -> Result<
+        crate::runtime::mem_tracker::TrackerLimitFailureRequestFacts,
+        novarocks_type_contract::ControlResourceError,
+    > {
+        self.tracker.limit_failure_request_facts()
+    }
+}
+
 /// Actual expression and aggregate backing share the same tracker adapter.
-pub(crate) fn expression_allocation_host(
-    tracker: Arc<MemTracker>,
-) -> Arc<dyn AggregateStateAllocator> {
+pub(crate) fn expression_allocation_host(tracker: Arc<MemTracker>) -> Arc<TrackedStateAllocator> {
     Arc::new(TrackedStateAllocator { tracker })
 }
 

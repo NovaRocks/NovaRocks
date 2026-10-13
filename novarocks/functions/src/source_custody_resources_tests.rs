@@ -146,7 +146,7 @@ pub(crate) fn without_recording<T>(operation: impl FnOnce() -> T) -> T {
     drop(restore);
     result
 }
-fn measured<T>(operation: impl FnOnce() -> T) -> (T, (usize, usize, usize, usize)) {
+pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, (usize, usize, usize, usize)) {
     MEASURED.with(|measured| *measured.borrow_mut() = Measured::new());
     ENABLED.with(|enabled| enabled.set(true));
     struct Stop;

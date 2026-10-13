@@ -395,7 +395,11 @@ fn source_for_arguments(
         fragment: id,
         output: fragment.nodes()[&project].output.clone(),
         fields: Box::from([ResultField {
-            domain: ResultValueDomain::Plain,
+            domain: match result_type.logical_type {
+                ValueLogicalType::Physical => ResultValueDomain::Plain,
+                ValueLogicalType::Json => ResultValueDomain::Json,
+                _ => panic!("fixture requires its authored integer or JSON result domain"),
+            },
             name: "r".into(),
             alias: None,
             value: output,

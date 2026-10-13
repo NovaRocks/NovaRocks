@@ -115,9 +115,7 @@ pub fn validate_argument_observed(
         argument.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
         if let EvaluatedArgument::Constant(value) = argument {
             work.step()?;
-            if value.value_type().logical_type != value_type.logical_type
-                || (value.value_type().nullable && !value_type.nullable)
-            {
+            if !constant_type_matches(value.value_type(), value_type) {
                 return Err(invalid(
                     "constant argument differs from its exact logical type or nullability",
                 ));
@@ -152,6 +150,15 @@ pub fn validate_argument_observed(
     }
     work.finish()?;
     result
+}
+
+/// One original Constant rule, shared with numerical request preparation.
+/// Physical comparison and selected NULL addressing retain their own authors.
+pub(crate) fn constant_type_matches(
+    actual: &FunctionValueType,
+    expected: &FunctionValueType,
+) -> bool {
+    actual.logical_type == expected.logical_type && (!actual.nullable || expected.nullable)
 }
 
 /// Inspect selected SQL NULLs through the original carrier-addressing owner.

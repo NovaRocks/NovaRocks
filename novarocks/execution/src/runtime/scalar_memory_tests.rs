@@ -57,6 +57,483 @@ fn request(binding: &QueryMemoryBinding, peak: usize) -> KernelMemoryAdmission {
     kernel_memory::request_complete_operation(Some(binding), peak)
 }
 
+fn json_binding() -> QueryMemoryBinding {
+    // A distinct explicit test budget covers JSONObject's complete cumulative
+    // source requests, rather than the old integer wrapper's tiny fixture.
+    let mut cfg = AuthorityConfig::new(256 << 20, 128 << 20, 128 << 20);
+    cfg.max_accounts = 32;
+    cfg.max_active_owners = 4;
+    cfg.metadata_budget_bytes = 16 * 1024;
+    cfg.top_up = novarocks_memory::TopUpPolicy::uniform(1024);
+    bind(Arc::new(MemoryAuthority::new(cfg).unwrap()))
+}
+fn actual_json(
+    types: &[arrow::datatypes::DataType],
+    host: &Arc<dyn AggregateStateAllocator>,
+) -> InvocationScalarEvaluationInstance {
+    let types: Vec<_> = types
+        .iter()
+        .cloned()
+        .map(|ty| novarocks_type_contract::FunctionValueType::new(ty, true))
+        .collect();
+    let novarocks_functions::PreparedPureKernel::ScalarInvocation(prepared) =
+        actual_prepared("json_object", &types)
+    else {
+        panic!("actual installed whole-call owner")
+    };
+    InvocationScalarEvaluationInstance::instantiate_with_allocator(prepared, Some(host.clone()))
+        .unwrap()
+}
+fn json_control(
+    binding: Option<&QueryMemoryBinding>,
+    label: &str,
+) -> (
+    RuntimeKernelControl,
+    Arc<crate::runtime::mem_tracker::MemTracker>,
+) {
+    let tracker = crate::runtime::mem_tracker::MemTracker::new_root(label);
+    let mut original = control(binding, Arc::default());
+    original.bind_mem_tracker(tracker.clone());
+    (original, tracker)
+}
+fn assert_completed_operation(body: &KernelMemoryJournal) {
+    assert_eq!(body.observation.entry(), AmbientEntryObservation::Bound);
+    assert_eq!(body.observation.exit(), AmbientExitObservation::Restored);
+    assert_eq!(body.settlement.as_ref().unwrap().next_step, Ok(()));
+    assert_eq!(body.stopped, Some(Ok(())));
+}
+
+#[test]
+fn runtime_invocation_memory_real_pending_registers_and_releases_before_actual_json_body() {
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::DataType,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let binding = json_binding();
+    let other = bind(binding.authority().clone());
+    // Leave only the explicit registry metadata budget; the complete JSON
+    // body is larger and must qualify the genuine busy competing writer.
+    let occupied_bytes = (128 << 20) - 16384;
+    let occupied = other.account().create_domain(occupied_bytes).unwrap();
+    let error = Arc::new(RuntimeErrorState::default());
+    let mut control = super::contract_tests::control(Some(&binding), error.clone());
+    let tracker = crate::runtime::mem_tracker::MemTracker::new_root("actual-pending");
+    control.bind_mem_tracker(tracker.clone());
+    let host = control.allocator().unwrap();
+    let mut instance = actual_json(&[DataType::Utf8], &host);
+    let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
+    let arguments = [EvaluatedArgument::Column(&key)];
+    let waited = AtomicBool::new(false);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            // The genuine competing writer stays on its own synchronous
+            // thread. It cannot yield idle stock while qualification runs.
+            let lease = occupied.activate(occupied_bytes, 0).unwrap();
+            ready_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while error.waiting_count() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "original Pending must register"
+                );
+                std::thread::yield_now();
+            }
+            waited.store(true, Ordering::Relaxed);
+            lease.finish();
+            occupied.stop_producing().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let output = RuntimeScalarMemoryScope::new(&control, &mut journal)
+            .evaluate_invocation(
+                &mut instance,
+                Selection::all(1),
+                &arguments,
+                ScalarInvocationActivation::Activated,
+                Some(&host),
+                &control,
+            )
+            .unwrap();
+        assert_eq!(
+            output
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "{\"key\": null}"
+        );
+    });
+    assert!(waited.load(Ordering::Relaxed));
+    assert_completed_operation(journal.preparation.as_ref().unwrap());
+    assert_completed_operation(&journal.body);
+    assert!(!instance.is_failed());
+    drop(instance);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn runtime_invocation_memory_activated_empty_requires_the_original_host_and_preserves_output() {
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::DataType,
+    };
+    let binding = json_binding();
+    let (original, tracker) = json_control(Some(&binding), "actual-empty");
+    let host = original.allocator().unwrap();
+    let mut instance = actual_json(&[DataType::Utf8], &host);
+    let empty: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+    let arguments = [EvaluatedArgument::Column(&empty)];
+    let missing = control(Some(&binding), Arc::default());
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    assert!(matches!(
+        RuntimeScalarMemoryScope::new(&missing, &mut journal).evaluate_invocation(
+            &mut instance,
+            Selection::all(0),
+            &arguments,
+            ScalarInvocationActivation::Activated,
+            Some(&host),
+            &missing
+        ),
+        Err(RuntimeScalarEvaluationFailure::Source(
+            ScalarResourceError::Invariant(
+                "whole-invocation runtime has no concrete allocation host"
+            )
+        ))
+    ));
+    assert!(!instance.is_failed());
+    let output = RuntimeScalarMemoryScope::new(&original, &mut journal)
+        .evaluate_invocation(
+            &mut instance,
+            Selection::all(0),
+            &arguments,
+            ScalarInvocationActivation::Activated,
+            Some(&host),
+            &original,
+        )
+        .unwrap();
+    assert_eq!(output.values().len(), 0);
+    assert_completed_operation(journal.preparation.as_ref().unwrap());
+    assert_completed_operation(&journal.body);
+    drop(output);
+    drop(instance);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn runtime_invocation_memory_actual_json_two_grants_use_same_account_and_original_source() {
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::DataType,
+    };
+    let binding = json_binding();
+    let (control, tracker) = json_control(Some(&binding), "actual\0µ-query");
+    let host = control.allocator().unwrap();
+    let mut instance = actual_json(&[DataType::Utf8, DataType::Utf8], &host);
+    let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
+    let value: ArrayRef = Arc::new(StringArray::from(vec![
+        "unused",
+        "[1,2]",
+        "unused",
+        "{\"b\":2,\"a\":1}",
+    ]));
+    let arguments = [
+        EvaluatedArgument::Scalar(&key),
+        EvaluatedArgument::Column(&value),
+    ];
+    let selection = Selection::try_sparse(4, &[1, 3]).unwrap();
+    let facts = instance
+        .invocation_resource_profile()
+        .unwrap()
+        .requests_for(
+            &instance,
+            selection,
+            &arguments,
+            ScalarInvocationActivation::Activated,
+            &control,
+        )
+        .unwrap();
+    let callback = control
+        .invocation_host(Some(&host))
+        .unwrap()
+        .limit_failure_request_facts()
+        .unwrap();
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    let output = RuntimeScalarMemoryScope::new(&control, &mut journal)
+        .evaluate_invocation(
+            &mut instance,
+            selection,
+            &arguments,
+            ScalarInvocationActivation::Activated,
+            Some(&host),
+            &control,
+        )
+        .unwrap();
+    let strings = output
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(strings.value(0), "{\"key\": [1, 2]}");
+    assert_eq!(strings.value(1), "{\"key\": {\"a\": 1, \"b\": 2}}");
+    assert_eq!(journal.preparation_workset_bytes, Some(520));
+    assert_completed_operation(journal.preparation.as_ref().unwrap());
+    assert_completed_operation(&journal.body);
+    assert_eq!(
+        journal.workset_bytes,
+        Some(facts.bytes() + callback.requested_bytes + 8 * (facts.requests() + callback.requests))
+    );
+    assert_eq!(binding.account().snapshot().granted_bytes, 0);
+    assert!(!instance.is_failed());
+    drop(output);
+    drop(instance);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn runtime_invocation_memory_missing_binding_and_policy_refuse_before_instance_call() {
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::DataType,
+    };
+    for capacity in [false, true] {
+        let binding = json_binding();
+        if capacity {
+            binding
+                .account()
+                .install_policy(0, novarocks_memory::LimitDimension::Work);
+        }
+        let (control, tracker) = json_control(capacity.then_some(&binding), "actual-query");
+        let host = control.allocator().unwrap();
+        let mut instance = actual_json(&[DataType::Utf8], &host);
+        let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
+        let arguments = [EvaluatedArgument::Column(&key)];
+        let mut journal = RuntimeScalarMemoryJournal::default();
+        let result = RuntimeScalarMemoryScope::new(&control, &mut journal).evaluate_invocation(
+            &mut instance,
+            Selection::all(1),
+            &arguments,
+            ScalarInvocationActivation::Activated,
+            Some(&host),
+            &control,
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(RuntimeScalarEvaluationFailure::Host(
+                    RuntimeScalarMemoryRefusal::MissingQueryMemory
+                ))
+            ) && !capacity
+                || matches!(
+                    &result,
+                    Err(RuntimeScalarEvaluationFailure::Host(
+                        RuntimeScalarMemoryRefusal::Capacity(_)
+                    ))
+                ) && capacity
+        );
+        assert!(!instance.is_failed());
+        assert_eq!(journal.workset_bytes, Some(520));
+        assert!(journal.body.settlement.is_none() && journal.preparation.is_none());
+        drop(result);
+        drop(instance);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[test]
+fn runtime_invocation_memory_cached_birth_host_rebind_is_source_refusal_without_reinstantiation() {
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::DataType,
+    };
+    let binding = json_binding();
+    let (original, tracker) = json_control(Some(&binding), "original");
+    let host = original.allocator().unwrap();
+    let mut instance = actual_json(&[DataType::Utf8], &host);
+    let (rebound, other) = json_control(Some(&binding), "rebound");
+    let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
+    let arguments = [EvaluatedArgument::Column(&key)];
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    let result = RuntimeScalarMemoryScope::new(&rebound, &mut journal).evaluate_invocation(
+        &mut instance,
+        Selection::all(1),
+        &arguments,
+        ScalarInvocationActivation::Activated,
+        Some(&host),
+        &rebound,
+    );
+    assert!(matches!(
+        result,
+        Err(RuntimeScalarEvaluationFailure::Source(
+            ScalarResourceError::Invariant(
+                "whole-invocation instance allocation host differs from its runtime owner"
+            )
+        ))
+    ));
+    assert!(!instance.is_failed());
+    assert_completed_operation(journal.preparation.as_ref().unwrap());
+    assert!(journal.body.settlement.is_none());
+    let output = RuntimeScalarMemoryScope::new(&original, &mut journal)
+        .evaluate_invocation(
+            &mut instance,
+            Selection::all(1),
+            &arguments,
+            ScalarInvocationActivation::Activated,
+            Some(&host),
+            &original,
+        )
+        .unwrap();
+    assert_eq!(
+        output
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "{\"key\": null}"
+    );
+    drop(output);
+    drop(instance);
+    assert_eq!(tracker.current(), 0);
+    assert_eq!(other.current(), 0);
+}
+
+#[test]
+fn runtime_invocation_memory_original_early_and_validate_only_paths_do_not_qualify_unused_host() {
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::DataType,
+    };
+    let binding = json_binding();
+    let (birth, tracker) = json_control(Some(&binding), "birth");
+    let host = birth.allocator().unwrap();
+    let caller = control(Some(&binding), Arc::default());
+    for activation in [
+        ScalarInvocationActivation::Activated,
+        ScalarInvocationActivation::ValidateOnly,
+    ] {
+        let mut instance = actual_json(&[DataType::Utf8], &host);
+        let mut journal = RuntimeScalarMemoryJournal::default();
+        let result = RuntimeScalarMemoryScope::new(&caller, &mut journal).evaluate_invocation(
+            &mut instance,
+            Selection::all(1),
+            &[],
+            activation,
+            None,
+            &caller,
+        );
+        let Err(RuntimeScalarEvaluationFailure::Kernel(KernelFailure::InvalidProgram(cause))) =
+            result
+        else {
+            panic!("original early contract refusal")
+        };
+        if activation == ScalarInvocationActivation::ValidateOnly {
+            assert_eq!(
+                cause.message(),
+                "nonempty scalar demand cannot be validation-only"
+            );
+        } else {
+            assert_eq!(
+                cause.message(),
+                "evaluated scalar arguments differ from the exact call shape"
+            );
+        }
+        assert!(instance.is_failed());
+        assert_completed_operation(journal.preparation.as_ref().unwrap());
+        assert_completed_operation(&journal.body);
+    }
+    let mut instance = actual_json(&[DataType::Utf8], &host);
+    let empty: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+    let arguments = [EvaluatedArgument::Column(&empty)];
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    let output = RuntimeScalarMemoryScope::new(&caller, &mut journal)
+        .evaluate_invocation(
+            &mut instance,
+            Selection::all(0),
+            &arguments,
+            ScalarInvocationActivation::ValidateOnly,
+            None,
+            &caller,
+        )
+        .unwrap();
+    assert_eq!(output.values().len(), 0);
+    assert_completed_operation(journal.preparation.as_ref().unwrap());
+    assert_completed_operation(&journal.body);
+    assert!(!instance.is_failed());
+    drop(output);
+    drop(instance);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn runtime_invocation_memory_whole_data_latches_and_failed_replay_reads_no_stopped_account() {
+    use arrow::{
+        array::{ArrayRef, LargeListArray, StringArray},
+        buffer::{OffsetBuffer, ScalarBuffer},
+        datatypes::{DataType, Field},
+    };
+    let binding = json_binding();
+    let (control, tracker) = json_control(Some(&binding), "actual-query");
+    let host = control.allocator().unwrap();
+    let unsupported: ArrayRef = Arc::new(LargeListArray::new(
+        Arc::new(Field::new("long\0µ".repeat(100), DataType::Utf8, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 0])),
+        Arc::new(StringArray::from(Vec::<&str>::new())),
+        None,
+    ));
+    let mut instance = actual_json(&[unsupported.data_type().clone()], &host);
+    let arguments = [EvaluatedArgument::Scalar(&unsupported)];
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    let result = RuntimeScalarMemoryScope::new(&control, &mut journal).evaluate_invocation(
+        &mut instance,
+        Selection::try_sparse(4, &[1, 3]).unwrap(),
+        &arguments,
+        ScalarInvocationActivation::Activated,
+        Some(&host),
+        &control,
+    );
+    let Err(RuntimeScalarEvaluationFailure::Data(data)) = result else {
+        panic!("original full Data")
+    };
+    assert!(
+        data.message()
+            .starts_with("unsupported scalar type: LargeList")
+    );
+    assert!(data.message().len() > 512);
+    assert_eq!(data.source_row(0), Some(1));
+    assert_eq!(data.source_row(1), Some(3));
+    assert!(instance.is_failed());
+    assert_completed_operation(journal.preparation.as_ref().unwrap());
+    assert_completed_operation(&journal.body);
+    let error = Arc::new(RuntimeErrorState::default());
+    error.set_error("stopped");
+    let stopped = super::contract_tests::control(None, error);
+    let replay = RuntimeScalarMemoryScope::new(&stopped, &mut journal).evaluate_invocation(
+        &mut instance,
+        Selection::all(usize::MAX),
+        &[],
+        ScalarInvocationActivation::Activated,
+        None,
+        &stopped,
+    );
+    assert!(matches!(
+        replay,
+        Err(RuntimeScalarEvaluationFailure::Kernel(
+            KernelFailure::InstanceFailed
+        ))
+    ));
+    assert!(
+        journal.workset_bytes.is_none()
+            && journal.preparation.is_none()
+            && journal.body.settlement.is_none()
+    );
+    drop(data);
+    drop(instance);
+    assert_eq!(tracker.current(), 0);
+}
+
 #[test]
 fn runtime_scalar_memory_real_complete_grant_preserves_one_body_and_exact_receipts() {
     let binding = bound();
@@ -362,9 +839,19 @@ fn actual_scalar(
     name: &str,
     sources: &[novarocks_type_contract::FunctionValueType],
 ) -> ScalarEvaluationInstance {
+    let novarocks_functions::PreparedPureKernel::Scalar(prepared) = actual_prepared(name, sources)
+    else {
+        panic!("actual ScalarV1 owner");
+    };
+    ScalarEvaluationInstance::instantiate(prepared).unwrap()
+}
+fn actual_prepared(
+    name: &str,
+    sources: &[novarocks_type_contract::FunctionValueType],
+) -> novarocks_functions::PreparedPureKernel {
     use novarocks_functions::{
         CallArgumentUses, CallEffectInput, FunctionArgument, FunctionBindingRequest, FunctionKind,
-        PreparedPureKernel, PureCallPreparation, ScopedExpressionEffects,
+        PureCallPreparation, ScopedExpressionEffects,
     };
     use novarocks_type_contract::{
         CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
@@ -419,10 +906,7 @@ fn actual_scalar(
             compile,
         )
         .unwrap();
-    let PreparedPureKernel::Scalar(prepared) = prepared.into_prepared() else {
-        panic!("actual ScalarV1 owner");
-    };
-    ScalarEvaluationInstance::instantiate(prepared).unwrap()
+    prepared.into_prepared()
 }
 #[test]
 fn runtime_scalar_memory_actual_three_sources_use_same_wrapper_arguments_and_empty_path() {

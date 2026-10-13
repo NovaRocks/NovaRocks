@@ -101,6 +101,7 @@ pub(super) trait FrameFailure: From<KernelFailure> {
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
         activation: ScalarInvocationActivation,
+        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
         work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self>;
     fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self>;
@@ -112,6 +113,7 @@ impl FrameFailure for KernelFailure {
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
         _activation: ScalarInvocationActivation,
+        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
         work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self> {
         match instance {
@@ -132,6 +134,7 @@ impl FrameFailure for ScalarInvocationFailure {
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
         activation: ScalarInvocationActivation,
+        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
         work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self> {
         instance.evaluate(selection, arguments, activation, work.control)
@@ -152,6 +155,7 @@ impl FrameFailure for crate::runtime::scalar_memory::RuntimeScalarEvaluationFail
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
         activation: ScalarInvocationActivation,
+        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
         work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self> {
         match instance {
@@ -161,9 +165,19 @@ impl FrameFailure for crate::runtime::scalar_memory::RuntimeScalarEvaluationFail
                 })?;
                 scope.evaluate(instance, selection, arguments, work.control)
             }
-            CallInstance::Invocation(instance) => instance
-                .evaluate(selection, arguments, activation, work.control)
-                .map_err(Into::into),
+            CallInstance::Invocation(instance) => {
+                let scope = work.scalar_scope.as_mut().ok_or_else(|| {
+                    super::internal("runtime scalar Frame has no explicit operation scope")
+                })?;
+                scope.evaluate_invocation(
+                    instance,
+                    selection,
+                    arguments,
+                    activation,
+                    allocator,
+                    work.control,
+                )
+            }
         }
     }
     fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
