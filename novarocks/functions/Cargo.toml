@@ -43,6 +43,7 @@ serde_json.workspace = true
 allocator-api2.workspace = true
 hashbrown = { workspace = true, features = ["raw", "allocator-api2"] }
 hex.workspace = true
+libm = "0.2"
 base64.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true

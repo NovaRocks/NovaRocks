@@ -1985,3 +1985,6 @@ mod substring_index_shared_core_tests;
 mod json_object_legacy_native_oracle_tests;
 
 mod json_object_shared_owner_tests;
+
+#[path = "pure_differential/mann_whitney_tests.rs"]
+mod mann_whitney_tests;

@@ -30,7 +30,6 @@ futures.workspace = true
 hashbrown = { workspace = true, features = ["raw"] }
 allocator-api2.workspace = true
 hex.workspace = true
-libm = "0.2"
 md-5.workspace = true
 novarocks-arrow-ipc-frame.workspace = true
 novarocks-types.workspace = true

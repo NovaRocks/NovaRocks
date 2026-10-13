@@ -14,352 +14,29 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::array::{
-    ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, StringArray, StringBuilder, StructArray,
-};
+use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder, StringBuilder, StructArray};
 use arrow::datatypes::DataType;
 
-use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
+use crate::exec::expr::agg::AggregateAllocator;
 use crate::exec::node::aggregate::AggFunction;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{AggScalarValue, scalar_from_array};
-use libm::erf;
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 pub(super) struct MannWhitneyUTestAgg;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TestingAlternative {
-    Unknown = 0,
-    TwoSided = 1,
-    Less = 2,
-    Greater = 3,
-}
+type MannWhitneyState =
+    novarocks_functions::builtin::aggregate_mann_whitney_core::MannWhitneyState<AggregateAllocator>;
+use novarocks_functions::aggregate_scalar::{ScalarStateError, ScalarWork};
+use novarocks_functions::builtin::aggregate_mann_whitney_core::MannWhitneyInput;
 
-impl TestingAlternative {
-    fn from_str(value: &str) -> Self {
-        match value {
-            "two-sided" => TestingAlternative::TwoSided,
-            "less" => TestingAlternative::Less,
-            "greater" => TestingAlternative::Greater,
-            _ => TestingAlternative::Unknown,
-        }
+fn legacy_error(error: ScalarStateError) -> String {
+    match error {
+        ScalarStateError::Legacy(message) | ScalarStateError::OutputAllocation(message) => message,
+        ScalarStateError::Kernel(error) => error.to_string(),
     }
-}
-
-#[derive(Debug)]
-struct MannWhitneyState {
-    allocator: AggregateAllocator,
-    alternative: TestingAlternative,
-    continuity_correction: i64,
-    stats: [AggregateVec<f64>; 2],
-    sorted: bool,
-}
-
-impl Default for MannWhitneyState {
-    fn default() -> Self {
-        Self::new(process_mem_tracker())
-    }
-}
-
-impl MannWhitneyState {
-    fn new(tracker: Arc<MemTracker>) -> Self {
-        let allocator = AggregateAllocator::new(tracker);
-        Self {
-            allocator: allocator.clone(),
-            alternative: TestingAlternative::Unknown,
-            continuity_correction: 0,
-            stats: [
-                AggregateVec::new_in(allocator.clone()),
-                AggregateVec::new_in(allocator),
-            ],
-            sorted: true,
-        }
-    }
-    fn is_uninitialized(&self) -> bool {
-        self.alternative == TestingAlternative::Unknown
-    }
-
-    fn init(&mut self, alternative: TestingAlternative, continuity_correction: i64) {
-        self.alternative = alternative;
-        self.continuity_correction = continuity_correction;
-    }
-
-    fn update(&mut self, value: f64, treatment: bool) -> Result<(), String> {
-        let idx = if treatment { 1 } else { 0 };
-        self.stats[idx].try_reserve(1).map_err(|_| {
-            self.allocator
-                .allocation_error("reserve Mann-Whitney sample")
-        })?;
-        self.stats[idx].push(value);
-        self.sorted = false;
-        Ok(())
-    }
-
-    fn sort_if_needed(&mut self) {
-        if !self.sorted {
-            for stats in &mut self.stats {
-                stats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-            }
-            self.sorted = true;
-        }
-    }
-
-    fn merge(&mut self, mut other: MannWhitneyState) -> Result<(), String> {
-        if self.is_uninitialized() {
-            *self = other;
-            return Ok(());
-        }
-        if other.is_uninitialized() {
-            return Ok(());
-        }
-        if self.alternative != other.alternative
-            || self.continuity_correction != other.continuity_correction
-        {
-            return Err("mann_whitney_u_test state parameters mismatch".to_string());
-        }
-        self.sort_if_needed();
-        other.sort_if_needed();
-        for idx in 0..2 {
-            let capacity = self.stats[idx]
-                .len()
-                .checked_add(other.stats[idx].len())
-                .ok_or_else(|| "mann_whitney_u_test sample count overflow".to_string())?;
-            let mut merged = AggregateVec::new_in(self.allocator.clone());
-            merged.try_reserve_exact(capacity).map_err(|_| {
-                self.allocator
-                    .allocation_error("reserve merged Mann-Whitney sample")
-            })?;
-            let mut i = 0;
-            let mut j = 0;
-            let left = &self.stats[idx];
-            let right = &other.stats[idx];
-            while i < left.len() && j < right.len() {
-                if left[i] <= right[j] {
-                    merged.push(left[i]);
-                    i += 1;
-                } else {
-                    merged.push(right[j]);
-                    j += 1;
-                }
-            }
-            merged.extend_from_slice(&left[i..]);
-            merged.extend_from_slice(&right[j..]);
-            self.stats[idx] = merged;
-        }
-        self.sorted = true;
-        Ok(())
-    }
-
-    fn serialize(&mut self) -> Vec<u8> {
-        self.sort_if_needed();
-        let mut out = Vec::new();
-        out.push(self.alternative as u8);
-        out.extend_from_slice(&self.continuity_correction.to_le_bytes());
-        let len0 = self.stats[0].len() as u32;
-        let len1 = self.stats[1].len() as u32;
-        out.extend_from_slice(&len0.to_le_bytes());
-        out.extend_from_slice(&len1.to_le_bytes());
-        for v in &self.stats[0] {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in &self.stats[1] {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out
-    }
-
-    fn deserialize_in(mut data: &[u8], allocator: AggregateAllocator) -> Result<Self, String> {
-        if data.len() < 1 + 8 + 4 + 4 {
-            return Err("mann_whitney_u_test deserialize: buffer too short".to_string());
-        }
-        let alternative = match data[0] {
-            1 => TestingAlternative::TwoSided,
-            2 => TestingAlternative::Less,
-            3 => TestingAlternative::Greater,
-            _ => TestingAlternative::Unknown,
-        };
-        data = &data[1..];
-        let mut cc_bytes = [0u8; 8];
-        cc_bytes.copy_from_slice(&data[..8]);
-        let continuity_correction = i64::from_le_bytes(cc_bytes);
-        data = &data[8..];
-        let mut len_bytes = [0u8; 4];
-        len_bytes.copy_from_slice(&data[..4]);
-        let len0 = u32::from_le_bytes(len_bytes) as usize;
-        data = &data[4..];
-        len_bytes.copy_from_slice(&data[..4]);
-        let len1 = u32::from_le_bytes(len_bytes) as usize;
-        data = &data[4..];
-
-        let mut stats0 = AggregateVec::new_in(allocator.clone());
-        stats0.try_reserve_exact(len0).map_err(|_| {
-            allocator.allocation_error("reserve decoded Mann-Whitney control sample")
-        })?;
-        for _ in 0..len0 {
-            if data.len() < 8 {
-                return Err("mann_whitney_u_test deserialize: buffer too short".to_string());
-            }
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&data[..8]);
-            stats0.push(f64::from_le_bytes(bytes));
-            data = &data[8..];
-        }
-        let mut stats1 = AggregateVec::new_in(allocator.clone());
-        stats1.try_reserve_exact(len1).map_err(|_| {
-            allocator.allocation_error("reserve decoded Mann-Whitney treatment sample")
-        })?;
-        for _ in 0..len1 {
-            if data.len() < 8 {
-                return Err("mann_whitney_u_test deserialize: buffer too short".to_string());
-            }
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&data[..8]);
-            stats1.push(f64::from_le_bytes(bytes));
-            data = &data[8..];
-        }
-
-        Ok(Self {
-            allocator,
-            alternative,
-            continuity_correction,
-            stats: [stats0, stats1],
-            sorted: true,
-        })
-    }
-
-    fn format_number(value: f64) -> String {
-        if let Some(num) = serde_json::Number::from_f64(value) {
-            let mut out = num.to_string();
-            if out.ends_with(".0") {
-                out.truncate(out.len().saturating_sub(2));
-            }
-            out
-        } else {
-            "null".to_string()
-        }
-    }
-
-    fn build_result(&mut self) -> String {
-        if self.is_uninitialized() {
-            return r#"{"Logical Error": "state not initialized."}"#.to_string();
-        }
-        self.sort_if_needed();
-        let n1 = self.stats[0].len() as f64;
-        let n2 = self.stats[1].len() as f64;
-        let size = n1 + n2;
-        if size == 0.0 {
-            return r#"{"Error": "No data in samples."}"#.to_string();
-        }
-
-        let mut combined = Vec::with_capacity(size as usize);
-        for v in &self.stats[0] {
-            combined.push((*v, 0usize));
-        }
-        for v in &self.stats[1] {
-            combined.push((*v, 1usize));
-        }
-        combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-
-        let mut r1 = 0.0;
-        let mut tie_num = 0.0;
-        let mut left = 0usize;
-        while left < combined.len() {
-            let mut right = left + 1;
-            while right < combined.len() && combined[right].0 == combined[left].0 {
-                right += 1;
-            }
-            let count_equal = (right - left) as f64;
-            if count_equal == size {
-                return r#"{"Error": "All numbers in both samples are identical."}"#.to_string();
-            }
-            let adjusted = (left as f64 + right as f64 + 1.0) / 2.0;
-            tie_num += count_equal.powi(3) - count_equal;
-            for (_, sample_id) in &combined[left..right] {
-                if *sample_id == 0 {
-                    r1 += adjusted;
-                }
-            }
-            left = right;
-        }
-
-        let tie_correction = 1.0 - (tie_num / (size.powi(3) - size));
-        let u1 = n1 * n2 + (n1 * (n1 + 1.0)) / 2.0 - r1;
-        let u2 = n1 * n2 - u1;
-        let meanrank = n1 * n2 / 2.0 + 0.5 * (self.continuity_correction as f64);
-        let sd = (tie_correction * n1 * n2 * (n1 + n2 + 1.0) / 12.0).sqrt();
-        if !sd.is_finite() || sd.abs() < 1e-7 {
-            return format!(r#"{{"Logical Error": "sd({}) is not a valid value."}}"#, sd);
-        }
-
-        let u = match self.alternative {
-            TestingAlternative::TwoSided => u1.max(u2),
-            TestingAlternative::Less => u1,
-            TestingAlternative::Greater => u2,
-            TestingAlternative::Unknown => u1.max(u2),
-        };
-        let mut z = (u - meanrank) / sd;
-        if self.alternative == TestingAlternative::TwoSided {
-            z = z.abs();
-        }
-
-        let cdf = normal_cdf(z);
-        let p_value = if self.alternative == TestingAlternative::TwoSided {
-            2.0 - 2.0 * cdf
-        } else {
-            1.0 - cdf
-        };
-
-        format!(
-            "[{}, {}]",
-            Self::format_number(u2),
-            Self::format_number(p_value)
-        )
-    }
-}
-
-enum TreatmentArrayView<'a> {
-    Boolean(&'a BooleanArray),
-    Int(IntArrayView<'a>),
-}
-
-impl<'a> TreatmentArrayView<'a> {
-    fn new(array: &'a ArrayRef) -> Result<Self, String> {
-        if matches!(array.data_type(), DataType::Boolean) {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-            return Ok(Self::Boolean(arr));
-        }
-        Ok(Self::Int(IntArrayView::new(array).map_err(|_| {
-            "mann_whitney_u_test expects boolean or integer treatment".to_string()
-        })?))
-    }
-
-    fn value_at(&self, row: usize) -> Option<bool> {
-        match self {
-            Self::Boolean(arr) => (!arr.is_null(row)).then(|| arr.value(row)),
-            Self::Int(arr) => arr.value_at(row).map(|value| value != 0),
-        }
-    }
-}
-
-fn mann_whitney_numeric_to_f64(value: &AggScalarValue) -> Option<f64> {
-    match value {
-        AggScalarValue::Int64(v) => Some(*v as f64),
-        AggScalarValue::Float64(v) => Some(*v),
-        AggScalarValue::Decimal128(v) => Some(*v as f64),
-        _ => None,
-    }
-}
-
-fn normal_cdf(z: f64) -> f64 {
-    0.5 * (1.0 + erf(z / std::f64::consts::SQRT_2))
 }
 
 impl AggregateFunction for MannWhitneyUTestAgg {
@@ -452,7 +129,10 @@ impl AggregateFunction for MannWhitneyUTestAgg {
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            std::ptr::write(ptr as *mut MannWhitneyState, MannWhitneyState::default());
+            std::ptr::write(
+                ptr as *mut MannWhitneyState,
+                MannWhitneyState::new(AggregateAllocator::new(process_mem_tracker())),
+            );
         }
     }
 
@@ -467,7 +147,7 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         })?;
         unsafe {
             ptr.cast::<MannWhitneyState>()
-                .write(MannWhitneyState::new(tracker))
+                .write(MannWhitneyState::new(AggregateAllocator::new(tracker)))
         };
         Ok(())
     }
@@ -500,74 +180,13 @@ impl AggregateFunction for MannWhitneyUTestAgg {
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| "mann_whitney_u_test expects struct input".to_string())?;
-        if !(struct_arr.num_columns() == 2
-            || struct_arr.num_columns() == 3
-            || struct_arr.num_columns() == 4)
-        {
-            return Err("mann_whitney_u_test expects 2 to 4 arguments".to_string());
-        }
-
-        let value_arr = struct_arr.column(0);
-        let treatment_arr = TreatmentArrayView::new(struct_arr.column(1))?;
-
-        let alternative_arr = if struct_arr.num_columns() >= 3 {
-            Some(
-                struct_arr
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "mann_whitney_u_test expects string alternative".to_string())?,
-            )
-        } else {
-            None
-        };
-
-        let continuity_arr = if struct_arr.num_columns() == 4 {
-            Some(IntArrayView::new(struct_arr.column(3))?)
-        } else {
-            None
-        };
-
+        let arguments = MannWhitneyInput::try_new(struct_arr.columns())?;
+        let mut work = ScalarWork::new(None);
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MannWhitneyState) };
-            if state.is_uninitialized() {
-                let mut alternative = TestingAlternative::TwoSided;
-                let mut continuity = 1;
-                if let Some(alt_arr) = alternative_arr
-                    && !alt_arr.is_null(row)
-                {
-                    let alt = alt_arr.value(row).to_lowercase();
-                    let parsed = TestingAlternative::from_str(&alt);
-                    if parsed == TestingAlternative::Unknown {
-                        return Err(format!("Logical Error: invalid alternative `{}`.", alt));
-                    }
-                    alternative = parsed;
-                }
-                if let Some(cont_arr) = continuity_arr.as_ref()
-                    && let Some(v) = cont_arr.value_at(row)
-                {
-                    if v < 0 {
-                        return Err("Logical Error: continuity_correction must be non-negative."
-                            .to_string());
-                    }
-                    continuity = v;
-                }
-                state.init(alternative, continuity);
-            }
-
-            let Some(treatment) = treatment_arr.value_at(row) else {
-                continue;
-            };
-            let Some(value) = scalar_from_array(value_arr, row)? else {
-                continue;
-            };
-            let Some(x) = mann_whitney_numeric_to_f64(&value) else {
-                return Err("mann_whitney_u_test expects numeric input".to_string());
-            };
-            if x.is_nan() || x.is_infinite() {
-                continue;
-            }
-            state.update(x, treatment)?;
+            arguments
+                .update_row(state, [row; 4], &mut work)
+                .map_err(legacy_error)?;
         }
         Ok(())
     }
@@ -588,11 +207,12 @@ impl AggregateFunction for MannWhitneyUTestAgg {
             }
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MannWhitneyState) };
             let bytes = arr.value(row);
-            let other = MannWhitneyState::deserialize_in(bytes, state.allocator.clone())?;
+            let other = MannWhitneyState::deserialize_in(bytes, state.allocator.clone())
+                .map_err(legacy_error)?;
             if state.is_uninitialized() {
                 *state = other;
             } else {
-                state.merge(other)?;
+                state.merge(other).map_err(legacy_error)?;
             }
         }
         Ok(())
@@ -619,8 +239,7 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         let mut builder = StringBuilder::new();
         for &base in group_states {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MannWhitneyState) };
-            if state.is_uninitialized() || (state.stats[0].is_empty() && state.stats[1].is_empty())
-            {
+            if state.is_uninitialized() || !state.has_samples() {
                 builder.append_null();
                 continue;
             }
@@ -790,3 +409,7 @@ mod tests {
         assert!((p - 1.0).abs() < 1e-9);
     }
 }
+
+#[cfg(test)]
+#[path = "mann_whitney_contract_tests.rs"]
+mod contract_tests;
