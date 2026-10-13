@@ -84,10 +84,14 @@ pub(crate) struct AggregateDiffSpec {
     pub groups: usize,
     pub partitions: usize,
     pub partition_seed: u64,
+    /// Match an immutable original transcript that partitions by row ordinal.
+    pub round_robin_partitions: bool,
     pub semantics: DiffSemantics,
     pub original_state: Option<novarocks_type_contract::AggregateStateInterpretation>,
     pub float_comparison: FloatComparison,
     pub error_messages: ErrorMessageCheck,
+    /// Require the lossless whole-invocation Data transport for legacy errors.
+    pub require_invocation_data_errors: bool,
     /// Only explicitly frozen original panic payloads can match.
     pub expected_panic_payload: Option<String>,
 }
@@ -102,10 +106,12 @@ impl AggregateDiffSpec {
             groups: 1,
             partitions: 3,
             partition_seed: 0xA66,
+            round_robin_partitions: false,
             semantics: DiffSemantics::default(),
             original_state: None,
             float_comparison: FloatComparison::Exact,
             error_messages: ErrorMessageCheck::LegacyContainsPure,
+            require_invocation_data_errors: false,
             expected_panic_payload: None,
         }
     }
@@ -151,6 +157,13 @@ impl AggregateDiffSpec {
         self
     }
 
+    pub(crate) fn round_robin_partitions(mut self, count: usize) -> Self {
+        assert!(count > 0);
+        self.partitions = count;
+        self.round_robin_partitions = true;
+        self
+    }
+
     /// The test producer authors the same original state options for both paths.
     pub(crate) fn original_state_interpretation(
         mut self,
@@ -185,6 +198,11 @@ impl AggregateDiffSpec {
 
     pub(crate) fn float_comparison(mut self, comparison: FloatComparison) -> Self {
         self.float_comparison = comparison;
+        self
+    }
+
+    pub(crate) fn invocation_data_errors(mut self) -> Self {
+        self.require_invocation_data_errors = true;
         self
     }
 
@@ -282,7 +300,12 @@ impl Layout {
             })
             .collect::<Vec<_>>();
         for (row, group) in group_ids.iter().copied().enumerate() {
-            let partition = &mut partitions[generator.rng().below(spec.partitions as u64) as usize];
+            let index = if spec.round_robin_partitions {
+                row % spec.partitions
+            } else {
+                generator.rng().below(spec.partitions as u64) as usize
+            };
+            let partition = &mut partitions[index];
             let local = match partition.globals.iter().position(|global| *global == group) {
                 Some(local) => local,
                 None => {
@@ -520,6 +543,11 @@ fn compare_shape(
         (Err(legacy), Err(novarocks_functions::EvaluationFailure::Kernel(KernelFailure::Operational(diagnostic)))) => {
             if legacy.starts_with(super::LEGACY_PANIC_PREFIX) {
                 details.push(format!("{shape}: {legacy}"));
+            } else if spec.require_invocation_data_errors {
+                details.push(format!(
+                    "{shape}: legacy `{legacy}` requires whole invocation Data, pure returned Kernel Operational `{}`",
+                    diagnostic.message()
+                ));
             } else if spec.error_messages == ErrorMessageCheck::LegacyContainsPure
                 && !legacy.contains(diagnostic.message())
             {
@@ -1171,5 +1199,93 @@ mod panic_comparison_tests {
         assert_eq!(summary.matched_failures, 0);
         assert_eq!(summary.null_results, 0);
         assert!(details.is_empty());
+    }
+}
+
+// This test-only port consumes authored encoded states through both actual
+// merge lifecycles; it never decodes or computes the payload in the harness.
+pub(super) fn assert_encoded_aggregate_matches_v1(spec: AggregateDiffSpec, encoded: ArrayRef) {
+    let catalog = builtin_engine_function_catalog();
+    let bound = resolve_aggregate_spec(catalog, &spec).unwrap();
+    let signature = resolved_aggregate_signature_from_binding(bound.clone()).unwrap();
+    let FunctionResultType::Scalar(result_type) = &bound.selected.result_type else {
+        panic!("scalar aggregate result")
+    };
+    let state_type = bound
+        .selected
+        .aggregate
+        .as_ref()
+        .unwrap()
+        .intermediate_type
+        .clone();
+    let legacy = LegacyAggregate::try_new(&spec, &signature).unwrap();
+    let groups = encoded.len();
+    for intermediate in [false, true] {
+        let phase = if intermediate {
+            AggregateKernelPhase::Intermediate
+        } else {
+            AggregateKernelPhase::Final
+        };
+        let handle = prepare_aggregate(catalog, &spec, &bound, &state_type, &[], phase).unwrap();
+        let legacy_result = guard_legacy(|| {
+            let mut arena = LegacyArena::new();
+            let states = LegacyStates::new(&legacy.merge, &mut arena, groups)?;
+            let entry = &legacy.merge.entries[0];
+            entry.merge_batch(
+                &states.pointers,
+                AggregateInputBatch::try_new(Some(&encoded), groups).map_err(|e| e.to_string())?,
+            )?;
+            entry.build_array(&states.pointers, intermediate)
+        });
+        let pure_result = guard_pure(|| {
+            let mut column = PureAggregate::column(&handle, groups)?;
+            let input = SelectedAggregateMergeInput::try_new(
+                handle.contract(),
+                Selection::all(groups),
+                EvaluatedArgument::Column(&encoded),
+                &HarnessControl,
+            )?;
+            column
+                .prepare_merge_batch_evaluation(
+                    &(0..groups).collect::<Vec<_>>(),
+                    input,
+                    &HarnessControl,
+                )?
+                .run(&HarnessControl)?;
+            column.emit_evaluation(&(0..groups).collect::<Vec<_>>(), groups, &HarnessControl)
+        });
+        let expected_type = if intermediate {
+            &state_type
+        } else {
+            result_type
+        };
+        let mut summary = AggregateDiffSummary {
+            function: bound.function_id.clone(),
+            overload: bound.selected.overload.clone(),
+            result_type: expected_type.clone(),
+            pure_state_type: state_type.clone(),
+            legacy_intermediate_type: signature.intermediate_type.clone(),
+            rows: groups,
+            groups,
+            partitions: 1,
+            matched_failures: 0,
+            matched_panics: 0,
+            null_results: 0,
+        };
+        let mut details = Vec::new();
+        compare_shape(
+            &spec,
+            expected_type,
+            "authored encoded state",
+            groups,
+            legacy_result,
+            pure_result,
+            &mut summary,
+            &mut details,
+        );
+        assert!(
+            details.is_empty(),
+            "encoded state phase {phase:?} mismatch: {details:?}"
+        );
     }
 }

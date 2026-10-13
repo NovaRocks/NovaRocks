@@ -20,11 +20,18 @@
 //! physical occurrences, including prefixes of unsupported scalar reads.
 
 use crate::aggregate_scalar::AggScalarValue;
-use crate::{KernelEvaluationControl, KernelFailure};
-use arrow_array::{
-    Array, ArrayRef, BinaryArray, LargeBinaryArray, ListArray, MapArray, StringArray, StructArray,
+#[cfg(test)]
+use crate::scalar_copy_geometry::arrow_default_debug_bytes_upper as type_debug;
+use crate::scalar_copy_geometry::{
+    ContainerExtent, CopyGeometry, GeometryFold, LeafExtent, observe_scalar_geometry,
 };
-use arrow_schema::{DataType, Field};
+use crate::{KernelEvaluationControl, KernelFailure};
+use arrow_array::{ArrayRef, StringArray};
+#[cfg(test)]
+use arrow_array::{BinaryArray, StructArray};
+use arrow_schema::DataType;
+#[cfg(test)]
+use arrow_schema::Field;
 use std::alloc::Layout;
 
 fn add(a: usize, b: usize) -> Result<usize, KernelFailure> {
@@ -38,31 +45,6 @@ fn quoted_debug(bytes: usize) -> Result<usize, KernelFailure> {
 }
 fn sequence_syntax(count: usize) -> Result<usize, KernelFailure> {
     add(2, mul(count.saturating_sub(1), 2)?)
-}
-
-/// Cumulative requests and peak stock for exact-copy scalar backing. Each
-/// occurrence is counted even when several addresses borrow the same source.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct CopyGeometry {
-    pub(crate) bytes: usize,
-    pub(crate) requests: usize,
-}
-impl CopyGeometry {
-    fn exact(count: usize, element: Layout) -> Result<Self, KernelFailure> {
-        let bytes = mul(count, element.size())?;
-        Layout::from_size_align(bytes, element.align())
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        Ok(Self {
-            bytes,
-            requests: usize::from(bytes != 0),
-        })
-    }
-    fn plus(self, other: Self) -> Result<Self, KernelFailure> {
-        Ok(Self {
-            bytes: add(self.bytes, other.bytes)?,
-            requests: add(self.requests, other.requests)?,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,178 +121,66 @@ impl ScalarGeometry {
     }
 }
 
-fn field_debug(
-    field: &Field,
-    control: &dyn KernelEvaluationControl,
-) -> Result<usize, KernelFailure> {
-    control.checkpoint(1)?;
-    let mut metadata = add(2, mul(field.metadata().len(), 8)?)?;
-    for (key, value) in field.metadata() {
-        control.checkpoint(1)?;
-        metadata = add(metadata, mul(add(key.len(), value.len())?, 10)?)?;
-    }
-    // Cover private dict_id/dict_is_ordered even when the public getters return
-    // None on a non-Dictionary Field. Do not normalize or clone metadata.
-    add(
-        add(
-            add(111, quoted_debug(field.name().len())?)?,
-            type_debug(field.data_type(), control)?,
-        )?,
-        metadata,
-    )
-}
-
-/// Exhaustive default Debug geometry of pinned Arrow DataType/Field authors.
-/// This is a borrowed extent walk, never a formatter or an unsupported verdict.
-fn type_debug(
-    ty: &DataType,
-    control: &dyn KernelEvaluationControl,
-) -> Result<usize, KernelFailure> {
-    control.checkpoint(1)?;
-    use DataType::*;
-    Ok(match ty {
-        Null => 4,
-        Boolean => 7,
-        Int8 => 4,
-        Int16 | Int32 | Int64 => 5,
-        UInt8 => 5,
-        UInt16 | UInt32 | UInt64 => 6,
-        Float16 | Float32 | Float64 => 7,
-        Date32 | Date64 => 6,
-        Binary => 6,
-        LargeBinary => 11,
-        BinaryView => 10,
-        Utf8 => 4,
-        LargeUtf8 => 9,
-        Utf8View => 8,
-        Timestamp(_, zone) => add(
-            24,
-            match zone {
-                None => 4,
-                Some(zone) => add(6, quoted_debug(zone.len())?)?,
-            },
-        )?,
-        Time32(_) | Time64(_) => 19,
-        Duration(_) => 21,
-        Interval(_) => 22,
-        FixedSizeBinary(_) => 28,
-        List(f) => add(6, field_debug(f, control)?)?,
-        ListView(f) => add(10, field_debug(f, control)?)?,
-        LargeList(f) => add(11, field_debug(f, control)?)?,
-        LargeListView(f) => add(15, field_debug(f, control)?)?,
-        FixedSizeList(f, _) => add(28, field_debug(f, control)?)?,
-        Struct(fields) => {
-            let mut total = add(8, sequence_syntax(fields.len())?)?;
-            for field in fields {
-                total = add(total, field_debug(field, control)?)?;
-            }
-            total
-        }
-        Union(fields, _) => {
-            let mut total = add(15, sequence_syntax(fields.len())?)?;
-            for (_, field) in fields.iter() {
-                total = add(total, add(8, field_debug(field, control)?)?)?;
-            }
-            total
-        }
-        Dictionary(key, value) => add(
-            add(14, type_debug(key, control)?)?,
-            type_debug(value, control)?,
-        )?,
-        Decimal32(_, _) | Decimal64(_, _) => 20,
-        Decimal128(_, _) | Decimal256(_, _) => 21,
-        Map(f, _) => add(12, field_debug(f, control)?)?,
-        RunEndEncoded(ends, values) => add(
-            add(17, field_debug(ends, control)?)?,
-            field_debug(values, control)?,
-        )?,
-    })
-}
-
-fn carrier<A: Array + 'static>(array: &ArrayRef) -> Result<&A, KernelFailure> {
-    array.as_any().downcast_ref::<A>().ok_or_else(|| {
-        crate::kernel_control::internal(
-            "json_object resource geometry requires its exact Arrow carrier",
-        )
-    })
-}
-
-/// Only null bits, offsets, child structure and resident byte extents are read.
-/// No numeric value, AggScalarValue, JSON parser or rendered text is produced.
+/// Preserve the original JSONObject summary on the shared scalar traversal.
 pub(crate) fn scalar_geometry(
     array: &ArrayRef,
     row: usize,
     control: &dyn KernelEvaluationControl,
 ) -> Result<ScalarGeometry, KernelFailure> {
-    control.checkpoint(1)?;
-    if row >= array.len() {
-        return Err(crate::kernel_control::internal(
-            "json_object resource address exceeds carrier",
-        ));
+    observe_scalar_geometry::<ScalarGeometry>(array, row, control)
+}
+impl GeometryFold for ScalarGeometry {
+    type Children = ChildrenGeometry;
+    fn leaf(copy: CopyGeometry, extent: LeafExtent) -> Result<Self, KernelFailure> {
+        let format = match extent {
+            LeafExtent::Null => FormatGeometry::Null,
+            LeafExtent::Bool => FormatGeometry::Bool,
+            LeafExtent::Integer => FormatGeometry::Integer,
+            LeafExtent::Float => FormatGeometry::Float,
+            LeafExtent::Date => FormatGeometry::Date,
+            LeafExtent::Timestamp => FormatGeometry::Timestamp,
+            LeafExtent::Decimal128 => FormatGeometry::Decimal128,
+            LeafExtent::Decimal256 => FormatGeometry::Decimal256,
+            LeafExtent::Text { bytes } => FormatGeometry::Text { bytes },
+            LeafExtent::Binary { bytes } => FormatGeometry::Binary { bytes },
+        };
+        Ok(Self::Known { copy, format })
     }
-    use DataType::*;
-    let supported = matches!(
-        array.data_type(),
-        Null | Boolean
-            | Int8
-            | Int16
-            | Int32
-            | Int64
-            | Float32
-            | Float64
-            | Utf8
-            | Binary
-            | LargeBinary
-            | Date32
-            | Timestamp(_, _)
-            | Decimal128(_, _)
-            | Decimal256(_, _)
-            | List(_)
-            | Struct(_)
-            | Map(_, _)
-    ) || matches!(array.data_type(), FixedSizeBinary(16));
-    if !supported {
-        return Ok(ScalarGeometry::FailureOnly {
-            copy: CopyGeometry::default(),
-            diagnostic_bytes: add(25, type_debug(array.data_type(), control)?)?,
-        });
-    }
-    if array.is_null(row) || matches!(array.data_type(), Null) {
-        return Ok(ScalarGeometry::Known {
-            copy: CopyGeometry::default(),
-            format: FormatGeometry::Null,
-        });
-    }
-    let mut copy = CopyGeometry::default();
-    let format = match array.data_type() {
-        Boolean => FormatGeometry::Bool,
-        Int8 | Int16 | Int32 | Int64 => FormatGeometry::Integer,
-        Float32 | Float64 => FormatGeometry::Float,
-        Date32 => FormatGeometry::Date,
-        Timestamp(_, _) => FormatGeometry::Timestamp,
-        Decimal128(_, _) | FixedSizeBinary(16) => FormatGeometry::Decimal128,
-        Decimal256(_, _) => FormatGeometry::Decimal256,
-        Utf8 => {
-            let bytes = carrier::<StringArray>(array)?.value(row).len();
-            copy = CopyGeometry::exact(bytes, Layout::new::<u8>())?;
-            FormatGeometry::Text { bytes }
+    fn failure(copy: CopyGeometry, diagnostic_bytes: usize) -> Self {
+        Self::FailureOnly {
+            copy,
+            diagnostic_bytes,
         }
-        Binary | LargeBinary => {
-            let bytes = if matches!(array.data_type(), Binary) {
-                carrier::<BinaryArray>(array)?.value(row).len()
-            } else {
-                carrier::<LargeBinaryArray>(array)?.value(row).len()
-            };
-            copy = CopyGeometry::exact(bytes, Layout::new::<u8>())?;
-            FormatGeometry::Binary { bytes }
-        }
-        List(_) | Struct(_) | Map(_, _) => return container_geometry(array, row, control),
-        _ => unreachable!("supported non-null scalar geometry"),
-    };
-    Ok(ScalarGeometry::Known { copy, format })
+    }
+    fn begin(
+        _: ContainerExtent,
+        count: usize,
+        copy: CopyGeometry,
+    ) -> Result<ChildrenGeometry, KernelFailure> {
+        Ok(ChildrenGeometry {
+            copy,
+            inner_debug: sequence_syntax(count)?,
+            diagnostic: 0,
+            failed: false,
+        })
+    }
+    fn pair(children: &mut ChildrenGeometry) -> Result<(), KernelFailure> {
+        children.inner_debug = add(children.inner_debug, 4)?;
+        Ok(())
+    }
+    fn child(children: &mut ChildrenGeometry, child: Self) -> Result<(), KernelFailure> {
+        children.child(child)
+    }
+    fn end(kind: ContainerExtent, children: ChildrenGeometry) -> Result<Self, KernelFailure> {
+        children.finish(match kind {
+            ContainerExtent::List => 4,
+            ContainerExtent::Struct => 6,
+            ContainerExtent::Map => 3,
+        })
+    }
 }
 
-struct ChildrenGeometry {
+pub(crate) struct ChildrenGeometry {
     copy: CopyGeometry,
     inner_debug: usize,
     diagnostic: usize,
@@ -349,74 +219,6 @@ impl ChildrenGeometry {
         }
     }
 }
-fn container_geometry(
-    array: &ArrayRef,
-    row: usize,
-    control: &dyn KernelEvaluationControl,
-) -> Result<ScalarGeometry, KernelFailure> {
-    match array.data_type() {
-        DataType::List(_) => {
-            let array = carrier::<ListArray>(array)?;
-            let offsets = array.value_offsets();
-            let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
-            let count = end
-                .checked_sub(start)
-                .ok_or(KernelFailure::ResourceExhausted)?;
-            let mut children = ChildrenGeometry {
-                copy: CopyGeometry::exact(count, Layout::new::<Option<AggScalarValue>>())?,
-                inner_debug: sequence_syntax(count)?,
-                diagnostic: 0,
-                failed: false,
-            };
-            for child in start..end {
-                children.child(scalar_geometry(array.values(), child, control)?)?;
-            }
-            children.finish(4)
-        }
-        DataType::Struct(_) => {
-            let array = carrier::<StructArray>(array)?;
-            let mut children = ChildrenGeometry {
-                copy: CopyGeometry::exact(
-                    array.num_columns(),
-                    Layout::new::<Option<AggScalarValue>>(),
-                )?,
-                inner_debug: sequence_syntax(array.num_columns())?,
-                diagnostic: 0,
-                failed: false,
-            };
-            for column in array.columns() {
-                children.child(scalar_geometry(column, row, control)?)?;
-            }
-            children.finish(6)
-        }
-        DataType::Map(_, _) => {
-            let array = carrier::<MapArray>(array)?;
-            let offsets = array.value_offsets();
-            let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
-            let count = end
-                .checked_sub(start)
-                .ok_or(KernelFailure::ResourceExhausted)?;
-            let mut children = ChildrenGeometry {
-                copy: CopyGeometry::exact(
-                    count,
-                    Layout::new::<(Option<AggScalarValue>, Option<AggScalarValue>)>(),
-                )?,
-                inner_debug: sequence_syntax(count)?,
-                diagnostic: 0,
-                failed: false,
-            };
-            for child in start..end {
-                // Pair punctuation; there is no enclosing Option around a pair.
-                children.inner_debug = add(children.inner_debug, 4)?;
-                children.child(scalar_geometry(array.keys(), child, control)?)?;
-                children.child(scalar_geometry(array.values(), child, control)?)?;
-            }
-            children.finish(3)
-        }
-        _ => unreachable!("supported container geometry"),
-    }
-}
-
 const GROWTH_REQUESTS: usize = usize::BITS as usize + 2;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AllocationGeometry {

@@ -60,6 +60,36 @@ fn opaque_host_actual_refusal_restores_charge_without_dummy_allocation() {
     drop(charge);
     assert_eq!(tracker.current(), 0);
 }
+
+#[test]
+fn typed_and_opaque_host_refusals_roll_back_all_ancestors_but_keep_peak() {
+    let root = MemTracker::new_root("host root".repeat(4096));
+    root.install_limit_once(31).unwrap();
+    let middle = MemTracker::new_child("middle", &root);
+    let leaf = MemTracker::new_child("leaf", &middle);
+    let host: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator {
+        tracker: Arc::clone(&leaf),
+    });
+    let layout = Layout::from_size_align(32, 8).unwrap();
+    assert_eq!(
+        host.allocate(layout).unwrap_err(),
+        KernelFailure::ResourceExhausted
+    );
+    let charge = OpaqueRetainedCharge::try_new(host).unwrap();
+    assert!(matches!(
+        charge.reserve_operation(32),
+        Err(KernelFailure::ResourceExhausted)
+    ));
+    for tracker in [&leaf, &middle, &root] {
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(tracker.allocated(), 64);
+        assert_eq!(tracker.deallocated(), 64);
+        assert_eq!(tracker.peak(), 32);
+    }
+    assert_eq!(charge.reserve_operation(0).unwrap().remaining_bytes(), 0);
+    drop(charge);
+    assert_eq!(root.current(), 0);
+}
 #[test]
 fn opaque_host_actual_underestimate_does_not_publish_retained_growth() {
     let (tracker, host) = host();

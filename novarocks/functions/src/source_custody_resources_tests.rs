@@ -146,6 +146,10 @@ pub(crate) fn without_recording<T>(operation: impl FnOnce() -> T) -> T {
     drop(restore);
     result
 }
+/// Borrow the existing test observer's current stock without allocating.
+pub(crate) fn measured_live_bytes() -> usize {
+    MEASURED.with(|measured| measured.borrow().live)
+}
 pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, (usize, usize, usize, usize)) {
     MEASURED.with(|measured| *measured.borrow_mut() = Measured::new());
     ENABLED.with(|enabled| enabled.set(true));

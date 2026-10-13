@@ -18,6 +18,7 @@
 //! Lifetime transfer for one already-authorized Arrow result backing group.
 //! This author changes buffer custody only, never bytes, schema or row meaning.
 
+use crate::ScalarResourceError;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostShared;
 use crate::kernel_control::invalid;
@@ -28,6 +29,7 @@ use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use novarocks_type_contract::owned_resources::layout::arc_layout;
 use std::{alloc::Layout, marker::PhantomData};
 use std::{any::Any, panic::RefUnwindSafe, sync::Arc};
 
@@ -54,6 +56,12 @@ fn checked_add(a: usize, b: usize) -> Result<usize, KernelFailure> {
 fn checked_mul(a: usize, b: usize) -> Result<usize, KernelFailure> {
     a.checked_mul(b).ok_or(KernelFailure::ResourceExhausted)
 }
+fn extent_add(a: usize, b: usize) -> Result<usize, ScalarResourceError> {
+    a.checked_add(b).ok_or(ScalarResourceError::Arithmetic)
+}
+fn extent_mul(a: usize, b: usize) -> Result<usize, ScalarResourceError> {
+    a.checked_mul(b).ok_or(ScalarResourceError::Arithmetic)
+}
 
 /// Conservative metadata peak of the pinned Arrow 58.4.0 custom-buffer route.
 /// Its private Bytes contains pointer, length and the three-word Deallocation
@@ -61,11 +69,14 @@ fn checked_mul(a: usize, b: usize) -> Result<usize, KernelFailure> {
 /// Arc headers are two atomic usize counters; padding is covered by one extra
 /// machine word per object. No amount here authorizes an allocation itself.
 fn custom_buffer_metadata() -> Result<usize, KernelFailure> {
+    custom_buffer_metadata_facts().map_err(model_failure)
+}
+fn custom_buffer_metadata_facts() -> Result<usize, ScalarResourceError> {
     let word = size_of::<usize>();
     // Arc<BufferCustodian> plus Arc<Bytes>, including both reference headers.
-    checked_add(
+    extent_add(
         size_of::<BufferCustodian<OpaqueRetainedCharge>>(),
-        checked_mul(word, 11)?,
+        extent_mul(word, 11)?,
     )
 }
 
@@ -195,10 +206,17 @@ pub(crate) fn custody_node_metadata_upper_bound(
     has_nulls: bool,
     children: usize,
 ) -> Result<usize, KernelFailure> {
-    let buffers = checked_add(data_buffers, usize::from(has_nulls))?;
-    let vector_bytes = checked_add(
-        checked_mul(data_buffers, size_of::<Buffer>())?,
-        checked_mul(children, size_of::<ArrayData>())?,
+    custody_node_metadata_facts(data_buffers, has_nulls, children).map_err(model_failure)
+}
+fn custody_node_metadata_facts(
+    data_buffers: usize,
+    has_nulls: bool,
+    children: usize,
+) -> Result<usize, ScalarResourceError> {
+    let buffers = extent_add(data_buffers, usize::from(has_nulls))?;
+    let vector_bytes = extent_add(
+        extent_mul(data_buffers, size_of::<Buffer>())?,
+        extent_mul(children, size_of::<ArrayData>())?,
     )?;
     // ArrayDataBuilder, the resulting ArrayData, and the original borrowed data
     // can coexist. make_array may own child ArrayRefs and one concrete body.
@@ -212,14 +230,208 @@ pub(crate) fn custody_node_metadata_upper_bound(
     .into_iter()
     .max()
     .expect("known supported scalar Arrow bodies");
-    let mut bytes = checked_add(checked_mul(size_of::<ArrayData>(), 3)?, vector_bytes)?;
-    bytes = checked_add(
+    let mut bytes = extent_add(extent_mul(size_of::<ArrayData>(), 3)?, vector_bytes)?;
+    bytes = extent_add(
         bytes,
-        checked_add(concrete_body, checked_mul(size_of::<usize>(), 3)?)?,
+        extent_add(concrete_body, extent_mul(size_of::<usize>(), 3)?)?,
     )?;
-    bytes = checked_add(bytes, checked_mul(buffers, custom_buffer_metadata()?)?)?;
-    bytes = checked_add(bytes, checked_mul(children, size_of::<ArrayRef>())?)?;
+    bytes = extent_add(bytes, extent_mul(buffers, custom_buffer_metadata_facts()?)?)?;
+    bytes = extent_add(bytes, extent_mul(children, size_of::<ArrayRef>())?)?;
     Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FlatByteKind {
+    Binary,
+    Utf8,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestUpper {
+    pub(crate) bytes: usize,
+    pub(crate) requests: usize,
+}
+/// Original default byte-builder finish and direct opaque custody only.
+/// Payload capacities and allocator metadata have their own source authors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FlatDirectByteFacts {
+    pub(crate) finish_global: RequestUpper,
+    pub(crate) custody_global: RequestUpper,
+    pub(crate) custody_typed: RequestUpper,
+    pub(crate) finish_global_peak_extra: usize,
+    pub(crate) custody_global_peak_extra: usize,
+    pub(crate) custody_typed_peak_extra: usize,
+    pub(crate) global_retained_metadata_upper: usize,
+    pub(crate) typed_retained_metadata_upper: usize,
+    pub(crate) original_metadata_stock_upper: usize,
+    pub(crate) settlement_metadata_upper: usize,
+}
+
+/// Facts from the actual private direct-opaque types, without constructing an
+/// array, charge, holder or fabricated validity bitmap. Validity is an upper
+/// shape, not a claim that the original builder will actually create it.
+pub(crate) fn direct_flat_byte_facts(
+    kind: FlatByteKind,
+    validity_upper: bool,
+) -> Result<FlatDirectByteFacts, ScalarResourceError> {
+    crate::scalar_resources::require_arrow_model()?;
+    let shared = |payload: Layout| {
+        arc_layout(payload)
+            .map(|layout| layout.size())
+            .map_err(|_| ScalarResourceError::Arithmetic)
+    };
+    // Pinned Bytes is bounded by 48/8; this is not its private representation.
+    let bytes_arc =
+        shared(Layout::from_size_align(48, 8).map_err(|_| ScalarResourceError::Arithmetic)?)?;
+    let array_arc = shared(match kind {
+        FlatByteKind::Binary => Layout::new::<arrow_array::BinaryArray>(),
+        FlatByteKind::Utf8 => Layout::new::<arrow_array::StringArray>(),
+    })?;
+    let holder = HostShared::<OriginalBacking<OpaqueRetainedCharge>>::allocation_layout().size();
+    let custodian = shared(Layout::new::<BufferCustodian<OpaqueRetainedCharge>>())?;
+    let buffers = extent_add(2, usize::from(validity_upper))?;
+    let b = size_of::<Buffer>();
+    let original = extent_add(extent_mul(buffers, bytes_arc)?, array_arc)?;
+    let finish = extent_add(
+        extent_add(original, extent_mul(4, b)?)?,
+        extent_mul(4, size_of::<i32>())?,
+    )?;
+    let custody = extent_add(
+        extent_add(
+            extent_mul(6, b)?,
+            extent_mul(buffers, extent_add(custodian, bytes_arc)?)?,
+        )?,
+        array_arc,
+    )?;
+    // A dependent Arrow build may enable validation. Cover the three original
+    // sites conservatively; their scratch lives sequentially, not all at once.
+    let validation = Layout::array::<arrow_data::BufferSpec>(2)
+        .map_err(|_| ScalarResourceError::Arithmetic)?
+        .size();
+    Ok(FlatDirectByteFacts {
+        finish_global: RequestUpper {
+            bytes: extent_add(finish, validation)?,
+            requests: extent_add(buffers, 4)?,
+        },
+        custody_global: RequestUpper {
+            bytes: extent_add(custody, extent_mul(2, validation)?)?,
+            requests: extent_add(6, extent_mul(2, buffers)?)?,
+        },
+        custody_typed: RequestUpper {
+            bytes: holder,
+            requests: 1,
+        },
+        finish_global_peak_extra: extent_add(finish, validation)?,
+        custody_global_peak_extra: extent_add(original, extent_add(custody, validation)?)?,
+        custody_typed_peak_extra: holder,
+        global_retained_metadata_upper: extent_add(
+            extent_add(original, extent_add(array_arc, extent_mul(2, b)?)?)?,
+            extent_mul(buffers, extent_add(custodian, bytes_arc)?)?,
+        )?,
+        typed_retained_metadata_upper: holder,
+        original_metadata_stock_upper: original,
+        settlement_metadata_upper: custody_node_metadata_facts(2, validity_upper, 0)?,
+    })
+}
+
+#[cfg(test)]
+mod flat_byte_pricing_tests {
+    use super::*;
+    use arrow_array::builder::{BinaryBuilder, StringBuilder};
+
+    #[test]
+    fn direct_flat_byte_zero_rows_keep_original_two_buffers_and_actual_private_holder() {
+        for kind in [FlatByteKind::Binary, FlatByteKind::Utf8] {
+            let original: ArrayRef = match kind {
+                FlatByteKind::Binary => Arc::new(BinaryBuilder::new().finish()),
+                FlatByteKind::Utf8 => Arc::new(StringBuilder::new().finish()),
+            };
+            let data = original.to_data();
+            assert_eq!(original.len(), 0);
+            assert_eq!(data.buffers().len(), 2);
+            assert_eq!(data.buffers()[0].capacity(), 4100);
+            assert_eq!(data.buffers()[1].capacity(), 1024);
+            assert!(data.nulls().is_none());
+            let facts = direct_flat_byte_facts(kind, false).unwrap();
+            // Three original validation sites are conservative extra requests.
+            assert_eq!(facts.finish_global.requests, 6);
+            assert_eq!(facts.custody_global.requests, 10);
+            assert_eq!(facts.custody_typed.requests, 1);
+            assert_eq!(
+                facts.custody_typed.bytes,
+                HostShared::<OriginalBacking<OpaqueRetainedCharge>>::allocation_layout().size()
+            );
+            assert_eq!(
+                facts.typed_retained_metadata_upper,
+                facts.custody_typed.bytes
+            );
+            assert_eq!(
+                facts.settlement_metadata_upper,
+                custody_metadata_upper_bound(&data, &mut EvaluationCheckpoints::new(&Control))
+                    .unwrap()
+            );
+            assert!(facts.finish_global_peak_extra < facts.custody_global_peak_extra);
+        }
+    }
+    struct Control;
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn direct_flat_byte_nullable_shape_covers_real_original_validity_and_settlement() {
+        for kind in [FlatByteKind::Binary, FlatByteKind::Utf8] {
+            let original: ArrayRef = match kind {
+                FlatByteKind::Binary => {
+                    let mut builder = BinaryBuilder::new();
+                    builder.append_value(b"body");
+                    builder.append_null();
+                    Arc::new(builder.finish())
+                }
+                FlatByteKind::Utf8 => {
+                    let mut builder = StringBuilder::new();
+                    builder.append_value("body");
+                    builder.append_null();
+                    Arc::new(builder.finish())
+                }
+            };
+            let data = original.to_data();
+            assert!(data.nulls().is_some());
+            let base = direct_flat_byte_facts(kind, false).unwrap();
+            let nullable = direct_flat_byte_facts(kind, true).unwrap();
+            assert_eq!(
+                nullable.finish_global.requests,
+                base.finish_global.requests + 1
+            );
+            assert_eq!(
+                nullable.custody_global.requests,
+                base.custody_global.requests + 2
+            );
+            assert_eq!(nullable.custody_typed, base.custody_typed);
+            assert!(nullable.global_retained_metadata_upper > base.global_retained_metadata_upper);
+            assert_eq!(
+                nullable.settlement_metadata_upper,
+                custody_metadata_upper_bound(&data, &mut EvaluationCheckpoints::new(&Control))
+                    .unwrap()
+            );
+        }
+    }
+    #[test]
+    fn direct_flat_byte_checked_metadata_keeps_original_arithmetic_failure_projection() {
+        for (buffers, children) in [(usize::MAX, 0), (0, usize::MAX)] {
+            assert_eq!(
+                custody_node_metadata_facts(buffers, false, children),
+                Err(ScalarResourceError::Arithmetic)
+            );
+            assert_eq!(
+                custody_node_metadata_upper_bound(buffers, false, children),
+                Err(KernelFailure::ResourceExhausted)
+            );
+        }
+    }
 }
 
 fn wrap_buffer<C: Send + Sync + 'static>(

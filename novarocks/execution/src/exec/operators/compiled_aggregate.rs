@@ -121,7 +121,7 @@ impl novarocks_functions::opaque_memory::OpaqueAllocationHost for TrackedStateAl
             return Ok(());
         }
         let bytes = i64::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
-        if self.tracker.consume_and_check_limit(bytes).is_err() {
+        if self.tracker.consume_and_check_limit_nominal(bytes).is_err() {
             self.tracker.release(bytes);
             return Err(KernelFailure::ResourceExhausted);
         }
@@ -149,7 +149,7 @@ impl AggregateStateAllocator for TrackedStateAllocator {
             )));
         }
         let bytes = i64::try_from(layout.size()).map_err(|_| KernelFailure::ResourceExhausted)?;
-        if self.tracker.consume_and_check_limit(bytes).is_err() {
+        if self.tracker.consume_and_check_limit_nominal(bytes).is_err() {
             self.tracker.release(bytes);
             return Err(KernelFailure::ResourceExhausted);
         }

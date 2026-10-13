@@ -737,7 +737,7 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
     ) -> Result<ArrayRef, EvaluationFailure>
     where
         Self::State: 's,
-        I: ExactSizeIterator<Item = &'s Self::State>,
+        I: ExactSizeIterator<Item = &'s Self::State> + Clone,
     {
         if matches!(self.operation, ApproxPercentileOperation::Union) {
             // Original Union Final and Intermediate share the exact state

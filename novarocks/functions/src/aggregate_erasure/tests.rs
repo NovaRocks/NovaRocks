@@ -48,6 +48,536 @@ use std::{
     time::Duration,
 };
 
+#[derive(Default)]
+struct HelperHost {
+    live: AtomicUsize,
+    peak: AtomicUsize,
+    requests: Mutex<Vec<usize>>,
+    refusal: Option<KernelFailure>,
+    refuse_at: Option<usize>,
+}
+impl crate::AggregateStateAllocator for HelperHost {
+    fn opaque_allocation_host(&self) -> Option<&dyn crate::opaque_memory::OpaqueAllocationHost> {
+        Some(self)
+    }
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
+        crate::UnaccountedAggregateStateAllocator.allocate(layout)
+    }
+    unsafe fn release(&self, block: NonNull<u8>, layout: Layout) {
+        // SAFETY: forward the exact block and Layout returned above.
+        unsafe { crate::UnaccountedAggregateStateAllocator.release(block, layout) };
+    }
+}
+impl crate::opaque_memory::OpaqueAllocationHost for HelperHost {
+    fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
+        let mut requests = self.requests.lock().unwrap();
+        requests.push(bytes);
+        if let Some(cause) = &self.refusal
+            && self.refuse_at.is_none_or(|at| at == requests.len())
+        {
+            return Err(cause.clone());
+        }
+        let live = self.live.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak.fetch_max(live, Ordering::Relaxed);
+        Ok(())
+    }
+    fn release_opaque(&self, bytes: usize) {
+        let previous = self.live.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(previous >= bytes);
+    }
+}
+
+#[test]
+fn protected_emission_reserves_both_observers_without_extra_control_callbacks() {
+    for phase in [AggregateKernelPhase::Partial, AggregateKernelPhase::Final] {
+        // Empty emission still creates and warms both fresh observers.
+        for empty in [false, true] {
+            let mut owner = Owner::new(0, false);
+            let plain = prepared_handle(&owner, phase);
+            owner.behavior.helper_memory = true;
+            let protected = prepared_handle(&owner, phase);
+            let init = RuntimeControl::default();
+            let mut storage = Storage::new();
+            let slots = [plain.initialize_in(&mut storage.0, &init).unwrap()];
+            let indices: &[usize] = if empty { &[] } else { &[0] };
+            let plain_control = RuntimeControl::default();
+            let plain_output = plain
+                .emit_evaluation(&slots, indices, indices.len(), &plain_control)
+                .unwrap();
+            let mut protected_storage = Storage::new();
+            let protected_slots = [protected
+                .initialize_in(&mut protected_storage.0, &init)
+                .unwrap()];
+            let host = Arc::new(HelperHost::default());
+            let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+            let control = RuntimeControl::default();
+            let output = protected
+                .emit_evaluation_with_allocator(
+                    &protected_slots,
+                    indices,
+                    indices.len(),
+                    Some(&allocator),
+                    &control,
+                )
+                .unwrap();
+            assert_eq!(integers(&output), integers(&plain_output));
+            assert_eq!(
+                *control.seen.lock().unwrap(),
+                *plain_control.seen.lock().unwrap()
+            );
+            let mutex_bytes = if cfg!(target_os = "macos") { 64 } else { 0 };
+            let layer = 3 * crate::MAX_ROW_ERROR_MESSAGE_BYTES + mutex_bytes;
+            assert_eq!(host.requests.lock().unwrap().as_slice(), [layer, layer]);
+            assert_eq!(host.peak.load(Ordering::Relaxed), 2 * layer);
+            assert_eq!(host.live.load(Ordering::Relaxed), 0);
+            drop(output);
+            assert_eq!(host.live.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
+#[test]
+fn protected_emission_either_guard_refusal_preserves_all_seven_causes() {
+    let mut all = failures();
+    all.extend([
+        invalid("original observer refusal"),
+        KernelFailure::InstanceFailed,
+    ]);
+    for at in [1, 2] {
+        for cause in &all {
+            let mut owner = Owner::new(0, false);
+            owner.behavior.helper_memory = true;
+            let handle = prepared_handle(&owner, AggregateKernelPhase::Final);
+            let runtime = RuntimeControl::default();
+            let mut storage = Storage::new();
+            let slots = [handle.initialize_in(&mut storage.0, &runtime).unwrap()];
+            let host = Arc::new(HelperHost {
+                refusal: Some(cause.clone()),
+                refuse_at: Some(at),
+                ..Default::default()
+            });
+            let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+            let actual = handle
+                .emit_evaluation_with_allocator(&slots, &[0], 1, Some(&allocator), &runtime)
+                .unwrap_err();
+            assert_eq!(actual, EvaluationFailure::Kernel(cause.clone()));
+            assert_eq!(host.requests.lock().unwrap().len(), at);
+            assert_eq!(host.live.load(Ordering::Relaxed), 0);
+            assert_eq!(owner.counts.final_emit.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
+#[test]
+fn protected_emission_controls_and_body_causes_keep_original_units_and_text() {
+    let mut all = failures();
+    all.extend([
+        invalid(&"x".repeat(crate::MAX_ROW_ERROR_MESSAGE_BYTES)),
+        KernelFailure::InstanceFailed,
+    ]);
+    for control_refusal in [false, true] {
+        for cause in &all {
+            let mut outcomes = Vec::new();
+            let mut units = Vec::new();
+            for protected in [false, true] {
+                let mut owner = Owner::new(0, false);
+                owner.behavior.helper_memory = protected;
+                if !control_refusal {
+                    owner.behavior.emit = Emit::Failure(cause.clone());
+                }
+                let handle = prepared_handle(&owner, AggregateKernelPhase::Final);
+                let mut storage = Storage::new();
+                let slots = [handle
+                    .initialize_in(&mut storage.0, &RuntimeControl::default())
+                    .unwrap()];
+                let host = Arc::new(HelperHost::default());
+                let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+                let control = RuntimeControl {
+                    failure: control_refusal.then(|| cause.clone()),
+                    positive: true,
+                    ..Default::default()
+                };
+                outcomes.push(
+                    handle
+                        .emit_evaluation_with_allocator(&slots, &[0], 1, Some(&allocator), &control)
+                        .unwrap_err(),
+                );
+                units.push(control.seen.lock().unwrap().clone());
+                assert_eq!(host.live.load(Ordering::Relaxed), 0);
+            }
+            assert_eq!(outcomes[0], EvaluationFailure::Kernel(cause.clone()));
+            assert_eq!(outcomes[0], outcomes[1]);
+            assert_eq!(units[0], units[1]);
+        }
+    }
+}
+
+#[test]
+fn protected_update_and_merge_frames_keep_actual_layout_lease_until_drop() {
+    for phase in [AggregateKernelPhase::Partial, AggregateKernelPhase::Final] {
+        let mut owner = Owner::new(1, false);
+        owner.behavior.helper_memory = true;
+        let handle = prepared_handle(&owner, phase);
+        let runtime = RuntimeControl::default();
+        let mut storage = Storage::new();
+        let mut slots = [handle.initialize_in(&mut storage.0, &runtime).unwrap()];
+        let values = value_array();
+        let args = [EvaluatedArgument::Column(&values)];
+        let rows = [2];
+        let selection = Selection::try_sparse(5, &rows).unwrap();
+        let mapping = [0];
+        let host = Arc::new(HelperHost::default());
+        let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+        let (mut frame, expected) = if phase.consumes_logical_arguments() {
+            let input = SelectedAggregateUpdateInput::try_new(
+                handle.contract(),
+                selection,
+                &args,
+                &[],
+                &runtime,
+            )
+            .unwrap();
+            (
+                handle
+                    .prepare_update_batch_evaluation(
+                        &mut slots,
+                        &mapping,
+                        input,
+                        Some(allocator),
+                        &runtime,
+                    )
+                    .unwrap(),
+                Layout::new::<UpdateFrame<'_, '_, Kernel>>().size(),
+            )
+        } else {
+            let input = SelectedAggregateMergeInput::try_new(
+                handle.contract(),
+                selection,
+                args[0],
+                &runtime,
+            )
+            .unwrap();
+            (
+                handle
+                    .prepare_merge_batch_evaluation(
+                        &mut slots,
+                        &mapping,
+                        input,
+                        Some(allocator),
+                        &runtime,
+                    )
+                    .unwrap(),
+                Layout::new::<MergeFrame<'_, '_, Kernel>>().size(),
+            )
+        };
+        assert_eq!(host.live.load(Ordering::Relaxed), expected);
+        assert_eq!(host.requests.lock().unwrap().as_slice(), [expected]);
+        frame.run(&runtime).unwrap();
+        assert_eq!(frame.rows_processed(), 1);
+        assert_eq!(host.live.load(Ordering::Relaxed), expected);
+        assert_eq!(
+            frame.run(&runtime),
+            Err(KernelFailure::InstanceFailed.into())
+        );
+        assert_eq!(host.live.load(Ordering::Relaxed), expected);
+        drop(frame);
+        assert_eq!(host.live.load(Ordering::Relaxed), 0);
+        assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 0);
+        drop(slots);
+        assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn protected_frame_host_refusal_keeps_all_seven_causes_before_preparation() {
+    let mut all = failures();
+    all.extend([
+        invalid("helper original refusal"),
+        KernelFailure::InstanceFailed,
+    ]);
+    for cause in all {
+        let mut owner = Owner::new(1, false);
+        owner.behavior.helper_memory = true;
+        let handle = prepared_handle(&owner, AggregateKernelPhase::Partial);
+        let runtime = RuntimeControl::default();
+        let mut storage = Storage::new();
+        let mut slots = [handle.initialize_in(&mut storage.0, &runtime).unwrap()];
+        let values = value_array();
+        let args = [EvaluatedArgument::Column(&values)];
+        let input = SelectedAggregateUpdateInput::try_new(
+            handle.contract(),
+            Selection::all(5),
+            &args,
+            &[],
+            &runtime,
+        )
+        .unwrap();
+        let host = Arc::new(HelperHost {
+            refusal: Some(cause.clone()),
+            ..Default::default()
+        });
+        let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+        let result = handle.prepare_update_batch_evaluation(
+            &mut slots,
+            &[0; 5],
+            input,
+            Some(allocator),
+            &runtime,
+        );
+        assert!(matches!(result, Err(EvaluationFailure::Kernel(actual)) if actual == cause));
+        assert_eq!(owner.counts.batches.load(Ordering::Relaxed), 0);
+        assert_eq!(owner.counts.update.load(Ordering::Relaxed), 0);
+        assert_eq!(host.live.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn protected_frame_missing_host_and_changed_declaration_reject_before_preparation() {
+    let mut owner = Owner::new(1, false);
+    owner.behavior.helper_memory = true;
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Partial);
+    let runtime = RuntimeControl::default();
+    let mut storage = Storage::new();
+    let mut slots = [handle.initialize_in(&mut storage.0, &runtime).unwrap()];
+    let values = value_array();
+    let args = [EvaluatedArgument::Column(&values)];
+    let input = || {
+        SelectedAggregateUpdateInput::try_new(
+            handle.contract(),
+            Selection::all(5),
+            &args,
+            &[],
+            &runtime,
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        handle.prepare_update_batch_evaluation(&mut slots, &[0; 5], input(), None, &runtime),
+        Err(EvaluationFailure::Kernel(KernelFailure::InvalidProgram(_)))
+    ));
+    owner.counts.helper_drift.store(1, Ordering::Relaxed);
+    let host = Arc::new(HelperHost::default());
+    let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+    assert!(matches!(
+        handle.prepare_update_batch_evaluation(
+            &mut slots,
+            &[0; 5],
+            input(),
+            Some(allocator),
+            &runtime
+        ),
+        Err(EvaluationFailure::Kernel(KernelFailure::Internal(_)))
+    ));
+    assert_eq!(host.live.load(Ordering::Relaxed), 0);
+    assert_eq!(owner.counts.batches.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn protected_local_stages_keep_the_original_helper_declaration() {
+    for replacement in [false, true] {
+        let mut owner = Owner::new(0, false);
+        owner.behavior.helper_memory = true;
+        owner.behavior.local_helper_override = Some(replacement);
+        let mut handle = prepared_handle(&owner, AggregateKernelPhase::Single);
+        let result = handle.prepare_local_stages(&CompileControl::default());
+        if replacement {
+            result.unwrap();
+            assert!(handle.local_stages().is_some());
+        } else {
+            assert!(matches!(result, Err(KernelFailure::Internal(_))));
+            assert!(handle.local_stages().is_none());
+        }
+    }
+}
+
+#[test]
+fn protected_frame_first_failure_and_unwind_release_the_external_lease() {
+    struct PanicControl;
+    impl KernelEvaluationControl for PanicControl {
+        fn checkpoint(&self, work: u32) -> Result<(), KernelFailure> {
+            assert_eq!(work, 0, "fixture unwind inside the actual frame");
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            unreachable!()
+        }
+    }
+    let mut all = failures();
+    all.extend([invalid("frame data"), KernelFailure::InstanceFailed]);
+    for phase in [AggregateKernelPhase::Partial, AggregateKernelPhase::Final] {
+        for cause in &all {
+            for unwind in [false, true] {
+                let mut owner = Owner::new(1, false);
+                owner.behavior.helper_memory = true;
+                owner.behavior.row_failure = Some((1, cause.clone()));
+                let handle = prepared_handle(&owner, phase);
+                let init = RuntimeControl::default();
+                let mut storage = Storage::new();
+                let mut slots = [handle.initialize_in(&mut storage.0, &init).unwrap()];
+                let host = Arc::new(HelperHost::default());
+                let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+                let values = value_array();
+                let args = [EvaluatedArgument::Column(&values)];
+                let rows = [0, 2];
+                let selection = Selection::try_sparse(5, &rows).unwrap();
+                let mapping = [0, 0];
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut frame = if phase.consumes_logical_arguments() {
+                        let input = SelectedAggregateUpdateInput::try_new(
+                            handle.contract(),
+                            selection,
+                            &args,
+                            &[],
+                            &init,
+                        )
+                        .unwrap();
+                        handle
+                            .prepare_update_batch_evaluation(
+                                &mut slots,
+                                &mapping,
+                                input,
+                                Some(allocator),
+                                &init,
+                            )
+                            .unwrap()
+                    } else {
+                        let input = SelectedAggregateMergeInput::try_new(
+                            handle.contract(),
+                            selection,
+                            args[0],
+                            &init,
+                        )
+                        .unwrap();
+                        handle
+                            .prepare_merge_batch_evaluation(
+                                &mut slots,
+                                &mapping,
+                                input,
+                                Some(allocator),
+                                &init,
+                            )
+                            .unwrap()
+                    };
+                    if unwind {
+                        let _ = frame.run(&PanicControl);
+                    } else {
+                        assert_eq!(
+                            frame.run(&init),
+                            Err(EvaluationFailure::Kernel(cause.clone()))
+                        );
+                        assert_eq!(frame.rows_processed(), 1);
+                        assert!(host.live.load(Ordering::Relaxed) > 0);
+                        assert_eq!(frame.run(&init), Err(KernelFailure::InstanceFailed.into()));
+                    }
+                }));
+                assert_eq!(result.is_err(), unwind);
+                assert_eq!(host.live.load(Ordering::Relaxed), 0);
+                assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 0);
+                drop(slots);
+                assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_lossless_data_returns_full_domain_without_a_footer() {
+    struct NoDataFooter<'a>(&'a Counts);
+    impl KernelEvaluationControl for NoDataFooter<'_> {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            assert!(units <= 256);
+            assert_eq!(self.0.data_published.load(Ordering::Relaxed), 0);
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            unreachable!()
+        }
+    }
+    let mut owner = Owner::new(0, false);
+    owner.behavior.helper_memory = true;
+    owner.behavior.lossless = true;
+    owner.behavior.emit = Emit::Data;
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Final);
+    let mut storage = Storage::new();
+    let slots = [handle
+        .initialize_in(&mut storage.0, &RuntimeControl::default())
+        .unwrap()];
+    let host = Arc::new(HelperHost::default());
+    let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+    let actual = handle
+        .emit_evaluation_with_allocator(
+            &slots,
+            &[0, 0],
+            7,
+            Some(&allocator),
+            &NoDataFooter(&owner.counts),
+        )
+        .unwrap_err();
+    let EvaluationFailure::InvocationData(data) = actual else {
+        panic!("full Data")
+    };
+    assert_eq!(data.message(), "original full emission data ".repeat(32));
+    assert!(data.message().len() > 512);
+    assert_eq!(data.input_rows(), [0, 1]);
+    assert_eq!(data.state_indices(), [0, 0]);
+    assert_eq!(data.emission_row_capacity(), Some(7));
+    assert_eq!(host.requests.lock().unwrap().len(), 2);
+    assert_eq!(host.live.load(Ordering::Relaxed), 0);
+    let loan = data.clone();
+    drop(slots);
+    drop(data);
+    assert_eq!(loan.message(), "original full emission data ".repeat(32));
+    drop(loan);
+}
+
+#[test]
+fn protected_lossless_kernel_errors_keep_all_seven_causes_without_a_footer() {
+    struct NoFailureFooter<'a>(&'a Counts);
+    impl KernelEvaluationControl for NoFailureFooter<'_> {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            assert!(units <= 256);
+            assert_eq!(self.0.data_published.load(Ordering::Relaxed), 0);
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            unreachable!()
+        }
+    }
+    let mut all = failures();
+    all.extend([
+        invalid("original full refusal"),
+        KernelFailure::InstanceFailed,
+    ]);
+    for phase in [AggregateKernelPhase::Partial, AggregateKernelPhase::Final] {
+        for cause in all.iter() {
+            let mut owner = Owner::new(0, false);
+            owner.behavior.helper_memory = true;
+            owner.behavior.lossless = true;
+            owner.behavior.emit = Emit::Failure(cause.clone());
+            let handle = prepared_handle(&owner, phase);
+            let mut storage = Storage::new();
+            let slots = [handle
+                .initialize_in(&mut storage.0, &RuntimeControl::default())
+                .unwrap()];
+            let host = Arc::new(HelperHost::default());
+            let allocator: Arc<dyn crate::AggregateStateAllocator> = host.clone();
+            let result = handle.emit_evaluation_with_allocator(
+                &slots,
+                &[0],
+                1,
+                Some(&allocator),
+                &NoFailureFooter(&owner.counts),
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                EvaluationFailure::Kernel(cause.clone())
+            );
+            assert_eq!(host.live.load(Ordering::Relaxed), 0);
+            assert_eq!(host.requests.lock().unwrap().len(), 2);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Counts {
     refine: AtomicUsize,
@@ -55,6 +585,7 @@ struct Counts {
     create: AtomicUsize,
     drop: AtomicUsize,
     policy_drift: AtomicUsize,
+    helper_drift: AtomicUsize,
     kernel_drop: AtomicUsize,
     drop_saw_live_owner: AtomicUsize,
     update: AtomicUsize,
@@ -62,6 +593,7 @@ struct Counts {
     batches: AtomicUsize,
     intermediate: AtomicUsize,
     final_emit: AtomicUsize,
+    data_published: AtomicUsize,
 }
 #[derive(Clone, Debug, Default)]
 enum Emit {
@@ -72,9 +604,13 @@ enum Emit {
     Null,
     Grow(Option<KernelFailure>),
     Failure(KernelFailure),
+    Data,
 }
 #[derive(Clone, Debug)]
 struct Behavior {
+    helper_memory: bool,
+    local_helper_override: Option<bool>,
+    lossless: bool,
     bound: usize,
     foreign: bool,
     create_failure: Option<KernelFailure>,
@@ -88,6 +624,9 @@ struct Behavior {
 impl Default for Behavior {
     fn default() -> Self {
         Self {
+            helper_memory: false,
+            local_helper_override: None,
+            lossless: false,
             bound: 0,
             foreign: false,
             create_failure: None,
@@ -453,7 +992,12 @@ impl Kernel {
             values.push(state.sum);
         }
         match &self.behavior.emit {
-            Emit::Grow(Some(error)) | Emit::Failure(error) => return Err(error.clone()),
+            Emit::Grow(Some(error)) | Emit::Failure(error) => {
+                if self.behavior.lossless {
+                    self.counts.data_published.store(1, Ordering::Relaxed);
+                }
+                return Err(error.clone());
+            }
             Emit::WrongRows => values.push(0),
             Emit::WrongType => {
                 return Ok(Arc::new(arrow_array::BooleanArray::from(vec![
@@ -485,6 +1029,27 @@ impl PreparedAggregateKernel for Kernel {
     type PreparedMergeBatch<'b> = SelectedAggregateMergeInput<'b, 'b>;
     fn contract(&self) -> &Arc<AggregateCallContract> {
         &self.contract
+    }
+    fn clone_for_local_phase(
+        &self,
+        contract: Arc<AggregateCallContract>,
+        _: &dyn PureCompileControl,
+    ) -> Result<Arc<Self>, KernelFailure> {
+        let mut behavior = self.behavior.clone();
+        if let Some(helper) = behavior.local_helper_override {
+            behavior.helper_memory = helper;
+        }
+        Ok(Arc::new(Self {
+            contract,
+            counts: self.counts.clone(),
+            behavior,
+        }))
+    }
+    fn has_invocation_data(&self) -> bool {
+        self.behavior.lossless
+    }
+    fn requires_helper_memory(&self) -> bool {
+        self.behavior.helper_memory ^ (self.counts.helper_drift.load(Ordering::Relaxed) != 0)
     }
     fn memory_policy(&self) -> AggregateStateMemoryPolicy {
         AggregateStateMemoryPolicy::BoundedRetained {
@@ -598,6 +1163,34 @@ impl PreparedAggregateKernel for Kernel {
     {
         self.counts.final_emit.fetch_add(1, Ordering::Relaxed);
         self.emit(states, true, control)
+    }
+    fn build_final_evaluation_with_context<'s, I>(
+        &self,
+        states: I,
+        context: &crate::AggregateEmissionContext<'_>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, EvaluationFailure>
+    where
+        I: ExactSizeIterator<Item = &'s State>,
+    {
+        if !matches!(self.behavior.emit, Emit::Data) {
+            return self.build_final(states, control).map_err(Into::into);
+        }
+        use crate::aggregate_invocation_backing::HostDiagnostic;
+        let host = context.allocator().unwrap();
+        let allocator =
+            crate::aggregate_host_allocator::HostAggregateAllocator::try_new(Arc::clone(host))?;
+        let mut work = EvaluationCheckpoints::new(control);
+        let diagnostic = HostDiagnostic::prepare(&allocator, &mut work, |out| {
+            for _ in 0..32 {
+                out.write_str("original full emission data ")?;
+            }
+            Ok(())
+        })?;
+        let data =
+            crate::InvocationData::prepare_emission(&allocator, context, diagnostic, &mut work)?;
+        self.counts.data_published.store(1, Ordering::Relaxed);
+        Err(data.into())
     }
     fn retained_bytes(&self, state: &State) -> usize {
         state.heap.lock().unwrap().capacity()

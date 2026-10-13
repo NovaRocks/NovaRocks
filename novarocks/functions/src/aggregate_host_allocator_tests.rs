@@ -25,13 +25,21 @@ struct Ledger {
     bytes: usize,
     peak: usize,
     live: Vec<(usize, Layout)>,
+    opaque_attempts: usize,
+    opaque_releases: usize,
+    opaque_bytes: usize,
+    opaque_peak: usize,
 }
 #[derive(Default)]
 struct Host {
     ledger: Mutex<Ledger>,
     refusal: Mutex<Option<(usize, KernelFailure)>>,
+    opaque_refusal: Mutex<Option<KernelFailure>>,
 }
 impl AggregateStateAllocator for Host {
+    fn opaque_allocation_host(&self) -> Option<&dyn crate::opaque_memory::OpaqueAllocationHost> {
+        Some(self)
+    }
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
         assert_ne!(layout.size(), 0);
         let mut ledger = self.ledger.lock().unwrap();
@@ -59,6 +67,23 @@ impl AggregateStateAllocator for Host {
         ledger.live.swap_remove(at);
         ledger.bytes -= layout.size();
         unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) };
+    }
+}
+impl crate::opaque_memory::OpaqueAllocationHost for Host {
+    fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
+        let mut ledger = self.ledger.lock().unwrap();
+        ledger.opaque_attempts += 1;
+        if let Some(cause) = self.opaque_refusal.lock().unwrap().as_ref() {
+            return Err(cause.clone());
+        }
+        ledger.opaque_bytes += bytes;
+        ledger.opaque_peak = ledger.opaque_peak.max(ledger.opaque_bytes);
+        Ok(())
+    }
+    fn release_opaque(&self, bytes: usize) {
+        let mut ledger = self.ledger.lock().unwrap();
+        ledger.opaque_bytes = ledger.opaque_bytes.checked_sub(bytes).unwrap();
+        ledger.opaque_releases += 1;
     }
 }
 fn arm_refusal(host: &Host, cause: KernelFailure) {
@@ -159,4 +184,96 @@ fn zero_sized_allocation_uses_no_host_block_and_does_not_change_metadata_lifetim
     );
     drop(allocator);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}
+
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", target_pointer_width = "64")
+))]
+mod covered_journal {
+    use super::*;
+
+    #[test]
+    fn covered_journal_refusal_precedes_metadata_and_preserves_all_seven_causes() {
+        for cause in causes() {
+            let host = Arc::new(Host::default());
+            *host.opaque_refusal.lock().unwrap() = Some(cause.clone());
+            assert!(matches!(
+                HostAggregateAllocator::try_new_with_journal(host.clone()),
+                Err(actual) if actual == cause
+            ));
+            let ledger = host.ledger.lock().unwrap();
+            assert_eq!(ledger.opaque_attempts, 1);
+            assert_eq!(ledger.attempts, 0);
+            assert_eq!(ledger.bytes, 0);
+            assert_eq!(ledger.opaque_bytes, 0);
+            assert!(ledger.live.is_empty());
+        }
+    }
+
+    #[test]
+    fn covered_metadata_refusal_releases_prior_journal_reservation() {
+        for cause in causes() {
+            let host = Arc::new(Host::default());
+            arm_refusal(&host, cause.clone());
+            assert!(matches!(
+                HostAggregateAllocator::try_new_with_journal(host.clone()),
+                Err(actual) if actual == cause
+            ));
+            let ledger = host.ledger.lock().unwrap();
+            assert_eq!(ledger.attempts, 1);
+            assert_eq!(ledger.opaque_attempts, 1);
+            assert_eq!(ledger.bytes, 0);
+            assert_eq!(ledger.opaque_bytes, 0);
+            assert!(ledger.live.is_empty());
+        }
+    }
+
+    #[test]
+    fn journal_lease_follows_clones_through_cross_thread_last_drop() {
+        let host = Arc::new(Host::default());
+        let allocator = HostAggregateAllocator::try_new_with_journal(host.clone()).unwrap();
+        let metadata = allocator.metadata_bytes();
+        let journal = allocator.journal_backing_bytes();
+        let child = allocator.clone();
+        let last = child.clone();
+        // Exercise the original container journal after the exclusive warm.
+        arm_refusal(&host, KernelFailure::DeadlineExceeded);
+        assert!(child.allocate(Layout::new::<u64>()).is_err());
+        assert_eq!(child.take_failure(), KernelFailure::DeadlineExceeded);
+        drop(allocator);
+        drop(child);
+        {
+            let ledger = host.ledger.lock().unwrap();
+            assert_eq!(ledger.bytes, metadata);
+            assert_eq!(ledger.opaque_bytes, journal);
+            assert_eq!(ledger.opaque_peak, journal);
+            assert_eq!(ledger.opaque_attempts, 1);
+        }
+        std::thread::spawn(move || drop(last)).join().unwrap();
+        let ledger = host.ledger.lock().unwrap();
+        assert_eq!(ledger.bytes, 0);
+        assert_eq!(ledger.opaque_bytes, 0);
+        assert!(ledger.live.is_empty());
+    }
+
+    #[test]
+    fn covered_constructor_requires_opaque_capability_even_without_separate_backing() {
+        struct TypedOnly(Host);
+        impl AggregateStateAllocator for TypedOnly {
+            fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
+                self.0.allocate(layout)
+            }
+            unsafe fn release(&self, block: NonNull<u8>, layout: Layout) {
+                // SAFETY: this adapter forwards the exact original host block.
+                unsafe { self.0.release(block, layout) };
+            }
+        }
+        let host = Arc::new(TypedOnly(Host::default()));
+        assert!(matches!(
+            HostAggregateAllocator::try_new_with_journal(host.clone()),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+        assert_eq!(host.0.ledger.lock().unwrap().attempts, 0);
+    }
 }

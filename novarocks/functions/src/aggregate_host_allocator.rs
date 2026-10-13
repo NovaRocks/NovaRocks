@@ -34,6 +34,8 @@ struct HostAllocatorInner {
     references: AtomicUsize,
     host: Arc<dyn AggregateStateAllocator>,
     failure: Mutex<Option<KernelFailure>>,
+    // Declaration order destroys the Mutex backing before releasing its lease.
+    journal_lease: Option<crate::opaque_memory::OpaqueReservation>,
 }
 pub(super) struct HostAggregateAllocator {
     inner: NonNull<HostAllocatorInner>,
@@ -44,19 +46,46 @@ unsafe impl Send for HostAggregateAllocator {}
 unsafe impl Sync for HostAggregateAllocator {}
 impl HostAggregateAllocator {
     pub(super) fn try_new(host: Arc<dyn AggregateStateAllocator>) -> Result<Self, KernelFailure> {
+        Self::try_new_inner(host, None)
+    }
+    /// Protect the private journal before its first lock, while the new
+    /// allocator is exclusive. Every later clone retains the same lease.
+    pub(super) fn try_new_with_journal(
+        host: Arc<dyn AggregateStateAllocator>,
+    ) -> Result<Self, KernelFailure> {
+        let journal = crate::aggregate_helper_memory::reserve_mutex_backing(Arc::clone(&host))?;
+        Self::try_new_inner(host, Some(journal))
+    }
+    fn try_new_inner(
+        host: Arc<dyn AggregateStateAllocator>,
+        journal_lease: Option<crate::opaque_memory::OpaqueReservation>,
+    ) -> Result<Self, KernelFailure> {
         let pointer = host
             .allocate(Layout::new::<HostAllocatorInner>())?
             .cast::<HostAllocatorInner>();
         // SAFETY: the host returned this exact nonzero, aligned Layout and it
-        // has not been published or initialized. No fallible work follows.
+        // has not been published or initialized.
         unsafe {
             pointer.as_ptr().write(HostAllocatorInner {
                 references: AtomicUsize::new(1),
                 host,
                 failure: Mutex::new(None),
+                journal_lease,
             })
         };
-        Ok(Self { inner: pointer })
+        // Establish ownership before warming: an unwind destroys the actual
+        // initialized Inner and its lease, rather than leaving a raw live block.
+        let allocator = Self { inner: pointer };
+        if allocator.inner().journal_lease.is_some() {
+            drop(
+                allocator
+                    .inner()
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            );
+        }
+        Ok(allocator)
     }
     /// Typed single-block custody allocation on the same actual host. Unlike
     /// allocator-api2 containers, this path needs no AllocError journal and
@@ -82,6 +111,14 @@ impl HostAggregateAllocator {
     /// Count the one actual metadata block once per state, not per clone.
     pub(super) fn metadata_bytes(&self) -> usize {
         Self::metadata_allocation_bytes()
+    }
+    /// Separate opaque journal stock from the host's typed metadata block.
+    /// Zero on the original constructor is not a resource coverage receipt.
+    pub(super) fn journal_backing_bytes(&self) -> usize {
+        self.inner()
+            .journal_lease
+            .as_ref()
+            .map_or(0, crate::opaque_memory::OpaqueReservation::remaining_bytes)
     }
     /// Borrow the originating allocator refusal without consuming its journal.
     /// serde's custom error carrier must not erase the distinct Kernel cause.
