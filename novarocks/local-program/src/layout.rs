@@ -781,6 +781,29 @@ mod tests {
     }
 
     #[test]
+    fn identity_distinguishes_complete_raw_domains_with_the_same_legacy_cache() {
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        let layout = |marker: Option<&str>| {
+            let mut field = Field::new("value", DataType::FixedSizeBinary(16), true);
+            if let Some(marker) = marker {
+                field = field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+            }
+            StaticLayout::try_new_exact(
+                Arc::new(Schema::new(vec![field])),
+                Arc::from([SlotId::new(1)]),
+                vec![(StaticFieldSchema::new(None, vec![]), None)],
+            )
+            .unwrap()
+        };
+        let physical = layout(None).identity().unwrap();
+        let large = layout(Some("largeint")).identity().unwrap();
+        let uuid = layout(Some("uuid")).identity().unwrap();
+        assert_ne!(physical, large);
+        assert_ne!(physical, uuid);
+        assert_ne!(large, uuid);
+    }
+
+    #[test]
     fn identity_includes_schema_and_slot_order() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),

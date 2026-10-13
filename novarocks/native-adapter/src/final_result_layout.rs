@@ -24,6 +24,7 @@ use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::common;
+use novarocks_type_contract::ValueLogicalType;
 use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
 
 /// Legacy writer columns are a compatibility projection only when a real
@@ -51,26 +52,39 @@ pub(crate) fn legacy_result_uses_declared_fields(
 
 fn strict_source_domain(
     field: &arrow::datatypes::Field,
-) -> Result<Option<LogicalType>, NativeFragmentDecodeError> {
+) -> Result<Option<ValueLogicalType>, NativeFragmentDecodeError> {
     let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
         return Ok(None);
     };
-    let value = value.trim();
-    for domain in [
-        LogicalType::Json,
-        LogicalType::Hll,
-        LogicalType::Bitmap,
-        LogicalType::Object,
-        LogicalType::Percentile,
-    ] {
-        if value.eq_ignore_ascii_case(domain.metadata_value()) {
-            return Ok(Some(domain));
-        }
+    let logical = ValueLogicalType::from_legacy_compatible_metadata_value(value).map_err(|_| {
+        NativeFragmentDecodeError::inconsistent(
+            FieldPath::root("plan_fragment").field("output_columns"),
+            "decoded root contains an unknown logical domain marker",
+        )
+    })?;
+    if matches!(
+        logical,
+        ValueLogicalType::LargeInt | ValueLogicalType::Variant | ValueLogicalType::Uuid
+    ) {
+        logical.validate_carrier(field.data_type()).map_err(|_| {
+            NativeFragmentDecodeError::inconsistent(
+                FieldPath::root("plan_fragment").field("output_columns"),
+                "final result output carrier differs from the decoded root carrier",
+            )
+        })?;
     }
-    Err(NativeFragmentDecodeError::inconsistent(
-        FieldPath::root("plan_fragment").field("output_columns"),
-        "decoded root contains an unknown logical domain marker",
-    ))
+    Ok(Some(logical))
+}
+
+fn legacy_projection(domain: Option<ValueLogicalType>) -> Option<&'static str> {
+    domain
+        .filter(|domain| {
+            !matches!(
+                domain,
+                ValueLogicalType::LargeInt | ValueLogicalType::Variant | ValueLogicalType::Uuid
+            )
+        })
+        .and_then(ValueLogicalType::metadata_value)
 }
 
 use crate::fragment_error::NativeFragmentDecodeError;
@@ -138,19 +152,33 @@ pub(crate) fn apply_final_root_output_layout(
                 "final result output carrier differs from the decoded root carrier",
             ));
         }
-        let target_domain = target.field_schema().logical_type();
+        let target_domain = strict_source_domain(target.field())?;
+        let target_projection = legacy_projection(target_domain);
+        if target
+            .field_schema()
+            .logical_type()
+            .map(LogicalType::metadata_value)
+            != target_projection
+        {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().index(index).field("type"),
+                "final result output contains conflicting logical domain facts",
+            ));
+        }
         // A carrier-only source may acquire the exact frozen root domain, but
         // an already known source domain cannot be erased or reinterpreted.
-        for source_domain in [
-            source.field_schema().logical_type(),
-            strict_source_domain(source.field())?,
-        ] {
-            if source_domain.is_some() && source_domain != target_domain {
-                return Err(NativeFragmentDecodeError::inconsistent(
-                    path.clone().index(index).field("type"),
-                    "final result output logical domain differs from the decoded root domain",
-                ));
-            }
+        let source_domain = strict_source_domain(source.field())?;
+        let source_cache = source
+            .field_schema()
+            .logical_type()
+            .map(LogicalType::metadata_value);
+        if (source_domain.is_some() && source_domain != target_domain)
+            || (source_cache.is_some() && source_cache != target_projection)
+        {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().index(index).field("type"),
+                "final result output logical domain differs from the decoded root domain",
+            ));
         }
         if source.nullable() && !target.nullable() {
             return Err(NativeFragmentDecodeError::inconsistent(
@@ -163,7 +191,9 @@ pub(crate) fn apply_final_root_output_layout(
     // the logical fields in its actual chunks. Materialize semantic/container
     // layouts at this final boundary even when the decoded facts already agree.
     let plain_leaf_layout = output_schema.slots().iter().all(|slot| {
-        slot.field_schema().logical_type().is_none() && slot.field_schema().children().is_empty()
+        !slot.field().metadata().contains_key(NR_LOGICAL_TYPE_KEY)
+            && slot.field_schema().logical_type().is_none()
+            && slot.field_schema().children().is_empty()
     });
     if plain_leaf_layout && decoded.output_schema.as_ref() == output_schema.as_ref() {
         return Ok(decoded);

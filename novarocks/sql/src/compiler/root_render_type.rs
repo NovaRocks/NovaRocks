@@ -24,7 +24,7 @@ use novarocks_result_contract::{
     ClientRenderSchema, NamedRenderField, NativeRenderType as N, OpaqueRenderType as O,
     RenderColumn, RenderField, RenderPresentation as R, RenderTimeUnit as U, RootProfileV1 as P,
 };
-use novarocks_types::logical::LogicalType as L;
+use novarocks_type_contract::ValueLogicalType as V;
 use std::mem::size_of;
 
 /// The application supplies the frontend's frozen presentation offset. No
@@ -46,6 +46,7 @@ pub fn client_render_schema_from_port(
 }
 
 fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, String> {
+    validate_public_fields(fields)?;
     if fields.is_empty() || fields.len() > P::MAX_COLUMNS || !(-86_399..=86_399).contains(&offset) {
         return Err(invalid());
     }
@@ -97,20 +98,93 @@ fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, Str
     ClientRenderSchema::try_new(columns, fields.len()).map_err(|error| error.to_string())
 }
 
+/// Qualify complete public identities without imposing ClientRows' carrier
+/// profile on ScalarValue or reconstructing a missing legacy declaration.
+pub fn validate_public_result_logical_identities(
+    port: Option<&novarocks_physical_plan::ResultPort>,
+) -> Result<(), String> {
+    if let Some(port) = port {
+        validate_public_fields(&port.fields)?;
+    }
+    Ok(())
+}
+
+fn validate_public_fields(fields: &[ResultField]) -> Result<(), String> {
+    fn uuid() -> String {
+        "public output logical type UUID is unsupported".into()
+    }
+    fn walk(data_type: &D, depth: usize, nodes: &mut usize) -> Result<(), String> {
+        *nodes = nodes.checked_add(1).ok_or_else(limited)?;
+        if depth > P::MAX_DEPTH || *nodes > P::SCHEMA_TYPE_NODES {
+            return Err(limited());
+        }
+        fn check_marker(field: &Field) -> Result<(), String> {
+            // Other invalid metadata still belongs to the original schema
+            // author; this narrow public gate protects complete UUID facts.
+            if field
+                .metadata()
+                .get(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
+                .is_some_and(|value| {
+                    value.len() <= P::MAX_NAME_BYTES
+                        && V::from_legacy_compatible_metadata_value(value) == Ok(V::Uuid)
+                })
+            {
+                return Err(uuid());
+            }
+            Ok(())
+        }
+        fn child(field: &Field, depth: usize, nodes: &mut usize) -> Result<(), String> {
+            check_marker(field)?;
+            walk(field.data_type(), depth, nodes)
+        }
+        match data_type {
+            D::List(field) | D::LargeList(field) | D::FixedSizeList(field, _) => {
+                child(field, depth + 1, nodes)?;
+            }
+            D::Map(entries, _) => {
+                check_marker(entries)?;
+                // Entries is the existing Arrow carrier, not a semantic
+                // render node. Use the original key/value profile geometry.
+                if let D::Struct(fields) = entries.data_type()
+                    && fields.len() == 2
+                {
+                    child(&fields[0], depth + 1, nodes)?;
+                    child(&fields[1], depth + 1, nodes)?;
+                }
+            }
+            D::Struct(fields) => {
+                for field in fields {
+                    child(field, depth + 1, nodes)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut nodes = 0;
+    for field in fields {
+        if field.ty.logical_type == V::Uuid {
+            return Err(uuid());
+        }
+        walk(&field.ty.data_type, 1, &mut nodes)?;
+    }
+    Ok(())
+}
+
 fn invalid() -> String {
     "client render identity or storage is unsupported or inconsistent".into()
 }
 fn limited() -> String {
     "client render schema exceeds its bounded profile".into()
 }
-fn domain(domain: Domain) -> Option<L> {
+fn domain(domain: Domain) -> Option<V> {
     match domain {
         Domain::Plain | Domain::Variant => None,
-        Domain::Json => Some(L::Json),
-        Domain::Hll => Some(L::Hll),
-        Domain::Bitmap => Some(L::Bitmap),
-        Domain::Object => Some(L::Object),
-        Domain::Percentile => Some(L::Percentile),
+        Domain::Json => Some(V::Json),
+        Domain::Hll => Some(V::Hll),
+        Domain::Bitmap => Some(V::Bitmap),
+        Domain::Object => Some(V::Object),
+        Domain::Percentile => Some(V::Percentile),
     }
 }
 struct Bounds {
@@ -157,14 +231,17 @@ fn unit(unit: TimeUnit) -> U {
         TimeUnit::Nanosecond => U::Nanosecond,
     }
 }
-fn kind(data_type: &D, marker: Option<L>) -> Result<Kind, String> {
+fn kind(data_type: &D, marker: Option<V>) -> Result<Kind, String> {
     if let Some(marker) = marker {
         return Ok(Kind::Leaf(match (marker, data_type) {
-            (L::Json, D::Utf8) => N::Json,
-            (L::Hll, D::Binary) => N::Opaque(O::Hll),
-            (L::Bitmap, D::Binary) => N::Opaque(O::Bitmap),
-            (L::Object, D::Binary) => N::Opaque(O::Object),
-            (L::Percentile, D::Binary) => N::Opaque(O::Percentile),
+            (V::Json, D::Utf8) => N::Json,
+            (V::LargeInt, D::FixedSizeBinary(16)) => N::LargeInt,
+            (V::Variant, D::LargeBinary) => N::Variant,
+            (V::Uuid, _) => return Err("public output logical type UUID is unsupported".into()),
+            (V::Hll, D::Binary) => N::Opaque(O::Hll),
+            (V::Bitmap, D::Binary) => N::Opaque(O::Bitmap),
+            (V::Object, D::Binary) => N::Opaque(O::Object),
+            (V::Percentile, D::Binary) => N::Opaque(O::Percentile),
             _ => return Err(invalid()),
         }));
     }
@@ -227,7 +304,7 @@ fn child_preflight(field: &Field, depth: usize, bounds: &mut Bounds) -> Result<(
 }
 fn preflight(
     data_type: &D,
-    marker: Option<L>,
+    marker: Option<V>,
     top: bool,
     depth: usize,
     bounds: &mut Bounds,
@@ -304,7 +381,7 @@ fn child_build(field: &Field, offset: i32) -> Result<RenderField, String> {
 fn build(
     data_type: &D,
     nullable: bool,
-    marker: Option<L>,
+    marker: Option<V>,
     top: bool,
     offset: i32,
 ) -> Result<RenderField, String> {
@@ -372,6 +449,7 @@ fn build(
 mod tests {
     use super::*;
     use novarocks_physical_plan::{ValueId, ValueType};
+    use novarocks_types::logical::LogicalType as L;
     use novarocks_types::logical::field_with_logical_type;
     use std::sync::Arc;
     fn output(name: &str, data_type: D, domain: Domain) -> ResultField {
@@ -383,6 +461,91 @@ mod tests {
             ty: ValueType::new(data_type, true),
         }
     }
+    #[test]
+    fn public_identity_gate_preserves_original_wide_map_semantic_profile() {
+        let map = D::Map(
+            Arc::new(Field::new(
+                "entries",
+                D::Struct(
+                    vec![
+                        Arc::new(Field::new("key", D::Int32, false)),
+                        Arc::new(Field::new("value", D::Int32, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        // The original render profile counts each Map and its key/value,
+        // without adding the synthetic Arrow entries Struct as a fourth node.
+        let fields = (0..2049)
+            .map(|_| output("m", map.clone(), Domain::Plain))
+            .collect::<Vec<_>>();
+        assert!(fields.len() <= P::MAX_COLUMNS);
+        assert!(3 * fields.len() <= P::SCHEMA_TYPE_NODES);
+        assert!(4 * fields.len() > P::SCHEMA_TYPE_NODES);
+        assert_eq!(schema(&fields, 0).unwrap().columns().len(), fields.len());
+    }
+
+    #[test]
+    fn complete_public_identities_keep_original_declarations_and_refuse_uuid() {
+        let mut large = output("large", D::FixedSizeBinary(16), Domain::Plain);
+        large.ty.logical_type = V::LargeInt;
+        assert_eq!(
+            schema(&[large], 0).unwrap().columns()[0].field.native_type,
+            N::LargeInt
+        );
+        let physical = output("uuid", D::FixedSizeBinary(16), Domain::Plain);
+        assert_eq!(
+            schema(&[physical], 0).unwrap().columns()[0]
+                .field
+                .native_type,
+            N::LargeInt
+        );
+        let mut json_plain = output("j", D::Utf8, Domain::Plain);
+        json_plain.ty.logical_type = V::Json;
+        assert_eq!(
+            schema(&[json_plain], 0).unwrap().columns()[0]
+                .field
+                .native_type,
+            N::String
+        );
+        let mut uuid = output("u", D::FixedSizeBinary(16), Domain::Plain);
+        uuid.ty.logical_type = V::Uuid;
+        let error = schema(&[uuid], 0).unwrap_err();
+        assert!(error.contains("UUID") && error.contains("unsupported"));
+    }
+
+    #[test]
+    fn complete_nested_variant_uses_original_renderer_and_uuid_is_named_refusal() {
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        for (marker, storage) in [
+            ("variant", D::LargeBinary),
+            ("uuid", D::FixedSizeBinary(16)),
+        ] {
+            let child = Field::new("item", storage, true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+            let field = output("items", D::List(Arc::new(child)), Domain::Plain);
+            if marker == "uuid" {
+                let error = schema(&[field], 0).unwrap_err();
+                assert!(error.contains("UUID") && error.contains("unsupported"));
+            } else {
+                let result = schema(&[field], 0).unwrap();
+                let N::List(child) = &result.columns()[0].field.native_type else {
+                    panic!("expected list")
+                };
+                assert_eq!(child.native_type, N::Variant);
+                assert_eq!(
+                    child.presentation,
+                    R::VariantJson {
+                        timezone_offset_seconds: 0
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn repeated_values_keep_ordered_occurrences_and_names_never_infer_domains() {
         let mut fields = vec![

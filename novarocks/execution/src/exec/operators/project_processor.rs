@@ -177,25 +177,37 @@ pub(crate) fn validate_final_result_identity_input_source(
     pair_count: usize,
     pairs: impl Iterator<Item = Result<(SlotId, SlotId), String>>,
 ) -> Result<(), String> {
-    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
+    use novarocks_type_contract::ValueLogicalType;
+    use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
 
-    fn marker(field: &arrow::datatypes::Field) -> Result<Option<LogicalType>, String> {
+    fn marker(field: &arrow::datatypes::Field) -> Result<Option<ValueLogicalType>, String> {
         let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
             return Ok(None);
         };
-        let value = value.trim();
-        for domain in [
-            LogicalType::Json,
-            LogicalType::Hll,
-            LogicalType::Bitmap,
-            LogicalType::Object,
-            LogicalType::Percentile,
-        ] {
-            if value.eq_ignore_ascii_case(domain.metadata_value()) {
-                return Ok(Some(domain));
-            }
+        let logical =
+            ValueLogicalType::from_legacy_compatible_metadata_value(value).map_err(|_| {
+                "final result input contains an unknown logical domain marker".to_owned()
+            })?;
+        if matches!(
+            logical,
+            ValueLogicalType::LargeInt | ValueLogicalType::Variant | ValueLogicalType::Uuid
+        ) {
+            logical
+                .validate_carrier(field.data_type())
+                .map_err(|_| "final result input carrier differs from output carrier".to_owned())?;
         }
-        Err("final result input contains an unknown logical domain marker".into())
+        Ok(Some(logical))
+    }
+
+    fn legacy_projection(domain: Option<ValueLogicalType>) -> Option<&'static str> {
+        domain
+            .filter(|domain| {
+                !matches!(
+                    domain,
+                    ValueLogicalType::LargeInt | ValueLogicalType::Variant | ValueLogicalType::Uuid
+                )
+            })
+            .and_then(ValueLogicalType::metadata_value)
     }
 
     fn check_field(
@@ -248,10 +260,18 @@ pub(crate) fn validate_final_result_identity_input_source(
     fn check_cached(
         source: &crate::exec::chunk::ChunkFieldSchema,
         target: &arrow::datatypes::Field,
+        exact_projection: bool,
     ) -> Result<(), String> {
         let actual = source.logical_type();
-        if actual.is_some() && actual != marker(target)? {
-            return Err("final result input logical domain differs from output domain".into());
+        if (exact_projection || actual.is_some())
+            && actual.map(|domain| domain.metadata_value()) != legacy_projection(marker(target)?)
+        {
+            return Err(if exact_projection {
+                "final result output contains conflicting logical domain facts"
+            } else {
+                "final result input logical domain differs from output domain"
+            }
+            .into());
         }
         if source.children().is_empty() {
             return Ok(());
@@ -262,11 +282,11 @@ pub(crate) fn validate_final_result_identity_input_source(
             | DataType::FixedSizeList(child, _)
                 if source.children().len() == 1 =>
             {
-                check_cached(&source.children()[0], child)
+                check_cached(&source.children()[0], child, exact_projection)
             }
             DataType::Struct(children) if children.len() == source.children().len() => {
                 for (source, target) in source.children().iter().zip(children) {
-                    check_cached(source, target)?;
+                    check_cached(source, target, exact_projection)?;
                 }
                 Ok(())
             }
@@ -282,7 +302,7 @@ pub(crate) fn validate_final_result_identity_input_source(
                     );
                 }
                 for (source, target) in source.children().iter().zip(children) {
-                    check_cached(source, target)?;
+                    check_cached(source, target, exact_projection)?;
                 }
                 Ok(())
             }
@@ -299,10 +319,7 @@ pub(crate) fn validate_final_result_identity_input_source(
         if output_slot != target.slot_id() || source_slot != output_slot {
             return Err("final result input validation requires exact identity slots".into());
         }
-        let expected = marker(target.field())?;
-        if target.field_schema().logical_type() != expected {
-            return Err("final result output contains conflicting logical domain facts".into());
-        }
+        check_cached(target.field_schema(), target.field(), true)?;
         let index = chunk
             .slot_id_to_index()
             .get(&source_slot)
@@ -323,7 +340,7 @@ pub(crate) fn validate_final_result_identity_input_source(
             .get(index)
             .ok_or("final result input array is missing")?;
         check_type(array.data_type(), target.data_type())?;
-        check_cached(actual_slot.field_schema(), target.field())?;
+        check_cached(actual_slot.field_schema(), target.field(), false)?;
     }
     Ok(())
 }
@@ -1633,6 +1650,196 @@ mod tests {
     }
 
     #[test]
+    fn final_identity_complete_domains_keep_raw_facts_with_legacy_cache_projection() {
+        use arrow::array::new_null_array;
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        for (marker, carrier) in [
+            ("json", DataType::Utf8),
+            ("variant", DataType::LargeBinary),
+            ("hll", DataType::Binary),
+            ("bitmap", DataType::Binary),
+            ("object", DataType::Binary),
+            ("percentile", DataType::Binary),
+            ("largeint", DataType::FixedSizeBinary(16)),
+            ("uuid", DataType::FixedSizeBinary(16)),
+        ] {
+            let marked = Field::new("source", carrier.clone(), true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+            for empty in [false, true] {
+                let mut operator = final_identity_operator_with_field(marked.clone());
+                let input = final_input_with_fields(
+                    marked.clone(),
+                    marked.clone(),
+                    None,
+                    new_null_array(&carrier, usize::from(!empty)),
+                );
+                assert!(
+                    operator.process_one(input).is_ok(),
+                    "{marker}, empty={empty}"
+                );
+                let plain = Field::new("source", carrier.clone(), true);
+                let mut operator = final_identity_operator_with_field(plain);
+                let input = final_input_with_fields(
+                    marked.clone(),
+                    marked.clone(),
+                    None,
+                    new_null_array(&carrier, usize::from(!empty)),
+                );
+                let error = operator.process_one(input).unwrap_err();
+                assert!(
+                    error.contains("logical domain differs"),
+                    "{marker}: {error}"
+                );
+                assert!(operator.pending_output.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn final_identity_complete_nested_domains_survive_each_original_container() {
+        use arrow::array::new_null_array;
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        fn nested(kind: usize, marker: &str) -> Field {
+            let carrier = if marker == "variant" {
+                DataType::LargeBinary
+            } else {
+                DataType::FixedSizeBinary(16)
+            };
+            let leaf = Arc::new(
+                Field::new("value", carrier, true)
+                    .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into()),
+            );
+            let carrier = match kind {
+                0 => DataType::Struct(vec![leaf].into()),
+                1 => DataType::List(leaf),
+                2 => DataType::LargeList(leaf),
+                3 => DataType::FixedSizeList(leaf, 2),
+                4 => DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![Arc::new(Field::new("key", DataType::Int32, false)), leaf].into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                _ => unreachable!(),
+            };
+            Field::new("source", carrier, true)
+        }
+        for kind in 0..5 {
+            for marker in ["largeint", "uuid", "variant"] {
+                let source = nested(kind, marker);
+                let input = final_input_with_fields(
+                    source.clone(),
+                    source.clone(),
+                    None,
+                    new_null_array(source.data_type(), 1),
+                );
+                let mut operator = final_identity_operator_with_field(source);
+                assert!(
+                    operator.process_one(input).is_ok(),
+                    "kind={kind}, marker={marker}"
+                );
+            }
+            for (source_marker, target_marker) in [("largeint", "uuid"), ("uuid", "largeint")] {
+                let source = nested(kind, source_marker);
+                let input = final_input_with_fields(
+                    source.clone(),
+                    source.clone(),
+                    None,
+                    new_null_array(source.data_type(), 1),
+                );
+                let mut operator = final_identity_operator_with_field(nested(kind, target_marker));
+                let error = operator.process_one(input).unwrap_err();
+                assert!(
+                    error.contains("logical domain differs"),
+                    "kind={kind}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_identity_rejects_only_target_nested_cache_conflict_before_materializing() {
+        use arrow::array::new_null_array;
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        let leaf = Arc::new(
+            Field::new("value", DataType::FixedSizeBinary(16), true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "largeint".into())].into()),
+        );
+        let field = Field::new("source", DataType::Struct(vec![leaf].into()), true);
+        let source = final_input_with_fields(
+            field.clone(),
+            field.clone(),
+            None,
+            new_null_array(field.data_type(), 1),
+        );
+        let bitmap = crate::exec::chunk::ChunkFieldSchema::from_field(&field_with_logical_type(
+            Field::new("cached", DataType::Binary, true),
+            LogicalType::Bitmap,
+        ))
+        .unwrap();
+        let cache = crate::exec::chunk::ChunkFieldSchema::new(None, vec![bitmap]);
+        let mut operator = final_identity_operator_with_field(field.clone());
+        operator.output_chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                field,
+                Some(cache),
+                None,
+            )])
+            .unwrap(),
+        );
+        let error = operator.process_one(source).unwrap_err();
+        assert!(
+            error.contains("output contains conflicting logical domain facts"),
+            "{error}"
+        );
+        assert!(operator.pending_output.is_none());
+    }
+
+    #[test]
+    fn final_identity_complete_fixed_width_checks_batch_slot_and_cache_separately() {
+        use arrow::array::new_null_array;
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        let field = |marker: &str| {
+            Field::new("source", DataType::FixedSizeBinary(16), true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into())
+        };
+        for empty in [false, true] {
+            for (batch, slot, cache) in [
+                (field("uuid"), field("largeint"), None),
+                (field("largeint"), field("uuid"), None),
+                (
+                    field("largeint"),
+                    field("largeint"),
+                    Some(LogicalType::Bitmap),
+                ),
+            ] {
+                let cached = cache.map(|logical| {
+                    crate::exec::chunk::ChunkFieldSchema::from_field(&field_with_logical_type(
+                        Field::new("cached", DataType::Binary, true),
+                        logical,
+                    ))
+                    .unwrap()
+                });
+                let input = final_input_with_fields(
+                    batch,
+                    slot,
+                    cached,
+                    new_null_array(&DataType::FixedSizeBinary(16), usize::from(!empty)),
+                );
+                let mut operator = final_identity_operator_with_field(field("largeint"));
+                let error = operator.process_one(input).unwrap_err();
+                assert!(error.contains("logical domain differs"), "{error}");
+                assert!(operator.pending_output.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn final_identity_rejects_actual_batch_slot_and_cache_conflicts_independently() {
         for (batch, slot, cached) in [
             (Some("hll"), None, None),
@@ -2052,6 +2259,9 @@ mod tests {
                 final_binary_input(Some("hll"), None, None, false),
             )
             .unwrap_err();
-        assert!(error.to_string().contains("logical domain differs"), "{error}");
+        assert!(
+            error.to_string().contains("logical domain differs"),
+            "{error}"
+        );
     }
 }

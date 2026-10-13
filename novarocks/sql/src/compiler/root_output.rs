@@ -43,6 +43,12 @@ impl RootOutputSemantics {
         // for preflight, then construct one bounded owned field; do not clone
         // a nested declaration once per repeated output occurrence.
         let scalar_field = match columns {
+            [column]
+                if column.value_type.logical_type
+                    == novarocks_type_contract::ValueLogicalType::Uuid =>
+            {
+                None
+            }
             [column] => super::root_scalar_type::scalar_field(
                 &column.value_type.data_type,
                 column.value_type.nullable,
@@ -247,6 +253,37 @@ mod tests {
             panic!("unexpected observation");
         };
         completed
+    }
+
+    #[test]
+    fn complete_uuid_without_a_legacy_declaration_never_captures_largeint_proof() {
+        use novarocks_type_contract::ValueLogicalType;
+        for logical in [
+            ValueLogicalType::Uuid,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Physical,
+        ] {
+            let mut factory = ColumnRefFactory::new();
+            let mut ty = ValueType::new(D::FixedSizeBinary(16), true);
+            ty.logical_type = logical;
+            let id = factory.create(None, "value".into(), ty.clone());
+            assert!(factory.borrowed_logical_type(id).is_none());
+            let column = OutputColumn {
+                column_id: id,
+                name: "value".into(),
+                value_type: ty,
+                is_internal: false,
+            };
+            let captured = RootOutputSemantics::capture(&[column], &factory).unwrap();
+            if logical == ValueLogicalType::Uuid {
+                assert!(captured.scalar_field.is_none());
+            } else {
+                assert!(matches!(
+                    captured.scalar_field.unwrap().value_type,
+                    novarocks_result_contract::ScalarValueType::LargeInt
+                ));
+            }
+        }
     }
 
     #[test]

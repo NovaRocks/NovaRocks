@@ -747,19 +747,9 @@ impl FrontendQueryCompiler {
                     .map_err(FrontendQueryCompilerError::Engine)?,
                 )
             }
-            FrontendQueryPurpose::ScalarValue => {
-                novarocks_result_contract::FrozenRootOutput::ScalarValue(
-                    completed
-                        .candidate()
-                        .original_public_result_port()
-                        .and_then(|port| port.scalar_schema.clone())
-                        .ok_or_else(|| {
-                            FrontendQueryCompilerError::Engine(
-                                "completed scalar query has no frozen SQL scalar schema".into(),
-                            )
-                        })?,
-                )
-            }
+            FrontendQueryPurpose::ScalarValue => scalar_root_output_from_public_port(
+                completed.candidate().original_public_result_port(),
+            )?,
             FrontendQueryPurpose::LocalRows | FrontendQueryPurpose::ProfileCountOnly => {
                 return Err(FrontendQueryCompilerError::Engine(
                     "distributed read received a different application output purpose".into(),
@@ -1179,6 +1169,21 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
     )
 }
 
+fn scalar_root_output_from_public_port(
+    port: Option<&novarocks_physical_plan::ResultPort>,
+) -> Result<novarocks_result_contract::FrozenRootOutput, FrontendQueryCompilerError> {
+    novarocks_sql::compiler::validate_public_result_logical_identities(port)
+        .map_err(FrontendQueryCompilerError::Engine)?;
+    Ok(novarocks_result_contract::FrozenRootOutput::ScalarValue(
+        port.and_then(|port| port.scalar_schema.clone())
+            .ok_or_else(|| {
+                FrontendQueryCompilerError::Engine(
+                    "completed scalar query has no frozen SQL scalar schema".into(),
+                )
+            })?,
+    ))
+}
+
 #[cfg(test)]
 mod compile_control_tests {
     use super::*;
@@ -1221,6 +1226,40 @@ mod purpose_tests {
 
     fn statement(sql: &str) -> Statement {
         novarocks_query_application::sql::parse_single_statement(sql).unwrap()
+    }
+
+    #[test]
+    fn public_scalar_complete_uuid_is_named_before_the_original_missing_proof_error() {
+        use novarocks_physical_plan::{
+            ResultField, ResultPort, ResultValueDomain, ValueId, ValueType,
+        };
+        use novarocks_type_contract::ValueLogicalType;
+        let mut ty = ValueType::new(arrow::datatypes::DataType::FixedSizeBinary(16), true);
+        ty.logical_type = ValueLogicalType::Uuid;
+        let port = ResultPort {
+            fragment: novarocks_physical_plan::FragmentId::new(1),
+            output: novarocks_physical_plan::OutputPort {
+                node: novarocks_physical_plan::NodeId::new(1),
+                columns: vec![ValueId::new(1)].into(),
+            },
+            fields: vec![ResultField {
+                domain: ResultValueDomain::Plain,
+                name: "u".into(),
+                alias: None,
+                value: ValueId::new(1),
+                ty,
+            }]
+            .into(),
+            scalar_schema: None,
+        };
+        let error = scalar_root_output_from_public_port(Some(&port)).unwrap_err();
+        assert!(
+            matches!(error, FrontendQueryCompilerError::Engine(ref text) if text.contains("UUID") && text.contains("unsupported"))
+        );
+        let error = scalar_root_output_from_public_port(None).unwrap_err();
+        assert!(
+            matches!(error, FrontendQueryCompilerError::Engine(ref text) if text == "completed scalar query has no frozen SQL scalar schema")
+        );
     }
 
     #[test]

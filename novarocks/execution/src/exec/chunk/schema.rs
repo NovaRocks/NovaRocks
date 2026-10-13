@@ -21,11 +21,11 @@ use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use novarocks_types::SlotId;
 use novarocks_type_contract::owned_resources::metadata_materialization::{
-    MaterializedMetadataMap, MetadataFieldLoan, OriginalFieldMaterialization, OriginalSharedField,
-    OriginalMetadataClone, SchemaMetadataMaterializations,
+    MaterializedMetadataMap, MetadataFieldLoan, OriginalFieldMaterialization,
+    OriginalMetadataClone, OriginalSharedField, SchemaMetadataMaterializations,
 };
+use novarocks_types::SlotId;
 use novarocks_types::arrow_metadata_owner::{
     ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnedSchema, MetadataOwnerLimits,
 };
@@ -531,7 +531,6 @@ pub struct ChunkSchema {
     field_metadata_origins: Option<FieldMetadataOrigins>,
     schema_metadata_origin: Option<MetadataOwnedSchema>,
 }
-
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
 
@@ -1397,12 +1396,11 @@ pub(super) fn align_chunk_schema_to_batch(
                 expected.unique_id,
             )?);
         } else {
-            let reconciled_field =
-                reconcile_chunk_field_to_data_type(
-                    expected.field(),
-                    field.data_type(),
-                    field.is_nullable(),
-                )?;
+            let reconciled_field = reconcile_chunk_field_to_data_type(
+                expected.field(),
+                field.data_type(),
+                field.is_nullable(),
+            )?;
             slots.push(
                 expected.with_field_and_slot_id(
                     expected.slot_id(),
@@ -1718,6 +1716,57 @@ mod tests {
             &chunk.schema(),
             &chunk.chunk_schema().arrow_schema_ref()
         ));
+    }
+
+    #[test]
+    fn static_and_compiled_layouts_keep_complete_raw_domains_and_legacy_projection() {
+        use novarocks_local_program::{StaticFieldSchema, StaticLayout};
+        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        for (logical, carrier) in [
+            (ValueLogicalType::Physical, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::Uuid, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::Variant, DataType::LargeBinary),
+            (ValueLogicalType::Json, DataType::Utf8),
+            (ValueLogicalType::Hll, DataType::Binary),
+            (ValueLogicalType::Bitmap, DataType::Binary),
+            (ValueLogicalType::Object, DataType::Binary),
+            (ValueLogicalType::Percentile, DataType::Binary),
+        ] {
+            let mut field = Field::new("value", carrier, true);
+            if let Some(marker) = logical.metadata_value() {
+                field = field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+            }
+            let source = ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                field.clone(),
+                None,
+                None,
+            )])
+            .unwrap();
+            let projection = source.slots()[0].field_schema().logical_type();
+            let layout = StaticLayout::try_new_exact(
+                source.arrow_schema_ref(),
+                Arc::from([SlotId::new(1)]),
+                vec![(StaticFieldSchema::new(projection, vec![]), None)],
+            )
+            .unwrap();
+            for restored in [
+                ChunkSchema::from_static_layout(&layout).unwrap(),
+                ChunkSchema::from_compiled_layout(&layout).unwrap(),
+            ] {
+                assert_eq!(restored.slots()[0].field(), &field);
+                assert_eq!(
+                    restored.slots()[0].field_schema().logical_type(),
+                    projection
+                );
+                assert_eq!(
+                    novarocks_type_contract::field_logical_type(restored.slots()[0].field())
+                        .unwrap(),
+                    logical
+                );
+            }
+        }
     }
 
     #[test]

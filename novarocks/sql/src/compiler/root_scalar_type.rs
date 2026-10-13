@@ -24,7 +24,7 @@ use novarocks_result_contract::{
     NamedScalarField, RootProfileV1 as P, ScalarField, ScalarOpaqueType as O, ScalarSchema,
     ScalarTimestampUnit as U, ScalarValueType as S,
 };
-use novarocks_types::logical::{LogicalType as L, NR_LOGICAL_TYPE_KEY};
+use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType as V};
 use novarocks_types::schema::SqlType as T;
 
 pub(super) fn scalar_field(
@@ -46,15 +46,19 @@ pub(super) fn scalar_field(
 pub(super) fn nested_domains_match(field: &ScalarField, data_type: &D) -> bool {
     fn child(expected: &ScalarField, actual: &Field) -> bool {
         let domain = match expected.value_type {
-            S::Json => Some(L::Json),
-            S::Opaque(O::Hll) => Some(L::Hll),
-            S::Opaque(O::Bitmap) => Some(L::Bitmap),
-            S::Opaque(O::Object) => Some(L::Object),
-            S::Opaque(O::Percentile) => Some(L::Percentile),
+            S::LargeInt => Some(V::LargeInt),
+            S::Variant => Some(V::Variant),
+            S::Json => Some(V::Json),
+            S::Opaque(O::Hll) => Some(V::Hll),
+            S::Opaque(O::Bitmap) => Some(V::Bitmap),
+            S::Opaque(O::Object) => Some(V::Object),
+            S::Opaque(O::Percentile) => Some(V::Percentile),
             _ => None,
         };
-        marker(actual).is_ok_and(|actual| actual == domain)
-            && nested_domains_match(expected, actual.data_type())
+        marker(actual).is_ok_and(|actual| {
+            actual == domain
+                || (actual.is_none() && matches!(expected.value_type, S::LargeInt | S::Variant))
+        }) && nested_domains_match(expected, actual.data_type())
     }
     match (&field.value_type, data_type) {
         (S::List(expected), D::List(actual)) => child(expected, actual),
@@ -122,35 +126,27 @@ enum Kind {
 // Match the existing logical helper's trim/case normalization without a
 // temporary String during source preflight. Unknown markers never become a
 // plain field. Other provider decorations are not semantic type facts.
-pub(super) fn marker(field: &Field) -> Result<Option<L>, String> {
+pub(super) fn marker(field: &Field) -> Result<Option<V>, String> {
     let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
         return Ok(None);
     };
     if value.len() > P::MAX_NAME_BYTES {
         return Err(limited());
     }
-    let value = value.trim();
-    for (name, logical) in [
-        ("json", L::Json),
-        ("hll", L::Hll),
-        ("bitmap", L::Bitmap),
-        ("object", L::Object),
-        ("percentile", L::Percentile),
-    ] {
-        if value.eq_ignore_ascii_case(name) {
-            return Ok(Some(logical));
-        }
-    }
-    Err(invalid())
+    V::from_legacy_compatible_metadata_value(value)
+        .map(Some)
+        .map_err(|_| invalid())
 }
 
-fn sql_domain(logical: &T) -> Option<L> {
+fn sql_domain(logical: &T) -> Option<V> {
     match logical {
-        T::Json => Some(L::Json),
-        T::Hll => Some(L::Hll),
-        T::Bitmap => Some(L::Bitmap),
-        T::Object => Some(L::Object),
-        T::Percentile => Some(L::Percentile),
+        T::LargeInt => Some(V::LargeInt),
+        T::Variant => Some(V::Variant),
+        T::Json => Some(V::Json),
+        T::Hll => Some(V::Hll),
+        T::Bitmap => Some(V::Bitmap),
+        T::Object => Some(V::Object),
+        T::Percentile => Some(V::Percentile),
         _ => None,
     }
 }
@@ -182,13 +178,21 @@ fn sql_storage_matches(logical: &T, data_type: &D) -> bool {
     }
 }
 
-fn kind(data_type: &D, logical: Option<&T>, nested: Option<L>, top: bool) -> Result<Kind, String> {
+fn kind(data_type: &D, logical: Option<&T>, nested: Option<V>, top: bool) -> Result<Kind, String> {
+    if matches!(logical, Some(T::Uuid)) || nested == Some(V::Uuid) {
+        return Err("scalar logical type UUID is unsupported".into());
+    }
     if logical.is_some_and(|logical| !sql_storage_matches(logical, data_type)) {
         return Err(invalid());
     }
     let domain = if let Some(logical) = logical {
         let expected = sql_domain(logical);
-        if nested != expected && (nested.is_some() || (!top && expected.is_some())) {
+        let historical_unmarked =
+            nested.is_none() && matches!(expected, Some(V::LargeInt | V::Variant));
+        if !historical_unmarked
+            && nested != expected
+            && (nested.is_some() || (!top && expected.is_some()))
+        {
             return Err(invalid());
         }
         expected
@@ -197,11 +201,13 @@ fn kind(data_type: &D, logical: Option<&T>, nested: Option<L>, top: bool) -> Res
     };
     if let Some(domain) = domain {
         return Ok(Kind::Leaf(match (domain, data_type) {
-            (L::Json, D::Utf8) => S::Json,
-            (L::Hll, D::Binary) => S::Opaque(O::Hll),
-            (L::Bitmap, D::Binary) => S::Opaque(O::Bitmap),
-            (L::Object, D::Binary) => S::Opaque(O::Object),
-            (L::Percentile, D::Binary) => S::Opaque(O::Percentile),
+            (V::Json, D::Utf8) => S::Json,
+            (V::LargeInt, D::FixedSizeBinary(16)) => S::LargeInt,
+            (V::Variant, D::LargeBinary) => S::Variant,
+            (V::Hll, D::Binary) => S::Opaque(O::Hll),
+            (V::Bitmap, D::Binary) => S::Opaque(O::Bitmap),
+            (V::Object, D::Binary) => S::Opaque(O::Object),
+            (V::Percentile, D::Binary) => S::Opaque(O::Percentile),
             _ => return Err(invalid()),
         }));
     }
@@ -289,7 +295,7 @@ fn preflight_field(
 fn preflight(
     data_type: &D,
     logical: Option<&T>,
-    nested: Option<L>,
+    nested: Option<V>,
     top: bool,
     depth: usize,
     bounds: &mut Bounds,
@@ -374,7 +380,7 @@ fn build(
     data_type: &D,
     nullable: bool,
     logical: Option<&T>,
-    nested: Option<L>,
+    nested: Option<V>,
     top: bool,
 ) -> Result<ScalarField, String> {
     let value_type = match kind(data_type, logical, nested, top)? {
@@ -427,6 +433,7 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_types::logical::LogicalType as L;
     use novarocks_types::logical::field_with_logical_type;
     use std::sync::Arc;
 
@@ -450,6 +457,44 @@ mod tests {
             )),
             false,
         )
+    }
+
+    #[test]
+    fn complete_scalar_markers_keep_original_unmarked_new_domains_and_refuse_uuid() {
+        for (marker, storage, logical, expected) in [
+            ("largeint", D::FixedSizeBinary(16), T::LargeInt, S::LargeInt),
+            ("variant", D::LargeBinary, T::Variant, S::Variant),
+        ] {
+            let declared = T::Array(Box::new(logical));
+            for marked in [false, true] {
+                let mut child = Field::new("item", storage.clone(), true);
+                if marked {
+                    child =
+                        child.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+                }
+                let data_type = list(child);
+                let projected = scalar_field(&data_type, true, Some(&declared)).unwrap();
+                let S::List(ref child) = projected.value_type else {
+                    panic!("expected List")
+                };
+                assert_eq!(child.value_type, expected);
+                assert!(nested_domains_match(&projected, &data_type));
+            }
+        }
+        let error = scalar_field(&D::FixedSizeBinary(16), true, Some(&T::Uuid)).unwrap_err();
+        assert!(error.contains("UUID") && error.contains("unsupported"));
+        let nested = list(
+            Field::new("item", D::FixedSizeBinary(16), true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "uuid".into())].into()),
+        );
+        let error = scalar_field(&nested, true, None).unwrap_err();
+        assert!(error.contains("UUID") && error.contains("unsupported"));
+        assert_eq!(
+            scalar_field(&D::FixedSizeBinary(16), true, None)
+                .unwrap()
+                .value_type,
+            S::LargeInt
+        );
     }
 
     #[test]

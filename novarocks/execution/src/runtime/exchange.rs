@@ -1557,23 +1557,25 @@ fn validate_root_result_wire_domains(
     source: &arrow::datatypes::Field,
     expected: &arrow::datatypes::Field,
 ) -> Result<(), String> {
-    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
-    fn marker(field: &arrow::datatypes::Field) -> Result<Option<LogicalType>, String> {
+    use novarocks_type_contract::ValueLogicalType;
+    use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
+    fn marker(field: &arrow::datatypes::Field) -> Result<Option<ValueLogicalType>, String> {
         let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
             return Ok(None);
         };
-        for domain in [
-            LogicalType::Json,
-            LogicalType::Hll,
-            LogicalType::Bitmap,
-            LogicalType::Object,
-            LogicalType::Percentile,
-        ] {
-            if value.trim().eq_ignore_ascii_case(domain.metadata_value()) {
-                return Ok(Some(domain));
-            }
+        let logical =
+            ValueLogicalType::from_legacy_compatible_metadata_value(value).map_err(|_| {
+                "root result wire field contains an unknown logical domain marker".to_owned()
+            })?;
+        if matches!(
+            logical,
+            ValueLogicalType::LargeInt | ValueLogicalType::Variant | ValueLogicalType::Uuid
+        ) {
+            logical.validate_carrier(field.data_type()).map_err(|_| {
+                "root result wire field carrier differs from declared output carrier".to_owned()
+            })?;
         }
-        Err("root result wire field contains an unknown logical domain marker".into())
+        Ok(Some(logical))
     }
     let actual = marker(source)?;
     let declared = marker(expected)?;
@@ -2659,6 +2661,37 @@ mod tests {
         assert!(error.to_string().contains("exceeds packet cap"));
         assert_eq!(writer.buffer.len(), before_len);
         assert_eq!(writer.buffer.capacity(), before_capacity);
+    }
+
+    #[test]
+    fn m07_root_ipc_complete_fixed_width_domains_survive_and_cannot_reinterpret() {
+        use super::validate_root_result_wire_domains;
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        let field = |marker: Option<&str>| {
+            let field = Field::new("value", DataType::FixedSizeBinary(16), true);
+            match marker {
+                Some(marker) => {
+                    field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into())
+                }
+                None => field,
+            }
+        };
+        for marker in ["largeint", "uuid"] {
+            assert!(
+                validate_root_result_wire_domains(&field(Some(marker)), &field(Some(marker)))
+                    .is_ok()
+            );
+            assert!(validate_root_result_wire_domains(&field(None), &field(Some(marker))).is_ok());
+            assert!(validate_root_result_wire_domains(&field(Some(marker)), &field(None)).is_err());
+        }
+        assert!(
+            validate_root_result_wire_domains(&field(Some("uuid")), &field(Some("largeint")))
+                .is_err()
+        );
+        assert!(
+            validate_root_result_wire_domains(&field(Some("largeint")), &field(Some("uuid")))
+                .is_err()
+        );
     }
 
     #[test]

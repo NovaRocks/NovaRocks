@@ -65,6 +65,31 @@ impl ValueLogicalType {
         }
     }
 
+    /// Borrow the complete marker grammar while preserving the original
+    /// final-result spelling contract for the five legacy domains only.
+    /// Carrier qualification remains with the caller's exact boundary.
+    pub fn from_legacy_compatible_metadata_value(value: &str) -> Result<Self, ValueTypeError> {
+        if let Ok(logical) = Self::from_metadata_value(value) {
+            return Ok(logical);
+        }
+        let value = value.trim();
+        for logical in [
+            Self::Json,
+            Self::Hll,
+            Self::Bitmap,
+            Self::Object,
+            Self::Percentile,
+        ] {
+            if logical
+                .metadata_value()
+                .is_some_and(|name| value.eq_ignore_ascii_case(name))
+            {
+                return Ok(logical);
+            }
+        }
+        Err(ValueTypeError::UnknownLogicalMetadata)
+    }
+
     pub fn validate_carrier(self, data_type: &DataType) -> Result<(), ValueTypeError> {
         let valid = match self {
             Self::Physical => true,
@@ -455,6 +480,49 @@ mod tests {
     use super::*;
     use crate::{FunctionValueType, fits_nested_nullability};
     use std::sync::Arc;
+
+    #[test]
+    fn complete_marker_grammar_preserves_only_original_legacy_spellings() {
+        for logical in [
+            ValueLogicalType::Json,
+            ValueLogicalType::Variant,
+            ValueLogicalType::Hll,
+            ValueLogicalType::Bitmap,
+            ValueLogicalType::Object,
+            ValueLogicalType::Percentile,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Uuid,
+        ] {
+            let canonical = logical.metadata_value().unwrap();
+            assert_eq!(
+                ValueLogicalType::from_legacy_compatible_metadata_value(canonical),
+                Ok(logical)
+            );
+            let decorated = format!(" {} ", canonical.to_ascii_uppercase());
+            let expected = if matches!(
+                logical,
+                ValueLogicalType::LargeInt | ValueLogicalType::Variant | ValueLogicalType::Uuid
+            ) {
+                Err(ValueTypeError::UnknownLogicalMetadata)
+            } else {
+                Ok(logical)
+            };
+            assert_eq!(
+                ValueLogicalType::from_legacy_compatible_metadata_value(&decorated),
+                expected
+            );
+            assert_eq!(
+                ValueLogicalType::from_metadata_value(&decorated),
+                Err(ValueTypeError::UnknownLogicalMetadata)
+            );
+        }
+        for value in ["", "   ", "unknown", "physical"] {
+            assert_eq!(
+                ValueLogicalType::from_legacy_compatible_metadata_value(value),
+                Err(ValueTypeError::UnknownLogicalMetadata)
+            );
+        }
+    }
 
     #[test]
     fn logical_domains_require_explicit_identity_and_exact_carriers() {
