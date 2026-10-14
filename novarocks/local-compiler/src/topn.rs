@@ -34,7 +34,7 @@
 //!   union selects it.
 //!
 //! `GroupedStates` merges partial states by the full group key (spec §5.8)
-//! and is refused here; it has no local owner yet.
+//! uses its own local state-reduction node and exact prepared call sites.
 
 use crate::{lowering::FragmentCompileError, sort::lower_sort_keys};
 use novarocks_local_program::{
@@ -126,4 +126,165 @@ fn lower_core(
         },
         layout.clone(),
     ))
+}
+
+/// Lower a grouped reduction through the original aggregate call/layout leaves.
+pub(crate) fn lower_grouped_topn(
+    package: &novarocks_physical_plan::FragmentPackage,
+    node: &PhysicalNode,
+    input: ProgramNodeId,
+    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    slots: &[novarocks_types::SlotId],
+    control: &dyn PureCompileControl,
+) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let NodeKind::TopN {
+            reduction:
+                TopNReduction::GroupedStates {
+                    group_by,
+                    calls,
+                    comparator,
+                },
+            order_by,
+            limit,
+            offset,
+            phase,
+        } = &node.kind
+        else {
+            return Err(FragmentCompileError::Invalid(
+                "GroupedTopN physical kind differs",
+            ));
+        };
+        if *offset != 0
+            || !matches!(phase, TopNPhase::Partial { .. })
+            || group_by.is_empty()
+            || node.inputs.len() != 1
+        {
+            return Err(FragmentCompileError::Invalid(
+                "GroupedTopN requires complete keys and a partial zero-offset input",
+            ));
+        }
+        let width = group_by
+            .len()
+            .checked_add(calls.len())
+            .ok_or(FragmentCompileError::Invalid("GroupedTopN width exhausted"))?;
+        if node.output.columns.len() != width
+            || slots.len() != width
+            || order_by.len() != group_by.len()
+        {
+            return Err(FragmentCompileError::Invalid(
+                "GroupedTopN output or complete key width differs",
+            ));
+        }
+        let expected = group_by
+            .iter()
+            .map(|(_, value)| value)
+            .chain(calls.iter().map(|call| &call.output));
+        for (actual, expected) in node.output.columns.iter().zip(expected) {
+            work.step()?;
+            if actual != expected {
+                return Err(FragmentCompileError::Invalid(
+                    "GroupedTopN output differs from its keys and new state calls",
+                ));
+            }
+        }
+        let definitions = package.fragment().expressions();
+        let mut groups = Vec::new();
+        crate::assert_rows::reserve_vec(&mut groups, group_by.len(), &mut work)?;
+        for (id, value) in group_by {
+            let definition = definitions
+                .get(*id)
+                .ok_or(FragmentCompileError::Invalid("missing GroupedTopN key"))?;
+            work.step()?;
+            if !matches!(definition.kind, novarocks_physical_plan::ExprKind::Value(source) if source == *value)
+                || !comparator.supports_value_type(&definition.ty)
+            {
+                return Err(FragmentCompileError::Invalid(
+                    "GroupedTopN key is not an exact supported direct value",
+                ));
+            }
+            groups.push(*expressions.get(id).ok_or(FragmentCompileError::Invalid(
+                "missing lowered GroupedTopN key",
+            ))?);
+        }
+        let mut permutation = Vec::new();
+        crate::assert_rows::reserve_vec(&mut permutation, order_by.len(), &mut work)?;
+        for key in order_by {
+            let definition = definitions
+                .get(key.expr)
+                .ok_or(FragmentCompileError::Invalid("missing GroupedTopN rank"))?;
+            let novarocks_physical_plan::ExprKind::Value(value) = definition.kind else {
+                return Err(FragmentCompileError::Invalid(
+                    "GroupedTopN rank is not a direct value",
+                ));
+            };
+            let mut ordinal = None;
+            for (index, (_, group)) in group_by.iter().enumerate() {
+                work.step()?;
+                if *group == value {
+                    ordinal = Some(index);
+                }
+            }
+            let ordinal = ordinal.ok_or(FragmentCompileError::Invalid(
+                "GroupedTopN rank is not a complete key",
+            ))?;
+            if permutation.contains(&ordinal) {
+                return Err(FragmentCompileError::Invalid(
+                    "GroupedTopN rank repeats a key",
+                ));
+            }
+            permutation.push(ordinal);
+        }
+        let keys = lower_sort_keys(order_by, expressions, &mut work)?;
+        let mut functions = Vec::new();
+        crate::assert_rows::reserve_vec(&mut functions, calls.len(), &mut work)?;
+        for call in calls {
+            work.step()?;
+            if !matches!(
+                call.binding.phase,
+                novarocks_physical_plan::AggregatePhase::Intermediate { .. }
+            ) || call.arguments.len() != 1
+                || call.distinct
+                || !call.order_by.is_empty()
+            {
+                return Err(FragmentCompileError::Invalid(
+                    "GroupedTopN call is not an exact Intermediate merge",
+                ));
+            }
+            functions.push(crate::aggregate::lower_call(
+                node,
+                call,
+                expressions,
+                &mut work,
+            )?);
+        }
+        let layout = crate::aggregate::lower_output_layout(
+            package,
+            node,
+            slots,
+            width,
+            "grouped_topn",
+            &mut work,
+        )?;
+        let limit = usize::try_from(*limit)
+            .map_err(|_| FragmentCompileError::Invalid("GroupedTopN limit exceeds host range"))?;
+        Ok((
+            ProgramNodeKind::GroupedTopN {
+                input,
+                group_by: groups,
+                order_by: keys,
+                rank_group_ordinals: permutation,
+                limit,
+                comparator: *comparator,
+                functions,
+            },
+            layout,
+        ))
+    })();
+    if matches!(&result, Err(FragmentCompileError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
 }

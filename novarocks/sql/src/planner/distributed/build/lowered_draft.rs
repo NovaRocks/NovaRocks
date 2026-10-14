@@ -870,7 +870,7 @@ pub enum AggregateRuntimeDemand {
 }
 #[derive(Debug)]
 pub(super) enum LoweredAggregateLogicalSource {
-    Captured(CapturedAggregateLogicalRequest),
+    Captured(Arc<CapturedAggregateLogicalRequest>),
     /// Existing manual/structural IR explicitly lacks an authenticated update.
     /// Retention cannot upgrade it; a fresh-source loan returns MissingLogicalSource.
     Uncertified,

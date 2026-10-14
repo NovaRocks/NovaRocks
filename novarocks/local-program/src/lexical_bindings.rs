@@ -805,6 +805,12 @@ pub fn root_input_layout(
                 (ProgramNodeKind::Scan { .. } | ProgramNodeKind::ExchangeSource { .. }, _) => {
                     (owner, Layout::NodeOutput)
                 }
+                (
+                    ProgramNodeKind::GroupedTopN { input, .. },
+                    Role::TopNGroup { .. }
+                    | Role::TopNOrder { .. }
+                    | Role::TopNStateArgument { .. },
+                ) => (*input, Layout::NodeOutput),
                 (ProgramNodeKind::TableFinish { .. }, Role::FinishUnpivotConstant { .. }) => {
                     (owner, Layout::WriterRootResult)
                 }

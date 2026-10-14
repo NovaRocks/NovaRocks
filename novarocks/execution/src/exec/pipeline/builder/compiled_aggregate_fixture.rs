@@ -559,21 +559,39 @@ fn freeze(
     }];
     let mut sites = Vec::new();
     for node in fragment.nodes().values() {
-        if let NodeKind::Aggregate { calls, .. } = &node.kind {
-            for ordinal in 0..calls.len() {
-                let k = u32::try_from(sites.len()).unwrap();
-                let context = ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(RELATIONAL_USE_BASE + k),
-                    domain: EvaluationDomainId::new(k + 1),
-                    demand: EvaluationDemand::Value,
-                };
-                domains.push(ExpressionEvaluationDomain {
-                    id: context.domain,
-                    parent: None,
-                    guard: None,
-                });
-                sites.push((node.id, u32::try_from(ordinal).unwrap(), context));
-            }
+        let (calls, topn) = match &node.kind {
+            NodeKind::Aggregate { calls, .. } => (calls, false),
+            NodeKind::TopN {
+                reduction: novarocks_physical_plan::TopNReduction::GroupedStates { calls, .. },
+                ..
+            } => (calls, true),
+            _ => continue,
+        };
+        for ordinal in 0..calls.len() {
+            let k = u32::try_from(sites.len()).unwrap();
+            let context = ExpressionEffectContext {
+                use_id: ExpressionUseId::new(RELATIONAL_USE_BASE + k),
+                domain: EvaluationDomainId::new(k + 1),
+                demand: EvaluationDemand::Value,
+            };
+            domains.push(ExpressionEvaluationDomain {
+                id: context.domain,
+                parent: None,
+                guard: None,
+            });
+            let call = u32::try_from(ordinal).unwrap();
+            let site = if topn {
+                PhysicalCallSite::TopNState {
+                    node: node.id,
+                    call,
+                }
+            } else {
+                PhysicalCallSite::Aggregate {
+                    node: node.id,
+                    call,
+                }
+            };
+            sites.push((node.id, call, context, site));
         }
     }
     let flow = ExpressionControlFlow::try_new(
@@ -587,9 +605,14 @@ fn freeze(
     let root_uses = PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut frozen = Vec::new();
-    for (node, ordinal, context) in sites {
-        let NodeKind::Aggregate { calls, .. } = &fragment.nodes()[&node].kind else {
-            unreachable!()
+    for (node, ordinal, context, call_site) in sites {
+        let calls = match &fragment.nodes()[&node].kind {
+            NodeKind::Aggregate { calls, .. }
+            | NodeKind::TopN {
+                reduction: novarocks_physical_plan::TopNReduction::GroupedStates { calls, .. },
+                ..
+            } => calls,
+            _ => unreachable!(),
         };
         let call = &calls[ordinal as usize];
         let binding = &call.binding;
@@ -619,9 +642,16 @@ fn freeze(
             .map(|argument| {
                 let site = ExpressionRootSite {
                     node,
-                    role: ExpressionRootRole::AggregateArgument {
-                        call: ordinal,
-                        argument: u32::try_from(argument).unwrap(),
+                    role: if matches!(call_site, PhysicalCallSite::TopNState { .. }) {
+                        ExpressionRootRole::TopNStateArgument {
+                            call: ordinal,
+                            argument: u32::try_from(argument).unwrap(),
+                        }
+                    } else {
+                        ExpressionRootRole::AggregateArgument {
+                            call: ordinal,
+                            argument: u32::try_from(argument).unwrap(),
+                        }
                     },
                 };
                 Some(root_uses.bindings()[&site])
@@ -698,10 +728,7 @@ fn freeze(
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
-            site: PhysicalCallSite::Aggregate {
-                node,
-                call: ordinal,
-            },
+            site: call_site,
             context,
             effects: token.call_contract().effects().clone(),
             decimal_overflow_policy: POLICY,
@@ -891,21 +918,58 @@ pub(super) fn try_run(
     bindings: ExchangeBindings,
     instance: UniqueId,
 ) -> Result<(), String> {
+    try_run_in(program, sink, bindings, instance, runtime_state(), false)
+}
+
+/// The same original local execution lane with an explicit declared query
+/// tracker. This is test input wiring, not a new source, control or executor.
+pub(super) fn try_run_with_tracker(
+    program: &Arc<LocalProgram>,
+    sink: Box<dyn OperatorFactory>,
+    bindings: ExchangeBindings,
+    instance: UniqueId,
+    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+) -> Result<(), String> {
+    let state = Arc::new(RuntimeState::new(
+        None,
+        None,
+        None,
+        Some(instance),
+        None,
+        Some(tracker),
+        Some(crate::runtime::execution_runtime::test_execution_runtime()),
+    ));
+    try_run_in(program, sink, bindings, instance, state, true)
+}
+fn try_run_in(
+    program: &Arc<LocalProgram>,
+    sink: Box<dyn OperatorFactory>,
+    bindings: ExchangeBindings,
+    instance: UniqueId,
+    state: Arc<RuntimeState>,
+    tracked: bool,
+) -> Result<(), String> {
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
-    prepare_compiled_program_pipeline_execution(
+    let running = prepare_compiled_program_pipeline_execution(
         Arc::clone(program),
         Duration::from_millis(10),
         sink,
         bindings,
         Some((instance.high(), instance.low())),
         dop,
-        runtime_state(),
+        state,
         Arc::new(NoopFragmentEventSink),
     )
     .map_err(|error| error.to_string())?
-    .start()
-    .join()
-    .map_err(|error| error.to_string())
+    .start();
+    running.join().map_err(|error| error.to_string())?;
+    if tracked {
+        assert!(
+            running.stopped_fact().is_some(),
+            "successful join proves actual driver exit"
+        );
+    }
+    Ok(())
 }
 
 /// The single receiver of `program`, registered for `instance` with

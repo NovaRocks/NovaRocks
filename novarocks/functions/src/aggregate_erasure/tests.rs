@@ -614,6 +614,7 @@ struct Behavior {
     bound: usize,
     foreign: bool,
     create_failure: Option<KernelFailure>,
+    create_unwind: bool,
     create_growth: bool,
     create_drift: bool,
     row_drift: bool,
@@ -630,6 +631,7 @@ impl Default for Behavior {
             bound: 0,
             foreign: false,
             create_failure: None,
+            create_unwind: false,
             create_growth: false,
             create_drift: false,
             row_drift: false,
@@ -1076,6 +1078,10 @@ impl PreparedAggregateKernel for Kernel {
         if self.behavior.create_drift {
             self.counts.policy_drift.store(1, Ordering::Relaxed);
         }
+        assert!(
+            !self.behavior.create_unwind,
+            "fixture unwind after constructing the unpublished state"
+        );
         if let Some(error) = &self.behavior.create_failure {
             return Err(error.clone());
         }
@@ -2267,6 +2273,19 @@ fn zero_sized_high_alignment_state_requires_actual_alignment_and_drops_exactly_o
     drop(slot);
     assert_eq!(ZERO_CREATE.load(Ordering::Relaxed), 1);
     assert_eq!(ZERO_DROP.load(Ordering::Relaxed), 1);
+
+    // The owning facade uses the same aligned zero-byte representation and
+    // never asks the host for a zero-size block. Keep this case with the sole
+    // test that owns the ZST counters rather than adding shared test state.
+    let allocator = Arc::new(CountingAllocator::default());
+    let owned = crate::OwnedAggregateState::try_new(handle, allocator.clone(), &runtime).unwrap();
+    assert_eq!(owned.backing_bytes(), 0);
+    assert_eq!(owned.retained_heap_bytes(), 0);
+    assert_eq!(allocator.allocated.load(Ordering::Relaxed), 0);
+    drop(owned);
+    assert_eq!(ZERO_CREATE.load(Ordering::Relaxed), 2);
+    assert_eq!(ZERO_DROP.load(Ordering::Relaxed), 2);
+    assert_eq!(allocator.released.load(Ordering::Relaxed), 0);
 }
 
 /// Counts the host's block traffic and can refuse one allocation.
@@ -2291,6 +2310,156 @@ impl crate::AggregateStateAllocator for CountingAllocator {
         // SAFETY: forwarded exactly as this allocator received it.
         unsafe { crate::UnaccountedAggregateStateAllocator.release(block, layout) }
     }
+}
+
+struct OrderedAllocator {
+    backing: CountingAllocator,
+    counts: Arc<Counts>,
+}
+impl crate::AggregateStateAllocator for OrderedAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
+        self.backing.allocate(layout)
+    }
+    unsafe fn release(&self, block: NonNull<u8>, layout: Layout) {
+        let returned = self.backing.released.load(Ordering::Relaxed);
+        assert!(self.counts.drop.load(Ordering::Relaxed) > returned);
+        // SAFETY: forwarded unchanged after the initialized state died.
+        unsafe { self.backing.release(block, layout) };
+    }
+}
+
+// Evictable states must keep high-alignment backing stable while moving, and
+// destroy their typed state before returning its block, including constructor
+// unwind. Column/frame tests do not exercise this independently owned lifetime.
+// Independent create/drop/block counters and known selected-row sums are the
+// oracle. Inputs and allocators are local to each test; Drop and joined threads
+// complete cleanup, with no external services or shared mutable fixture.
+// Functions owns these small libtest cases, run on affected aggregate changes
+// and the regular library chain; no elapsed-time or performance gate applies.
+#[test]
+fn owned_aggregate_state_moves_merges_selected_rows_and_destroys_before_release() {
+    let owner = Owner::new(1, false);
+    let runtime = RuntimeControl::default();
+    let allocator = Arc::new(OrderedAllocator {
+        backing: CountingAllocator::default(),
+        counts: Arc::clone(&owner.counts),
+    });
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Intermediate);
+    let state =
+        crate::OwnedAggregateState::try_new(handle.clone(), allocator.clone(), &runtime).unwrap();
+    assert_eq!(
+        state.backing_bytes(),
+        handle.state_layout().pad_to_align().size()
+    );
+    let mut moved = Vec::with_capacity(1);
+    moved.push(state);
+    moved.push(
+        crate::OwnedAggregateState::try_new(handle.clone(), allocator.clone(), &runtime).unwrap(),
+    );
+    let values = value_array();
+    let selection = Selection::try_sparse(5, &[1, 4]).unwrap();
+    let input = SelectedAggregateMergeInput::try_new(
+        handle.contract(),
+        selection,
+        EvaluatedArgument::Column(&values),
+        &runtime,
+    )
+    .unwrap();
+    let mut frame = moved[0]
+        .prepare_merge_batch_evaluation(&[0, 0], input, &runtime)
+        .unwrap();
+    frame.run(&runtime).unwrap();
+    drop(frame);
+    assert_eq!(
+        integers(&moved[0].emit_evaluation(1, &runtime).unwrap()),
+        [70]
+    );
+
+    let output = std::thread::spawn(move || {
+        let runtime = RuntimeControl::default();
+        let output = moved[0].emit_evaluation(1, &runtime).unwrap();
+        drop(moved);
+        output
+    })
+    .join()
+    .unwrap();
+    assert_eq!(integers(&output), [70]);
+    assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 2);
+    assert_eq!(allocator.backing.released.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn owned_aggregate_state_refused_block_initializes_nothing() {
+    let owner = Owner::new(1, false);
+    let allocator = Arc::new(CountingAllocator {
+        refuse_at: Some(0),
+        ..CountingAllocator::default()
+    });
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Intermediate);
+    assert!(matches!(
+        crate::OwnedAggregateState::try_new(handle, allocator.clone(), &RuntimeControl::default()),
+        Err(KernelFailure::ResourceExhausted)
+    ));
+    assert_eq!(owner.counts.create.load(Ordering::Relaxed), 0);
+    assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 0);
+    assert_eq!(allocator.allocated.load(Ordering::Relaxed), 0);
+    assert_eq!(allocator.released.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn owned_aggregate_state_initialization_failure_returns_its_unpublished_block() {
+    let mut owner = Owner::new(1, false);
+    owner.behavior.create_failure = Some(KernelFailure::Cancelled);
+    let allocator = Arc::new(CountingAllocator::default());
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Intermediate);
+    assert!(matches!(
+        crate::OwnedAggregateState::try_new(handle, allocator.clone(), &RuntimeControl::default()),
+        Err(KernelFailure::Cancelled)
+    ));
+    assert_eq!(owner.counts.create.load(Ordering::Relaxed), 1);
+    assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
+    assert_eq!(allocator.allocated.load(Ordering::Relaxed), 1);
+    assert_eq!(allocator.released.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn owned_aggregate_state_initialization_unwind_destroys_before_returning_block() {
+    let mut owner = Owner::new(1, false);
+    owner.behavior.create_unwind = true;
+    let allocator = Arc::new(OrderedAllocator {
+        backing: CountingAllocator::default(),
+        counts: Arc::clone(&owner.counts),
+    });
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Intermediate);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::OwnedAggregateState::try_new(handle, allocator.clone(), &RuntimeControl::default())
+    }));
+    assert!(result.is_err());
+    assert_eq!(owner.counts.create.load(Ordering::Relaxed), 1);
+    assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
+    assert_eq!(allocator.backing.allocated.load(Ordering::Relaxed), 1);
+    assert_eq!(allocator.backing.released.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn owned_aggregate_state_emission_keeps_original_invocation_data_after_state_drop() {
+    let mut owner = Owner::new(0, false);
+    owner.behavior.helper_memory = true;
+    owner.behavior.lossless = true;
+    owner.behavior.emit = Emit::Data;
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Final);
+    let host = Arc::new(HelperHost::default());
+    let runtime = RuntimeControl::default();
+    let state = crate::OwnedAggregateState::try_new(handle, host, &runtime).unwrap();
+    let EvaluationFailure::InvocationData(data) = state.emit_evaluation(1, &runtime).unwrap_err()
+    else {
+        panic!("original invocation Data must survive the owning facade")
+    };
+    drop(state);
+    assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
+    assert_eq!(data.message(), "original full emission data ".repeat(32));
+    assert_eq!(data.state_indices(), [0]);
+    assert_eq!(data.emission_row_capacity(), Some(1));
 }
 
 // An owned column grows across blocks, updates groups that live in different

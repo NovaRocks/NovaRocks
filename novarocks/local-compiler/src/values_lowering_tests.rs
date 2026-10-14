@@ -31,7 +31,7 @@ use novarocks_type_contract::{FunctionArgumentType, ValueLogicalType};
 use novarocks_types::SlotId;
 use std::num::NonZeroUsize;
 
-pub(super) fn checked_pool(
+pub(crate) fn checked_pool(
     array: ArrayRef,
     nullable: bool,
     logical: ValueLogicalType,
@@ -48,7 +48,7 @@ pub(super) fn checked_pool(
     )
     .unwrap()
 }
-pub(super) fn compile_options() -> LocalCompileOptions {
+pub(crate) fn compile_options() -> LocalCompileOptions {
     LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
@@ -57,13 +57,13 @@ pub(super) fn compile_options() -> LocalCompileOptions {
         constants: policy(),
     }
 }
-pub(super) fn providers(package: Arc<FragmentPackage>) -> crate::ProviderValidatedFragment {
+pub(crate) fn providers(package: Arc<FragmentPackage>) -> crate::ProviderValidatedFragment {
     let catalog =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Control::good())
             .unwrap();
     validate_fragment_providers(package, &catalog, &Control::good()).unwrap()
 }
-pub(super) fn build(
+pub(crate) fn build(
     pools: &[ConstantPool],
     rows: &[Vec<(usize, u32)>],
     column_pools: &[usize],

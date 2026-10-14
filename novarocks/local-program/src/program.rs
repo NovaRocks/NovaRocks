@@ -462,6 +462,16 @@ pub enum ProgramNodeKind {
         topn_filters: Vec<AggregateTopNFilter>,
         streaming_preaggregation_mode: Option<StreamingPreaggregationMode>,
     },
+    /// A complete-key budget over intermediate state contributions.
+    GroupedTopN {
+        input: ProgramNodeId,
+        group_by: Vec<ProgramExprId>,
+        order_by: Vec<SortExpression>,
+        rank_group_ordinals: Vec<usize>,
+        limit: usize,
+        comparator: novarocks_type_contract::OrderedComparisonAlgorithm,
+        functions: Vec<StaticAggregateCall>,
+    },
     Join {
         left: ProgramNodeId,
         right: ProgramNodeId,
@@ -560,6 +570,7 @@ impl ProgramNodeKind {
             | Self::TableFunction { input, .. }
             | Self::GenerateSeries { input, .. }
             | Self::Aggregate { input, .. }
+            | Self::GroupedTopN { input, .. }
             | Self::Analytic { input, .. }
             | Self::RuntimeFilterConsumer { input, .. }
             | Self::TableWriter { input, .. } => visit(*input)?,
@@ -655,6 +666,25 @@ impl ProgramNodeKind {
                 }
                 for filter in topn_filters {
                     visit(Some(filter.group_key_expr))?;
+                }
+            }
+            Self::GroupedTopN {
+                group_by,
+                order_by,
+                functions,
+                ..
+            } => {
+                for id in group_by {
+                    visit(Some(*id))?;
+                }
+                for key in order_by {
+                    visit(Some(key.expr))?;
+                }
+                for function in functions {
+                    visit(None)?;
+                    for id in &function.inputs {
+                        visit(Some(*id))?;
+                    }
                 }
             }
             Self::Join {
@@ -1712,6 +1742,41 @@ fn validate_shape(
         ProgramNodeKind::TableFunction { function_name, .. } if function_name.is_empty() => {
             return Err(LocalProgramError::InvalidNodeShape.into());
         }
+        ProgramNodeKind::GroupedTopN {
+            group_by,
+            order_by,
+            rank_group_ordinals,
+            functions,
+            ..
+        } => {
+            let width = group_by.len().checked_add(functions.len());
+            if group_by.is_empty()
+                || order_by.len() != group_by.len()
+                || rank_group_ordinals.len() != group_by.len()
+                || width != Some(node.output_layout.slots().len())
+            {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            let mut permutation = std::collections::BTreeSet::new();
+            for ordinal in rank_group_ordinals {
+                work.step()?;
+                if *ordinal >= group_by.len() || !permutation.insert(*ordinal) {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+            for function in functions {
+                work.step()?;
+                if function.name.is_empty()
+                    || !function.input_is_intermediate
+                    || function.inputs.len() != 1
+                    || function.order.is_distinct
+                    || !function.order.is_asc_order.is_empty()
+                    || !function.order.nulls_first.is_empty()
+                {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+        }
         ProgramNodeKind::Aggregate {
             group_by,
             functions,
@@ -1876,6 +1941,49 @@ mod tests {
             layout.identity().unwrap(),
             KernelAbiVersion::CURRENT,
         )
+    }
+
+    #[test]
+    fn grouped_topn_shape_requires_a_complete_rank_permutation_even_at_zero_limit() {
+        // The graph owner rejects an invalid rank mapping before an executor
+        // can index group keys. This local input needs no external resource;
+        // LocalProgram owns the small affected-node regression. Installed
+        // call/type/root correspondence is covered by the compiler fixture.
+        let make = |rank_group_ordinals| {
+            let (values, layout) = values();
+            let expressions = Arc::new(
+                ImmutableExpressions::try_new(
+                    vec![StaticExprNode::new(
+                        StaticExprKind::SlotId(SlotId::new(1)),
+                        DataType::Int64,
+                        None,
+                    )],
+                    false,
+                    HashMap::new(),
+                    None,
+                )
+                .unwrap(),
+            );
+            LocalProgramGraph::try_new(
+                vec![
+                    ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
+                    ProgramNode::new(2, ProgramNodeKind::GroupedTopN {
+                        input: ProgramNodeId::new(0), group_by: vec![ProgramExprId::new(0)],
+                        order_by: vec![SortExpression { expr: ProgramExprId::new(0), asc: true, nulls_first: false }],
+                        rank_group_ordinals, limit: 0,
+                        comparator: novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
+                        functions: vec![],
+                    }, layout.clone()),
+                ], ProgramNodeId::new(1), expressions, profile(&layout), BindingRequirements::try_new(Vec::new()).unwrap(),
+            )
+        };
+        assert!(make(vec![0]).is_ok());
+        for permutation in [vec![], vec![1], vec![0, 0]] {
+            assert!(matches!(
+                make(permutation),
+                Err(LocalProgramError::InvalidNodeShape)
+            ));
+        }
     }
 
     #[test]

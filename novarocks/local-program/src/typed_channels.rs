@@ -392,7 +392,55 @@ impl ProgramTypedChannels {
                     group_by,
                     functions,
                     ..
+                }
+                | ProgramNodeKind::GroupedTopN {
+                    group_by,
+                    functions,
+                    ..
                 } => {
+                    let grouped = matches!(node.kind(), ProgramNodeKind::GroupedTopN { .. });
+                    if let ProgramNodeKind::GroupedTopN {
+                        order_by,
+                        rank_group_ordinals,
+                        comparator,
+                        ..
+                    } = node.kind()
+                    {
+                        let arena = &self
+                            .expressions
+                            .resolved_calls()
+                            .snapshot()
+                            .roots()
+                            .arenas()[&ProgramExpressionArena::Main];
+                        for (key, group) in order_by.iter().zip(rank_group_ordinals) {
+                            work.step()?;
+                            let id = *group_by
+                                .get(*group)
+                                .ok_or(ProgramChannelTypeError::WrongShape)?;
+                            let group_slot = arena
+                                .node(id)
+                                .ok_or(ProgramChannelTypeError::InvalidSite)?
+                                .kind();
+                            let rank_slot = arena
+                                .node(key.expr)
+                                .ok_or(ProgramChannelTypeError::InvalidSite)?
+                                .kind();
+                            if !matches!((group_slot, rank_slot), (crate::StaticExprKind::SlotId(a), crate::StaticExprKind::SlotId(b)) if a == b)
+                            {
+                                return Err(ProgramChannelTypeError::WrongShape);
+                            }
+                            let ty = self.definition(ProgramExpressionArena::Main, id)?;
+                            if !comparator.supports_value_type(ty)
+                                || !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(&ty.data_type)
+                            { return Err(ProgramChannelTypeError::TypeMismatch); }
+                            same_value(
+                                ty,
+                                self.definition(ProgramExpressionArena::Main, key.expr)?,
+                                false,
+                                work,
+                            )?;
+                        }
+                    }
                     // Actual aggregate arrays are group keys followed by call
                     // emissions; the existing runtime consumes that prefix.
                     for (ordinal, id) in group_by.iter().enumerate() {
@@ -405,10 +453,19 @@ impl ProgramTypedChannels {
                     }
                     for (ordinal, source) in functions.iter().enumerate() {
                         work.step()?;
-                        let contract = self.aggregate(ProgramCallSite::Aggregate {
-                            node: node_id,
-                            call: ordinal_id(ordinal)?,
-                        })?;
+                        let call = ordinal_id(ordinal)?;
+                        let site = if grouped {
+                            ProgramCallSite::TopNState {
+                                node: node_id,
+                                call,
+                            }
+                        } else {
+                            ProgramCallSite::Aggregate {
+                                node: node_id,
+                                call,
+                            }
+                        };
+                        let contract = self.aggregate(site)?;
                         if contract.phase().consumes_logical_arguments() {
                             let expected = contract
                                 .logical_argument_types()

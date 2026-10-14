@@ -24,6 +24,7 @@
 
 #![allow(dead_code)]
 
+mod grouped_topn;
 mod neutral_requests;
 mod nullable_transaction;
 
@@ -1759,6 +1760,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                 detail: "aggregate capture belongs to a different source revision",
             });
         }
+        self.work.flush()?;
+        let captured = Arc::new(captured);
+        self.work.step()?;
         Ok(LoweredAggregateLogicalSource::Captured(captured))
     }
 
@@ -7062,6 +7066,9 @@ impl<'a> ContractLoweringVisitor<'a> {
             expressions: order_by,
             ..
         } = self.lower_ordering(node, items, &child.columns)?;
+        if self.requires_grouped_topn(&child, phase)? {
+            return self.append_grouped_topn(node, child, order_by, limit, offset, phase);
+        }
         if matches!(phase, ContractTopNPhase::Partial { .. }) {
             let mut grouped: BTreeMap<ValueId, Vec<AggregateStateLink>> = BTreeMap::new();
             for (ordinal, value) in child.output.iter().enumerate() {
@@ -17576,7 +17583,10 @@ mod tests {
                         } else {
                             LiteralValue::String(format!("{row}_{col}"))
                         }),
-                        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, row == 0 && col == 0),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            row == 0 && col == 0,
+                        ),
                     })
                     .collect()
             })

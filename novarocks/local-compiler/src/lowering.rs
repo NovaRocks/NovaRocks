@@ -606,6 +606,12 @@ fn lower<H: ProjectMetadataScope>(
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             } => node.inputs.len() == 1,
+            NodeKind::TopN {
+                reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
+                phase: novarocks_physical_plan::TopNPhase::Partial { .. },
+                offset: 0,
+                ..
+            } => node.inputs.len() == 1,
             // A window, under its own admission: one input and an installed
             // pure window kernel for each call shape.
             NodeKind::Window(_) => {
@@ -724,7 +730,6 @@ fn lower<H: ProjectMetadataScope>(
             node.kind,
             NodeKind::TopN {
                 phase: novarocks_physical_plan::TopNPhase::Partial { .. },
-                reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             }
         );
@@ -826,10 +831,7 @@ fn lower<H: ProjectMetadataScope>(
                 mode: novarocks_physical_plan::SortMode::Global
                     | novarocks_physical_plan::SortMode::Analytic { .. },
                 ..
-            } | NodeKind::TopN {
-                reduction: novarocks_physical_plan::TopNReduction::Rows,
-                ..
-            }
+            } | NodeKind::TopN { .. }
         );
         // A window emits its gathered input on one driver in arrival order,
         // so it preserves exactly the ordering it reads. One that partitions
@@ -1230,13 +1232,26 @@ fn lower<H: ProjectMetadataScope>(
                     .get(&node.inputs[0])
                     .ok_or(FragmentCompileError::Invalid("missing lowered TopN child"))?;
                 work.flush()?;
-                lower_topn(
-                    node,
-                    child,
-                    nodes[child.index()].output_layout(),
-                    &expressions.ids,
-                    work.control(),
-                )?
+                match &node.kind {
+                    NodeKind::TopN {
+                        reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
+                        ..
+                    } => crate::topn::lower_grouped_topn(
+                        package,
+                        node,
+                        child,
+                        &expressions.ids,
+                        &planned.slots,
+                        work.control(),
+                    )?,
+                    _ => lower_topn(
+                        node,
+                        child,
+                        nodes[child.index()].output_layout(),
+                        &expressions.ids,
+                        work.control(),
+                    )?,
+                }
             }
             NodeKind::Filter { predicates } => {
                 let child = *local_ids
@@ -1891,7 +1906,19 @@ fn lower<H: ProjectMetadataScope>(
             ExpressionRootRole::WindowOrder { key } => {
                 ProgramNodeExpressionRole::WindowOrder { key }
             }
-            ExpressionRootRole::TopNOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
+            ExpressionRootRole::TopNOrder { key } => match &physical.nodes()[&site.node].kind {
+                NodeKind::TopN {
+                    reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
+                    ..
+                } => ProgramNodeExpressionRole::TopNOrder { key },
+                _ => ProgramNodeExpressionRole::SortOrder { key },
+            },
+            ExpressionRootRole::TopNGroup { group } => {
+                ProgramNodeExpressionRole::TopNGroup { group }
+            }
+            ExpressionRootRole::TopNStateArgument { call, argument } => {
+                ProgramNodeExpressionRole::TopNStateArgument { call, argument }
+            }
             ExpressionRootRole::ProjectOutput { expression } => {
                 ProgramNodeExpressionRole::ProjectOutput { expression }
             }

@@ -2950,6 +2950,352 @@ mod tests {
         )
     }
 
+    // SQL owner regression for complete-key state TopN authorship.
+    // The original all_t0 declares all 24 columns; its three key columns are
+    // nullable Int8/Int16/Int32 and the three inserts declare 30_002 rows.
+    // Uncollected metrics remain Missing. This pure completion fixture owns
+    // no external resource and needs no cleanup. Run in the short SQL owner
+    // lane when grouped TopN authorship changes. The inner query is a separate
+    // compilation assertion, not evidence that the outer MD5 query executed.
+    // The oracle checks new Intermediate state identities, unchanged complete
+    // keys/bindings, and the same captured producer request; old Rows fixtures
+    // cannot exercise this state lifecycle. Native owns actual result/exit proof.
+    fn grouped_state_topn_sequence_fixture(
+        sql: &str,
+        mode: super::super::SqlPhysicalEmissionMode,
+    ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
+        use arrow::datatypes::TimeUnit;
+        use novarocks_types::schema::{ColumnDef, SqlType};
+
+        let declarations = [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Utf8,
+            DataType::Utf8,
+            DataType::Utf8,
+            DataType::Float32,
+            DataType::Float64,
+        ];
+        let columns = declarations
+            .iter()
+            .cycle()
+            .take(24)
+            .enumerate()
+            .map(|(ordinal, ty)| ColumnDef {
+                name: format!("c{}", ordinal + 1),
+                data_type: ty.clone(),
+                nullable: ordinal < 12,
+                write_default: None,
+                logical_type: matches!(ordinal, 4 | 16).then_some(SqlType::LargeInt),
+            })
+            .collect::<Vec<_>>();
+        let mut input = request(sql, SqlCompileIntent::Query);
+        input.emission_mode = mode;
+        // Original compressed_key query 132 admits this value before 137.
+        input.session.sql_semantics = input
+            .session
+            .sql_semantics
+            .clone()
+            .with_group_concat_max_len(65_535);
+        input.dop_domain = PipelineDopDomain {
+            min: 2,
+            max: 2,
+            requires_power_of_two: true,
+        };
+        let control = SqlCompileControl::unbounded();
+        let catalog = incomplete(SqlCompiler::start(
+            input.try_into_completion().unwrap(),
+            &control,
+        )?);
+        let SqlNeedBatch::CatalogRelations(needs) = catalog.needs() else {
+            panic!("expected catalog needs");
+        };
+        let facts = needs
+            .iter()
+            .map(|need| {
+                let relation = need.relation();
+                assert_eq!(relation.table, "all_t0");
+                let mut table = resolved_table(need).planner;
+                table.columns = columns.clone();
+                CatalogRelationFact::resolved(
+                    need,
+                    ResolvedAnalyzerTable::from_planner(
+                        Some(&relation.catalog),
+                        &relation.namespace,
+                        table,
+                    ),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let statistics = incomplete(SqlCompiler::finish(
+            catalog,
+            SqlFactBatch::CatalogRelations(facts.into_boxed_slice()),
+            &control,
+        )?);
+        let SqlNeedBatch::Statistics(needs) = statistics.needs() else {
+            panic!("expected statistics needs");
+        };
+        assert_eq!(needs.len(), 1);
+        let mut frozen = available_statistics_evidence(30_002);
+        let DmlStatisticsEvidence::Available {
+            binding,
+            label,
+            columns: statistics_columns,
+            evidence,
+            ..
+        } = &mut frozen
+        else {
+            unreachable!();
+        };
+        *binding = needs[0].binding();
+        *label = "iceberg.db.all_t0".into();
+        *statistics_columns = columns;
+        // Declared key metrics from SHOW TABLE STATS after the original three
+        // INSERTs. These are explicit fixture inputs, not guessed NDV values.
+        // Missing bounds and other omitted metrics stay explicitly Missing.
+        use novarocks_spi::connector::{
+            StatisticsBasisRelation, StatisticsEvidence, StatisticsMetricObservation,
+            StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
+            StatisticsNumericNature,
+        };
+        let mut metrics = evidence.metrics().clone();
+        for (column, nulls, average_size, ndv) in [
+            ("c1", 10_801, 0.7430171321911873, 129.0),
+            ("c2", 1, 1.230151323245117, 201.0),
+            ("c3", 1, 1.230151323245117, 201.0),
+        ] {
+            for (metric, value, source, nature) in [
+                (
+                    StatisticsMetric::NullCount {
+                        column: column.into(),
+                    },
+                    StatisticsMetricValue::U64(nulls),
+                    StatisticsMetricSource::CurrentManifest,
+                    StatisticsNumericNature::Exact,
+                ),
+                (
+                    StatisticsMetric::AverageSize {
+                        column: column.into(),
+                    },
+                    StatisticsMetricValue::F64(average_size),
+                    StatisticsMetricSource::CurrentManifest,
+                    StatisticsNumericNature::TwoSidedApproximate,
+                ),
+                (
+                    StatisticsMetric::ThetaNdv {
+                        column: column.into(),
+                    },
+                    StatisticsMetricValue::F64(ndv),
+                    StatisticsMetricSource::ProviderArtifact,
+                    StatisticsNumericNature::TwoSidedApproximate,
+                ),
+            ] {
+                metrics.insert(
+                    metric,
+                    StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                        value,
+                        evidence.data_version().clone(),
+                        source,
+                        nature,
+                        StatisticsBasisRelation::Identical,
+                    )),
+                );
+            }
+        }
+        *evidence = StatisticsEvidence::try_new(
+            evidence.data_version().clone(),
+            evidence.evidence_revision().clone(),
+            evidence.row_coverage(),
+            metrics,
+        )
+        .unwrap();
+        let provider = incomplete(answer_frozen_statistics(statistics, frozen));
+        let SqlNeedBatch::ProviderReads(needs) = provider.needs() else {
+            panic!("expected provider needs");
+        };
+        let facts = needs
+            .iter()
+            .map(|need| ProviderReadFact::negotiated(need, provider_contract(need)).unwrap())
+            .collect::<Vec<_>>();
+        SqlCompiler::finish(
+            provider,
+            SqlFactBatch::ProviderReads(facts.into_boxed_slice()),
+            &control,
+        )
+    }
+
+    fn assert_grouped_state_topn_sequence(mode: super::super::SqlPhysicalEmissionMode) {
+        let queries = [
+            (
+                "inner",
+                "SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100",
+            ),
+            (
+                "original-137",
+                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING)||':'||CAST(c2 AS STRING)||':'||CAST(c3 AS STRING)||':'||CAST(cnt AS STRING))) AS result_hash FROM result",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (label, sql) in queries {
+            match grouped_state_topn_sequence_fixture(sql, mode) {
+                Ok(SqlCompileProgress::Complete(completed)) => {
+                    assert_eq!(
+                        mode,
+                        super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration
+                    );
+                    let owner = completed.into_plan();
+                    assert_grouped_state_topn_sources(&owner);
+                }
+                Ok(SqlCompileProgress::Incomplete(_)) => {
+                    failures.push(format!("{label}: unresolved completion needs"));
+                }
+                Err(error) if mode == super::super::SqlPhysicalEmissionMode::OriginalNativeV1 => {
+                    assert!(
+                        error.to_string().contains(
+                            "TopN partial paths do not reduce exactly into their matching final"
+                        ),
+                        "{label}: {error:?}"
+                    );
+                }
+                Err(error) => failures.push(format!("{label}: {error:?}")),
+            }
+        }
+        assert!(failures.is_empty(), "{mode:?}: {failures:?}");
+    }
+
+    fn assert_grouped_state_topn_sources(owner: &super::super::SqlAuthoredPhysicalPlan) {
+        use novarocks_physical_plan::{
+            AggregateGrouping, AggregatePhase, ExprKind as PhysicalExprKind, PhysicalCallSite,
+            TopNReduction,
+        };
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        let control = SqlCompileControl::unbounded();
+        let mut work =
+            CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
+        let mut reductions = 0;
+        for fragment in owner.plan().fragments().values() {
+            for node in fragment.nodes().values() {
+                let NodeKind::TopN {
+                    reduction:
+                        TopNReduction::GroupedStates {
+                            group_by, calls, ..
+                        },
+                    ..
+                } = &node.kind
+                else {
+                    continue;
+                };
+                reductions += 1;
+                let producer = &fragment.nodes()[&node.inputs[0]];
+                let NodeKind::Aggregate {
+                    group_by: original_keys,
+                    calls: originals,
+                    grouping: AggregateGrouping::Partial,
+                } = &producer.kind
+                else {
+                    panic!("expected actual direct partial aggregate");
+                };
+                assert_eq!(
+                    group_by.iter().map(|(_, value)| value).collect::<Vec<_>>(),
+                    original_keys
+                        .iter()
+                        .map(|(_, value)| value)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(calls.len(), originals.len());
+                for (ordinal, (call, original)) in calls.iter().zip(originals).enumerate() {
+                    let AggregatePhase::Intermediate { sequence } = call.binding.phase else {
+                        panic!("expected intermediate state reduction");
+                    };
+                    assert_eq!(Some(sequence), original.binding.phase.sequence());
+                    assert_ne!(call.id, original.id);
+                    assert_ne!(call.output, original.output);
+                    let mut binding = original.binding.clone();
+                    binding.phase = call.binding.phase;
+                    assert_eq!(call.binding, binding);
+                    assert!(
+                        matches!(fragment.expressions().get(call.arguments[0]).unwrap().kind, PhysicalExprKind::Value(input) if input == original.output)
+                    );
+                    let ordinal = u32::try_from(ordinal).unwrap();
+                    let consumer = owner
+                        .checked_aggregate_source_observed(
+                            fragment,
+                            node,
+                            PhysicalCallSite::TopNState {
+                                node: node.id,
+                                call: ordinal,
+                            },
+                            call,
+                            &mut work,
+                        )
+                        .unwrap();
+                    let source = owner
+                        .checked_aggregate_source_observed(
+                            fragment,
+                            producer,
+                            PhysicalCallSite::Aggregate {
+                                node: producer.id,
+                                call: ordinal,
+                            },
+                            original,
+                            &mut work,
+                        )
+                        .unwrap();
+                    assert!(std::ptr::eq(consumer.captured(), source.captured()));
+                    let input = consumer.state_inputs_observed(&mut work).unwrap();
+                    assert_eq!(input.root().node, producer.id);
+                    assert_eq!(input.root().value, original.output);
+                }
+            }
+        }
+        assert!(
+            reductions > 0,
+            "actual completion must author a state reduction"
+        );
+        work.finish().unwrap();
+    }
+
+    #[test]
+    fn grouped_state_topn_sequence_original() {
+        assert_grouped_state_topn_sequence(super::super::SqlPhysicalEmissionMode::OriginalNativeV1);
+    }
+
+    #[test]
+    fn grouped_state_topn_sequence_candidate() {
+        assert_grouped_state_topn_sequence(
+            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+        );
+    }
+
+    #[test]
+    fn grouped_state_topn_sequence_multiple_aggregate_sources() {
+        let sql = "SELECT c1,c2,c3,COUNT(*) AS cnt,SUM(c4) AS total,MIN(c4) AS lo,MAX(c4) AS hi FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100";
+        let SqlCompileProgress::Complete(completed) = grouped_state_topn_sequence_fixture(
+            sql,
+            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+        )
+        .unwrap() else {
+            panic!("expected complete multi-aggregate state reduction");
+        };
+        let owner = completed.into_plan();
+        assert!(owner.plan().fragments().values().any(|fragment| {
+            fragment.nodes().values().any(|node| matches!(
+                &node.kind,
+                NodeKind::TopN {
+                    reduction: novarocks_physical_plan::TopNReduction::GroupedStates { calls, .. },
+                    ..
+                } if calls.len() == 4
+            ))
+        }));
+        assert_grouped_state_topn_sources(&owner);
+    }
+
     fn assert_distinct_rows_topn_sequence(mode: super::super::SqlPhysicalEmissionMode) {
         let mut failures = Vec::new();
         for sql in [

@@ -55,7 +55,6 @@ use arrow::array::{Array, ArrayRef};
 use arrow::compute::{
     SortColumn, SortOptions, concat, concat_batches, lexsort_to_indices, take, take_record_batch,
 };
-use arrow::record_batch::RecordBatch;
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramNodeKind, SortTopNType,
@@ -247,7 +246,7 @@ impl OperatorFactory for CompiledSortProcessorFactory {
 
 /// Payload rows with their already evaluated, normalized key columns.
 struct SortedRun {
-    batch: RecordBatch,
+    chunk: Chunk,
     keys: Vec<ArrayRef>,
 }
 
@@ -287,7 +286,7 @@ impl CompiledSortProcessor {
             return Ok(None);
         }
         let schema = self.output.arrow_schema_ref();
-        let batch = concat_batches(&schema, self.runs.iter().map(|run| &run.batch))
+        let batch = concat_batches(&schema, self.runs.iter().map(|run| &run.chunk.batch))
             .map_err(|error| failure("compiled Sort payload concat", error))?;
         let mut keys = Vec::with_capacity(self.options.len());
         for key in 0..self.options.len() {
@@ -321,7 +320,10 @@ impl CompiledSortProcessor {
         } else {
             Vec::new()
         };
-        Ok(Some(SortedRun { batch, keys }))
+        Ok(Some(SortedRun {
+            chunk: Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.output))?,
+            keys,
+        }))
     }
 
     fn prune(&mut self) -> ExecutionResult<()> {
@@ -335,7 +337,7 @@ impl CompiledSortProcessor {
         self.runs.clear();
         self.buffered_rows = 0;
         if let Some(run) = kept {
-            self.buffered_rows = run.batch.num_rows();
+            self.buffered_rows = run.chunk.len();
             self.runs.push(run);
         }
         Ok(())
@@ -345,7 +347,7 @@ impl CompiledSortProcessor {
         let Some(sorted) = self.sort_runs(self.keep, false)? else {
             return Ok(None);
         };
-        let rows = sorted.batch.num_rows();
+        let rows = sorted.chunk.len();
         if self.offset >= rows {
             return Ok(None);
         }
@@ -355,7 +357,7 @@ impl CompiledSortProcessor {
         if len == 0 {
             return Ok(None);
         }
-        let batch = sorted.batch.slice(self.offset, len);
+        let batch = sorted.chunk.batch.slice(self.offset, len);
         Ok(Some(Chunk::try_new_with_chunk_schema(
             batch,
             Arc::clone(&self.output),
@@ -417,10 +419,7 @@ impl ProcessorOperator for CompiledSortProcessor {
             return Ok(());
         }
         self.buffered_rows = self.buffered_rows.saturating_add(chunk.len());
-        self.runs.push(SortedRun {
-            batch: chunk.batch,
-            keys,
-        });
+        self.runs.push(SortedRun { chunk, keys });
         self.prune()
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {

@@ -70,6 +70,16 @@ pub enum ProgramNodeExpressionRole {
         call: u32,
         argument: u32,
     },
+    TopNGroup {
+        group: u32,
+    },
+    TopNOrder {
+        key: u32,
+    },
+    TopNStateArgument {
+        call: u32,
+        argument: u32,
+    },
     JoinProbeKey {
         key: u32,
     },
@@ -447,6 +457,45 @@ impl RootCollector<'_> {
                 }
                 // TopN producers observe the already evaluated group array.
                 // Their source expression is lineage, not another invocation.
+            }
+            ProgramNodeKind::GroupedTopN {
+                group_by,
+                order_by,
+                functions,
+                ..
+            } => {
+                for (group, id) in group_by.iter().enumerate() {
+                    self.node_root(
+                        node,
+                        Role::TopNGroup {
+                            group: ordinal(group)?,
+                        },
+                        *id,
+                        Value,
+                    )?;
+                }
+                for (key, order) in order_by.iter().enumerate() {
+                    self.node_root(
+                        node,
+                        Role::TopNOrder { key: ordinal(key)? },
+                        order.expr,
+                        Value,
+                    )?;
+                }
+                for (call, function) in functions.iter().enumerate() {
+                    self.step()?;
+                    for (argument, id) in function.inputs.iter().enumerate() {
+                        self.node_root(
+                            node,
+                            Role::TopNStateArgument {
+                                call: ordinal(call)?,
+                                argument: ordinal(argument)?,
+                            },
+                            *id,
+                            Value,
+                        )?;
+                    }
+                }
             }
             ProgramNodeKind::Join {
                 probe_keys,

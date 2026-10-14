@@ -53,6 +53,7 @@ use crate::exec::operators::compiled_expression::{
     CompiledFilterProcessorFactory, CompiledProjectProcessorFactory,
 };
 use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
+use crate::exec::operators::compiled_grouped_topn::CompiledGroupedTopNProcessorFactory;
 use crate::exec::operators::compiled_repeat::CompiledRepeatProcessorFactory;
 use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
 use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
@@ -734,6 +735,16 @@ fn build_node<H: CompiledSchemaMetadataScope>(
         }
         ProgramNodeKind::UnionAll { inputs } => {
             build_union_all(program, id, node_id, inputs, ctx, error, metadata)
+        }
+        ProgramNodeKind::GroupedTopN { input, .. } => {
+            let factory = CompiledGroupedTopNProcessorFactory::try_new(
+                Arc::clone(program), id, Arc::clone(error),
+            )?;
+            let build = build_node(program, *input, ctx, error, metadata)?;
+            let mut build = gather_to_one(build, ctx, node_id);
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::single();
+            Ok(build)
         }
         ProgramNodeKind::Aggregate { input, .. } => {
             // Preserve the original driver-local Partial -> exchange -> Final

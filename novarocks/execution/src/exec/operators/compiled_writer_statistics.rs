@@ -1098,7 +1098,10 @@ impl GroupedUnpivotSource for CompiledGroupedUnpivot {
                 return Ok(None);
             };
             if !self.started {
-                let row = self.final_chunk.batch.slice(target.row, 1);
+                let row = Chunk::try_new_like(
+                    self.final_chunk.batch.slice(target.row, 1),
+                    &self.final_chunk,
+                )?;
                 let constants = self
                     .constants
                     .iter()

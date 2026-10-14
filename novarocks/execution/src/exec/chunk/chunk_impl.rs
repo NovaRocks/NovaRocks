@@ -45,6 +45,9 @@ pub struct Chunk {
     /// charge for the same buffers. The last chunk owner releases the original
     /// provider charge.
     connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    /// The original columns Vec is freed by batch before this metadata
+    /// keeper drops. Payload accounting/source authority stays separate.
+    output_column_metadata: Option<super::OutputColumnMetadata>,
 }
 
 impl Chunk {
@@ -68,11 +71,14 @@ impl Chunk {
             chunk_schema,
             accounting: None,
             connector_output_memory: None,
+            output_column_metadata: None,
         })
     }
 
     pub fn try_new_like(batch: RecordBatch, source: &Chunk) -> Result<Self, String> {
-        Self::try_new_with_chunk_schema(batch, source.chunk_schema_ref())
+        let mut out = Self::try_new_with_chunk_schema(batch, source.chunk_schema_ref())?;
+        out.output_column_metadata = source.output_column_metadata.clone();
+        Ok(out)
     }
 
     pub fn new_like(batch: RecordBatch, source: &Chunk) -> Self {
@@ -93,6 +99,7 @@ impl Chunk {
                 chunk_schema,
                 accounting: None,
                 connector_output_memory: None,
+                output_column_metadata: None,
             });
         }
         let row_count = batch.num_rows();
@@ -104,7 +111,50 @@ impl Chunk {
             chunk_schema,
             accounting: None,
             connector_output_memory: None,
+            output_column_metadata: None,
         })
+    }
+
+    /// The caller admitted and allocated the original column Vec under this
+    /// keeper. Do not retag or rebuild that container during publication.
+    pub(crate) fn try_new_with_output_column_metadata(
+        batch: RecordBatch,
+        chunk_schema: ChunkSchemaRef,
+        metadata: super::OutputColumnMetadata,
+    ) -> Result<Self, novarocks_functions::KernelFailure> {
+        // Establish the same data-before-keeper Drop order for unpublished
+        // validation failures as for successful publication.
+        let out = Self {
+            batch,
+            chunk_schema,
+            accounting: None,
+            connector_output_memory: None,
+            output_column_metadata: Some(metadata),
+        };
+        if out.batch.schema().as_ref() != out.chunk_schema.arrow_schema_ref().as_ref()
+            || out.batch.num_columns()
+                != out
+                    .output_column_metadata
+                    .as_ref()
+                    .expect("keeper installed")
+                    .columns()
+        {
+            return Err(novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "output column metadata requires the original frozen column container",
+                ),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Pure construction backing cannot silently acquire or discard a live
+    /// runtime container owner. A refusal drops the whole original Chunk.
+    pub(crate) fn try_into_static_batch(self) -> Result<RecordBatch, String> {
+        if self.output_column_metadata.is_some() {
+            return Err("StaticValues cannot retain runtime output column metadata".to_string());
+        }
+        Ok(self.batch)
     }
 
     pub fn new_with_chunk_schema(batch: RecordBatch, chunk_schema: ChunkSchemaRef) -> Self {
@@ -135,6 +185,11 @@ impl Chunk {
         }
         if let Some(output_memory) = &self.connector_output_memory {
             inspection.charge_arc(output_memory.as_ref())?;
+        }
+        if let Some(metadata) = &self.output_column_metadata {
+            inspection.charge(metadata.holder_bytes().map_err(|_| {
+                super::root_schema_backing::RootSchemaBackingError::UnsupportedType
+            })?)?;
         }
         Ok(())
     }
@@ -178,6 +233,7 @@ impl Chunk {
             chunk_schema: Arc::clone(&self.chunk_schema),
             accounting: None,
             connector_output_memory: self.connector_output_memory.clone(),
+            output_column_metadata: self.output_column_metadata.clone(),
         };
         if let Some(accounting) = self.accounting.as_ref() {
             let tracker = accounting.tracker();
@@ -318,6 +374,7 @@ impl Default for Chunk {
             chunk_schema: Arc::new(ChunkSchema::empty()),
             accounting: None,
             connector_output_memory: None,
+            output_column_metadata: None,
         }
     }
 }

@@ -174,12 +174,10 @@ impl AggregateStateColumn {
                 self.blocks
                     .try_reserve(1)
                     .map_err(|_| KernelFailure::ResourceExhausted)?;
-                let block = self.allocator.allocate(self.block_layout)?;
-                new_block = Some(UnpublishedBlock {
-                    pointer: Some(block),
-                    layout: self.block_layout,
-                    allocator: Arc::clone(&self.allocator),
-                });
+                new_block = Some(StateBackingBlock::try_new(
+                    Arc::clone(&self.allocator),
+                    self.block_layout,
+                )?);
             }
             let block = new_block
                 .as_ref()
@@ -190,18 +188,17 @@ impl AggregateStateColumn {
             // `states_per_block` strides.
             unsafe { block.add(within * self.stride) }
         };
-        // SAFETY: the bytes belong to a block this column owns and never moves
-        // or releases while any state lives, and no other slot covers them.
-        // The 'static borrow never leaves the column: its slots are destroyed
-        // in Drop before the block is returned to the host.
-        let storage: &'static mut [MaybeUninit<u8>] = unsafe {
-            std::slice::from_raw_parts_mut(pointer.as_ptr().cast::<MaybeUninit<u8>>(), self.stride)
-        };
-        let slot = self.handle.initialize_in_with_allocator(
-            storage,
-            Some(Arc::clone(&self.allocator)),
-            control,
-        )?;
+        // SAFETY: the column keeps this stable, exclusive region alive until
+        // its slot is destroyed, before returning the backing to the host.
+        let slot = unsafe {
+            initialize_owned_slot(
+                &self.handle,
+                pointer,
+                self.stride,
+                Arc::clone(&self.allocator),
+                control,
+            )
+        }?;
         if let Some(mut block) = new_block.take() {
             self.blocks
                 .push(block.pointer.take().expect("unpublished aggregate block"));
@@ -293,14 +290,67 @@ impl AggregateStateColumn {
     }
 }
 
-struct UnpublishedBlock {
+/// Exact host backing, kept alive until all slots borrowing it are destroyed.
+/// A constructor failure leaves it unpublished and returns it through Drop.
+pub(crate) struct StateBackingBlock {
     pointer: Option<NonNull<u8>>,
     layout: Layout,
     allocator: Arc<dyn AggregateStateAllocator>,
 }
-impl Drop for UnpublishedBlock {
+impl StateBackingBlock {
+    pub(crate) fn try_new(
+        allocator: Arc<dyn AggregateStateAllocator>,
+        layout: Layout,
+    ) -> Result<Self, KernelFailure> {
+        let pointer = if layout.size() == 0 {
+            None
+        } else {
+            Some(allocator.allocate(layout)?)
+        };
+        Ok(Self {
+            pointer,
+            layout,
+            allocator,
+        })
+    }
+
+    pub(crate) fn pointer(&self) -> NonNull<u8> {
+        self.pointer.unwrap_or_else(|| {
+            NonNull::new(self.layout.align() as *mut u8).expect("nonzero aggregate state alignment")
+        })
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.layout.size()
+    }
+}
+
+/// Initialize the original typed slot over stable storage owned by its caller.
+///
+/// # Safety
+/// `pointer` names an exclusive, aligned region of `bytes` writable bytes.
+/// Its owner must keep the region stable until the returned slot is destroyed,
+/// and must not expose the private storage lifetime or create another slot in
+/// the same region. A zero-byte region uses the original aligned ZST sentinel.
+pub(crate) unsafe fn initialize_owned_slot(
+    handle: &PreparedAggregateHandle,
+    pointer: NonNull<u8>,
+    bytes: usize,
+    allocator: Arc<dyn AggregateStateAllocator>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<AggregateStateSlot<'static>, KernelFailure> {
+    // SAFETY: the caller's owning facade discharges the stable/exclusive
+    // storage lifetime; the slot never escapes that facade's borrows.
+    let storage = unsafe {
+        std::slice::from_raw_parts_mut(pointer.as_ptr().cast::<MaybeUninit<u8>>(), bytes)
+    };
+    handle.initialize_in_with_allocator(storage, Some(allocator), control)
+}
+
+impl Drop for StateBackingBlock {
     fn drop(&mut self) {
-        // SAFETY: construction has not published a state borrowing this block.
+        // SAFETY: the owning facade destroys every initialized slot before
+        // dropping its backing; failed initialization never published a slot.
         if let Some(pointer) = self.pointer {
             unsafe { self.allocator.release(pointer, self.layout) };
         }

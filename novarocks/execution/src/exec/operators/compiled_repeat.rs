@@ -156,7 +156,7 @@ struct CompiledRepeatProcessor {
     output: ChunkSchemaRef,
     null_ordinals: Arc<[Vec<usize>]>,
     grouping_values: Arc<[Vec<i64>]>,
-    input: Option<RecordBatch>,
+    input: Option<Chunk>,
     next_set: usize,
     finishing: bool,
     finished: bool,
@@ -214,7 +214,7 @@ impl ProcessorOperator for CompiledRepeatProcessor {
         if chunk.batch.schema().as_ref() != self.input_schema.as_ref() {
             return Err("compiled Repeat input differs from its frozen input port".into());
         }
-        self.input = Some(chunk.batch);
+        self.input = Some(chunk);
         self.next_set = 0;
         Ok(())
     }
@@ -225,7 +225,7 @@ impl ProcessorOperator for CompiledRepeatProcessor {
             }
             return Ok(None);
         };
-        let output = self.expand(input, self.next_set)?;
+        let output = self.expand(&input.batch, self.next_set)?;
         self.next_set += 1;
         if self.next_set == self.grouping_values.len() {
             self.input = None;

@@ -316,7 +316,7 @@ impl OperatorFactory for CompiledUnpivotProcessorFactory {
 
 /// One input batch and its evaluated scalar constant columns.
 struct Expanding {
-    batch: RecordBatch,
+    chunk: Chunk,
     constants: Vec<ArrayRef>,
 }
 
@@ -361,11 +361,7 @@ impl UnpivotExpansion {
 
     /// Start expanding one input batch with its evaluated scalar constant
     /// columns, one per `LiteralSource::Root` index.
-    pub(crate) fn start(
-        &mut self,
-        batch: RecordBatch,
-        constants: Vec<ArrayRef>,
-    ) -> ExecutionResult<()> {
+    pub(crate) fn start(&mut self, chunk: Chunk, constants: Vec<ArrayRef>) -> ExecutionResult<()> {
         if self.input.is_some() {
             return Err("compiled Unpivot received input while expanding".into());
         }
@@ -390,7 +386,7 @@ impl UnpivotExpansion {
                 }
             }
         }
-        self.input = Some(Expanding { batch, constants });
+        self.input = Some(Expanding { chunk, constants });
         self.cursor = 0;
         Ok(())
     }
@@ -404,7 +400,7 @@ impl UnpivotExpansion {
             return Ok(None);
         };
         let total =
-            input.batch.num_rows().checked_mul(self.mappings).ok_or(
+            input.chunk.len().checked_mul(self.mappings).ok_or(
                 "ResourceExhausted: unpivot expanded row count exceeds addressable memory",
             )?;
         let (producers, output, cursor) = (&self.producers, &self.output, self.cursor);
@@ -499,7 +495,7 @@ fn build_output(
     start: usize,
     len: usize,
 ) -> Result<Chunk, String> {
-    let segments = flattened_segments(start, len, input.batch.num_rows());
+    let segments = flattened_segments(start, len, input.chunk.len());
     let schema = output.arrow_schema_ref();
     let mut columns = Vec::with_capacity(producers.len());
     for (ordinal, producer) in producers.iter().enumerate() {
@@ -509,9 +505,10 @@ fn build_output(
             let (offset, rows) = (segment.input_offset, segment.len);
             parts.push(match producer {
                 Producer::Passthrough { input: source } => {
-                    input.batch.column(*source).slice(offset, rows)
+                    input.chunk.batch.column(*source).slice(offset, rows)
                 }
                 Producer::Value { inputs } => input
+                    .chunk
                     .batch
                     .column(inputs[segment.mapping_index])
                     .slice(offset, rows),
@@ -589,7 +586,7 @@ impl ProcessorOperator for CompiledUnpivotProcessor {
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
             constants.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
         }
-        self.expansion.start(chunk.batch, constants)
+        self.expansion.start(chunk, constants)
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if !self.expansion.is_expanding() {

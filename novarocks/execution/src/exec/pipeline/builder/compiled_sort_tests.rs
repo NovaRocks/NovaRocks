@@ -325,6 +325,47 @@ fn compiled_sort_factory_refuses_a_node_that_is_not_a_sort() {
     assert!(error.contains("is not a Sort"), "{error}");
 }
 
+#[test]
+fn compiled_sort_retains_original_column_metadata_until_input_or_processor_exit() {
+    use crate::runtime::mem_tracker::MemTracker;
+    for finish in [false, true] {
+        let program = program(&[A_ASC_NULLS_LAST], Shape::Sort);
+        let tracker = MemTracker::new_root("sort-input-column-owner");
+        let chunk = super::family_fixture::paid_input(&program, &tracker);
+        let charged = tracker.current();
+        assert!(charged > 0);
+        let factory = CompiledSortProcessorFactory::try_new(
+            Arc::clone(&program),
+            ProgramNodeId::new(1),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let mut operator = factory.create(1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().unwrap();
+        processor.push_chunk(&state, chunk).unwrap();
+        assert_eq!(
+            tracker.current(),
+            charged,
+            "the input container is still live"
+        );
+        if finish {
+            processor.set_finishing(&state).unwrap();
+            assert_eq!(tracker.current(), 0, "original runs have actually exited");
+            let mut output = Vec::new();
+            while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+                output.push(chunk);
+            }
+            assert_eq!(
+                int64_rows(&output),
+                oracle(&ROWS, &[A_ASC_NULLS_LAST], None, 0)
+            );
+        }
+        drop(operator);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
 // A row-count partial TopN is the ordinary local TopN of its own instance:
 // the top `limit` rows with offset 0, emitted as one ordered stream. Its
 // pairing with a Final is a whole-plan fact (see `compiled_topn_split_tests`);

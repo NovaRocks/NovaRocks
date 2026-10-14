@@ -365,7 +365,11 @@ impl Lowering<'_> {
                 (n.node_id, P::AssertNumRows { input, mode })
             }
             ExecNodeKind::Values(n) => {
-                let values = lp::StaticValues::try_new(n.chunk.batch, output.clone())
+                let batch = n
+                    .chunk
+                    .try_into_static_batch()
+                    .map_err(LocalProgramLoweringError::new)?;
+                let values = lp::StaticValues::try_new(batch, output.clone())
                     .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
                 (n.node_id, P::Values { values })
             }

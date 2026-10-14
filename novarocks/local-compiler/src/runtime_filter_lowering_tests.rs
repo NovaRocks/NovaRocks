@@ -1646,21 +1646,39 @@ fn freeze_counts(
     }];
     let mut sites = Vec::new();
     for node in fragment.nodes().values() {
-        if let NodeKind::Aggregate { calls, .. } = &node.kind {
-            for ordinal in 0..calls.len() {
-                let k = u32::try_from(sites.len()).unwrap();
-                let context = ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(base + k),
-                    domain: EvaluationDomainId::new(k + 1),
-                    demand: EvaluationDemand::Value,
-                };
-                domains.push(ExpressionEvaluationDomain {
-                    id: context.domain,
-                    parent: None,
-                    guard: None,
-                });
-                sites.push((node.id, u32::try_from(ordinal).unwrap(), context));
-            }
+        let (calls, topn) = match &node.kind {
+            NodeKind::Aggregate { calls, .. } => (calls, false),
+            NodeKind::TopN {
+                reduction: TopNReduction::GroupedStates { calls, .. },
+                ..
+            } => (calls, true),
+            _ => continue,
+        };
+        for ordinal in 0..calls.len() {
+            let k = u32::try_from(sites.len()).unwrap();
+            let context = ExpressionEffectContext {
+                use_id: ExpressionUseId::new(base + k),
+                domain: EvaluationDomainId::new(k + 1),
+                demand: EvaluationDemand::Value,
+            };
+            domains.push(ExpressionEvaluationDomain {
+                id: context.domain,
+                parent: None,
+                guard: None,
+            });
+            let call = u32::try_from(ordinal).unwrap();
+            let site = if topn {
+                PhysicalCallSite::TopNState {
+                    node: node.id,
+                    call,
+                }
+            } else {
+                PhysicalCallSite::Aggregate {
+                    node: node.id,
+                    call,
+                }
+            };
+            sites.push((node.id, call, context, site));
         }
     }
     let flow = ExpressionControlFlow::try_new(
@@ -1674,9 +1692,14 @@ fn freeze_counts(
     let root_uses = PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut frozen = Vec::new();
-    for (node, ordinal, context) in sites {
-        let NodeKind::Aggregate { calls, .. } = &fragment.nodes()[&node].kind else {
-            unreachable!()
+    for (node, ordinal, context, site) in sites {
+        let calls = match &fragment.nodes()[&node].kind {
+            NodeKind::Aggregate { calls, .. }
+            | NodeKind::TopN {
+                reduction: TopNReduction::GroupedStates { calls, .. },
+                ..
+            } => calls,
+            _ => unreachable!(),
         };
         let call = &calls[ordinal as usize];
         let binding = &call.binding;
@@ -1711,9 +1734,15 @@ fn freeze_counts(
         } else {
             let state_use = root_uses.bindings()[&ExpressionRootSite {
                 node,
-                role: ExpressionRootRole::AggregateArgument {
-                    call: ordinal,
-                    argument: 0,
+                role: match site {
+                    PhysicalCallSite::TopNState { .. } => ExpressionRootRole::TopNStateArgument {
+                        call: ordinal,
+                        argument: 0,
+                    },
+                    _ => ExpressionRootRole::AggregateArgument {
+                        call: ordinal,
+                        argument: 0,
+                    },
                 },
             }];
             state_type = fragment
@@ -1770,10 +1799,7 @@ fn freeze_counts(
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
-            site: PhysicalCallSite::Aggregate {
-                node,
-                call: ordinal,
-            },
+            site,
             context,
             effects: token.call_contract().effects().clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
@@ -1983,3 +2009,6 @@ fn a_runtime_filter_key_root_never_reuses_a_relational_call_use() {
         "no Main occurrence takes the relational call's identity"
     );
 }
+
+#[path = "grouped_topn_lowering_tests.rs"]
+mod grouped_topn_lowering_tests;

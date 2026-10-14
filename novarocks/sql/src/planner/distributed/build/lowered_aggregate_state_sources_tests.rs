@@ -291,6 +291,64 @@ fn check_merge(
 }
 
 #[test]
+fn state_sources_grouped_topn_refuses_transported_state_without_a_rows_fallback() {
+    fn topn(child: PhysicalPlanNode, phase: SqlTopNPhase) -> PhysicalPlanNode {
+        let column = child.output_columns[0].clone();
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::TopN(crate::planner::physical::PhysicalTopNNode {
+                items: vec![SortItem {
+                    expr: reference(&column),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                limit: Some(1),
+                offset: Some(0),
+                phase,
+                is_split: phase == SqlTopNPhase::Final,
+            }),
+            output_columns: child.output_columns.clone(),
+            children: vec![child],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    // Reuse the original actual Partial -> Project -> Stream -> Final source
+    // fixture. This unsupported author shape must fail before row-quota
+    // transport can discard state contributions. The oracle is its named
+    // lowering refusal; no service, historical evidence or runtime hook is
+    // needed. SQL owns this short source-family regression on affected changes.
+    let partial = topn(single_alias(local("count", vec![])), SqlTopNPhase::Partial);
+    let plan = topn(
+        merge("count", vec![], gather(partial), false),
+        SqlTopNPhase::Final,
+    );
+    let control = Control::default();
+    let result = lower_final_physical_plan(
+        &plan,
+        version(),
+        dop(),
+        crate::functions::builtin_sql_function_catalog().snapshot(),
+        false,
+        policy(),
+        crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+        &control,
+    );
+    let Err(error) = result else {
+        panic!("transported state must not be lowered as ordinary Rows");
+    };
+    assert!(
+        matches!(
+            &error,
+            ContractLoweringError::UnsupportedTopNShape {
+                detail: "GroupedStates TopN requires a direct partial aggregate producer"
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn state_sources_count_star_stream_loans_exact_actual_partial_and_final_own_request() {
     let source = merge("count", vec![], gather(local("count", vec![])), false);
     let owner = authored(&source, &Control::default()).unwrap();

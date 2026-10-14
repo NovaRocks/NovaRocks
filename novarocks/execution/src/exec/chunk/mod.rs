@@ -19,6 +19,7 @@ mod chunk_impl;
 mod compiled_layout_metadata_request;
 mod hydrate;
 mod memory;
+mod output_metadata;
 mod root_array_storage;
 mod root_chunk_storage;
 mod root_schema_backing;
@@ -39,6 +40,7 @@ pub(crate) use memory::{
     ChunkMemoryLease, TransferredChunkBytes, record_batch_additional_bytes,
     record_batch_shared_owner_bytes,
 };
+pub(crate) use output_metadata::OutputColumnMetadata;
 pub use root_array_storage::{
     ARROW_BUFFER_OWNER_METADATA_BOUND, RootArrayStorageError, RootArrayStorageLimits,
     borrowed_root_array_storage, borrowed_root_batch_storage,

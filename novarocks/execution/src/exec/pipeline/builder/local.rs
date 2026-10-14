@@ -36,7 +36,9 @@ use crate::exec::node::analytic::{
     WindowType as RuntimeWindowType,
 };
 use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
-use crate::exec::node::change_event_expand::{ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec};
+use crate::exec::node::change_event_expand::{
+    ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
+};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::join::{
     JoinDistributionMode as RuntimeJoinDistributionMode, JoinRuntimeFilterProducerBinding,
@@ -216,6 +218,7 @@ fn validate_runtime_binding_shape(
             | lp::ProgramNodeKind::ChangeEventExpand { input, .. }
             | lp::ProgramNodeKind::Limit { input, .. }
             | lp::ProgramNodeKind::Aggregate { input, .. }
+            | lp::ProgramNodeKind::GroupedTopN { input, .. }
             | lp::ProgramNodeKind::Analytic { input, .. }
             | lp::ProgramNodeKind::RuntimeFilterConsumer { input, .. }
             | lp::ProgramNodeKind::TableWriter { input, .. }
@@ -1050,6 +1053,9 @@ fn build_pipeline_for_program_node(
                 extra_pipelines,
                 stream: StreamDesc::any(dop),
             })
+        }
+        lp::ProgramNodeKind::GroupedTopN { .. } => {
+            Err("grouped-state TopN requires its compiled owner".to_string())
         }
         lp::ProgramNodeKind::Aggregate {
             input,
