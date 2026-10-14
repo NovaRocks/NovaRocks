@@ -151,6 +151,12 @@ fn rewrite_topn_preagg(
     if !global.is_split || !local.is_split {
         return Ok(Vec::new());
     }
+    // Zero-call grouping is deduplication even without a DISTINCT call.
+    // Local dedup does not promise task-wide unique rows, so its row budget
+    // must remain above the complete grouping.
+    if global.aggregates.is_empty() || local.aggregates.is_empty() {
+        return Ok(Vec::new());
+    }
     if global.aggregates.iter().any(|agg| agg.distinct)
         || local.aggregates.iter().any(|agg| agg.distinct)
     {
@@ -583,6 +589,26 @@ mod tests {
         let items = vec![sort_key(&mut arena, 101), sort_key(&mut arena, 102)];
 
         assert!(order_by_covers_group_by(&items, &global, &arena));
+    }
+
+    #[test]
+    fn group_only_distinct_keeps_rows_budget_above_complete_grouping() {
+        // This is a lawful group-only layout, not a damaged aggregate shape.
+        // SQL completion separately checks the ordinary split over Complete.
+        let mut fixture = preagg_memo();
+        for group in [fixture.local_group, fixture.global_group] {
+            let Operator::LogicalAggregate(aggregate) =
+                &mut fixture.memo.groups[group].logical_exprs[0].op
+            else {
+                panic!("expected aggregate");
+            };
+            aggregate.aggregates.clear();
+            aggregate.is_merge.clear();
+            aggregate.output_columns.truncate(aggregate.group_by.len());
+            aggregate.output_layout =
+                AggregateOutputLayout::new(aggregate.output_columns.clone(), Vec::new());
+        }
+        assert_does_not_fire(&mut fixture);
     }
 
     #[test]

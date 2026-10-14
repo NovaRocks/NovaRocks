@@ -2857,6 +2857,186 @@ mod tests {
             .expect("completed plan")
     }
 
+    // SQL owner regression for a real DISTINCT/Rows TopN compilation refusal.
+    // The oracle is the existing complete-group/sequence contract, rather than
+    // an optimizer node count. Inputs are the original nullable Int8/Int16
+    // columns and DOP 2; row count 30_004 follows the original fixture inserts,
+    // while uncollected column metrics remain explicitly Missing. Provider
+    // properties are unconstrained. This pure component owns no external
+    // resources, needs no cleanup, and runs in the short SQL owner test lane
+    // whenever DISTINCT/TopN planning changes. The offset query below is a
+    // derived two-column boundary, not the original ten-column query 114.
+    fn distinct_rows_topn_sequence_fixture(
+        sql: &str,
+        mode: super::super::SqlPhysicalEmissionMode,
+    ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
+        let columns = vec![
+            novarocks_types::schema::ColumnDef {
+                name: "c1".into(),
+                data_type: DataType::Int8,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+            novarocks_types::schema::ColumnDef {
+                name: "c2".into(),
+                data_type: DataType::Int16,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+        ];
+        let mut input = request(sql, SqlCompileIntent::Query);
+        input.emission_mode = mode;
+        input.dop_domain = PipelineDopDomain {
+            min: 2,
+            max: 2,
+            requires_power_of_two: true,
+        };
+        let control = SqlCompileControl::unbounded();
+        let catalog = incomplete(SqlCompiler::start(
+            input.try_into_completion().unwrap(),
+            &control,
+        )?);
+        let SqlNeedBatch::CatalogRelations(needs) = catalog.needs() else {
+            panic!("expected catalog needs");
+        };
+        let facts = needs
+            .iter()
+            .map(|need| {
+                let relation = need.relation();
+                assert_eq!(relation.table, "all_numbers_t0");
+                let mut table = resolved_table(need).planner;
+                table.columns = columns.clone();
+                CatalogRelationFact::resolved(
+                    need,
+                    ResolvedAnalyzerTable::from_planner(
+                        Some(&relation.catalog),
+                        &relation.namespace,
+                        table,
+                    ),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let statistics = incomplete(SqlCompiler::finish(
+            catalog,
+            SqlFactBatch::CatalogRelations(facts.into_boxed_slice()),
+            &control,
+        )?);
+        let mut frozen = available_statistics_evidence(30_004);
+        let DmlStatisticsEvidence::Available {
+            label,
+            columns: statistics_columns,
+            ..
+        } = &mut frozen
+        else {
+            unreachable!();
+        };
+        *label = "iceberg.db.all_numbers_t0".into();
+        *statistics_columns = columns;
+        let provider = incomplete(answer_frozen_statistics(statistics, frozen));
+        let SqlNeedBatch::ProviderReads(needs) = provider.needs() else {
+            panic!("expected provider needs");
+        };
+        let facts = needs
+            .iter()
+            .map(|need| ProviderReadFact::negotiated(need, provider_contract(need)).unwrap())
+            .collect::<Vec<_>>();
+        SqlCompiler::finish(
+            provider,
+            SqlFactBatch::ProviderReads(facts.into_boxed_slice()),
+            &control,
+        )
+    }
+
+    fn assert_distinct_rows_topn_sequence(mode: super::super::SqlPhysicalEmissionMode) {
+        let mut failures = Vec::new();
+        for sql in [
+            "select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 1;",
+            "select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 30,1;",
+        ] {
+            match distinct_rows_topn_sequence_fixture(sql, mode) {
+                Ok(SqlCompileProgress::Complete(completed)) => {
+                    let plan = completed.plan();
+                    let result = plan.result_port().expect("result port");
+                    let fields = result
+                        .fields
+                        .iter()
+                        .map(|field| (field.name.as_ref(), field.ty.clone()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        fields,
+                        vec![
+                            ("c2", ValueType::new(DataType::Int16, true)),
+                            ("c1", ValueType::new(DataType::Int8, true)),
+                        ],
+                    );
+                    assert!(plan.fragments().values().all(|fragment| {
+                        fragment.dop_domain().min == 2 && fragment.dop_domain().max == 2
+                    }));
+                    let fragment = &plan.fragments()[&result.fragment];
+                    let root = &fragment.nodes()[&fragment.root()];
+                    if sql.ends_with("limit 1;") {
+                        // Completed publication already proves the exact
+                        // reduction path; retain ordinary parallel Rows split.
+                        assert!(matches!(
+                            root.kind,
+                            NodeKind::TopN {
+                                phase: novarocks_physical_plan::TopNPhase::Final { .. },
+                                reduction: novarocks_physical_plan::TopNReduction::Rows,
+                                limit: 1,
+                                offset: 0,
+                                ..
+                            }
+                        ));
+                        assert!(plan.fragments().values().any(|fragment| {
+                            fragment.nodes().values().any(|node| {
+                                matches!(
+                                    node.kind,
+                                    NodeKind::TopN {
+                                        phase: novarocks_physical_plan::TopNPhase::Partial { .. },
+                                        reduction: novarocks_physical_plan::TopNReduction::Rows,
+                                        ..
+                                    }
+                                )
+                            })
+                        }));
+                    } else {
+                        assert!(matches!(
+                            root.kind,
+                            NodeKind::TopN {
+                                phase: novarocks_physical_plan::TopNPhase::Single,
+                                limit: 1,
+                                offset: 30,
+                                ..
+                            }
+                        ));
+                    }
+                }
+                Ok(SqlCompileProgress::Incomplete(_)) => {
+                    failures.push(format!("unexpected incomplete plan for {sql}"));
+                }
+                Err(error) => {
+                    failures.push(error.to_string());
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{mode:?}: {failures:?}");
+    }
+
+    #[test]
+    fn distinct_rows_topn_sequence_original() {
+        assert_distinct_rows_topn_sequence(super::super::SqlPhysicalEmissionMode::OriginalNativeV1);
+    }
+
+    #[test]
+    fn distinct_rows_topn_sequence_candidate() {
+        assert_distinct_rows_topn_sequence(
+            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+        );
+    }
+
     pub(super) fn frozen_table_statistics(
         plan: &novarocks_physical_plan::PhysicalPlan,
     ) -> Vec<&str> {
