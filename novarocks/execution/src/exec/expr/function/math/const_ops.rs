@@ -27,26 +27,26 @@ use novarocks_functions::builtin::numeric_elementary::{
 #[cfg(test)]
 use std::sync::Arc;
 
-pub fn eval_e(
-    arena: &ExprArena,
+pub fn eval_e<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let out = evaluate_legacy_numeric_elementary(NumericElementaryOp::E, &[], chunk.len())
         .map_err(|error| error.to_string())?;
-    cast_output(out, arena.data_type(expr))
+    Ok((cast_output(out, arena.data_type(expr)))?)
 }
 
-pub fn eval_pi(
-    arena: &ExprArena,
+pub fn eval_pi<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let out = evaluate_legacy_numeric_elementary(NumericElementaryOp::Pi, &[], chunk.len())
         .map_err(|error| error.to_string())?;
-    cast_output(out, arena.data_type(expr))
+    Ok((cast_output(out, arena.data_type(expr)))?)
 }
 
 #[cfg(test)]

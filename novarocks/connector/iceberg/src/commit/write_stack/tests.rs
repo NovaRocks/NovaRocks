@@ -4389,7 +4389,7 @@ fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
         let error = lake.control.begin_write(request).unwrap_err();
         assert_eq!(
             error.kind(),
-            if case >= 6 {
+            if case == 0 || case >= 6 {
                 ConnectorErrorKind::InvalidRequest
             } else {
                 ConnectorErrorKind::Internal
@@ -4588,7 +4588,7 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
         let error = lake.control.begin_write(request).unwrap_err();
         assert_eq!(
             error.kind(),
-            if matches!(case, 8 | 10) {
+            if case == 8 {
                 ConnectorErrorKind::Internal
             } else {
                 ConnectorErrorKind::InvalidRequest
@@ -4725,7 +4725,7 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
         ConnectorRewriteCohortRead::DeleteArtifactGroup(g) => g,
         _ => unreachable!(),
     };
-    for case in 0..8 {
+    for case in 0..9 {
         let mut owner = lake.control.binding_key().clone();
         let mut private = content.as_ref().clone();
         let mut op = group.operation_id();
@@ -4740,6 +4740,7 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
             5 => private.artifact.table_uuid = "different".to_string(),
             6 => private.artifact.schema_id += 1,
             7 => private.artifact.base_snapshot_id = None,
+            8 => owner.incarnation = ProviderBindingEpoch::new(),
             _ => unreachable!(),
         }
         let payload = if case == 1 {
@@ -4759,13 +4760,19 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
             .unwrap_err();
         assert_eq!(
             error.kind(),
-            if case < 5 {
+            if (1..5).contains(&case) {
                 ConnectorErrorKind::Internal
             } else {
                 ConnectorErrorKind::InvalidRequest
             },
             "case {case}: {error}"
         );
+        if case == 8 {
+            assert_eq!(
+                error.message(),
+                "process-local payload belongs to another connector generation"
+            );
+        }
         assert_eq!(lake.inventory(), before);
     }
     drop(plan);
@@ -5312,3 +5319,5 @@ fn logical_row_merge_facts_must_match_the_one_sealed_reference_owner() {
             .contains("one managed publication owner")
     );
 }
+#[path = "tests/baseline_contract_tests.rs"]
+mod baseline_contract_tests;

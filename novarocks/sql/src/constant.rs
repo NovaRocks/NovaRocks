@@ -357,13 +357,80 @@ pub(crate) fn test_constant_policy() -> ConstantPolicy {
 #[path = "constant_tests.rs"]
 mod constant_tests;
 
-/// Diagnostic output borrows the checked selected value; it is not a syntax
-/// author, semantic key, or representation for re-entering expression binding.
+fn is_physical_binary(value: &ConstantValue) -> bool {
+    let ty = value.value_type();
+    ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+        && matches!(
+            ty.data_type(),
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        )
+}
+
+// SQL display follows the existing binary literal spelling. This reads only
+// the checked ordinal and does not alter the shared diagnostic formatter.
+fn write_binary_display(
+    selected: Option<&[u8]>,
+    work: &mut CompileCheckpoints<'_>,
+    output: &mut dyn std::fmt::Write,
+) -> Result<std::fmt::Result, crate::compiler::SqlCompileError> {
+    let Some(bytes) = selected else {
+        work.flush()?;
+        let result = output.write_str("NULL");
+        for _ in 0..4 {
+            work.step()?;
+        }
+        return Ok(result);
+    };
+    work.flush()?;
+    if output.write_str("X'").is_err() {
+        return Ok(Err(std::fmt::Error));
+    }
+    work.step()?;
+    work.step()?;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in bytes {
+        let pair = [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]];
+        if output
+            .write_str(std::str::from_utf8(&pair).expect("hex pair is ASCII"))
+            .is_err()
+        {
+            return Ok(Err(std::fmt::Error));
+        }
+        work.step()?;
+        work.step()?;
+    }
+    work.flush()?;
+    let result = output.write_str("'");
+    work.step()?;
+    Ok(result)
+}
+
+/// SQL display borrows the checked selected value; it is not a semantic key
+/// or a representation for re-entering expression binding.
 pub(crate) fn format_constant_observed(
     value: &ConstantValue,
     control: &dyn PureCompileControl,
 ) -> Result<String, crate::compiler::SqlCompileError> {
     use crate::compiler::SqlCompileError;
+    if is_physical_binary(value) {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let selected = value.try_binary()?;
+        let capacity = match selected {
+            Some(bytes) => bytes
+                .len()
+                .checked_mul(2)
+                .and_then(|len| len.checked_add(3)),
+            None => Some(4),
+        }
+        .ok_or(SqlCompileError::ResourceExhausted)?;
+        let mut text = String::new();
+        text.try_reserve_exact(capacity)
+            .map_err(|_| SqlCompileError::ResourceExhausted)?;
+        write_binary_display(selected, &mut work, &mut text)?
+            .map_err(|_| SqlCompileError::ResourceExhausted)?;
+        work.finish()?;
+        return Ok(text);
+    }
     let text = value
         .format_diagnostic_observed(CompilePhase::LowerProgram, control)
         .map_err(SqlCompileError::from)?;
@@ -417,6 +484,12 @@ pub(crate) fn write_constant_observed(
     control: &dyn PureCompileControl,
     output: &mut dyn std::fmt::Write,
 ) -> Result<std::fmt::Result, crate::compiler::SqlCompileError> {
+    if is_physical_binary(value) {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let result = write_binary_display(value.try_binary()?, &mut work, output)?;
+        work.finish()?;
+        return Ok(result);
+    }
     let ty = value.value_type();
     let quoted = ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
         && matches!(

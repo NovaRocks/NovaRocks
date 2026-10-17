@@ -25,17 +25,14 @@ use novarocks_types::SlotId;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub fn eval_array_map(
-    arena: &ExprArena,
+pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     id: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() < 2 {
-        return Err(format!(
-            "array_map expects at least 2 arguments, got {}",
-            args.len()
-        ));
+        return Err((format!("array_map expects at least 2 arguments, got {}", args.len())).into());
     }
 
     let (lambda_id, array_args) = match arena.node(args[0]) {
@@ -46,7 +43,9 @@ pub fn eval_array_map(
             }
             _ => {
                 return Err(
-                    "array_map expects a lambda function as the first or last argument".to_string(),
+                    ("array_map expects a lambda function as the first or last argument"
+                        .to_string())
+                    .into(),
                 );
             }
         },
@@ -62,10 +61,7 @@ pub fn eval_array_map(
             (field, item_type)
         }
         other => {
-            return Err(format!(
-                "array_map output type must be List, got {:?}",
-                other
-            ));
+            return Err((format!("array_map output type must be List, got {:?}", other)).into());
         }
     };
 
@@ -76,11 +72,11 @@ pub fn eval_array_map(
             common_sub_exprs,
             ..
         }) => (*body, arg_slots.clone(), common_sub_exprs.clone()),
-        _ => return Err("array_map expects lambda function expression".to_string()),
+        _ => return Err(("array_map expects lambda function expression".to_string()).into()),
     };
 
     if lambda_args.len() != array_args.len() {
-        return Err("Lambda arguments should equal to lambda input arrays.".to_string());
+        return Err(("Lambda arguments should equal to lambda input arrays.".to_string()).into());
     }
 
     let num_rows = chunk.len();
@@ -88,11 +84,12 @@ pub fn eval_array_map(
     for expr_id in array_args {
         let array = arena.eval(*expr_id, chunk)?;
         if array.len() != num_rows {
-            return Err(format!(
+            return Err((format!(
                 "array_map input length mismatch: expected {}, got {}",
                 num_rows,
                 array.len()
-            ));
+            ))
+            .into());
         }
         input_arrays.push(array);
     }
@@ -132,14 +129,14 @@ pub fn eval_array_map(
             let start = offsets[row] as i64;
             let end = offsets[row + 1] as i64;
             if end < start {
-                return Err("array_map list offsets are invalid".to_string());
+                return Err(("array_map list offsets are invalid".to_string()).into());
             }
             let len = (end - start) as usize;
             if let Some(prev) = len_opt {
                 if prev != len {
-                    return Err(
-                        "Input array element's size is not equal in array_map().".to_string()
-                    );
+                    return Err(("Input array element's size is not equal in array_map()."
+                        .to_string())
+                    .into());
                 }
             } else {
                 len_opt = Some(len);
@@ -166,7 +163,7 @@ pub fn eval_array_map(
         if row_valid[row] {
             current += row_lengths[row] as i64;
             if current > i32::MAX as i64 {
-                return Err("array_map offset overflow".to_string());
+                return Err(("array_map offset overflow".to_string()).into());
             }
         }
         offsets.push(current as i32);
@@ -238,7 +235,7 @@ pub fn eval_array_map(
         };
         let flat = flatten_list_values(list, &row_valid)?;
         if flat.len() != total_elements {
-            return Err("array_map flattened argument length mismatch".to_string());
+            return Err(("array_map flattened argument length mismatch".to_string()).into());
         }
         flat_args.push(flat);
     }
@@ -255,7 +252,7 @@ pub fn eval_array_map(
 
     for (idx, slot_id) in lambda_args.iter().enumerate() {
         if !seen.insert(*slot_id) {
-            return Err(format!("duplicate lambda argument slot id: {}", slot_id));
+            return Err((format!("duplicate lambda argument slot id: {}", slot_id)).into());
         }
         let col = flat_args[idx].clone();
         fields.push(Field::new(
@@ -269,7 +266,7 @@ pub fn eval_array_map(
 
     for (slot_id, col) in captured_columns {
         if !seen.insert(slot_id) {
-            return Err(format!("lambda captured slot id conflicts: {}", slot_id));
+            return Err((format!("lambda captured slot id conflicts: {}", slot_id)).into());
         }
         fields.push(Field::new(
             format!("lambda_capture_{slot_id}"),
@@ -284,10 +281,7 @@ pub fn eval_array_map(
 
     for (idx, (slot_id, expr_id)) in common_sub_exprs.iter().enumerate() {
         if !seen.insert(*slot_id) {
-            return Err(format!(
-                "lambda common sub expr slot id conflicts: {}",
-                slot_id
-            ));
+            return Err((format!("lambda common sub expr slot id conflicts: {}", slot_id)).into());
         }
         let col = if let Some(source_col) = &source_row_common_sub_exprs[idx] {
             replicate_array_by_row_lengths(source_col, &row_lengths, total_elements)?
@@ -319,11 +313,12 @@ pub fn eval_array_map(
             }
         };
         if col.len() != total_elements {
-            return Err(format!(
+            return Err((format!(
                 "lambda common sub expr length mismatch: expected {}, got {}",
                 total_elements,
                 col.len()
-            ));
+            ))
+            .into());
         }
         fields.push(Field::new(
             format!("lambda_common_{idx}"),
@@ -337,18 +332,20 @@ pub fn eval_array_map(
 
     let result = arena.eval(lambda_body, &lambda_chunk)?;
     if result.len() != total_elements {
-        return Err(format!(
+        return Err((format!(
             "lambda body length mismatch: expected {}, got {}",
             total_elements,
             result.len()
-        ));
+        ))
+        .into());
     }
     if result.data_type() != &item_type {
-        return Err(format!(
+        return Err((format!(
             "array_map result type mismatch: expected {:?}, got {:?}",
             item_type,
             result.data_type()
-        ));
+        ))
+        .into());
     }
 
     let list = ListArray::new(
@@ -388,8 +385,8 @@ fn flatten_list_values(list: &ListArray, row_valid: &[bool]) -> Result<ArrayRef,
     concat(&refs).map_err(|e| e.to_string())
 }
 
-fn collect_captured_slots(
-    arena: &ExprArena,
+fn collect_captured_slots<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     lambda_body: ExprId,
     common_sub_exprs: &[(SlotId, ExprId)],
     lambda_args: &[SlotId],
@@ -414,8 +411,8 @@ fn collect_captured_slots(
     captured
 }
 
-fn collect_slot_ids(
-    arena: &ExprArena,
+fn collect_slot_ids<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr_id: ExprId,
     bound: &HashSet<SlotId>,
     out: &mut HashSet<SlotId>,
@@ -512,13 +509,15 @@ enum CommonSubExprEval {
     FlatRows(ArrayRef),
 }
 
-fn try_eval_expr_on_source_rows(
-    arena: &ExprArena,
+fn try_eval_expr_on_source_rows<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr_id: ExprId,
     source_chunk: &Chunk,
-) -> Result<Option<ArrayRef>, String> {
-    let Ok(source_result) = arena.eval(expr_id, source_chunk) else {
-        return Ok(None);
+) -> Result<Option<ArrayRef>, __Eval::Error> {
+    let source_result = match arena.eval(expr_id, source_chunk) {
+        Ok(value) => value,
+        Err(error) if arena.recoverable_error(&error) => return Ok(None),
+        Err(error) => return Err(error),
     };
 
     let source_result = match source_result.len() {
@@ -530,24 +529,30 @@ fn try_eval_expr_on_source_rows(
     Ok(Some(source_result))
 }
 
-fn eval_common_sub_expr_on_source_rows(
-    arena: &ExprArena,
+fn eval_common_sub_expr_on_source_rows<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr_id: ExprId,
     source_chunk: &Chunk,
     lambda_chunk: &Chunk,
     row_lengths: &[usize],
     total_elements: usize,
-) -> Result<CommonSubExprEval, String> {
-    if let Ok(source_col) = arena.eval(expr_id, source_chunk) {
+) -> Result<CommonSubExprEval, __Eval::Error> {
+    let source_attempt = match arena.eval(expr_id, source_chunk) {
+        Ok(value) => Some(value),
+        Err(error) if arena.recoverable_error(&error) => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(source_col) = source_attempt {
         let source_col = match source_col.len() {
             len if len == source_chunk.len() => source_col,
             1 => broadcast_array(&source_col, source_chunk.len())?,
             other => {
-                return Err(format!(
+                return Err((format!(
                     "lambda common sub expr source length mismatch: expected {} or 1, got {}",
                     source_chunk.len(),
                     other
-                ));
+                ))
+                .into());
             }
         };
         let flat_col = replicate_array_by_row_lengths(&source_col, row_lengths, total_elements)?;

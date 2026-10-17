@@ -31,34 +31,32 @@ pub fn avg_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
     super::sum::sum_state_union(a, b)
 }
 
-pub fn eval_avg_state_union(
-    arena: &ExprArena,
+pub fn eval_avg_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!(
-            "avg_state_union expects 2 arguments, got {}",
-            args.len()
-        ));
+        return Err((format!("avg_state_union expects 2 arguments, got {}", args.len())).into());
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    eval_avg_state_union_arrays(&lhs, &rhs)
+    Ok((eval_avg_state_union_arrays(&lhs, &rhs))?)
 }
 
-pub fn eval_avg_state_visible(
-    arena: &ExprArena,
+pub fn eval_avg_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if !(2..=4).contains(&args.len()) {
-        return Err(format!(
+        return Err((format!(
             "avg_state_visible expects 2 to 4 arguments, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
     let sum_state = arena.eval(args[0], chunk)?;
     let count_state = arena.eval(args[1], chunk)?;
@@ -73,7 +71,12 @@ pub fn eval_avg_state_visible(
         .cloned()
         .or_else(|| arena.data_type(expr).cloned())
         .unwrap_or(DataType::Float64);
-    eval_avg_state_visible_array(&sum_state, &count_state, input_scale.as_ref(), &output_type)
+    Ok((eval_avg_state_visible_array(
+        &sum_state,
+        &count_state,
+        input_scale.as_ref(),
+        &output_type,
+    ))?)
 }
 
 pub fn eval_avg_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {

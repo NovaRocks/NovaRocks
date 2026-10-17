@@ -23,14 +23,14 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_map_concat(
-    arena: &ExprArena,
+pub fn eval_map_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.is_empty() {
-        return Err("map_concat expects at least one argument".to_string());
+        return Err(("map_concat expects at least one argument".to_string()).into());
     }
 
     let mut map_arrays = Vec::<ArrayRef>::with_capacity(args.len());
@@ -56,10 +56,10 @@ pub fn eval_map_concat(
         "map_concat",
     )?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err("map_concat map entries type must be Struct".to_string());
+        return Err(("map_concat map entries type must be Struct".to_string()).into());
     };
     if fields.len() != 2 {
-        return Err("map_concat map entries type must have 2 fields".to_string());
+        return Err(("map_concat map entries type must have 2 fields".to_string()).into());
     }
 
     for arr in &map_arrays {
@@ -151,7 +151,7 @@ pub fn eval_map_concat(
             current += 1;
         }
         if current > i32::MAX as i64 {
-            return Err("map_concat offset overflow".to_string());
+            return Err(("map_concat offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

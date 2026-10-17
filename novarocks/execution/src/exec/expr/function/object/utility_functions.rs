@@ -24,15 +24,13 @@ use arrow::array::{
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
-pub fn eval_sleep(
-    arena: &ExprArena,
+pub fn eval_sleep<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    arena
-        .runtime_error_binding()
-        .map_err(|_| "SLEEP requires an exact fragment runtime binding".to_string())?;
+) -> Result<ArrayRef, __Eval::Error> {
+    arena.require_runtime_binding()?;
     arena.check_runtime_error()?;
     let input = arena.eval(args[0], chunk)?;
     let mut builder = BooleanBuilder::with_capacity(input.len());
@@ -66,10 +64,7 @@ pub fn eval_sleep(
         eval_sleep_array!(arr, "Int64");
     }
 
-    Err(format!(
-        "sleep expects integer input, got {:?}",
-        input.data_type()
-    ))
+    Err((format!("sleep expects integer input, got {:?}", input.data_type())).into())
 }
 
 #[cfg(test)]

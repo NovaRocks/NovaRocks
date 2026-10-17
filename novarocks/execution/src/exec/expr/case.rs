@@ -23,20 +23,20 @@ use arrow::compute::kernels::zip::zip;
 use arrow::datatypes::DataType;
 
 // CASE expression for Arrow arrays
-pub fn eval_case(
-    arena: &ExprArena,
+pub fn eval_case<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     has_case_expr: bool,
     has_else_expr: bool,
     children: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let len = chunk.len();
     let mut idx = 0usize;
 
     // If has_case_expr, first child is the case expression to compare
     let case_expr = if has_case_expr {
         if children.is_empty() {
-            return Err("CASE_EXPR: missing case expression".to_string());
+            return Err(("CASE_EXPR: missing case expression".to_string()).into());
         }
         let expr = children[idx];
         idx += 1;
@@ -121,13 +121,13 @@ pub fn eval_case(
     Ok(result)
 }
 
-fn resolve_case_result_type(
-    arena: &ExprArena,
+fn resolve_case_result_type<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     children: &[ExprId],
     start: usize,
     has_else_expr: bool,
     chunk: &Chunk,
-) -> Result<DataType, String> {
+) -> Result<DataType, __Eval::Error> {
     let end = if has_else_expr && !children.is_empty() {
         children.len() - 1
     } else {

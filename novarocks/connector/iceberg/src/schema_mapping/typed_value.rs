@@ -53,8 +53,51 @@ pub(crate) fn from_declaration(
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<DeclaredValue, Failure> {
-    let (source_layout, layout, semantic) =
-        author(declaration, nullable, nominal, integer, 1, &mut 0, creation)?;
+    from_declaration_with_nominals(
+        declaration,
+        nullable,
+        nominal,
+        integer,
+        &Default::default(),
+        creation,
+    )
+}
+
+pub(crate) fn from_field(
+    field: &crate::iceberg::spec::NestedField,
+    nullable: bool,
+    nominals: &super::nominal_declaration::NominalSourceDeclarations,
+    integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<DeclaredValue, Failure> {
+    from_declaration_with_nominals(
+        &field.field_type,
+        nullable,
+        nominals.get(&field.id).map(|domain| domain.logical_type()),
+        integer,
+        nominals,
+        creation,
+    )
+}
+
+fn from_declaration_with_nominals(
+    declaration: &Type,
+    nullable: bool,
+    nominal: Option<ValueLogicalType>,
+    integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    nominals: &super::nominal_declaration::NominalSourceDeclarations,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<DeclaredValue, Failure> {
+    let (source_layout, layout, semantic) = author(
+        declaration,
+        nullable,
+        nominal,
+        integer,
+        nominals,
+        1,
+        &mut 0,
+        creation,
+    )?;
     creation.request(ValueLayout::storage_allocation_layout().map_err(|_| resource())?)?;
     let storage = creation.storage();
     let layout = ValueLayout::try_from_normalized_arrow_observed(layout, storage, |units| {
@@ -76,6 +119,7 @@ fn author(
     nullable: bool,
     nominal: Option<ValueLogicalType>,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    nominals: &super::nominal_declaration::NominalSourceDeclarations,
     depth: usize,
     nodes: &mut usize,
     creation: &mut ConnectorReadSchemaCreation<'_>,
@@ -137,8 +181,9 @@ fn author(
                 let (source_type, layout_type, child) = author(
                     &field.field_type,
                     !field.required,
+                    nominals.get(&field.id).map(|domain| domain.logical_type()),
                     None,
-                    None,
+                    nominals,
                     depth + 1,
                     nodes,
                     creation,
@@ -171,8 +216,9 @@ fn author(
             let (source_type, layout_type, child) = author(
                 &item.field_type,
                 !item.required,
+                nominals.get(&item.id).map(|domain| domain.logical_type()),
                 None,
-                None,
+                nominals,
                 depth + 1,
                 nodes,
                 creation,
@@ -198,8 +244,11 @@ fn author(
             let (key_source, key_layout, key) = author(
                 &map.key_field.field_type,
                 !map.key_field.required,
+                nominals
+                    .get(&map.key_field.id)
+                    .map(|domain| domain.logical_type()),
                 None,
-                None,
+                nominals,
                 depth + 2,
                 nodes,
                 creation,
@@ -207,8 +256,11 @@ fn author(
             let (value_source, value_layout, value) = author(
                 &map.value_field.field_type,
                 !map.value_field.required,
+                nominals
+                    .get(&map.value_field.id)
+                    .map(|domain| domain.logical_type()),
                 None,
-                None,
+                nominals,
                 depth + 2,
                 nodes,
                 creation,

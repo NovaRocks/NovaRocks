@@ -27,13 +27,15 @@ use novarocks_functions::builtin::value_conversion::{
     is_default_json_text_keep, is_default_percentile_binary_keep, share_same_structure_keep,
 };
 
-pub(in crate::exec::expr) fn eval_percentile_to_binary(
-    arena: &ExprArena,
+pub(in crate::exec::expr) fn eval_percentile_to_binary<
+    __Eval: crate::exec::expr::ExprEvaluation + ?Sized,
+>(
+    arena: &__Eval,
     expression: ExprId,
     arguments: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_same_structure_keep(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_same_structure_keep(
         arena,
         expression,
         arguments,
@@ -47,16 +49,18 @@ pub(in crate::exec::expr) fn eval_percentile_to_binary(
             "opaque Binary conversion input differs from its complete declared carrier",
             "opaque Binary conversion received NULL in a required source",
         ],
-    )
+    ))?)
 }
 
-pub(in crate::exec::expr) fn eval_json_to_text(
-    arena: &ExprArena,
+pub(in crate::exec::expr) fn eval_json_to_text<
+    __Eval: crate::exec::expr::ExprEvaluation + ?Sized,
+>(
+    arena: &__Eval,
     expression: ExprId,
     arguments: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_same_structure_keep(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_same_structure_keep(
         arena,
         expression,
         arguments,
@@ -70,11 +74,11 @@ pub(in crate::exec::expr) fn eval_json_to_text(
             "JSON text conversion input differs from its complete declared carrier",
             "JSON text conversion received NULL in a required source",
         ],
-    )
+    ))?)
 }
 
-fn eval_same_structure_keep(
-    arena: &ExprArena,
+fn eval_same_structure_keep<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expression: ExprId,
     arguments: &[ExprId],
     chunk: &Chunk,
@@ -83,7 +87,7 @@ fn eval_same_structure_keep(
         &novarocks_type_contract::FunctionValueType,
     ) -> bool,
     errors: [&'static str; 6],
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let [child] = arguments else {
         return Err(errors[0].into());
     };

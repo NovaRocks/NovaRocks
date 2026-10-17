@@ -24,12 +24,12 @@ use novarocks_functions::builtin::string_concat_core::{
 };
 use std::convert::Infallible;
 
-pub fn eval_concat(
-    arena: &ExprArena,
+pub fn eval_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let mut arrays = Vec::with_capacity(args.len());
     for arg in args {

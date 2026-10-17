@@ -53,6 +53,10 @@ mod row_conversion;
 pub use row_conversion::{RowConversionStructureFailure, preflight_row_converter_structure};
 pub use zip::preflight_zip;
 
+#[path = "selected_copy/guarded_nested.rs"]
+mod guarded_nested;
+pub use guarded_nested::{guarded_result_extent, supports_guarded_result};
+
 #[path = "selected_copy/root_scratch_host.rs"]
 mod root_scratch_host;
 pub use root_scratch_host::{
@@ -1491,6 +1495,23 @@ pub fn preflight_take_construction<H>(
     )
 }
 
+/// Observe the original unified copy author with the caller's exact error
+/// vocabulary. The source inspection, scratch invoice and one peak observation
+/// remain the same as `preflight_take_construction`.
+pub fn preflight_take_construction_unified_observed<H>(
+    array: &dyn Array,
+    indices: CopyIndexView<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    observe: &mut impl FnMut(bool) -> Result<(), H>,
+) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
+    take_construction_core(
+        array,
+        indices,
+        &mut TakeConstructionPorts::Unified(creation),
+        &mut |boundary| observe(boundary).map_err(CopyConstructionError::Creator),
+    )
+}
+
 /// SAME full copy invoice with explicit temporary/result classification.
 /// The caller keeps temporary responsibility through the real Arrow operation;
 /// result payload/headers retain only the independent result owner. Original
@@ -2127,14 +2148,17 @@ fn validate_interleave_plan<E: From<CopyError>>(
     Ok(())
 }
 
-/// Exact multi-source byte plan. Views and encoded/nested carriers retain
-/// their explicit separate admission boundary; this does not mint a grant.
+/// Exact multi-source flat or closed List/Struct plan. Views, encoded and
+/// other nested carriers retain their separate boundary; this mints no grant.
 pub fn preflight_guarded_interleave(
     ty: &DataType,
     sources: &[ArrayRef],
     choices: &[(usize, usize)],
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
+    if matches!(ty, DataType::List(_) | DataType::Struct(_)) {
+        return guarded_nested::preflight_nested_interleave(ty, sources, choices, observe);
+    }
     if !matches!(
         ty,
         DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary

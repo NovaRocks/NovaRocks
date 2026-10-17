@@ -82,14 +82,14 @@ fn cast_float_to_utf8(value_arr: &ArrayRef) -> Result<ArrayRef, String> {
     Ok(Arc::new(out.finish()) as ArrayRef)
 }
 
-pub fn eval_arrays_zip(
-    arena: &ExprArena,
+pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.is_empty() {
-        return Err("arrays_zip expects at least one argument".to_string());
+        return Err(("arrays_zip expects at least one argument".to_string()).into());
     }
 
     let mut list_arrays: Vec<Option<ArrayRef>> = Vec::with_capacity(args.len());
@@ -111,11 +111,12 @@ pub fn eval_arrays_zip(
 
     let (list_field, struct_fields) = resolve_output_type(arena.data_type(expr), &value_arrays)?;
     if struct_fields.len() != value_arrays.len() {
-        return Err(format!(
+        return Err((format!(
             "arrays_zip output struct field count mismatch: expected {}, got {}",
             value_arrays.len(),
             struct_fields.len()
-        ));
+        ))
+        .into());
     }
 
     for (idx, value_arr) in value_arrays.iter_mut().enumerate() {
@@ -202,7 +203,7 @@ pub fn eval_arrays_zip(
             }
             current += 1;
             if current > i32::MAX as i64 {
-                return Err("arrays_zip offset overflow".to_string());
+                return Err(("arrays_zip offset overflow".to_string()).into());
             }
         }
 

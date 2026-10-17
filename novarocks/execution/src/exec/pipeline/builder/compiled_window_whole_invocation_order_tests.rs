@@ -76,7 +76,8 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
             ]
         })
         .collect::<Vec<_>>();
-    let actual = novarocks_functions::builtin::catalogue::by_window_private_test_catalog();
+    let actual =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let catalogue =
         crate::exec::pipeline::builder::compiled::window_fixture::window_catalog_from_actual(
             &[

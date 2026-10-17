@@ -27,11 +27,11 @@ use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 const DEFAULT_FALSE_MESSAGE: &str = "assert_true failed due to false value";
 const NULL_MESSAGE: &str = "assert_true failed due to null value";
 
-pub fn eval_assert_true(
-    arena: &ExprArena,
+pub fn eval_assert_true<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let condition = arena.eval(args[0], chunk)?;
     let condition = cast_condition_to_boolean(&condition)?;
     let condition = condition
@@ -40,13 +40,13 @@ pub fn eval_assert_true(
         .ok_or_else(|| "assert_true: failed to downcast condition to BooleanArray".to_string())?;
 
     if condition.null_count() > 0 {
-        return Err(NULL_MESSAGE.to_string());
+        return Err((NULL_MESSAGE.to_string()).into());
     }
 
     let error_message = resolve_error_message(arena, args, chunk)?;
     for row in 0..condition.len() {
         if !condition.value(row) {
-            return Err(error_message.clone());
+            return Err((error_message.clone()).into());
         }
     }
 
@@ -62,11 +62,11 @@ fn cast_condition_to_boolean(condition: &ArrayRef) -> Result<ArrayRef, String> {
         .map_err(|e| format!("assert_true: failed to cast condition to BOOLEAN: {e}"))
 }
 
-fn resolve_error_message(
-    arena: &ExprArena,
+fn resolve_error_message<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<String, String> {
+) -> Result<String, __Eval::Error> {
     if args.len() < 2 {
         return Ok(DEFAULT_FALSE_MESSAGE.to_string());
     }

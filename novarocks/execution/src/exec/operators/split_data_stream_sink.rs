@@ -28,6 +28,7 @@ use std::sync::Arc;
 use crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates;
 
 use arrow::array::{Array, BooleanArray};
+#[cfg(test)]
 use arrow::compute::filter_record_batch;
 
 use crate::exec::chunk::Chunk;
@@ -185,6 +186,7 @@ struct SplitDataStreamSinkOperator {
     sinks: Vec<InnerSinkRuntime>,
     finishing: bool,
     sink_observable: Arc<Observable>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
 impl SplitDataStreamSinkOperator {
@@ -215,6 +217,7 @@ impl SplitDataStreamSinkOperator {
             sinks,
             finishing: false,
             sink_observable,
+            construction: None,
         }
     }
 }
@@ -227,6 +230,7 @@ impl Operator for SplitDataStreamSinkOperator {
         for sink in &mut self.sinks {
             sink.op.set_construction_factory(factory.clone());
         }
+        self.construction = Some(factory);
     }
     fn creates_typed_storage(&self) -> bool {
         true
@@ -351,8 +355,29 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
             return Ok(());
         }
 
-        let split_chunks =
-            split_chunk_by_exprs(&self.split_arena, &self.split_exprs, chunk, self.fanout)?;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let control = super::compiled_expression::RuntimeKernelControl::new(state.error_state());
+        let split_chunks = split_chunk_by_exprs_with(
+            &self.split_exprs,
+            chunk,
+            self.fanout,
+            &mut |expr, input| {
+                let owner = factory.begin_input_construction(input)?;
+                crate::exec::expr::ExprEvaluationContext::new(
+                    &self.split_arena,
+                    owner.as_ref(),
+                    &control,
+                )
+                .eval(expr, input)
+            },
+            &mut |input, mask| {
+                let owner = factory.begin_input_construction(input)?;
+                input.filter_for_evaluation(mask, owner.as_ref())
+            },
+        )?;
         if split_chunks.len() != self.sinks.len() {
             return Err(format!(
                 "split chunk output size {} != sink size {}",
@@ -410,12 +435,39 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
     }
 }
 
-fn split_chunk_by_exprs(
-    arena: &ExprArena,
+#[cfg(test)]
+fn split_chunk_by_exprs<E: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &E,
+    exprs: &[ExprId],
+    chunk: Chunk,
+    fanout: bool,
+) -> Result<Vec<Option<Chunk>>, E::Error> {
+    if chunk.chunk_schema().is_typed() {
+        return Err(E::Error::from(
+            "reference split evaluation requires an untyped input".to_owned(),
+        ));
+    }
+    split_chunk_by_exprs_with(
+        exprs,
+        chunk,
+        fanout,
+        &mut |expr, input| arena.eval(expr, input),
+        &mut |input, mask| {
+            let filtered = filter_record_batch(input.record_batch(), mask).map_err(|error| {
+                E::Error::from(format!("split sink filter chunk failed: {error}"))
+            })?;
+            Chunk::try_new_like(filtered, input).map_err(Into::into)
+        },
+    )
+}
+
+fn split_chunk_by_exprs_with<E: From<String>>(
     split_exprs: &[ExprId],
     chunk: Chunk,
     fanout: bool,
-) -> Result<Vec<Option<Chunk>>, String> {
+    evaluate: &mut dyn FnMut(ExprId, &Chunk) -> Result<arrow::array::ArrayRef, E>,
+    filter_input: &mut dyn FnMut(&Chunk, &BooleanArray) -> Result<Chunk, E>,
+) -> Result<Vec<Option<Chunk>>, E> {
     if split_exprs.is_empty() {
         return Ok(vec![]);
     }
@@ -427,8 +479,8 @@ fn split_chunk_by_exprs(
         return split_exprs
             .iter()
             .map(|expr| {
-                eval_split_mask(arena, *expr, &chunk)
-                    .and_then(|mask| filter_chunk_by_mask(&chunk, &mask))
+                eval_split_mask(evaluate, *expr, &chunk)
+                    .and_then(|mask| filter_chunk_by_mask(&chunk, &mask, filter_input))
             })
             .collect();
     }
@@ -440,7 +492,7 @@ fn split_chunk_by_exprs(
         if remaining.is_empty() {
             break;
         }
-        let mask = eval_split_mask(arena, split_exprs[idx], &remaining)?;
+        let mask = eval_split_mask(evaluate, split_exprs[idx], &remaining)?;
         let matched = mask.iter().filter(|flag| **flag).count();
         if matched == 0 {
             continue;
@@ -450,21 +502,25 @@ fn split_chunk_by_exprs(
             return Ok(out);
         }
 
-        out[idx] = filter_chunk_by_mask(&remaining, &mask)?;
+        out[idx] = filter_chunk_by_mask(&remaining, &mask, filter_input)?;
         let remaining_mask = mask.into_iter().map(|flag| !flag).collect::<Vec<_>>();
-        remaining = filter_chunk_by_mask(&remaining, &remaining_mask)?
+        remaining = filter_chunk_by_mask(&remaining, &remaining_mask, filter_input)?
             .ok_or_else(|| "split sink produced empty remaining chunk unexpectedly".to_string())?;
     }
 
     if !remaining.is_empty() {
-        let mask = eval_split_mask(arena, split_exprs[0], &remaining)?;
-        out[0] = filter_chunk_by_mask(&remaining, &mask)?;
+        let mask = eval_split_mask(evaluate, split_exprs[0], &remaining)?;
+        out[0] = filter_chunk_by_mask(&remaining, &mask, filter_input)?;
     }
     Ok(out)
 }
 
-fn eval_split_mask(arena: &ExprArena, expr_id: ExprId, chunk: &Chunk) -> Result<Vec<bool>, String> {
-    let predicate_array = arena.eval(expr_id, chunk)?;
+fn eval_split_mask<E: From<String>>(
+    evaluate: &mut dyn FnMut(ExprId, &Chunk) -> Result<arrow::array::ArrayRef, E>,
+    expr_id: ExprId,
+    chunk: &Chunk,
+) -> Result<Vec<bool>, E> {
+    let predicate_array = evaluate(expr_id, chunk)?;
     let mask = predicate_array
         .as_any()
         .downcast_ref::<BooleanArray>()
@@ -474,7 +530,8 @@ fn eval_split_mask(arena: &ExprArena, expr_id: ExprId, chunk: &Chunk) -> Result<
             "split expr result length {} != chunk length {}",
             mask.len(),
             chunk.len()
-        ));
+        )
+        .into());
     }
 
     let mut out = Vec::with_capacity(mask.len());
@@ -484,13 +541,18 @@ fn eval_split_mask(arena: &ExprArena, expr_id: ExprId, chunk: &Chunk) -> Result<
     Ok(out)
 }
 
-fn filter_chunk_by_mask(chunk: &Chunk, mask: &[bool]) -> Result<Option<Chunk>, String> {
+fn filter_chunk_by_mask<E: From<String>>(
+    chunk: &Chunk,
+    mask: &[bool],
+    filter_input: &mut dyn FnMut(&Chunk, &BooleanArray) -> Result<Chunk, E>,
+) -> Result<Option<Chunk>, E> {
     if mask.len() != chunk.len() {
         return Err(format!(
             "filter mask length {} != chunk length {}",
             mask.len(),
             chunk.len()
-        ));
+        )
+        .into());
     }
 
     let selected = mask.iter().filter(|flag| **flag).count();
@@ -502,9 +564,7 @@ fn filter_chunk_by_mask(chunk: &Chunk, mask: &[bool]) -> Result<Option<Chunk>, S
     }
 
     let predicate = BooleanArray::from(mask.to_vec());
-    let filtered = filter_record_batch(&chunk.record_batch(), &predicate)
-        .map_err(|e| format!("split sink filter chunk failed: {e}"))?;
-    Ok(Some(Chunk::new_like(filtered, chunk)))
+    Ok(Some(filter_input(chunk, &predicate)?))
 }
 
 #[cfg(test)]
@@ -828,5 +888,159 @@ mod tests {
         );
         assert!(!op.finishing_wait().is_pending());
         assert!(op.is_finished());
+    }
+    fn typed_split_fixture() -> (ExprArena, Vec<crate::exec::expr::ExprId>, Chunk) {
+        use crate::exec::chunk::ChunkSlotSchema;
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let slot = SlotId::new(91);
+        let ty = FunctionValueType::new(DataType::Boolean, true);
+        let field = Arc::new(Field::new("flag", DataType::Boolean, true));
+        let schema = Arc::new(
+            ChunkSchema::try_new_typed(
+                vec![
+                    ChunkSlotSchema::try_new_typed(
+                        slot,
+                        field,
+                        ty.typed_binding().clone(),
+                        None,
+                        ValueTypeStorageLifetime::pure(),
+                    )
+                    .unwrap(),
+                ],
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        );
+        let input = Chunk::try_new_with_chunk_schema(
+            RecordBatch::try_new(
+                schema.arrow_schema_ref(),
+                vec![Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    None,
+                    Some(false),
+                ]))],
+            )
+            .unwrap(),
+            schema,
+        )
+        .unwrap();
+        let mut arena = ExprArena::default();
+        let flag = arena.push_typed(ExprNode::SlotId(slot), DataType::Boolean);
+        let inverse = arena.push_typed(ExprNode::Not(flag), DataType::Boolean);
+        (arena, vec![inverse, flag], input)
+    }
+
+    #[test]
+    fn actual_split_remaining_has_its_own_creator_and_original_null_routing() {
+        let (arena, exprs, input) = typed_split_fixture();
+        let state = RuntimeState::default();
+        let factory =
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root("split actual creator fixture"),
+                state.error_state(),
+            )
+            .unwrap();
+        let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+            state.error_state(),
+        );
+        let mut evaluations = Vec::new();
+        let mut filters = Vec::new();
+        let out = super::split_chunk_by_exprs_with(
+            &exprs,
+            input,
+            false,
+            &mut |expr, input| {
+                evaluations.push((
+                    expr,
+                    input.len(),
+                    input.construction_storage_lifetime().is_pure(),
+                ));
+                let owner = factory.begin_input_construction(input)?;
+                crate::exec::expr::ExprEvaluationContext::new(&arena, owner.as_ref(), &control)
+                    .eval(expr, input)
+            },
+            &mut |input, mask| {
+                filters.push(input.len());
+                let owner = factory.begin_input_construction(input)?;
+                input.filter_for_evaluation(mask, owner.as_ref())
+            },
+        )
+        .unwrap();
+        assert_eq!(evaluations, vec![(exprs[1], 3, true), (exprs[0], 2, false)]);
+        assert_eq!(filters, vec![3, 3, 2]);
+        for (index, expected) in [(0, false), (1, true)] {
+            let output = out[index].as_ref().unwrap();
+            assert_eq!(output.len(), 1);
+            assert!(!output.construction_storage_lifetime().is_pure());
+            assert_eq!(
+                output.columns()[0]
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![Some(expected)]
+            );
+        }
+    }
+
+    #[test]
+    fn split_filter_and_next_evaluation_preserve_the_original_runtime_failure() {
+        use crate::runtime::fragment::{ExecutionFailure, PipelineOperation};
+        use novarocks_functions::{KernelDiagnostic, KernelFailure};
+        let mut failures: Vec<ExecutionFailure> = vec![
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InstanceFailed,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("exact invalid")),
+            KernelFailure::Internal(KernelDiagnostic::new("exact internal")),
+            KernelFailure::Operational(KernelDiagnostic::new("exact operation")),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        failures.push(ExecutionFailure::from("cancelled").at_operator(47, PipelineOperation::Push));
+        for original in failures {
+            let (arena, exprs, input) = typed_split_fixture();
+            let state = RuntimeState::default();
+            let factory =
+                crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                    crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                    crate::runtime::mem_tracker::MemTracker::new_root("split failure fixture"),
+                    state.error_state(),
+                )
+                .unwrap();
+            let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+                state.error_state(),
+            );
+            let mut calls = 0;
+            let failure = super::split_chunk_by_exprs_with(
+                &exprs,
+                input,
+                false,
+                &mut |expr, input| {
+                    calls += 1;
+                    assert_eq!(calls, 1, "no evaluation after originating failure");
+                    let owner = factory.begin_input_construction(input)?;
+                    let result = crate::exec::expr::ExprEvaluationContext::new(
+                        &arena,
+                        owner.as_ref(),
+                        &control,
+                    )
+                    .eval(expr, input)?;
+                    state.error_state().set_error(original.clone());
+                    Ok(result)
+                },
+                &mut |input, mask| {
+                    let owner = factory.begin_input_construction(input)?;
+                    input.filter_for_evaluation(mask, owner.as_ref())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(failure, original);
+            assert_eq!(calls, 1);
+        }
     }
 }

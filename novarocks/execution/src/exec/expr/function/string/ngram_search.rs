@@ -139,13 +139,13 @@ fn extract_const_i64(
     }
 }
 
-fn eval_ngram_search_impl(
-    arena: &ExprArena,
+fn eval_ngram_search_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     case_insensitive: bool,
     fn_name: &str,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let haystack_arr = arena.eval(args[0], chunk)?;
     let needle_arr = arena.eval(args[1], chunk)?;
     let gram_num_arr = arena.eval(args[2], chunk)?;
@@ -165,10 +165,11 @@ fn eval_ngram_search_impl(
         return Ok(Arc::new(Float64Array::from(Vec::<Option<f64>>::new())) as ArrayRef);
     }
     if haystack_arr.len() != 1 && haystack_arr.len() != rows {
-        return Err(format!(
+        return Err((format!(
             "{fn_name} haystack length mismatch: {} vs {rows}",
             haystack_arr.len()
-        ));
+        ))
+        .into());
     }
     let needle = extract_const_string(
         needle_arr,
@@ -185,13 +186,15 @@ fn eval_ngram_search_impl(
         return Ok(Arc::new(Float64Array::from(vec![None; rows])) as ArrayRef);
     };
     if gram_num_i64 <= 0 {
-        return Err("ngram search's third parameter must be a positive number".to_string());
+        return Err(
+            ("ngram search's third parameter must be a positive number".to_string()).into(),
+        );
     }
     let gram_num = usize::try_from(gram_num_i64)
         .map_err(|_| "ngram search's third parameter must be a positive number".to_string())?;
 
     if needle.len() > MAX_STRING_SIZE {
-        return Err("ngram function's second parameter is larger than 2^15".to_string());
+        return Err(("ngram function's second parameter is larger than 2^15".to_string()).into());
     }
 
     let normalized_needle = normalize_ascii_case(needle, case_insensitive);
@@ -221,20 +224,20 @@ fn eval_ngram_search_impl(
     Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
 }
 
-pub fn eval_ngram_search(
-    arena: &ExprArena,
+pub fn eval_ngram_search<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_ngram_search_impl(arena, args, chunk, false, "ngram_search")
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_ngram_search_impl(arena, args, chunk, false, "ngram_search"))?)
 }
 
-pub fn eval_ngram_search_case_insensitive(
-    arena: &ExprArena,
+pub fn eval_ngram_search_case_insensitive<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_ngram_search_impl(arena, args, chunk, true, "ngram_search_case_insensitive")
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_ngram_search_impl(arena, args, chunk, true, "ngram_search_case_insensitive"))?)
 }

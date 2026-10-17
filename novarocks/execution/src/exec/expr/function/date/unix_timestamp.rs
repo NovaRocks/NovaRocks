@@ -24,12 +24,12 @@ use novarocks_functions::builtin::calendar_extended_shared::{
 };
 use std::sync::Arc;
 
-pub fn eval_unix_timestamp(
-    arena: &ExprArena,
+pub fn eval_unix_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.is_empty() {
         // Preserve the existing clock source; no pure owner admits this form yet.
         let now = calendar_unix_seconds(datetime_from_local_now());
@@ -37,10 +37,10 @@ pub fn eval_unix_timestamp(
     }
     let source = arena.eval(args[0], chunk)?;
     let rows = source.len();
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::UnixTimestamp,
         &[source],
         &DataType::Int64,
         rows,
-    )
+    ))?)
 }

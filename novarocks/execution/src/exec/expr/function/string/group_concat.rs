@@ -18,11 +18,11 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 
-pub fn eval_group_concat(
-    arena: &ExprArena,
+pub fn eval_group_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    Err("group_concat is an aggregate function".to_string())
+) -> Result<ArrayRef, __Eval::Error> {
+    Err(("group_concat is an aggregate function".to_string()).into())
 }

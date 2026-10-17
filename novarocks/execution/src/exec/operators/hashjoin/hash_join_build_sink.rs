@@ -248,6 +248,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             input_chunks: 0,
             build_input_chunks_mem_tracker: None,
             build_table_mem_tracker: None,
+            construction: None,
         })
     }
 
@@ -257,6 +258,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
 }
 
 struct HashJoinBuildSinkOperator {
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     name: String,
     node_id: i32,
     driver_id: i32,
@@ -292,6 +294,15 @@ struct HashJoinBuildSinkOperator {
 }
 
 impl Operator for HashJoinBuildSinkOperator {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -356,7 +367,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         if self.finished {
             return Ok(());
         }
-        let result = (|| {
+        let result: ExecutionResult<()> = (|| {
             self.init_profile_if_needed();
             if !matches!(
                 self.join_type,
@@ -370,7 +381,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                     | JoinType::RightAnti
                     | JoinType::NullAwareLeftAnti
             ) {
-                return Err("unsupported join type for hash join build".to_string());
+                return Err("unsupported join type for hash join build".into());
             }
             if chunk.is_empty() {
                 return Ok(());
@@ -410,9 +421,21 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 return Ok(());
             }
 
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            let owner = factory.begin_input_construction(&chunk)?;
+            let control =
+                super::super::compiled_expression::RuntimeKernelControl::new(_state.error_state());
+            let evaluation = crate::exec::expr::ExprEvaluationContext::new(
+                &self.arena,
+                owner.as_ref(),
+                &control,
+            );
             let mut key_arrays = Vec::with_capacity(self.build_keys.len());
             for expr in &self.build_keys {
-                let array = self.arena.eval(*expr, &chunk).map_err(|e| e.to_string())?;
+                let array = evaluation.eval(*expr, &chunk)?;
                 key_arrays.push(array);
             }
             if self.eq_null_safe.len() != key_arrays.len() {
@@ -420,7 +443,8 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                     "hash join build null-safe key count mismatch: flags={} keys={}",
                     self.eq_null_safe.len(),
                     key_arrays.len()
-                ));
+                )
+                .into());
             }
 
             if !self.build_has_null_key {
@@ -775,6 +799,16 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
+    fn actual_evaluation_factory()
+    -> Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory> {
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("hash build evaluation construction"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap()
+    }
+
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind;
@@ -956,26 +990,35 @@ mod tests {
         let array = Arc::new(Int32Array::from(values)) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("record batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema");
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
     }
 
     fn nullable_int32_chunk(values: Vec<Option<i32>>) -> Chunk {
         let array = Arc::new(Int32Array::from(values)) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("record batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema");
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                true,
+            )],
+        )
     }
 
     fn direct_int_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
         let mut arena = ExprArena::default();
         let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
         HashJoinBuildSinkOperator {
+            construction: Some(actual_evaluation_factory()),
             name: "HASH_JOIN (id=1)".to_string(),
             node_id: 1,
             driver_id: 0,
@@ -1040,7 +1083,10 @@ mod tests {
             JoinDistributionMode::Broadcast,
             sink_state,
         );
-        factory.create(1, 0)
+        let mut operator = factory.create(1, 0);
+        operator.set_construction_factory(actual_evaluation_factory());
+        operator.set_construction_factory(actual_evaluation_factory());
+        operator
     }
 
     fn no_key_inner_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
@@ -1148,7 +1194,9 @@ mod tests {
             Some(producer_factory),
         );
         let mut first = factory.create(2, 0);
+        first.set_construction_factory(actual_evaluation_factory());
         let mut sibling = factory.create(2, 1);
+        sibling.set_construction_factory(actual_evaluation_factory());
         first
             .bind_runtime_state(&RuntimeState::default())
             .expect("bind first");
@@ -1194,6 +1242,7 @@ mod tests {
             Some(producer_factory),
         );
         let mut operator = factory.create(3, 0);
+        operator.set_construction_factory(actual_evaluation_factory());
 
         let error = operator
             .bind_runtime_state(&RuntimeState::default())
@@ -1230,6 +1279,7 @@ mod tests {
 
         for local_index in 0..3 {
             let mut operator = factory.create(3, local_index);
+            operator.set_construction_factory(actual_evaluation_factory());
             operator
                 .bind_runtime_state(&RuntimeState::default())
                 .expect("bind producer");
@@ -1543,6 +1593,7 @@ mod tests {
         let state = Arc::new(TestBuildState::default());
         let root = MemTracker::new_root("hash-build-test");
         let mut operator = HashJoinBuildSinkOperator {
+            construction: Some(actual_evaluation_factory()),
             name: "HASH_JOIN (id=1)".to_string(),
             node_id: 1,
             driver_id: 0,
@@ -1659,6 +1710,7 @@ mod tests {
         let state = Arc::new(TestBuildState::default());
         let root = MemTracker::new_root("hash-build-test");
         let mut operator = HashJoinBuildSinkOperator {
+            construction: Some(actual_evaluation_factory()),
             name: "HASH_JOIN (id=1)".to_string(),
             node_id: 1,
             driver_id: 0,

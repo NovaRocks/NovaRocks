@@ -39,7 +39,10 @@ impl ConnectorProcessLocalPayload {
         }
     }
 
-    pub(crate) fn validate_owner(
+    /// Validate the complete provider generation before opening the content.
+    /// Providers use their retained binding key here: `value` checks the
+    /// instance and private type, but cannot establish the incarnation fence.
+    pub fn validate_owner(
         &self,
         expected: &ConnectorProviderBindingKey,
     ) -> Result<(), ConnectorError> {
@@ -126,5 +129,22 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(clone);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn process_local_payload_rejects_same_instance_from_another_incarnation() {
+        let current = owner();
+        let mut previous = current.clone();
+        previous.incarnation = super::super::ProviderBindingEpoch::from_bytes([2; 16]);
+        let payload = ConnectorProcessLocalPayload::new(previous.clone(), Arc::new(17u64));
+        // A matching private type and instance do not establish generation ownership.
+        assert_eq!(**payload.value::<u64>(current.instance_id()).unwrap(), 17);
+        payload.validate_owner(&previous).unwrap();
+        let error = payload.validate_owner(&current).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "process-local payload belongs to another connector generation"
+        );
     }
 }

@@ -43,115 +43,137 @@ pub fn metadata(name: &str) -> Option<FunctionMeta> {
     DATE_METADATA.iter().find(|m| m.name == name).copied()
 }
 
-pub fn eval_date_function(
+pub fn eval_date_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let canonical = DATE_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "add_months" => super::add_months::eval_add_months(arena, expr, args, chunk),
-        "date_add" => super::date_add::eval_date_add(arena, expr, args, chunk),
-        "date_diff" => super::datediff::eval_date_diff(arena, expr, args, chunk),
+        "add_months" => Ok((super::add_months::eval_add_months(arena, expr, args, chunk))?),
+        "date_add" => Ok((super::date_add::eval_date_add(arena, expr, args, chunk))?),
+        "date_diff" => Ok((super::datediff::eval_date_diff(arena, expr, args, chunk))?),
         "alignment_timestamp" => {
-            super::date_trunc::eval_alignment_timestamp(arena, expr, args, chunk)
+            Ok((super::date_trunc::eval_alignment_timestamp(arena, expr, args, chunk))?)
         }
-        "convert_tz" => super::convert_tz::eval_convert_tz(arena, expr, args, chunk),
-        "current_date" => super::current_date::eval_current_date(arena, expr, args, chunk),
-        "current_time" => super::current_time::eval_current_time(arena, expr, args, chunk),
+        "convert_tz" => Ok((super::convert_tz::eval_convert_tz(arena, expr, args, chunk))?),
+        "current_date" => Ok((super::current_date::eval_current_date(arena, expr, args, chunk))?),
+        "current_time" => Ok((super::current_time::eval_current_time(arena, expr, args, chunk))?),
         "current_timestamp" => {
-            super::current_timestamp::eval_current_timestamp(arena, expr, args, chunk)
+            Ok((super::current_timestamp::eval_current_timestamp(arena, expr, args, chunk))?)
         }
-        "date" => super::date::eval_date(arena, expr, args, chunk),
-        "date_floor" => super::date_trunc::eval_date_floor(arena, expr, args, chunk),
-        "date_format" => super::date_format::eval_date_format(arena, expr, args, chunk),
-        "date_slice" => super::time_slice::eval_date_slice(arena, expr, args, chunk),
-        "date_sub" => super::date_add::eval_date_sub(arena, expr, args, chunk),
-        "date_trunc" => super::date_trunc::eval_date_trunc(arena, expr, args, chunk),
-        "datediff" => super::datediff::eval_datediff(arena, expr, args, chunk),
-        "day" => super::date_parts::eval_day(arena, expr, args, chunk),
-        "dayname" => super::date_parts::eval_dayname(arena, expr, args, chunk),
-        "dayofweek" => super::date_parts::eval_dayofweek(arena, expr, args, chunk),
-        "dayofweek_iso" => super::date_parts::eval_dayofweek_iso(arena, expr, args, chunk),
-        "dayofyear" => super::date_parts::eval_dayofyear(arena, expr, args, chunk),
-        "days_add" => super::date_add::eval_days_add(arena, expr, args, chunk),
-        "days_diff" => super::datediff::eval_days_diff(arena, expr, args, chunk),
-        "days_sub" => super::date_add::eval_days_sub(arena, expr, args, chunk),
-        "from_days" => super::from_days::eval_from_days(arena, expr, args, chunk),
-        "from_unixtime" => super::from_unixtime::eval_from_unixtime(arena, expr, args, chunk),
-        "from_unixtime_ms" => super::from_unixtime::eval_from_unixtime_ms(arena, expr, args, chunk),
-        "hour" => super::date_parts::eval_hour(arena, expr, args, chunk),
+        "date" => Ok((super::date::eval_date(arena, expr, args, chunk))?),
+        "date_floor" => Ok((super::date_trunc::eval_date_floor(arena, expr, args, chunk))?),
+        "date_format" => Ok((super::date_format::eval_date_format(arena, expr, args, chunk))?),
+        "date_slice" => Ok((super::time_slice::eval_date_slice(arena, expr, args, chunk))?),
+        "date_sub" => Ok((super::date_add::eval_date_sub(arena, expr, args, chunk))?),
+        "date_trunc" => Ok((super::date_trunc::eval_date_trunc(arena, expr, args, chunk))?),
+        "datediff" => Ok((super::datediff::eval_datediff(arena, expr, args, chunk))?),
+        "day" => Ok((super::date_parts::eval_day(arena, expr, args, chunk))?),
+        "dayname" => Ok((super::date_parts::eval_dayname(arena, expr, args, chunk))?),
+        "dayofweek" => Ok((super::date_parts::eval_dayofweek(arena, expr, args, chunk))?),
+        "dayofweek_iso" => Ok((super::date_parts::eval_dayofweek_iso(arena, expr, args, chunk))?),
+        "dayofyear" => Ok((super::date_parts::eval_dayofyear(arena, expr, args, chunk))?),
+        "days_add" => Ok((super::date_add::eval_days_add(arena, expr, args, chunk))?),
+        "days_diff" => Ok((super::datediff::eval_days_diff(arena, expr, args, chunk))?),
+        "days_sub" => Ok((super::date_add::eval_days_sub(arena, expr, args, chunk))?),
+        "from_days" => Ok((super::from_days::eval_from_days(arena, expr, args, chunk))?),
+        "from_unixtime" => {
+            Ok((super::from_unixtime::eval_from_unixtime(arena, expr, args, chunk))?)
+        }
+        "from_unixtime_ms" => {
+            Ok((super::from_unixtime::eval_from_unixtime_ms(arena, expr, args, chunk))?)
+        }
+        "hour" => Ok((super::date_parts::eval_hour(arena, expr, args, chunk))?),
         "hour_from_unixtime" => {
-            super::hour_from_unixtime::eval_hour_from_unixtime(arena, expr, args, chunk)
+            Ok((super::hour_from_unixtime::eval_hour_from_unixtime(arena, expr, args, chunk))?)
         }
-        "hours_add" => super::seconds_add::eval_hours_add(arena, expr, args, chunk),
-        "hours_diff" => super::datediff::eval_hours_diff(arena, expr, args, chunk),
-        "hours_sub" => super::seconds_add::eval_hours_sub(arena, expr, args, chunk),
-        "jodatime_format" => super::date_format::eval_jodatime_format(arena, expr, args, chunk),
-        "last_day" => super::last_day::eval_last_day(arena, expr, args, chunk),
-        "makedate" => super::makedate::eval_makedate(arena, expr, args, chunk),
-        "microseconds_add" => super::seconds_add::eval_microseconds_add(arena, expr, args, chunk),
-        "microseconds_sub" => super::seconds_add::eval_microseconds_sub(arena, expr, args, chunk),
-        "milliseconds_add" => super::seconds_add::eval_milliseconds_add(arena, expr, args, chunk),
-        "milliseconds_diff" => super::datediff::eval_milliseconds_diff(arena, expr, args, chunk),
-        "milliseconds_sub" => super::seconds_add::eval_milliseconds_sub(arena, expr, args, chunk),
-        "minute" => super::date_parts::eval_minute(arena, expr, args, chunk),
-        "minutes_add" => super::seconds_add::eval_minutes_add(arena, expr, args, chunk),
-        "minutes_diff" => super::datediff::eval_minutes_diff(arena, expr, args, chunk),
-        "minutes_sub" => super::seconds_add::eval_minutes_sub(arena, expr, args, chunk),
-        "month" => super::date_parts::eval_month(arena, expr, args, chunk),
-        "monthname" => super::date_parts::eval_monthname(arena, expr, args, chunk),
-        "months_add" => super::add_months::eval_months_add(arena, expr, args, chunk),
-        "months_diff" => super::datediff::eval_months_diff(arena, expr, args, chunk),
-        "months_sub" => super::add_months::eval_months_sub(arena, expr, args, chunk),
-        "next_day" => super::next_day::eval_next_day(arena, expr, args, chunk),
-        "previous_day" => super::next_day::eval_previous_day(arena, expr, args, chunk),
-        "quarter" => super::date_parts::eval_quarter(arena, expr, args, chunk),
-        "quarters_add" => super::add_months::eval_quarters_add(arena, expr, args, chunk),
-        "quarters_sub" => super::add_months::eval_quarters_sub(arena, expr, args, chunk),
-        "sec_to_time" => super::sec_to_time::eval_sec_to_time(arena, expr, args, chunk),
-        "second" => super::date_parts::eval_second(arena, expr, args, chunk),
-        "seconds_add" => super::seconds_add::eval_seconds_add(arena, expr, args, chunk),
-        "seconds_diff" => super::datediff::eval_seconds_diff(arena, expr, args, chunk),
-        "seconds_sub" => super::seconds_add::eval_seconds_sub(arena, expr, args, chunk),
-        "str_to_jodatime" => super::date::eval_str_to_jodatime(arena, expr, args, chunk),
-        "str_to_date" => super::str_to_date::eval_str_to_date(arena, expr, args, chunk),
-        "substitute" => super::substitute::eval_substitute(arena, expr, args, chunk),
-        "time_format" => super::time_format::eval_time_format(arena, expr, args, chunk),
-        "time_slice" => super::time_slice::eval_time_slice(arena, expr, args, chunk),
-        "time_to_sec" => super::time_to_sec::eval_time_to_sec(arena, expr, args, chunk),
-        "timediff" => super::timediff::eval_timediff(arena, expr, args, chunk),
-        "timestamp" => super::date::eval_timestamp(arena, expr, args, chunk),
-        "timestampadd" => super::timestampadd::eval_timestampadd(arena, expr, args, chunk),
-        "timestampdiff" => super::timestampdiff::eval_timestampdiff(arena, expr, args, chunk),
-        "to_date" => super::date::eval_to_date(arena, expr, args, chunk),
-        "to_datetime" => super::date::eval_to_datetime(arena, expr, args, chunk),
-        "to_datetime_ntz" => super::date::eval_to_datetime_ntz(arena, expr, args, chunk),
-        "to_days" => super::to_days::eval_to_days(arena, expr, args, chunk),
-        "to_iso8601" => super::to_iso8601::eval_to_iso8601(arena, expr, args, chunk),
-        "to_tera_date" => super::date::eval_to_tera_date(arena, expr, args, chunk),
-        "to_tera_timestamp" => super::date::eval_to_tera_timestamp(arena, expr, args, chunk),
-        "unix_timestamp" => super::unix_timestamp::eval_unix_timestamp(arena, expr, args, chunk),
-        "utc_time" => super::current_time::eval_utc_time(arena, expr, args, chunk),
-        "utc_timestamp" => super::current_timestamp::eval_utc_timestamp(arena, expr, args, chunk),
-        "week" => super::date_parts::eval_week(arena, expr, args, chunk),
-        "weekday" => super::date_parts::eval_weekday(arena, expr, args, chunk),
-        "weeks_add" => super::date_add::eval_weeks_add(arena, expr, args, chunk),
-        "weeks_diff" => super::datediff::eval_weeks_diff(arena, expr, args, chunk),
-        "weeks_sub" => super::date_add::eval_weeks_sub(arena, expr, args, chunk),
-        "year" => super::date_parts::eval_year(arena, expr, args, chunk),
-        "yearweek" => super::date_parts::eval_yearweek(arena, expr, args, chunk),
-        "years_add" => super::add_months::eval_years_add(arena, expr, args, chunk),
-        "years_diff" => super::datediff::eval_years_diff(arena, expr, args, chunk),
-        "years_sub" => super::add_months::eval_years_sub(arena, expr, args, chunk),
-        "quarters_diff" => super::datediff::eval_quarters_diff(arena, expr, args, chunk),
-        other => Err(format!("unsupported date function: {}", other)),
+        "hours_add" => Ok((super::seconds_add::eval_hours_add(arena, expr, args, chunk))?),
+        "hours_diff" => Ok((super::datediff::eval_hours_diff(arena, expr, args, chunk))?),
+        "hours_sub" => Ok((super::seconds_add::eval_hours_sub(arena, expr, args, chunk))?),
+        "jodatime_format" => {
+            Ok((super::date_format::eval_jodatime_format(arena, expr, args, chunk))?)
+        }
+        "last_day" => Ok((super::last_day::eval_last_day(arena, expr, args, chunk))?),
+        "makedate" => Ok((super::makedate::eval_makedate(arena, expr, args, chunk))?),
+        "microseconds_add" => {
+            Ok((super::seconds_add::eval_microseconds_add(arena, expr, args, chunk))?)
+        }
+        "microseconds_sub" => {
+            Ok((super::seconds_add::eval_microseconds_sub(arena, expr, args, chunk))?)
+        }
+        "milliseconds_add" => {
+            Ok((super::seconds_add::eval_milliseconds_add(arena, expr, args, chunk))?)
+        }
+        "milliseconds_diff" => {
+            Ok((super::datediff::eval_milliseconds_diff(arena, expr, args, chunk))?)
+        }
+        "milliseconds_sub" => {
+            Ok((super::seconds_add::eval_milliseconds_sub(arena, expr, args, chunk))?)
+        }
+        "minute" => Ok((super::date_parts::eval_minute(arena, expr, args, chunk))?),
+        "minutes_add" => Ok((super::seconds_add::eval_minutes_add(arena, expr, args, chunk))?),
+        "minutes_diff" => Ok((super::datediff::eval_minutes_diff(arena, expr, args, chunk))?),
+        "minutes_sub" => Ok((super::seconds_add::eval_minutes_sub(arena, expr, args, chunk))?),
+        "month" => Ok((super::date_parts::eval_month(arena, expr, args, chunk))?),
+        "monthname" => Ok((super::date_parts::eval_monthname(arena, expr, args, chunk))?),
+        "months_add" => Ok((super::add_months::eval_months_add(arena, expr, args, chunk))?),
+        "months_diff" => Ok((super::datediff::eval_months_diff(arena, expr, args, chunk))?),
+        "months_sub" => Ok((super::add_months::eval_months_sub(arena, expr, args, chunk))?),
+        "next_day" => Ok((super::next_day::eval_next_day(arena, expr, args, chunk))?),
+        "previous_day" => Ok((super::next_day::eval_previous_day(arena, expr, args, chunk))?),
+        "quarter" => Ok((super::date_parts::eval_quarter(arena, expr, args, chunk))?),
+        "quarters_add" => Ok((super::add_months::eval_quarters_add(arena, expr, args, chunk))?),
+        "quarters_sub" => Ok((super::add_months::eval_quarters_sub(arena, expr, args, chunk))?),
+        "sec_to_time" => Ok((super::sec_to_time::eval_sec_to_time(arena, expr, args, chunk))?),
+        "second" => Ok((super::date_parts::eval_second(arena, expr, args, chunk))?),
+        "seconds_add" => Ok((super::seconds_add::eval_seconds_add(arena, expr, args, chunk))?),
+        "seconds_diff" => Ok((super::datediff::eval_seconds_diff(arena, expr, args, chunk))?),
+        "seconds_sub" => Ok((super::seconds_add::eval_seconds_sub(arena, expr, args, chunk))?),
+        "str_to_jodatime" => Ok((super::date::eval_str_to_jodatime(arena, expr, args, chunk))?),
+        "str_to_date" => Ok((super::str_to_date::eval_str_to_date(arena, expr, args, chunk))?),
+        "substitute" => Ok((super::substitute::eval_substitute(arena, expr, args, chunk))?),
+        "time_format" => Ok((super::time_format::eval_time_format(arena, expr, args, chunk))?),
+        "time_slice" => Ok((super::time_slice::eval_time_slice(arena, expr, args, chunk))?),
+        "time_to_sec" => Ok((super::time_to_sec::eval_time_to_sec(arena, expr, args, chunk))?),
+        "timediff" => Ok((super::timediff::eval_timediff(arena, expr, args, chunk))?),
+        "timestamp" => Ok((super::date::eval_timestamp(arena, expr, args, chunk))?),
+        "timestampadd" => Ok((super::timestampadd::eval_timestampadd(arena, expr, args, chunk))?),
+        "timestampdiff" => {
+            Ok((super::timestampdiff::eval_timestampdiff(arena, expr, args, chunk))?)
+        }
+        "to_date" => Ok((super::date::eval_to_date(arena, expr, args, chunk))?),
+        "to_datetime" => Ok((super::date::eval_to_datetime(arena, expr, args, chunk))?),
+        "to_datetime_ntz" => Ok((super::date::eval_to_datetime_ntz(arena, expr, args, chunk))?),
+        "to_days" => Ok((super::to_days::eval_to_days(arena, expr, args, chunk))?),
+        "to_iso8601" => Ok((super::to_iso8601::eval_to_iso8601(arena, expr, args, chunk))?),
+        "to_tera_date" => Ok((super::date::eval_to_tera_date(arena, expr, args, chunk))?),
+        "to_tera_timestamp" => Ok((super::date::eval_to_tera_timestamp(arena, expr, args, chunk))?),
+        "unix_timestamp" => {
+            Ok((super::unix_timestamp::eval_unix_timestamp(arena, expr, args, chunk))?)
+        }
+        "utc_time" => Ok((super::current_time::eval_utc_time(arena, expr, args, chunk))?),
+        "utc_timestamp" => {
+            Ok((super::current_timestamp::eval_utc_timestamp(arena, expr, args, chunk))?)
+        }
+        "week" => Ok((super::date_parts::eval_week(arena, expr, args, chunk))?),
+        "weekday" => Ok((super::date_parts::eval_weekday(arena, expr, args, chunk))?),
+        "weeks_add" => Ok((super::date_add::eval_weeks_add(arena, expr, args, chunk))?),
+        "weeks_diff" => Ok((super::datediff::eval_weeks_diff(arena, expr, args, chunk))?),
+        "weeks_sub" => Ok((super::date_add::eval_weeks_sub(arena, expr, args, chunk))?),
+        "year" => Ok((super::date_parts::eval_year(arena, expr, args, chunk))?),
+        "yearweek" => Ok((super::date_parts::eval_yearweek(arena, expr, args, chunk))?),
+        "years_add" => Ok((super::add_months::eval_years_add(arena, expr, args, chunk))?),
+        "years_diff" => Ok((super::datediff::eval_years_diff(arena, expr, args, chunk))?),
+        "years_sub" => Ok((super::add_months::eval_years_sub(arena, expr, args, chunk))?),
+        "quarters_diff" => Ok((super::datediff::eval_quarters_diff(arena, expr, args, chunk))?),
+        other => Err((format!("unsupported date function: {}", other)).into()),
     }
 }
 

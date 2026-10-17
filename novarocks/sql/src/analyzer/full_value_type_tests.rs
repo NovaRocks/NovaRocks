@@ -1131,3 +1131,50 @@ fn exact_value_conversion_call_preserves_nested_sql_mode_policy() {
         assert_eq!(inner.decimal_overflow_policy(), inner_policy, "{sql}");
     }
 }
+
+#[test]
+fn variant_get_text_admission_preserves_parse_json_and_original_union_common_type() {
+    use novarocks_functions::FunctionArgumentType;
+    for (sql, expected_source) in [
+        (
+            r#"SELECT variant_get(parse_json('{"a":1}'),'$.a','bigint')"#,
+            ValueLogicalType::Json,
+        ),
+        (
+            r#"SELECT try_variant_get('{"a":99}','$.a','bigint')"#,
+            ValueLogicalType::Physical,
+        ),
+        (
+            r#"WITH source_values AS (
+            SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
+            UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
+            UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
+            UNION ALL SELECT 4, parse_json('{"a":1.5}')
+            UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+            UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+        ) SELECT id, try_variant_get(v, '$.a', 'bigint') FROM source_values ORDER BY id"#,
+            ValueLogicalType::Physical,
+        ),
+    ] {
+        let query = analyze(sql);
+        let QueryBody::Select(select) = &query.body else {
+            panic!("original outer SELECT")
+        };
+        let expression = &select.projection.last().unwrap().expr;
+        let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
+            panic!("original scalar")
+        };
+        assert_eq!(args[0].value_type.data_type(), &DataType::Utf8);
+        assert_eq!(args[0].value_type.logical_type(), expected_source);
+        assert_eq!(
+            binding.selected.argument_types[0],
+            FunctionArgumentType::Value(args[0].value_type.clone())
+        );
+        assert_eq!(expression.value_type.data_type(), &DataType::Int64);
+        assert_eq!(
+            expression.value_type.logical_type(),
+            ValueLogicalType::Physical
+        );
+        assert!(expression.value_type.nullable());
+    }
+}

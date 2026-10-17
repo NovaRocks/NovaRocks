@@ -38,14 +38,14 @@ fn inferred_if_output_type(then_type: &DataType, else_type: &DataType) -> Option
 }
 
 // IF function for Arrow arrays
-pub fn eval_if(
-    arena: &ExprArena,
+pub fn eval_if<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     if_expr: ExprId,
     condition_expr: ExprId,
     then_expr: ExprId,
     else_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let condition_array = arena.eval(condition_expr, chunk)?;
     let len = condition_array.len();
 
@@ -96,21 +96,25 @@ pub fn eval_if(
 
     if !any_true {
         let else_array = arena.eval(else_expr, chunk)?;
-        return cast_branch_to(&else_array, &target_type, len).map_err(|e| {
-            format!(
-                "if: failed to cast else expression to {:?}: {}",
-                target_type, e
-            )
-        });
+        return Ok(
+            (cast_branch_to(&else_array, &target_type, len).map_err(|e| {
+                format!(
+                    "if: failed to cast else expression to {:?}: {}",
+                    target_type, e
+                )
+            }))?,
+        );
     }
     if !any_false {
         let then_array = arena.eval(then_expr, chunk)?;
-        return cast_branch_to(&then_array, &target_type, len).map_err(|e| {
-            format!(
-                "if: failed to cast then expression to {:?}: {}",
-                target_type, e
-            )
-        });
+        return Ok(
+            (cast_branch_to(&then_array, &target_type, len).map_err(|e| {
+                format!(
+                    "if: failed to cast then expression to {:?}: {}",
+                    target_type, e
+                )
+            }))?,
+        );
     }
 
     // Mixed mask: evaluate each branch only on the rows where it is taken, then "scatter" the
@@ -171,12 +175,12 @@ pub fn eval_if(
     let then_full = take(&then_small, &true_idx_arr, None).map_err(|e| e.to_string())?;
     let else_full = take(&else_small, &false_idx_arr, None).map_err(|e| e.to_string())?;
 
-    zip(
+    Ok((zip(
         &condition_mask,
         &then_full.as_ref() as &dyn arrow::array::Datum,
         &else_full.as_ref() as &dyn arrow::array::Datum,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string()))?)
 }
 
 fn cast_branch_to(

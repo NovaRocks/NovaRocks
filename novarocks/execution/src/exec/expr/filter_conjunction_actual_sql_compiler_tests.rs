@@ -120,6 +120,12 @@ fn providers() -> PureProviderProgramCatalog<ConnectorError> {
 fn frozen_reads(
     source: &SqlAuthoredPhysicalPlan,
 ) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
+    frozen_reads_with_declared_fields(source, None)
+}
+fn frozen_reads_with_declared_fields(
+    source: &SqlAuthoredPhysicalPlan,
+    declared_fields: Option<&[Field]>,
+) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
     let mut reads = BTreeMap::new();
     for fragment in source.plan().fragments().values() {
         for node in fragment.nodes().values() {
@@ -165,12 +171,27 @@ fn frozen_reads(
                         .all(|guarantee| guarantee.kind == PredicateGuaranteeKind::Exact)
                 );
                 assert_eq!(relation.schema().len(), provider_outputs.len());
+                if let Some(declared) = declared_fields {
+                    assert_eq!(relation.schema().len(), declared.len());
+                }
                 let read = relation.read();
                 let mut assignments = Vec::new();
                 let mut fields = Vec::new();
                 let mut complete_types = Vec::new();
                 for (ordinal, field) in relation.schema().iter().enumerate() {
-                    assert!(field.ty.nullable(), "original k/v/s all nullable");
+                    assert_eq!(provider_outputs[ordinal].0, field.column);
+                    if let Some(declared) = declared_fields {
+                        assert_eq!(
+                            field.ty,
+                            FunctionValueType::new(
+                                declared[ordinal].data_type().clone(),
+                                declared[ordinal].is_nullable(),
+                            ),
+                            "the frozen read preserves each independently declared source type"
+                        );
+                    } else {
+                        assert!(field.ty.nullable(), "original k/v/s all nullable");
+                    }
                     let carrier = connector_type_for_value_type(&field.ty)
                         .expect("sole original connector projection");
                     let name = format!("fixture_column_{ordinal}");
@@ -289,6 +310,12 @@ fn frozen_reads(
 pub(super) fn source_packages(
     source: &SqlAuthoredPhysicalPlan,
 ) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
+    source_packages_with_reads(source, frozen_reads(source))
+}
+fn source_packages_with_reads(
+    source: &SqlAuthoredPhysicalPlan,
+    reads: BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
+) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
     let semantics = author_fragment_package_semantics(source, policy(), &Control).unwrap();
     let uses = semantics
         .iter()
@@ -323,7 +350,7 @@ pub(super) fn source_packages(
         .collect();
     let packages = extract_fragment_packages(
         source.plan(),
-        &frozen_reads(source),
+        &reads,
         &BTreeMap::new(),
         &uses,
         &calls,
@@ -350,7 +377,23 @@ pub(super) fn compiler_results(
     source: &SqlAuthoredPhysicalPlan,
     functions: &PureEngineFunctionCatalog,
 ) -> BTreeMap<FragmentId, Result<LocalProgram, novarocks_local_compiler::FragmentCompileError>> {
-    source_packages(source)
+    compiler_results_from_packages(source_packages(source), functions)
+}
+/// Preserve the supplied SQL source's complete multi-field declaration. The
+/// original conjunction fixture retains its separate all-nullable contract.
+pub(super) fn compiler_results_with_declared_read_fields(
+    source: &SqlAuthoredPhysicalPlan,
+    declared_fields: &[Field],
+    functions: &PureEngineFunctionCatalog,
+) -> BTreeMap<FragmentId, Result<LocalProgram, novarocks_local_compiler::FragmentCompileError>> {
+    let reads = frozen_reads_with_declared_fields(source, Some(declared_fields));
+    compiler_results_from_packages(source_packages_with_reads(source, reads), functions)
+}
+fn compiler_results_from_packages(
+    packages: BTreeMap<FragmentId, Arc<FragmentPackage>>,
+    functions: &PureEngineFunctionCatalog,
+) -> BTreeMap<FragmentId, Result<LocalProgram, novarocks_local_compiler::FragmentCompileError>> {
+    packages
         .into_iter()
         .map(|(id, package)| {
             (

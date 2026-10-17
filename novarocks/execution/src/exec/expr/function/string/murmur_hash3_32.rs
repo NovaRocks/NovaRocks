@@ -24,12 +24,12 @@ use std::sync::Arc;
 #[cfg(test)]
 const MURMUR3_32_SEED: u32 = 104_729;
 
-pub fn eval_murmur_hash3_32(
-    arena: &ExprArena,
+pub fn eval_murmur_hash3_32<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let mut inputs = Vec::with_capacity(args.len());
     for arg in args {
         let input = arena.eval(*arg, chunk)?;
@@ -56,10 +56,12 @@ pub fn eval_murmur_hash3_32(
         }
     }
 
-    novarocks_functions::builtin::string_extended::evaluate_legacy(
-        novarocks_functions::builtin::string_extended::StringOperation::Murmur,
-        &inputs,
-        chunk.len(),
+    Ok(
+        (novarocks_functions::builtin::string_extended::evaluate_legacy(
+            novarocks_functions::builtin::string_extended::StringOperation::Murmur,
+            &inputs,
+            chunk.len(),
+        ))?,
     )
 }
 

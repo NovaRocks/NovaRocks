@@ -35,18 +35,14 @@ use novarocks_types::value::variant::{
 /// Parsed path arguments of one evaluation, keyed by path text.
 type PathMemo<'a> = PatternMemo<'a, VariantPath, String>;
 
-fn eval_variant_path_args(
-    arena: &ExprArena,
+fn eval_variant_path_args<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     fn_name: &str,
-) -> Result<(ArrayRef, ArrayRef), String> {
+) -> Result<(ArrayRef, ArrayRef), __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!(
-            "{} expects 2 arguments, got {}",
-            fn_name,
-            args.len()
-        ));
+        return Err((format!("{} expects 2 arguments, got {}", fn_name, args.len())).into());
     }
     let variant_array = arena.eval(args[0], chunk)?;
     let path_array = arena.eval(args[1], chunk)?;
@@ -279,12 +275,12 @@ fn variant_value_to_query_string(value: &VariantValue) -> Option<String> {
     json_value_to_query_string(&json)
 }
 
-pub fn eval_json_query(
-    arena: &ExprArena,
+pub fn eval_json_query<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) = eval_variant_path_args(arena, args, chunk, "json_query")?;
     let path_arr = path_array
         .as_any()
@@ -344,12 +340,12 @@ pub fn eval_json_query(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_variant_query(
-    arena: &ExprArena,
+pub fn eval_variant_query<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) = eval_variant_path_args(arena, args, chunk, "variant_query")?;
     let (variant_arr, path_arr) =
         downcast_variant_path_args(&variant_array, &path_array, "variant_query")?;
@@ -371,12 +367,12 @@ pub fn eval_variant_query(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_get_variant_bool(
-    arena: &ExprArena,
+pub fn eval_get_variant_bool<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_bool")?;
     let path_arr = path_array
@@ -440,12 +436,12 @@ pub fn eval_get_variant_bool(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_get_variant_int(
-    arena: &ExprArena,
+pub fn eval_get_variant_int<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_int")?;
     let path_arr = path_array
@@ -509,12 +505,12 @@ pub fn eval_get_variant_int(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_get_variant_double(
-    arena: &ExprArena,
+pub fn eval_get_variant_double<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_double")?;
     let path_arr = path_array
@@ -578,12 +574,12 @@ pub fn eval_get_variant_double(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_get_variant_string(
-    arena: &ExprArena,
+pub fn eval_get_variant_string<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_string")?;
     let path_arr = path_array
@@ -657,12 +653,12 @@ fn json_length_of_value(value: &JsonValue) -> i32 {
     }
 }
 
-pub fn eval_json_exists(
-    arena: &ExprArena,
+pub fn eval_json_exists<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) = eval_variant_path_args(arena, args, chunk, "json_exists")?;
     let path_arr = path_array
         .as_any()
@@ -726,12 +722,12 @@ pub fn eval_json_exists(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_json_length(
-    arena: &ExprArena,
+pub fn eval_json_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) = eval_variant_path_args(arena, args, chunk, "json_length")?;
     let path_arr = path_array
         .as_any()
@@ -816,12 +812,12 @@ pub fn eval_json_length(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_get_variant_date(
-    arena: &ExprArena,
+pub fn eval_get_variant_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_date")?;
     let (variant_arr, path_arr) =
@@ -850,12 +846,12 @@ pub fn eval_get_variant_date(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_get_variant_datetime(
-    arena: &ExprArena,
+pub fn eval_get_variant_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_datetime")?;
     let (variant_arr, path_arr) =
@@ -884,12 +880,12 @@ pub fn eval_get_variant_datetime(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_get_variant_time(
-    arena: &ExprArena,
+pub fn eval_get_variant_time<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_time")?;
     let (variant_arr, path_arr) =

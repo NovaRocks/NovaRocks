@@ -144,13 +144,11 @@ pub(super) fn publish(
             }
         };
         validate_column_declaration(source, column, schema.as_ref(), table, relation, creation)?;
-        let nominal = nominal
-            .and_then(|domains| domains.get(&source.id))
-            .map(|domain| domain.logical_type());
-        let declared = crate::schema_mapping::typed_value::from_declaration(
-            &source.field_type,
+        let empty = Default::default();
+        let declared = crate::schema_mapping::typed_value::from_field(
+            source,
             column.nullable(),
-            nominal,
+            nominal.unwrap_or(&empty),
             column.scalar_integer_domain(),
             creation,
         )?;

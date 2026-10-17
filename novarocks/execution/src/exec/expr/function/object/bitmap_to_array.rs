@@ -26,12 +26,12 @@ fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
 }
 
-pub fn eval_bitmap_to_array(
-    arena: &ExprArena,
+pub fn eval_bitmap_to_array<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
     let arr = input
         .as_any()

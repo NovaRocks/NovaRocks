@@ -256,6 +256,28 @@ impl RegistryTaskExecutionIngress {
                 Ok(encoded)
             }
             DecodedOperation::UpdateTask(request) => {
+                #[cfg(novarocks_dev_controls)]
+                let replay_target = self
+                    .test_controls
+                    .get()
+                    .map(|controls| controls.reserve_task_update_replay_target(request.request()))
+                    .transpose()
+                    .map_err(tonic::Status::failed_precondition)?
+                    .flatten();
+                #[cfg(novarocks_dev_controls)]
+                let mut replay_gate = replay_target
+                    .as_ref()
+                    .map(|target| {
+                        self.registry
+                            .reserve_test_update_consumption(
+                                request.request(),
+                                target.cancellation(),
+                            )
+                            .map_err(|error| {
+                                tonic::Status::failed_precondition(error.detail().as_str())
+                            })
+                    })
+                    .transpose()?;
                 let receipt = self.registry.update_task(request.request());
                 // Read off the receipt, not the request: the condition is that
                 // this backend durably accepted a delivery that both carried
@@ -276,12 +298,31 @@ impl RegistryTaskExecutionIngress {
                 });
                 #[cfg(novarocks_dev_controls)]
                 if let Some(controls) = self.test_controls.get() {
-                    fault::task_update_terminal_ack_dropped(
+                    let dropped = fault::task_update_terminal_ack_dropped(
                         controls,
                         request.request().identity(),
                         receipt.outcome(),
                         terminal_nonempty,
-                    )?;
+                        || {
+                            if let Some(gate) = replay_gate.as_mut() {
+                                return gate.activate();
+                            }
+                            if controls
+                                .claimed_task_update_replay(request.request().identity())?
+                                .requires_replay_barrier()
+                            {
+                                return Err("declared replay barrier had no reserved nonempty terminal input".into());
+                            }
+                            Ok(())
+                        },
+                    );
+                    if matches!(&dropped, Err(status) if status.code() == tonic::Code::DeadlineExceeded)
+                    {
+                        if let Some(gate) = replay_gate.as_mut() {
+                            gate.acknowledgement_dropped();
+                        }
+                    }
+                    dropped?;
                 }
                 encode_operation_receipt(&receipt, |ack| {
                     encode_update_task_ack(ack).map(ReceiptAck::UpdateTask)

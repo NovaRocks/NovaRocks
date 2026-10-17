@@ -18,17 +18,19 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 
-pub fn eval_array_struct_subfield(
-    arena: &ExprArena,
+pub fn eval_array_struct_subfield<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
     let field_name_arr = arena.eval(args[1], chunk)?;
-    novarocks_functions::builtin::array_struct_subfield_core::project(
-        &input,
-        &field_name_arr,
-        arena.data_type(expr),
+    Ok(
+        (novarocks_functions::builtin::array_struct_subfield_core::project(
+            &input,
+            &field_name_arr,
+            arena.data_type(expr),
+        ))?,
     )
 }

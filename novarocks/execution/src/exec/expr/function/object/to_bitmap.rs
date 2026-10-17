@@ -24,12 +24,12 @@ use arrow::array::{
 use novarocks_types::value::bitmap::encode_bitmap_single;
 use std::sync::Arc;
 
-pub fn eval_to_bitmap(
-    arena: &ExprArena,
+pub fn eval_to_bitmap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let input = arena.eval(args[0], chunk)?;
     let mut builder = BinaryBuilder::new();
@@ -178,10 +178,11 @@ pub fn eval_to_bitmap(
         return Ok(Arc::new(builder.finish()) as ArrayRef);
     }
 
-    Err(format!(
+    Err((format!(
         "to_bitmap expects BOOLEAN/INTEGER/VARCHAR/BINARY input, got {:?}",
         input.data_type()
     ))
+    .into())
 }
 
 fn parse_unsigned_decimal(text: &str) -> Option<u64> {

@@ -111,7 +111,8 @@ impl TopNHeapKernel {
         let chunk = Arc::new(chunk);
         let mut key_columns = creation.vector::<ArrayRef>(self.order_by.len(), owner.as_ref())?;
         for sort_expr in &self.order_by {
-            let key = arena.eval(sort_expr.expr, &chunk)?;
+            let evaluation = creation.expression_context(arena, owner.as_ref())?;
+            let key = evaluation.eval(sort_expr.expr, &chunk)?;
             let declared = arena.value_type(sort_expr.expr).ok_or_else(|| {
                 crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
                     "sort key lacks its complete declared logical type".into(),

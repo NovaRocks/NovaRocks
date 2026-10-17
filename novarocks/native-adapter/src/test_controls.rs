@@ -35,6 +35,7 @@ struct FaultGrant {
     handle: GrantHandle,
     kind: QueryLifecycleFaultKind,
     bind: bool,
+    replay_barrier: bool,
     target_session_id: String,
     target_process_receipt: Option<PathBuf>,
     root: PathBuf,
@@ -44,6 +45,7 @@ struct FaultGrant {
 }
 #[derive(Debug)]
 struct Claimed {
+    replay_barrier: bool,
     scope: QueryLifecycleFaultScope,
     kind: QueryLifecycleFaultKind,
     grant_id: String,
@@ -64,6 +66,9 @@ impl std::ops::Deref for NativeFaultClaim {
     }
 }
 impl NativeFaultClaim {
+    pub(crate) fn requires_replay_barrier(&self) -> bool {
+        self.inner.replay_barrier
+    }
     pub(crate) fn action_ended(&self) -> Result<bool, String> {
         let cancellation = self.cancellation();
         if grant_retired(
@@ -201,6 +206,31 @@ impl NativeHoldClaim {
     }
 }
 
+pub struct NativeReplayTargetReservation {
+    controls: Arc<NativeTestControls>,
+    identity: TaskIdentity,
+    operation: novarocks_execution_contract::TaskOperationId,
+    cancellation: ControlCancellation,
+}
+impl NativeReplayTargetReservation {
+    pub fn cancellation(&self) -> ControlCancellation {
+        self.cancellation.clone()
+    }
+}
+impl Drop for NativeReplayTargetReservation {
+    fn drop(&mut self) {
+        let mut pending = self
+            .controls
+            .replay_reservations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let execution = self.identity.query_execution_id();
+        if pending.get(&execution) == Some(&(self.identity, self.operation)) {
+            pending.remove(&execution);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct NominationPin {
     input: Option<StatementInputNomination>,
@@ -217,6 +247,9 @@ pub struct NativeTestControls {
     published_once: Mutex<HashSet<usize>>,
     nominations: Mutex<Vec<NominationPin>>,
     claimed: Mutex<HashMap<(QueryLifecycleFaultKind, QueryExecutionId), NativeFaultClaim>>,
+    replay_reservations: Mutex<
+        HashMap<QueryExecutionId, (TaskIdentity, novarocks_execution_contract::TaskOperationId)>,
+    >,
     restart: Mutex<
         HashMap<
             novarocks_execution_contract::task_execution::identity::QueryContextRef,
@@ -423,7 +456,12 @@ impl NativeTestControls {
                 continue;
             }
             let bind = action.starts_with("bind-");
-            if parameters.len() != if bind { 6 } else { 5 } {
+            let replay_barrier = match parameters.get("hold_split_consumption_until_replay") {
+                None => false,
+                Some(serde_json::Value::Bool(true)) if matches!(action, "task-update-terminal-ack-drop" | "bind-task-update-terminal-ack-drop") => true,
+                Some(_) => return Err("split consumption refinement requires the terminal ACK-drop fault and literal true".into()),
+            };
+            if parameters.len() != (if bind { 6 } else { 5 }) + usize::from(replay_barrier) {
                 return Err("Native fault grant target parameters are invalid".into());
             }
             let target_process_receipt = if bind {
@@ -499,6 +537,7 @@ impl NativeTestControls {
                 handle,
                 kind,
                 bind,
+                replay_barrier,
                 target_session_id,
                 target_process_receipt,
                 root,
@@ -517,6 +556,7 @@ impl NativeTestControls {
             published_once: Mutex::new(HashSet::new()),
             nominations: Mutex::new(nominations),
             claimed: Mutex::new(HashMap::new()),
+            replay_reservations: Mutex::new(HashMap::new()),
             restart: Mutex::new(HashMap::new()),
         })
     }
@@ -734,6 +774,104 @@ impl NativeTestControls {
         }
         Ok(published)
     }
+    /// Matches the declared gate without claiming an ACK-drop before acceptance.
+    pub fn reserve_task_update_replay_target(
+        self: &Arc<Self>,
+        request: &novarocks_execution_contract::UpdateTask,
+    ) -> Result<Option<NativeReplayTargetReservation>, String> {
+        let identity = request.identity();
+        let execution = identity.query_execution_id();
+        let process = identity.backend_process_id();
+        let kind = QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop;
+        // A replay uses the original gate. It never reserves or claims another.
+        let claimed = self
+            .claimed
+            .lock()
+            .map_err(|_| "Native fault claim lock failed")?;
+        if claimed.contains_key(&(kind, execution)) {
+            return Ok(None);
+        }
+        for grant in self
+            .faults
+            .iter()
+            .filter(|grant| grant.kind == kind && grant.replay_barrier && !grant.bind)
+        {
+            if !grant.handle.cancellation().is_active()
+                || grant.handle.cancellation().process() != ProcessBinding::Backend(process)
+                || grant_retired(
+                    &grant.root,
+                    kind,
+                    grant.backend_index,
+                    &grant.statement_run_token,
+                    &grant.target_session_id,
+                    grant.handle.cancellation().launch_id(),
+                    process,
+                    &grant.ended,
+                )?
+            {
+                continue;
+            }
+            let binding = match StatementExecutionBinding::read_private(&fault_binding_path(
+                &grant.root,
+                kind,
+                grant.backend_index,
+                &grant.statement_run_token,
+            )) {
+                Ok(binding) => binding,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("read nominated replay gate: {error}")),
+            };
+            if binding.target_session_id != grant.target_session_id
+                || binding.statement_run_token != grant.statement_run_token
+                || binding.backend_index != grant.backend_index
+                || binding.execution().map_err(|error| error.to_string())? != execution
+                || binding.process().map_err(|error| error.to_string())? != process
+                || action_ended(&grant.root, kind, &binding, &grant.ended)?
+            {
+                continue;
+            }
+            // Nonterminal updates cannot own the one terminal replay barrier.
+            if !request.domains().iter().any(|domain| {
+                matches!(domain,
+                novarocks_execution_contract::TaskDomainUpdate::SplitAssignment(intent)
+                    if intent.no_more_splits() && intent.offer().range().is_some())
+            }) {
+                continue;
+            }
+            let mut reservations = self
+                .replay_reservations
+                .lock()
+                .map_err(|_| "Native replay reservation lock failed")?;
+            if reservations.contains_key(&execution) {
+                return Err("the selected replay gate already has an in-flight reservation".into());
+            }
+            reservations.insert(execution, (identity, request.envelope().operation_id()));
+            return Ok(Some(NativeReplayTargetReservation {
+                controls: Arc::clone(self),
+                identity,
+                operation: request.envelope().operation_id(),
+                cancellation: grant.handle.cancellation(),
+            }));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn claimed_task_update_replay(
+        &self,
+        identity: TaskIdentity,
+    ) -> Result<NativeFaultClaim, String> {
+        self.claimed
+            .lock()
+            .map_err(|_| "Native fault claim lock failed")?
+            .get(&(
+                QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+                identity.query_execution_id(),
+            ))
+            .filter(|claim| claim.process_id == identity.backend_process_id())
+            .cloned()
+            .ok_or_else(|| "replay gate cannot activate before the actual ACK-drop claim".into())
+    }
+
     pub fn claim(
         &self,
         kind: QueryLifecycleFaultKind,
@@ -808,6 +946,7 @@ impl NativeTestControls {
                 .map_err(|error| error.to_string())?;
             let scope = NativeFaultClaim {
                 inner: Arc::new(Claimed {
+                    replay_barrier: grant.replay_barrier,
                     scope,
                     kind,
                     grant_id: grant.handle.grant_id().to_owned(),
@@ -1104,6 +1243,22 @@ pub(crate) mod tests {
         controlled_with_follow_up(action, false)
     }
     fn controlled_with_follow_up(action: &str, follow_up: bool) -> Controlled {
+        controlled_options(action, follow_up, false, 10_000)
+    }
+    pub(crate) fn controlled_replay(lifetime_millis: u64) -> Controlled {
+        controlled_options(
+            "task-update-terminal-ack-drop",
+            false,
+            true,
+            lifetime_millis,
+        )
+    }
+    fn controlled_options(
+        action: &str,
+        follow_up: bool,
+        replay: bool,
+        lifetime_millis: u64,
+    ) -> Controlled {
         let directory = tempfile::Builder::new()
             .prefix("g2-native-")
             .tempdir_in("/tmp")
@@ -1113,13 +1268,16 @@ pub(crate) mod tests {
         let token = format!("g2-{process}");
         let execution =
             QueryExecutionId::new(QueryId::new(71, 73), AttemptId::new(1).unwrap()).unwrap();
-        let parameters = if matches!(action, "ingress-hold" | "registry-hold") {
+        let mut parameters = if matches!(action, "ingress-hold" | "registry-hold") {
             serde_json::json!({"action":action,"token":token,"backend_index":0,"query_id_hi":71,"query_id_lo":73,"attempt_id":1,"frontend_process_id":frontend.to_string()})
         } else if action == "preparation-hold" {
             serde_json::json!({"action":action,"token":token,"backend_index":0,"query_id_hi":71,"query_id_lo":73,"attempt_id":1,"stage_id":1,"task_id":2})
         } else {
             serde_json::json!({"action":action,"root":directory.path(),"backend_index":0,"statement_run_token":token,"target_session_id":"native-tests"})
         };
+        if replay {
+            parameters["hold_split_consumption_until_replay"] = serde_json::json!(true);
+        }
         let mut domain_grants = vec![DomainGrant {
             domain: "native".into(),
             grant_id: "one-action".into(),
@@ -1143,7 +1301,7 @@ pub(crate) mod tests {
             session_id: "native-tests".into(),
             launch_id: process.to_string(),
             role: SessionRole::Be,
-            lifetime_millis: 10_000,
+            lifetime_millis,
             liveness_socket: directory.path().join("live.sock"),
             handshake_secret: "01234567890123456789012345678901".into(),
             domain_grants,

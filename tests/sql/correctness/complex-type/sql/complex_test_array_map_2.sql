@@ -36,7 +36,7 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into array_map_test values (1, array_repeat("abcdefghasdasdasirnqwrq", 20000), array_repeat(100, 20000));
+insert into array_map_test values (1, array_repeat("abcdefghasdasdasirnqwrq", 20000), array_repeat(CAST(100 AS LARGEINT), 20000));
 
 -- query 4
 USE ${case_db};
@@ -213,7 +213,7 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 42
 -- @skip_result_check=true
 USE ${case_db};
-insert into array_map_x values (1, array_repeat("abcdefghasdasdasirnqwrq", 2), array_repeat(100, 2));
+insert into array_map_x values (1, array_repeat("abcdefghasdasdasirnqwrq", 2), array_repeat(CAST(100 AS LARGEINT), 2));
 
 -- query 43
 USE ${case_db};

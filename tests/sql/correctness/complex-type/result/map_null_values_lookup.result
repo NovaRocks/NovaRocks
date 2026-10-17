@@ -1,0 +1,9 @@
+-- query 1
+found_value	missing_value	explicit_call
+NULL	NULL	NULL
+
+-- query 2
+id	found_value	missing_value
+1	NULL	NULL
+2	NULL	NULL
+3	NULL	NULL

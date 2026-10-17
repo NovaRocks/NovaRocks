@@ -2760,6 +2760,211 @@ mod sdk_nested_representation_tests {
         assert!(map.is_null(0));
         assert_eq!(map.value_offsets(), &[1, 1, 2]);
     }
+
+    #[tokio::test]
+    async fn recursive_nominal_largeint_sdk_file_preserves_nested_values_and_storage() {
+        use crate::schema_mapping::nominal_declaration;
+        use arrow::array::{FixedSizeBinaryArray, Int32Array};
+        use novarocks_spi::connector::{ConnectorColumnDefinition, ConnectorDataType as D};
+        let column = |name: &str, data_type| ConnectorColumnDefinition {
+            name: name.into(),
+            data_type,
+            nullable: true,
+            aggregation: None,
+            default: None,
+        };
+        let columns = vec![
+            column("numbers", D::Array(Box::new(D::LargeInt))),
+            column("mapping", D::Map(Box::new(D::Int), Box::new(D::LargeInt))),
+        ];
+        let schema = Schema::builder()
+            .with_fields(crate::catalog_control::type_mapping::schema_fields(&columns).unwrap())
+            .build()
+            .unwrap();
+        let declarations = nominal_declaration::from_columns(&schema, &columns).unwrap();
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://nested-largeint".into(),
+            crate::iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::from([(
+                nominal_declaration::PROPERTY.into(),
+                nominal_declaration::encode(&declarations).unwrap(),
+            )]),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let table_schema = metadata.current_schema();
+        let arrow =
+            crate::scalar_integer_domain::metadata_sql_schema(&metadata, table_schema).unwrap();
+        let bytes = [
+            i128::MAX.to_be_bytes(),
+            i128::MIN.to_be_bytes(),
+            (-1_i128).to_be_bytes(),
+        ];
+        let values = |input: Vec<Option<&[u8]>>| -> ArrayRef {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(input.into_iter(), 16)
+                    .unwrap(),
+            )
+        };
+        let DataType::List(item) = arrow.field(0).data_type() else {
+            panic!("list");
+        };
+        let numbers = ListArray::try_new(
+            item.clone(),
+            OffsetBuffer::new(vec![0, 2, 2, 4].into()),
+            values(vec![
+                Some(&bytes[0]),
+                None,
+                Some(&bytes[1]),
+                Some(&bytes[2]),
+            ]),
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let DataType::Map(entries, sorted) = arrow.field(1).data_type() else {
+            panic!("map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("entries");
+        };
+        let entries_array = StructArray::try_new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                values(vec![Some(&bytes[0]), Some(&bytes[1]), None]),
+            ],
+            None,
+        )
+        .unwrap();
+        let mapping = MapArray::try_new(
+            entries.clone(),
+            OffsetBuffer::new(vec![0, 1, 1, 3].into()),
+            entries_array,
+            Some(NullBuffer::from(vec![true, false, true])),
+            *sorted,
+        )
+        .unwrap();
+        let input =
+            RecordBatch::try_new(arrow, vec![Arc::new(numbers), Arc::new(mapping)]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let runtime = tokio::runtime::Handle::current();
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        );
+        let context = staged_write_context_from_frozen_facts(
+            &binding,
+            &input.schema(),
+            FrozenDataWriteFacts {
+                format_version: 3,
+                table_location: location.clone(),
+                data_location: format!("{location}/data"),
+                target_partition_spec_id: 0,
+                partition_source_column_names: vec![],
+                partition_column_names: vec![],
+                transform_exprs: vec![],
+                target_schema_json: serde_json::to_string(table_schema).unwrap(),
+                parquet_row_group_size_bytes: None,
+            },
+        )
+        .unwrap();
+        let files = crate::commit::data_writer::write_record_batches(&context, vec![input])
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let path = files[0].data_file.file_path();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(path.strip_prefix("file://").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let columns = [
+            IcebergColumnHandle::base_column_of(table_schema, 1).unwrap(),
+            IcebergColumnHandle::base_column_of(table_schema, 2).unwrap(),
+        ];
+        let scan = bind_scan_columns(IcebergSchemaBindingRequest {
+            table_schema,
+            file_schema: reader.schema(),
+            name_mapping: None,
+            partition_spec: None,
+            partition_values: None,
+            columns: &columns,
+        })
+        .unwrap();
+        let batch = reader.build().unwrap().next().unwrap().unwrap();
+        let facts = IcebergSplitFacts {
+            path,
+            file_first_row_id: None,
+            data_sequence_number: None,
+        };
+        let output = scan.materialize(&batch, None, &facts).unwrap();
+        let list = output[0].as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value_offsets(), &[0, 2, 2, 4]);
+        assert!(list.is_null(1));
+        let actual = list
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(actual.value(0), bytes[0]);
+        assert!(actual.is_null(1));
+        assert_eq!(actual.value(2), bytes[1]);
+        assert_eq!(actual.value(3), bytes[2]);
+        let map = output[1].as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.value_offsets(), &[0, 1, 1, 3]);
+        assert!(map.is_null(1));
+        let actual = map
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(actual.value(0), bytes[0]);
+        assert_eq!(actual.value(1), bytes[1]);
+        assert!(actual.is_null(2));
+        let mut request = |_: std::alloc::Layout| Ok(());
+        let mut work = |_: usize| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        let exact = crate::schema_mapping::catalog_value::table(
+            &metadata,
+            table_schema,
+            &[],
+            &mut creation,
+        )
+        .unwrap();
+        assert_eq!(
+            exact
+                .binding(0)
+                .unwrap()
+                .child_at(0)
+                .unwrap()
+                .logical_type(),
+            novarocks_type_contract::ValueLogicalType::LargeInt
+        );
+        assert_eq!(
+            exact
+                .binding(1)
+                .unwrap()
+                .child_at(1)
+                .unwrap()
+                .logical_type(),
+            novarocks_type_contract::ValueLogicalType::LargeInt
+        );
+        let sliced = scan.materialize(&batch.slice(1, 2), None, &facts).unwrap();
+        let list = sliced[0].as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value_offsets(), &[2, 2, 4]);
+        assert!(list.is_null(0));
+    }
     #[test]
     fn recursive_representation_keeps_closed_leaf_and_container_rules() {
         let list = |ty| DataType::List(Arc::new(Field::new("element", ty, true)));

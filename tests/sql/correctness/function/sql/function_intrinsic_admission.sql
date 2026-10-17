@@ -36,7 +36,8 @@ SELECT field(1,1,2) AS first_match;
 SELECT array_reverse([1]) WHERE FALSE;
 
 -- query 7
--- @expect_error=no admitted selected scalar implementation
+-- Invalid arity must be rejected even when the row predicate is false.
+-- @expect_error=no matching declared overload
 SELECT next_day('2020-01-01') WHERE FALSE;
 
 -- query 8

@@ -20,7 +20,10 @@ use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::{ArrayRef, StringArray};
 use std::sync::Arc;
 
-fn should_prefer_latin1_bytes(arena: &ExprArena, arg: ExprId) -> bool {
+fn should_prefer_latin1_bytes<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    arg: ExprId,
+) -> bool {
     let name = match arena.node(arg) {
         Some(ExprNode::FunctionCall {
             kind: FunctionKind::Encryption(name),
@@ -32,12 +35,12 @@ fn should_prefer_latin1_bytes(arena: &ExprArena, arg: ExprId) -> bool {
         .prefers_latin1()
 }
 
-pub fn eval_to_base64(
-    arena: &ExprArena,
+pub fn eval_to_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let prefer_latin1 = should_prefer_latin1_bytes(arena, args[0]);
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "to_base64", 0)?;

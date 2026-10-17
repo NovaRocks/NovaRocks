@@ -19,7 +19,7 @@
 -- Test Objective:
 -- 1. Validate MAP subscript access via [] operator and element_at() on literals and table columns.
 -- 2. Validate ORDER BY on a MAP subscript value with LIMIT/OFFSET.
--- 3. Cover NULL-value lookup, empty-map lookup, column-indexed map literal, and null-key access.
+-- 3. Cover NULL values, empty maps, column probes, NULL probes, and rejected NULL keys.
 -- @order_sensitive=true
 
 -- query 1
@@ -86,5 +86,11 @@ SELECT c2["key1"] FROM ${case_db}.map_top_n ORDER BY c1;
 SELECT map{1: "a", 2: "b"}[c1] FROM ${case_db}.map_top_n ORDER BY c1;
 
 -- query 14
--- Null-key map access: map{null:"a",...}[null] → "a"
+-- Frozen Map keys are non-null. Match both the constructor cause and the
+-- execution phase so a preparation or protocol failure cannot satisfy this case.
+-- @expect_error=map literal key must not be NULL"), phase: Execution
 SELECT map{null: "a", 2: "b"}[null];
+
+-- query 15
+-- A NULL probe into a valid Map remains a successful NULL result.
+SELECT map{1: "a", 2: "b"}[null] AS null_probe;

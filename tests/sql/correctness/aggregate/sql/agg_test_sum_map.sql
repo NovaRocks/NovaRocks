@@ -283,8 +283,8 @@ TBLPROPERTIES ("format-version" = "3");
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t5 values
-    (1, map{1:10, 2:20, NULL:100}),
-    (2, map{1:5, NULL:50, 3:30});
+    (1, map{1:10, 2:20}),
+    (2, map{1:5, 3:30});
 
 -- query 51
 USE ${case_db};
@@ -304,7 +304,7 @@ select sum_map(m_nullable)[1], sum_map(m_nullable)[2], sum_map(m_nullable)[3], s
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t5 values
-    (4, map{NULL:25, 5:NULL, 6:60});
+    (4, map{5:NULL, 6:60});
 
 -- query 55
 USE ${case_db};

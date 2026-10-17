@@ -1607,11 +1607,11 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
     };
     let fixture = published(&fixture);
     assert_unchanged(&fixture.build());
-    for revision in [2, 3, 4, 5, 6] {
+    for revision in [2, 3, 4, 5, 6, 7] {
         let old = fixture.build_modified(None, None, Some(revision));
         assert_provider(&old, ConnectorCodecErrorKind::VersionMismatch);
     }
-    for revision in [3, 4, 5, 6] {
+    for revision in [3, 4, 5, 6, 7] {
         let old = fixture.build_modified(
             None,
             Some(bytes::Bytes::from_static(b"invalid private body")),
@@ -1684,4 +1684,111 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
         work_source: ConnectorReadWorkSource::RuntimeSplits,
     };
     assert_unchanged(&published(&window_fixture).build());
+}
+
+#[test]
+fn recursive_nominal_table_window_and_projected_struct_field_keep_exact_frozen_domains() {
+    use crate::schema_mapping::nominal_declaration::{self, NominalSourceDomain};
+    let metadata = nominal_declaration::recursive_tests::metadata();
+    let schema = metadata.current_schema();
+    let declarations = nominal_declaration::from_metadata(&metadata).unwrap();
+    let table = IcebergTableHandle::try_new(table_handle_params(schema, None))
+        .unwrap()
+        .with_nominal_declarations(declarations.clone())
+        .unwrap();
+    let root = IcebergColumnHandle::base_column_of(schema, 1).unwrap();
+    let hll_id = *declarations
+        .iter()
+        .find(|(_, domain)| **domain == NominalSourceDomain::Hll)
+        .unwrap()
+        .0;
+    let columns = vec![root.clone(), root.dereference(&[hll_id]).unwrap(), root];
+    let relation = IcebergRuntimeRelation::Table(table.clone());
+    let public = fixture_public_read_schema(&relation, &columns).unwrap();
+    let bindings = public.execution_schema().unwrap();
+    assert_eq!(
+        bindings.binding(1).unwrap().logical_type(),
+        novarocks_type_contract::ValueLogicalType::Hll
+    );
+    assert_eq!(
+        bindings
+            .binding(0)
+            .unwrap()
+            .child_at(0)
+            .unwrap()
+            .child_at(0)
+            .unwrap()
+            .logical_type(),
+        novarocks_type_contract::ValueLogicalType::LargeInt
+    );
+    let fixture = Fixture {
+        source: source_for(&relation),
+        domains: BTreeMap::new(),
+        published_source: None,
+        published_bindings: None,
+        fields: public.schema().fields().to_vec(),
+        relation,
+        columns: columns.clone(),
+        metadata: None,
+        work_source: ConnectorReadWorkSource::RuntimeSplits,
+    };
+    let fixture = published(&fixture);
+    assert_unchanged(&fixture.build());
+    let mut wrong = fixture.clone();
+    let mut drift = declarations.clone();
+    drift.insert(hll_id, NominalSourceDomain::Bitmap);
+    wrong.relation =
+        IcebergRuntimeRelation::Table(table.clone().with_nominal_declarations(drift).unwrap());
+    assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
+    let mut erased = fixture.clone();
+    erased.relation = IcebergRuntimeRelation::Table(
+        table
+            .clone()
+            .with_nominal_declarations(BTreeMap::new())
+            .unwrap(),
+    );
+    assert_provider(&erased.build(), ConnectorCodecErrorKind::InconsistentFields);
+    let to = table.read_domain().unwrap().clone();
+    let from = crate::delete_semantics::test_read_domain(schema, &[], 10);
+    let window = IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
+        schema_table_name: table.schema_table_name().clone(),
+        table_schema_json: table.table_schema_json().into(),
+        // A table read may repeat projections; the canonical change window's
+        // owned column set must contain each exact handle once.
+        columns: columns[..2].to_vec(),
+        name_mapping_json: None,
+        from_snapshot_id_exclusive: 10,
+        to_snapshot_id_inclusive: 11,
+        from_read_domain: from,
+        to_read_domain: to,
+        partition_spec_jsons: table.partition_spec_jsons().clone(),
+    })
+    .unwrap()
+    .with_nominal_declarations(declarations)
+    .unwrap();
+    let relation = IcebergRuntimeRelation::ChangeWindow(window);
+    let fixture = Fixture {
+        source: source_for(&relation),
+        relation,
+        columns: columns[..2].to_vec(),
+        fields: fixture.fields[..2].to_vec(),
+        ..fixture
+    };
+    let fixture = published(&fixture);
+    let bindings = fixture.published_bindings.as_ref().unwrap();
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(
+        bindings[0]
+            .child_at(0)
+            .unwrap()
+            .child_at(0)
+            .unwrap()
+            .logical_type(),
+        novarocks_type_contract::ValueLogicalType::LargeInt
+    );
+    assert_eq!(
+        bindings[1].logical_type(),
+        novarocks_type_contract::ValueLogicalType::Hll
+    );
+    assert_unchanged(&fixture.build());
 }

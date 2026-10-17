@@ -216,12 +216,12 @@ fn hash_value_impl(
     Ok(())
 }
 
-pub fn eval_array_distinct(
-    arena: &ExprArena,
+pub fn eval_array_distinct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
         format!(
@@ -235,10 +235,9 @@ pub fn eval_array_distinct(
         _ => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_distinct output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_distinct output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -320,7 +319,7 @@ pub fn eval_array_distinct(
             current += 1;
         }
         if current > i32::MAX as i64 {
-            return Err("array_distinct offset overflow".to_string());
+            return Err(("array_distinct offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

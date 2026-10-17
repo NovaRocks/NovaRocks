@@ -275,12 +275,34 @@ struct SplitQueueState<S> {
     duplicate_splits_skipped: u64,
     no_more_splits: bool,
     closed: bool,
+    #[cfg(novarocks_dev_controls)]
+    consumption_gate: Option<Arc<TestSplitConsumptionGate>>,
 }
 
 /// What the classification pass decided about one offered split.
 enum SplitDecision {
     Enqueue { retained: u64 },
     Duplicate,
+}
+
+/// A finite test owner may pause consumption without stopping split delivery.
+/// Releasing it wakes the same queue observation used by ordinary empty input.
+#[cfg(novarocks_dev_controls)]
+pub struct TestSplitConsumptionGate {
+    held: AtomicBool,
+    observable: Arc<Observable>,
+}
+#[cfg(novarocks_dev_controls)]
+impl TestSplitConsumptionGate {
+    pub fn release(&self) {
+        let notify = self.observable.defer_notify();
+        if self.held.swap(false, Ordering::AcqRel) {
+            notify.arm();
+        }
+    }
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::Acquire)
+    }
 }
 
 /// One plan node's runtime split queue inside one task attempt.
@@ -307,6 +329,8 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
                 duplicate_splits_skipped: 0,
                 no_more_splits: false,
                 closed: false,
+                #[cfg(novarocks_dev_controls)]
+                consumption_gate: None,
             }),
             observable: Arc::new(Observable::new()),
         })
@@ -515,12 +539,42 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
         Ok(outcome)
     }
 
+    /// Reserves a real input-consumption pause before a test-faulted enqueue.
+    /// A closed queue can never be reopened, including by a controlled test.
+    #[cfg(novarocks_dev_controls)]
+    pub fn reserve_test_consumption_gate(&self) -> Result<Arc<TestSplitConsumptionGate>, String> {
+        let mut state = self.state.lock().expect("split queue lock");
+        if state.closed {
+            return Err("cannot gate a closed split queue".into());
+        }
+        if state
+            .consumption_gate
+            .as_ref()
+            .is_some_and(|gate| gate.is_held())
+        {
+            return Err("split queue already has a held consumption gate".into());
+        }
+        let gate = Arc::new(TestSplitConsumptionGate {
+            held: AtomicBool::new(true),
+            observable: Arc::clone(&self.observable),
+        });
+        state.consumption_gate = Some(Arc::clone(&gate));
+        Ok(gate)
+    }
+
     /// Take the next split, or report why there is none.
     pub fn poll(&self) -> SplitPoll<S> {
         let notify = self.observable.defer_notify();
         let mut state = self.state.lock().expect("split queue lock");
         if state.closed {
             return SplitPoll::Exhausted;
+        }
+        #[cfg(novarocks_dev_controls)]
+        if let Some(gate) = state.consumption_gate.as_ref() {
+            if gate.is_held() {
+                return SplitPoll::Blocked;
+            }
+            state.consumption_gate = None;
         }
         if let Some(split) = state.pending.pop_front() {
             state.queued_bytes = state
@@ -551,9 +605,15 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
             return;
         }
         state.closed = true;
+        #[cfg(novarocks_dev_controls)]
+        let gate = state.consumption_gate.take();
         state.pending.clear();
         state.queued_bytes = 0;
         drop(state);
+        #[cfg(novarocks_dev_controls)]
+        if let Some(gate) = gate {
+            gate.release();
+        }
         notify.arm();
     }
 
@@ -1119,6 +1179,83 @@ mod tests {
         assert_eq!(error.kind(), SplitQueueErrorKind::AfterNoMoreSplits);
         assert_eq!(error.sequence_id(), Some(2));
         assert_eq!(queue.stats().queued_splits, 1);
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn reserved_consumption_keeps_original_input_for_live_duplicate_then_wakes_once() {
+        let queue = queue();
+        let gate = queue.reserve_test_consumption_gate().unwrap();
+        queue
+            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"abc")], true)
+            .unwrap();
+        let wake = counting_observer(&queue);
+        let before = queue.stats();
+        // Both ordinary and speculative callers use this same poll seam.
+        assert!(matches!(queue.poll(), SplitPoll::Blocked));
+        assert!(matches!(queue.poll(), SplitPoll::Blocked));
+        assert_eq!(queue.stats().queued_splits, 1);
+        assert_eq!(queue.stats().queued_bytes, before.queued_bytes);
+        let duplicate = queue
+            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"ignored")], true)
+            .unwrap();
+        assert_eq!(duplicate.duplicate_sequences, vec![1]);
+        assert!(duplicate.enqueued.is_empty());
+        assert_eq!(queue.stats().duplicate_splits_skipped, 1);
+        assert!(matches!(queue.poll(), SplitPoll::Blocked));
+        gate.release();
+        gate.release();
+        assert_eq!(wake.load(Ordering::Acquire), 1);
+        let SplitPoll::Ready(original) = queue.poll() else {
+            panic!("original input is released once");
+        };
+        assert_eq!(original.retained_size_in_bytes(), 3);
+        assert!(matches!(queue.poll(), SplitPoll::Exhausted));
+        assert!(!queue.is_closed());
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn consumption_gate_cannot_delay_close_or_reopen_closed_input() {
+        let queue = queue();
+        let gate = queue.reserve_test_consumption_gate().unwrap();
+        queue
+            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], true)
+            .unwrap();
+        queue.close();
+        assert!(!gate.is_held());
+        assert!(matches!(queue.poll(), SplitPoll::Exhausted));
+        assert!(queue.reserve_test_consumption_gate().is_err());
+        assert_eq!(queue.stats().queued_splits, 0);
+        gate.release();
+        assert!(matches!(queue.poll(), SplitPoll::Exhausted));
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn a_reservation_precedes_enqueue_even_when_the_consumer_is_already_polling() {
+        let queue = queue();
+        let gate = queue.reserve_test_consumption_gate().unwrap();
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let consumer = {
+            let queue = Arc::clone(&queue);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                for _ in 0..100 {
+                    assert!(matches!(queue.poll(), SplitPoll::Blocked));
+                }
+            })
+        };
+        ready.wait();
+        queue
+            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], true)
+            .unwrap();
+        consumer.join().unwrap();
+        assert_eq!(queue.stats().queued_splits, 1);
+        gate.release();
+        assert!(matches!(queue.poll(), SplitPoll::Ready(_)));
+        assert!(matches!(queue.poll(), SplitPoll::Exhausted));
     }
 
     #[test]

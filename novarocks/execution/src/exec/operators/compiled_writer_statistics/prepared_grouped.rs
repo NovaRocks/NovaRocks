@@ -137,10 +137,10 @@ pub(crate) fn create_prepared_grouped_in(
     )
     .map_err(grouped_hashmap_error)?;
     temporary.observe_opaque_upper_bound(shape.request_bytes_upper_bound)?;
-    control.checkpoint(0)?;
+    crate::exec::expr::ExprEvaluationControl::checkpoint(&control)?;
     let mut seen = std::collections::HashSet::with_capacity(groups.len());
     for row in 0..groups.len() {
-        control.checkpoint(1)?;
+        crate::exec::expr::ExprEvaluationControl::checkpoint(&control)?;
         if groups.is_null(row) {
             return Err("table finish final aggregate produced a null grouping key".into());
         }
@@ -161,7 +161,7 @@ pub(crate) fn create_prepared_grouped_in(
         }
         rows.push((target, row));
     }
-    control.checkpoint(0)?;
+    crate::exec::expr::ExprEvaluationControl::checkpoint(&control)?;
     let scalar_count = plan
         .mappings
         .iter()
@@ -332,10 +332,15 @@ pub(crate) fn create_prepared_grouped_in(
                                 )
                                 .into());
                             }
-                            control.checkpoint(0)?;
-                            let array =
-                                arena.eval(*expr_id, row.as_ref().expect("actual literal row"))?;
-                            control.checkpoint(0)?;
+                            crate::exec::expr::ExprEvaluationControl::checkpoint(&control)?;
+                            let evaluation = crate::exec::expr::ExprEvaluationContext::new(
+                                arena,
+                                owner.as_ref(),
+                                &control,
+                            );
+                            let array = evaluation
+                                .eval(*expr_id, row.as_ref().expect("actual literal row"))?;
+                            crate::exec::expr::ExprEvaluationControl::checkpoint(&control)?;
                             let array = crate::exec::chunk::normalize_execution_array_observed::<
                                 ConstructionFailure,
                                 _,

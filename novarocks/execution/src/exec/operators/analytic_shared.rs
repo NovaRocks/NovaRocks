@@ -30,6 +30,10 @@
 #[path = "analytic_input_stages.rs"]
 mod analytic_input_stages;
 
+#[cfg(test)]
+#[path = "analytic_frozen_parameter_tests.rs"]
+mod frozen_parameter_tests;
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -289,15 +293,49 @@ impl AnalyticSharedState {
         Ok(())
     }
 
+    pub(crate) fn finish_created(
+        &self,
+        state: &RuntimeState,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        self.finish_with(state, |chunk, exprs| {
+            if exprs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let owner = factory.begin_input_construction(chunk)?;
+            let control =
+                super::compiled_expression::RuntimeKernelControl::new(state.error_state());
+            let evaluation = crate::exec::expr::ExprEvaluationContext::new(
+                &self.arena,
+                owner.as_ref(),
+                &control,
+            );
+            exprs.iter().map(|id| evaluation.eval(*id, chunk)).collect()
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn finish(&self, state: &RuntimeState) -> Result<(), String> {
+        self.finish_with(state, |chunk, exprs| {
+            self.eval_exprs(chunk, exprs).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    fn finish_with<F>(
+        &self,
+        state: &RuntimeState,
+        evaluate: F,
+    ) -> crate::runtime::fragment::ExecutionResult<()>
+    where
+        F: FnMut(&Chunk, &[ExprId]) -> crate::runtime::fragment::ExecutionResult<Vec<ArrayRef>>,
+    {
         let notify = self.observable.defer_notify();
         let aggregate_tracker = self.aggregate_mem_tracker(state);
         let mut guard = self.inner.lock().expect("analytic state lock");
         guard.sink_finishing = true;
         if !guard.computed {
-            let outputs = self
-                .compute_outputs(&guard.input, aggregate_tracker)
-                .map_err(|e| e.to_string())?;
+            let outputs = self.compute_outputs_with(&guard.input, aggregate_tracker, evaluate)?;
             let mut outputs = outputs;
             if let Some(tracker) = self.queue_mem_tracker(state).as_ref() {
                 for chunk in outputs.iter_mut() {
@@ -349,11 +387,27 @@ impl AnalyticSharedState {
         guard.sink_complete && guard.output.is_empty() && guard.pending.is_empty()
     }
 
+    #[cfg(test)]
     fn compute_outputs(
         &self,
         input: &[Chunk],
         aggregate_tracker: Option<Arc<MemTracker>>,
     ) -> Result<VecDeque<Chunk>, String> {
+        self.compute_outputs_with(input, aggregate_tracker, |chunk, exprs| {
+            self.eval_exprs(chunk, exprs).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    fn compute_outputs_with<F>(
+        &self,
+        input: &[Chunk],
+        aggregate_tracker: Option<Arc<MemTracker>>,
+        mut evaluate: F,
+    ) -> crate::runtime::fragment::ExecutionResult<VecDeque<Chunk>>
+    where
+        F: FnMut(&Chunk, &[ExprId]) -> crate::runtime::fragment::ExecutionResult<Vec<ArrayRef>>,
+    {
         if input.is_empty() {
             return Ok(VecDeque::new());
         }
@@ -369,8 +423,8 @@ impl AnalyticSharedState {
         if total_rows == 0 {
             return Ok(VecDeque::new());
         }
-        let mut partition_keys = self.eval_exprs(&ordered_chunk, &self.partition_exprs)?;
-        let mut order_keys = self.eval_exprs(&ordered_chunk, &self.order_by_exprs)?;
+        let mut partition_keys = evaluate(&ordered_chunk, &self.partition_exprs)?;
+        let mut order_keys = evaluate(&ordered_chunk, &self.order_by_exprs)?;
 
         // Hash-based analytic plans may emit the same partition key in non-contiguous blocks.
         // For partition-only full-frame window aggregates, regroup rows by partition key first.
@@ -383,8 +437,8 @@ impl AnalyticSharedState {
                 reordered.try_transfer_to(tracker)?;
             }
             ordered_chunk = reordered;
-            partition_keys = self.eval_exprs(&ordered_chunk, &self.partition_exprs)?;
-            order_keys = self.eval_exprs(&ordered_chunk, &self.order_by_exprs)?;
+            partition_keys = evaluate(&ordered_chunk, &self.partition_exprs)?;
+            order_keys = evaluate(&ordered_chunk, &self.order_by_exprs)?;
         }
 
         let partitions = compute_partitions(&partition_keys, total_rows)?;
@@ -393,7 +447,7 @@ impl AnalyticSharedState {
 
         let mut func_outputs: Vec<ArrayRef> = Vec::with_capacity(self.functions.len());
         for (func_idx, func) in self.functions.iter().enumerate() {
-            let arrays = self.eval_exprs(&ordered_chunk, &func.args)?;
+            let arrays = evaluate(&ordered_chunk, &func.args)?;
             let out = compute_window_function(
                 &self.arena,
                 func,
@@ -428,9 +482,14 @@ impl AnalyticSharedState {
         }
 
         validate_analytic_output_columns(&columns, &output_chunk_schema, total_rows)?;
-        split_analytic_output_chunks(output_chunk_schema, &columns, input)
+        Ok(split_analytic_output_chunks(
+            output_chunk_schema,
+            &columns,
+            input,
+        )?)
     }
 
+    #[cfg(test)]
     fn eval_exprs(&self, chunk: &Chunk, exprs: &[ExprId]) -> Result<Vec<ArrayRef>, String> {
         let mut out = Vec::with_capacity(exprs.len());
         for id in exprs {
@@ -1478,11 +1537,9 @@ fn compute_session_number(
     let delta_node = arena
         .node(func.args[1])
         .ok_or_else(|| "invalid ExprId".to_string())?;
-    let delta = match delta_node {
-        ExprNode::Literal(LiteralValue::Null) => {
-            return Ok(new_null_array(&DataType::Int64, total_rows));
-        }
-        _ => parse_int64_literal(arena, func.args[1])? as i64,
+    let delta = match nullable_int64_parameter(delta_node)? {
+        Some(delta) => delta,
+        None => return Ok(new_null_array(&DataType::Int64, total_rows)),
     };
 
     let value = args
@@ -3001,10 +3058,30 @@ fn rows_frame_bounds(
 
 fn parse_int64_literal(arena: &ExprArena, id: ExprId) -> Result<i64, String> {
     let node = arena.node(id).ok_or_else(|| "invalid ExprId".to_string())?;
+    nullable_int64_parameter(node)?
+        .ok_or_else(|| format!("expected integer literal, got {:?}", node))
+}
+
+fn nullable_int64_parameter(node: &ExprNode) -> Result<Option<i64>, String> {
     match node {
-        ExprNode::Literal(LiteralValue::Int64(v)) => Ok(*v),
-        ExprNode::Literal(LiteralValue::Int32(v)) => Ok(*v as i64),
-        other => Err(format!("expected integer literal, got {:?}", other)),
+        ExprNode::Literal(LiteralValue::Null) => Ok(None),
+        ExprNode::Literal(LiteralValue::Int64(value)) => Ok(Some(*value)),
+        ExprNode::Literal(LiteralValue::Int32(value)) => Ok(Some(i64::from(*value))),
+        ExprNode::Constant(value)
+            if value.value_type().logical_type()
+                == novarocks_type_contract::ValueLogicalType::Physical =>
+        {
+            // Keep the window parameter domain narrower than try_i64's signed carriers.
+            // Check the declared type before accepting a selected SQL NULL.
+            match value.value_type().data_type() {
+                DataType::Int32 | DataType::Int64 => value
+                    .try_i64()
+                    .map_err(|error| format!("invalid integer constant: {error}")),
+                DataType::Null => Ok(None),
+                _ => Err(format!("expected integer literal, got {:?}", node)),
+            }
+        }
+        _ => Err(format!("expected integer literal, got {:?}", node)),
     }
 }
 

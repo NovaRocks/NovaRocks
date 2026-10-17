@@ -28,12 +28,12 @@ fn legacy_error(error: AccessFailure<Infallible>) -> String {
         AccessFailure::Control(never) => match never {},
     }
 }
-pub fn eval_element_at(
-    arena: &ExprArena,
+pub fn eval_element_at<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let subscript_arr = arena.eval(args[1], chunk)?;
     let check_arr = if args.len() == 3 {
@@ -45,7 +45,7 @@ pub fn eval_element_at(
     let inputs = ArrayAccessInputs::new(arr, subscript_arr, check_arr, &mut observer)
         .map_err(legacy_error)?;
     inputs.validate_legacy_lengths()?;
-    lookup_observed(
+    Ok((lookup_observed(
         &inputs,
         novarocks_functions::Selection::all(inputs.list().len()),
         |_, row| Ok::<_, Infallible>(inputs.legacy_rows(row)),
@@ -53,5 +53,5 @@ pub fn eval_element_at(
         |_, _| Ok::<(), Infallible>(()),
         &mut observer,
     )
-    .map_err(legacy_error)
+    .map_err(legacy_error))?)
 }

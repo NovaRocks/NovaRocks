@@ -14,10 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Real SQL fact/resume source and permanent compilation success oracles.
-//! UNRUN; before expected UnsupportedAbi(AggregateV1), not new math semantics.
+//! Real SQL fact/resume sources and complete BY window compilation oracles.
+use super::filter_conjunction_actual_sql_compiler_tests::compiler_results_with_declared_read_fields;
 use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields;
-use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
 use arrow::datatypes::{DataType, Field};
 use novarocks_physical_plan::ExprKind;
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
@@ -84,7 +83,10 @@ fn compile(sql: &str, fields: &[Field]) {
     assert_eq!(inspect(&source), 2);
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
-    let programs = programs_with_catalogue_and_original_inlist_source(&source, &functions);
+    let programs = compiler_results_with_declared_read_fields(&source, fields, &functions)
+        .into_iter()
+        .map(|(id, result)| (id, result.unwrap()))
+        .collect::<std::collections::BTreeMap<_, _>>();
     assert!(!programs.is_empty());
     assert!(programs.values().any(
         |program| program.graph().nodes().iter().any(|node| matches!(

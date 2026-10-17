@@ -40,12 +40,12 @@ fn assert_struct_child_type(
     ))
 }
 
-pub fn eval_struct_expr(
-    arena: &ExprArena,
+pub fn eval_struct_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     id: ExprId,
     fields: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let output_type = arena
         .data_type(id)
         .cloned()
@@ -53,18 +53,18 @@ pub fn eval_struct_expr(
     let struct_fields = match output_type {
         DataType::Struct(fields) => fields,
         other => {
-            return Err(format!(
-                "struct_expr output type must be Struct, got {:?}",
-                other
-            ));
+            return Err(
+                (format!("struct_expr output type must be Struct, got {:?}", other)).into(),
+            );
         }
     };
     if struct_fields.len() != fields.len() {
-        return Err(format!(
+        return Err((format!(
             "struct_expr field count mismatch: expected {}, got {}",
             struct_fields.len(),
             fields.len()
-        ));
+        ))
+        .into());
     }
 
     let num_rows = chunk.len();
@@ -72,12 +72,13 @@ pub fn eval_struct_expr(
     for (idx, expr_id) in fields.iter().enumerate() {
         let mut array = arena.eval(*expr_id, chunk)?;
         if array.len() != num_rows {
-            return Err(format!(
+            return Err((format!(
                 "struct_expr field length mismatch at {}: expected {}, got {}",
                 idx,
                 num_rows,
                 array.len()
-            ));
+            ))
+            .into());
         }
         let expected_type = struct_fields
             .get(idx)

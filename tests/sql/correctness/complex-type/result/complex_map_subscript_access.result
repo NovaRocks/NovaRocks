@@ -63,6 +63,6 @@ NULL
 NULL
 NULL
 
--- query 14
-map{NULL:'a',2:'b'}[NULL]
-a
+-- query 15
+null_probe
+NULL

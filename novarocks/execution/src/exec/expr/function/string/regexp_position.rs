@@ -21,12 +21,12 @@ use novarocks_functions::builtin::regexp_position::{
     evaluate_legacy, validate_legacy_position, validate_legacy_strings,
 };
 
-pub fn eval_regexp_position(
-    arena: &ExprArena,
+pub fn eval_regexp_position<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
@@ -42,5 +42,5 @@ pub fn eval_regexp_position(
         validate_legacy_position(&occurrence)?;
         arrays.push(occurrence);
     }
-    evaluate_legacy(&arrays, chunk.len())
+    Ok((evaluate_legacy(&arrays, chunk.len()))?)
 }

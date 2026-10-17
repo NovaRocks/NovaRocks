@@ -424,14 +424,14 @@ fn encode_column(
     Ok(())
 }
 
-pub fn eval_encode_sort_key(
-    arena: &ExprArena,
+pub fn eval_encode_sort_key<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.is_empty() {
-        return Err("encode_sort_key requires at least 1 argument".to_string());
+        return Err(("encode_sort_key requires at least 1 argument".to_string()).into());
     }
 
     let rows = chunk.len();
@@ -456,5 +456,5 @@ pub fn eval_encode_sort_key(
         builder.append_value(value);
     }
     let out = Arc::new(builder.finish()) as ArrayRef;
-    super::common::cast_output(out, arena.data_type(expr), "encode_sort_key")
+    Ok((super::common::cast_output(out, arena.data_type(expr), "encode_sort_key"))?)
 }

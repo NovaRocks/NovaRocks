@@ -39,63 +39,79 @@ pub fn metadata(name: &str) -> Option<FunctionMeta> {
     ARRAY_METADATA.iter().find(|m| m.name == name).copied()
 }
 
-pub fn eval_array_function(
+pub fn eval_array_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let canonical = ARRAY_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "all_match" => super::all_match::eval_all_match(arena, expr, args, chunk),
-        "any_match" => super::any_match::eval_any_match(arena, expr, args, chunk),
-        "array_append" => super::array_append::eval_array_append(arena, expr, args, chunk),
-        "array_avg" => super::array_avg::eval_array_avg(arena, expr, args, chunk),
-        "array_concat" => super::array_concat::eval_array_concat(arena, expr, args, chunk),
-        "array_cum_sum" => super::array_cum_sum::eval_array_cum_sum(arena, expr, args, chunk),
-        "array_length" => super::array_length::eval_array_length(arena, expr, args, chunk),
-        "array_contains" => super::array_contains::eval_array_contains(arena, expr, args, chunk),
+        "all_match" => Ok((super::all_match::eval_all_match(arena, expr, args, chunk))?),
+        "any_match" => Ok((super::any_match::eval_any_match(arena, expr, args, chunk))?),
+        "array_append" => Ok((super::array_append::eval_array_append(arena, expr, args, chunk))?),
+        "array_avg" => Ok((super::array_avg::eval_array_avg(arena, expr, args, chunk))?),
+        "array_concat" => Ok((super::array_concat::eval_array_concat(arena, expr, args, chunk))?),
+        "array_cum_sum" => {
+            Ok((super::array_cum_sum::eval_array_cum_sum(arena, expr, args, chunk))?)
+        }
+        "array_length" => Ok((super::array_length::eval_array_length(arena, expr, args, chunk))?),
+        "array_contains" => {
+            Ok((super::array_contains::eval_array_contains(arena, expr, args, chunk))?)
+        }
         "array_contains_all" => {
-            super::array_contains_all::eval_array_contains_all(arena, expr, args, chunk)
+            Ok((super::array_contains_all::eval_array_contains_all(arena, expr, args, chunk))?)
         }
         "array_contains_seq" => {
-            super::array_contains_seq::eval_array_contains_seq(arena, expr, args, chunk)
+            Ok((super::array_contains_seq::eval_array_contains_seq(arena, expr, args, chunk))?)
         }
-        "array_distinct" => super::array_distinct::eval_array_distinct(arena, expr, args, chunk),
+        "array_distinct" => {
+            Ok((super::array_distinct::eval_array_distinct(arena, expr, args, chunk))?)
+        }
         "array_difference" => {
-            super::array_difference::eval_array_difference(arena, expr, args, chunk)
+            Ok((super::array_difference::eval_array_difference(arena, expr, args, chunk))?)
         }
         "__array_element_at" | "element_at" => {
-            super::element_at::eval_element_at(arena, expr, args, chunk)
+            Ok((super::element_at::eval_element_at(arena, expr, args, chunk))?)
         }
-        "__array_struct_subfield" | "array_struct_subfield" => {
-            super::array_struct_subfield::eval_array_struct_subfield(arena, expr, args, chunk)
+        "__array_struct_subfield" | "array_struct_subfield" => Ok(
+            (super::array_struct_subfield::eval_array_struct_subfield(arena, expr, args, chunk))?,
+        ),
+        "array_filter" => Ok((super::array_filter::eval_array_filter(arena, expr, args, chunk))?),
+        "array_flatten" => {
+            Ok((super::array_flatten::eval_array_flatten(arena, expr, args, chunk))?)
         }
-        "array_filter" => super::array_filter::eval_array_filter(arena, expr, args, chunk),
-        "array_flatten" => super::array_flatten::eval_array_flatten(arena, expr, args, chunk),
-        "array_generate" => super::array_generate::eval_array_generate(arena, expr, args, chunk),
-        "array_intersect" => super::array_intersect::eval_array_intersect(arena, expr, args, chunk),
-        "array_join" => super::array_join::eval_array_join(arena, expr, args, chunk),
-        "array_max" => super::array_max::eval_array_max(arena, expr, args, chunk),
-        "array_min" => super::array_min::eval_array_min(arena, expr, args, chunk),
-        "array_position" => super::array_position::eval_array_position(arena, expr, args, chunk),
-        "array_repeat" => super::array_repeat::eval_array_repeat(arena, expr, args, chunk),
-        "array_remove" => super::array_remove::eval_array_remove(arena, expr, args, chunk),
-        "array_slice" => super::array_slice::eval_array_slice(arena, expr, args, chunk),
-        "array_sort" => super::array_sort::eval_array_sort(arena, expr, args, chunk),
+        "array_generate" => {
+            Ok((super::array_generate::eval_array_generate(arena, expr, args, chunk))?)
+        }
+        "array_intersect" => {
+            Ok((super::array_intersect::eval_array_intersect(arena, expr, args, chunk))?)
+        }
+        "array_join" => Ok((super::array_join::eval_array_join(arena, expr, args, chunk))?),
+        "array_max" => Ok((super::array_max::eval_array_max(arena, expr, args, chunk))?),
+        "array_min" => Ok((super::array_min::eval_array_min(arena, expr, args, chunk))?),
+        "array_position" => {
+            Ok((super::array_position::eval_array_position(arena, expr, args, chunk))?)
+        }
+        "array_repeat" => Ok((super::array_repeat::eval_array_repeat(arena, expr, args, chunk))?),
+        "array_remove" => Ok((super::array_remove::eval_array_remove(arena, expr, args, chunk))?),
+        "array_slice" => Ok((super::array_slice::eval_array_slice(arena, expr, args, chunk))?),
+        "array_sort" => Ok((super::array_sort::eval_array_sort(arena, expr, args, chunk))?),
         "array_sort_lambda" => {
-            super::array_sort_lambda::eval_array_sort_lambda(arena, expr, args, chunk)
+            Ok((super::array_sort_lambda::eval_array_sort_lambda(arena, expr, args, chunk))?)
         }
-        "array_sortby" => super::array_sortby::eval_array_sortby(arena, expr, args, chunk),
-        "array_top_n" => super::array_top_n::eval_array_top_n(arena, expr, args, chunk),
-        "array_sum" => super::array_sum::eval_array_sum(arena, expr, args, chunk),
-        "arrays_overlap" => super::arrays_overlap::eval_arrays_overlap(arena, expr, args, chunk),
-        other => Err(format!("unsupported array function: {}", other)),
+        "array_sortby" => Ok((super::array_sortby::eval_array_sortby(arena, expr, args, chunk))?),
+        "array_top_n" => Ok((super::array_top_n::eval_array_top_n(arena, expr, args, chunk))?),
+        "array_sum" => Ok((super::array_sum::eval_array_sum(arena, expr, args, chunk))?),
+        "arrays_overlap" => {
+            Ok((super::arrays_overlap::eval_arrays_overlap(arena, expr, args, chunk))?)
+        }
+        other => Err((format!("unsupported array function: {}", other)).into()),
     }
 }
 

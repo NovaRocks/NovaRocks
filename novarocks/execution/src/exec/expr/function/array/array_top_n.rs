@@ -79,12 +79,12 @@ fn top_n_value_at(array: &ArrayRef, row: usize) -> Result<Option<i64>, String> {
     }
 }
 
-pub fn eval_array_top_n(
-    arena: &ExprArena,
+pub fn eval_array_top_n<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let n_arr = arena.eval(args[1], chunk)?;
     // SQL NULL propagation: a literal `NULL` (DataType::Null) input means
@@ -105,10 +105,9 @@ pub fn eval_array_top_n(
         _ => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_top_n output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_top_n output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -188,7 +187,7 @@ pub fn eval_array_top_n(
         }
 
         if current > i32::MAX as i64 {
-            return Err("array_top_n offset overflow".to_string());
+            return Err(("array_top_n offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

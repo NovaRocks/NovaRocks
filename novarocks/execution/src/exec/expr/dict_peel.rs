@@ -35,7 +35,10 @@ pub fn is_supported_i32_string_dictionary(data_type: &DataType) -> bool {
     )
 }
 
-pub fn referenced_slots(arena: &ExprArena, expr_id: ExprId) -> Option<BTreeSet<SlotId>> {
+pub fn referenced_slots<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr_id: ExprId,
+) -> Option<BTreeSet<SlotId>> {
     let mut slots = BTreeSet::new();
     visit_referenced_slots(arena, expr_id, &mut |slot| {
         slots.insert(slot);
@@ -45,8 +48,8 @@ pub fn referenced_slots(arena: &ExprArena, expr_id: ExprId) -> Option<BTreeSet<S
 
 /// Observe the same lexical references without constructing a temporary set.
 /// An invalid expression cannot establish an encoding capability.
-pub(crate) fn expression_uses_slot(
-    arena: &ExprArena,
+pub(crate) fn expression_uses_slot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr_id: ExprId,
     slot_id: SlotId,
 ) -> Option<bool> {
@@ -54,23 +57,29 @@ pub(crate) fn expression_uses_slot(
     visit_referenced_slots(arena, expr_id, &mut |slot| found |= slot == slot_id).then_some(found)
 }
 
-pub fn expr_can_peel_from_slot(arena: &ExprArena, expr_id: ExprId, slot_id: SlotId) -> bool {
+pub fn expr_can_peel_from_slot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr_id: ExprId,
+    slot_id: SlotId,
+) -> bool {
     peel_source_slot(arena, expr_id) == Some(slot_id)
 }
 
-pub fn try_peel_dict_expr(
-    arena: &ExprArena,
+pub fn try_peel_dict_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr_id: ExprId,
     chunk: &Chunk,
-) -> Result<Option<ArrayRef>, String> {
-    try_peel_dict_expr_with(
+) -> Result<Option<ArrayRef>, __Eval::Error> {
+    Ok((try_peel_dict_expr_with(
         arena,
         expr_id,
         chunk,
-        |slot, values| dict_values_chunk_for_source(chunk, slot, values),
+        |slot, values| -> Result<Chunk, __Eval::Error> {
+            Ok(dict_values_chunk_for_source(chunk, slot, values)?)
+        },
         |_| Ok(()),
         |_, _| Ok(()),
-    )
+    ))?)
 }
 
 pub(crate) struct OwnedDictionaryPeel {
@@ -86,7 +95,7 @@ pub(crate) fn try_peel_dict_expr_owned(
     chunk: &Chunk,
     output_name: &str,
     owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
-    control: &dyn novarocks_functions::KernelEvaluationControl,
+    control: &dyn crate::exec::expr::ExprEvaluationControl,
 ) -> crate::runtime::fragment::ExecutionResult<Option<OwnedDictionaryPeel>> {
     use crate::exec::chunk::{ArrayNormalizationStep, ChunkSlotSchema};
     use crate::exec::pipeline::operator::ConstructionFailure;
@@ -120,18 +129,20 @@ pub(crate) fn try_peel_dict_expr_owned(
     let storage = chunk.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
         owner.request(layout)
     })?;
-    let array = try_peel_dict_expr_with::<ConstructionFailure>(
-        arena,
+    let evaluation = crate::exec::expr::ExprEvaluationContext::new(arena, owner, control);
+    let array = try_peel_dict_expr_with(
+        &evaluation,
         expr_id,
         chunk,
-        |slot, values| {
+        |slot, values| -> crate::runtime::fragment::ExecutionResult<Chunk> {
             let source = chunk.chunk_schema().slot(slot).ok_or_else(|| {
                 ConstructionFailure::InvalidSource("dictionary peel source is absent".into())
             })?;
             if !source.is_typed() {
                 return Err(ConstructionFailure::InvalidSource(
                     "dictionary peel source lacks its complete binding".into(),
-                ));
+                )
+                .into());
             }
             // The whole-values fast path was refused above if any value is NULL.
             // Preserve the actual source declaration; unused NULLs never widen it.
@@ -165,37 +176,43 @@ pub(crate) fn try_peel_dict_expr_owned(
                     )
                 },
             )?;
-            owner.request(arc_layout(std::alloc::Layout::new::<ChunkSchema>())?)?;
+            owner.request(
+                arc_layout(std::alloc::Layout::new::<ChunkSchema>())
+                    .map_err(ConstructionFailure::from)?,
+            )?;
             let schema = Arc::new(schema);
             let rows = values.len();
             owner.request(std::alloc::Layout::new::<ArrayRef>())?;
             let mut columns = Vec::with_capacity(1);
             columns.push(values);
-            Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+                ConstructionFailure,
+                _,
+            >(
                 schema,
                 columns,
                 rows,
                 storage.clone(),
                 |step| owner.observe(0, &[], step),
-            )
+            )?)
         },
-        |_| {
+        |_| -> crate::runtime::fragment::ExecutionResult<()> {
             // Arrow's actual DictionaryArray constructor creates its two boxed
             // DataType operands and the new shared array wrapper.
             owner.request(std::alloc::Layout::new::<DataType>())?;
             owner.request(std::alloc::Layout::new::<DataType>())?;
-            owner.request(arc_layout(std::alloc::Layout::new::<
-                DictionaryArray<Int32Type>,
-            >())?)
+            Ok(owner.request(
+                arc_layout(std::alloc::Layout::new::<DictionaryArray<Int32Type>>())
+                    .map_err(ConstructionFailure::from)?,
+            )?)
         },
-        |values, dict| {
+        |values, dict| -> crate::runtime::fragment::ExecutionResult<()> {
             let mut request = |layout| owner.request(layout);
             let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
             let mut creation = ValueSchemaCreation::new(storage.clone(), &mut request, &mut opaque);
-            // Only the geometry borrows an unsigned view. Valid Int32 keys
-            // were checked by the immutable typed Chunk; NULL key bits are
-            // ignored by the same selection visitor. The actual take below
-            // still executes with the original signed keys and NULL mask.
+            // Immutable ingress has checked every live signed Int32 key. This
+            // borrowed unsigned view is used only by the copy geometry author;
+            // the original signed keys and NULL mask still drive Arrow take.
             let unsigned = arrow::array::UInt32Array::new(
                 arrow::buffer::ScalarBuffer::new(
                     dict.keys().values().inner().clone(),
@@ -204,31 +221,34 @@ pub(crate) fn try_peel_dict_expr_owned(
                 ),
                 dict.keys().nulls().cloned(),
             );
-            novarocks_functions::selected_copy::preflight_take_construction(
+            novarocks_functions::selected_copy::preflight_take_construction_unified_observed(
                 values.as_ref(),
                 novarocks_functions::selected_copy::CopyIndexView::UInt32(&unsigned),
                 &mut creation,
-                control,
+                &mut |_| control.checkpoint().map_err(ConstructionFailure::from),
             )
-            .map(|_| ())
-            .map_err(|error| match error {
-                novarocks_functions::selected_copy::CopyConstructionError::Creator(error) => error,
-                novarocks_functions::selected_copy::CopyConstructionError::Resource(error) => {
-                    ConstructionFailure::Resource(error)
-                }
-                novarocks_functions::selected_copy::CopyConstructionError::Copy(error) => {
-                    match error {
-                        novarocks_functions::selected_copy::CopyError::Control(error) => {
-                            ConstructionFailure::from(
-                                crate::runtime::fragment::ExecutionFailure::from(error),
-                            )
+            .map_err(|error| -> crate::runtime::fragment::ExecutionFailure {
+                match error {
+                    novarocks_functions::selected_copy::CopyConstructionError::Creator(error) => {
+                        error.into()
+                    }
+                    novarocks_functions::selected_copy::CopyConstructionError::Resource(error) => {
+                        ConstructionFailure::Resource(error).into()
+                    }
+                    novarocks_functions::selected_copy::CopyConstructionError::Copy(error) => {
+                        match error {
+                            novarocks_functions::selected_copy::CopyError::Control(error) => {
+                                error.into()
+                            }
+                            error => ConstructionFailure::InvalidSource(format!(
+                                "dictionary peel copy: {error:?}"
+                            ))
+                            .into(),
                         }
-                        _ => ConstructionFailure::InvalidSource(format!(
-                            "dictionary peel copy: {error:?}"
-                        )),
                     }
                 }
-            })
+            })?;
+            Ok(())
         },
     )?;
     let Some(array) = array else {
@@ -277,8 +297,8 @@ pub(crate) fn try_peel_dict_expr_owned(
 
 /// Validate only this installed PEEL grammar's actual reachable sources.
 /// This has no lambda/binder vocabulary and cannot authorize a general arena.
-fn validate_peel_source_bindings(
-    arena: &ExprArena,
+fn validate_peel_source_bindings<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     chunk: &Chunk,
     owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
@@ -345,14 +365,17 @@ fn validate_peel_source_bindings(
     }
 }
 
-fn try_peel_dict_expr_with<E: From<String>>(
-    arena: &ExprArena,
+fn try_peel_dict_expr_with<
+    __Eval: crate::exec::expr::ExprEvaluation + ?Sized,
+    CallbackError: Into<__Eval::Error>,
+>(
+    arena: &__Eval,
     expr_id: ExprId,
     chunk: &Chunk,
-    mut value_port: impl FnMut(SlotId, ArrayRef) -> Result<Chunk, E>,
-    mut rewrap: impl FnMut(&DictionaryArray<Int32Type>) -> Result<(), E>,
-    mut expand: impl FnMut(&ArrayRef, &DictionaryArray<Int32Type>) -> Result<(), E>,
-) -> Result<Option<ArrayRef>, E> {
+    mut value_port: impl FnMut(SlotId, ArrayRef) -> Result<Chunk, CallbackError>,
+    mut rewrap: impl FnMut(&DictionaryArray<Int32Type>) -> Result<(), CallbackError>,
+    mut expand: impl FnMut(&ArrayRef, &DictionaryArray<Int32Type>) -> Result<(), CallbackError>,
+) -> Result<Option<ArrayRef>, __Eval::Error> {
     let Some(source_slot) = peel_source_slot(arena, expr_id) else {
         return Ok(None);
     };
@@ -374,24 +397,24 @@ fn try_peel_dict_expr_with<E: From<String>>(
                 source.data_type()
             )
         })
-        .map_err(E::from)?;
+        .map_err(__Eval::Error::from)?;
     if dict.values().null_count() > 0 {
         return Ok(None);
     }
 
-    let value_chunk = value_port(source_slot, Arc::clone(dict.values()))?;
-    let new_values = arena.eval(expr_id, &value_chunk).map_err(E::from)?;
+    let value_chunk = value_port(source_slot, Arc::clone(dict.values())).map_err(Into::into)?;
+    let new_values = arena.eval(expr_id, &value_chunk)?;
 
     if new_values.data_type() == &DataType::Utf8 && new_values.null_count() == 0 {
-        rewrap(dict)?;
+        rewrap(dict).map_err(Into::into)?;
         let peeled = DictionaryArray::<Int32Type>::try_new(dict.keys().clone(), new_values)
-            .map_err(|e| E::from(format!("dictionary peel rewrap failed: {e}")))?;
+            .map_err(|e| __Eval::Error::from(format!("dictionary peel rewrap failed: {e}")))?;
         return Ok(Some(Arc::new(peeled) as ArrayRef));
     }
 
-    expand(&new_values, dict)?;
+    expand(&new_values, dict).map_err(Into::into)?;
     let expanded = take(new_values.as_ref(), dict.keys(), None)
-        .map_err(|e| E::from(format!("dictionary peel take failed: {e}")))?;
+        .map_err(|e| __Eval::Error::from(format!("dictionary peel take failed: {e}")))?;
     Ok(Some(expanded))
 }
 
@@ -414,7 +437,10 @@ fn dict_values_chunk_for_source(
     Chunk::try_new_with_columns(value_schema, vec![values])
 }
 
-fn peel_source_slot(arena: &ExprArena, expr_id: ExprId) -> Option<SlotId> {
+fn peel_source_slot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr_id: ExprId,
+) -> Option<SlotId> {
     if !is_peel_safe_expr(arena, expr_id) {
         return None;
     }
@@ -427,8 +453,8 @@ fn peel_source_slot(arena: &ExprArena, expr_id: ExprId) -> Option<SlotId> {
     (valid && !multiple).then_some(source).flatten()
 }
 
-fn visit_referenced_slots(
-    arena: &ExprArena,
+fn visit_referenced_slots<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr_id: ExprId,
     visit: &mut impl FnMut(SlotId),
 ) -> bool {
@@ -455,8 +481,8 @@ impl LexicalBindings<'_> {
     }
 }
 
-fn visit_referenced_slots_with_bound(
-    arena: &ExprArena,
+fn visit_referenced_slots_with_bound<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr_id: ExprId,
     bound: Option<&LexicalBindings<'_>>,
     visit: &mut impl FnMut(SlotId),
@@ -529,8 +555,8 @@ fn visit_referenced_slots_with_bound(
     }
 }
 
-fn visit_all_referenced_slots_with_bound(
-    arena: &ExprArena,
+fn visit_all_referenced_slots_with_bound<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr_ids: &[ExprId],
     bound: Option<&LexicalBindings<'_>>,
     visit: &mut impl FnMut(SlotId),
@@ -541,7 +567,10 @@ fn visit_all_referenced_slots_with_bound(
         .all(|expr_id| visit_referenced_slots_with_bound(arena, expr_id, bound, visit))
 }
 
-fn is_peel_safe_expr(arena: &ExprArena, expr_id: ExprId) -> bool {
+fn is_peel_safe_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr_id: ExprId,
+) -> bool {
     let Some(node) = arena.node(expr_id) else {
         return false;
     };

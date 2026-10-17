@@ -2830,6 +2830,11 @@ pub mod string_repeat_pad_core;
 
 mod scalar_invocation;
 pub use scalar_invocation::*;
+mod invocation_scope;
+pub use invocation_scope::{
+    EvaluatedSourceLoan, InvocationInputDomainPolicy, ScalarInvocationScope,
+    ScalarInvocationSource, ScopedScalarCallInput,
+};
 
 pub mod string_left_right_core;
 

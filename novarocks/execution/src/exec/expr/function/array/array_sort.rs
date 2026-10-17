@@ -42,12 +42,12 @@ fn insertion_sort_indices(values: &ArrayRef, indices: &mut [usize]) -> Result<()
     Ok(())
 }
 
-pub fn eval_array_sort(
-    arena: &ExprArena,
+pub fn eval_array_sort<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let list = arr
         .as_any()
@@ -59,10 +59,9 @@ pub fn eval_array_sort(
         _ => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_sort output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_sort output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -115,7 +114,7 @@ pub fn eval_array_sort(
             current += 1;
         }
         if current > i32::MAX as i64 {
-            return Err("array_sort offset overflow".to_string());
+            return Err(("array_sort offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

@@ -18,6 +18,7 @@
 //! Actual installed whole-call differential checks against the shared v1 shell.
 use super::generate::InputProfile;
 use super::*;
+use crate::runtime::fragment::ExecutionFailureCause;
 use arrow::array::{
     BooleanArray, Date32Array, Decimal256Array, ListArray, MapArray, StringArray, StructArray,
     UInt32Array,
@@ -25,7 +26,7 @@ use arrow::array::{
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{Field, TimeUnit};
 use arrow_buffer::i256;
-use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationFailure};
+use novarocks_functions::ScalarInvocationActivation;
 
 fn result() -> FunctionValueType {
     FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap()
@@ -495,9 +496,12 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 &FrameControl,
             );
             if complex_key {
-                let Err(ScalarInvocationFailure::Data(data)) = output else {
-                    panic!("whole-call complex-key Data");
+                let error = output.unwrap_err();
+                let ExecutionFailureCause::ScalarInvocationData(data) = error.cause() else {
+                    panic!("whole-call complex-key Data: {error:?}")
                 };
+                let data = data.clone();
+                drop(error);
                 assert_eq!(
                     data.message(),
                     "json_object key does not support complex type"
@@ -511,9 +515,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         ScalarInvocationActivation::Activated,
                         &FrameControl
                     ),
-                    Err(ScalarInvocationFailure::Kernel(
-                        KernelFailure::InstanceFailed
-                    ))
+                    Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
                 ));
                 drop(frame);
                 assert!(tracker.current() > 0, "Data retains actual host funding");

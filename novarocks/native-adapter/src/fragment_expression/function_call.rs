@@ -92,8 +92,12 @@ pub(crate) fn lower_function_call(
             type_decoder,
         );
     }
-    let NativeScalarActor::Registered(kind) = actor else {
-        unreachable!("the original ARRAY actor was handled above")
+    let (kind, regexp_count_source) = match actor {
+        NativeScalarActor::Registered(kind) => (kind, None),
+        NativeScalarActor::RegexpCount(source) => {
+            (FunctionKind::String("regexp_count"), Some(source))
+        }
+        _ => unreachable!("the original constructor actors were handled above"),
     };
     let args = lower_expr_list(
         &call.args,
@@ -103,9 +107,17 @@ pub(crate) fn lower_function_call(
         type_decoder,
     )?;
     validate_function_arity(&call.function_name, kind, args.len()).map_err(|error| {
-        super::NativeExpressionDecodeError::invalid_value(path.field("args"), error)
+        super::NativeExpressionDecodeError::invalid_value(path.clone().field("args"), error)
     })?;
-    Ok(arena.push_typed(ExprNode::FunctionCall { kind, args }, data_type))
+    let id = arena.push_typed(ExprNode::FunctionCall { kind, args }, data_type);
+    if let Some(source) = regexp_count_source {
+        arena
+            .set_regexp_count_pattern_source(id, source)
+            .map_err(|error| {
+                super::NativeExpressionDecodeError::invalid_value(path.clone(), error)
+            })?;
+    }
+    Ok(id)
 }
 
 pub(super) fn validate_function_arity(

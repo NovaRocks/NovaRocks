@@ -338,7 +338,8 @@ fn eval_order_by_columns(
     let types = creation.begin(chunk)?;
     let mut key_columns = creation.vector::<ArrayRef>(order_by.len(), owner.as_ref())?;
     for sort_expr in order_by {
-        let key = arena.eval(sort_expr.expr, chunk)?;
+        let evaluation = creation.expression_context(arena, owner.as_ref())?;
+        let key = evaluation.eval(sort_expr.expr, chunk)?;
         let declared = arena.value_type(sort_expr.expr).ok_or_else(|| {
             crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
                 "sort key lacks its complete declared logical type".into(),
@@ -568,6 +569,7 @@ mod tests {
         layout: StaticLayout,
         output: crate::exec::chunk::ChunkSchemaRef,
         creator: Arc<dyn InputConstructionFactory>,
+        control: crate::exec::operators::compiled_expression::RuntimeKernelControl,
     }
     fn source_for(names: &[&str]) -> TestSource {
         // All original kernels in this module declare nullable Int32 channels.
@@ -623,11 +625,15 @@ mod tests {
             layout,
             output,
             creator,
+            control: crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+                state.error_state(),
+            ),
         }
     }
     impl TestSource {
         fn creation(&self) -> SortCreation<'_> {
             SortCreation::new(self.creator.as_ref(), &self.output)
+                .with_evaluation_control(&self.control)
         }
         fn value(&self, ordinal: usize) -> FunctionValueType {
             FunctionValueType::try_from_typed_binding(

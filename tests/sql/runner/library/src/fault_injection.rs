@@ -804,6 +804,33 @@ where
                         "query completed before the post-query fault could claim its marker barrier"
                     );
                 }
+                let restart_marker = if let FaultBaseline::BackendInit {
+                    index,
+                    token,
+                    marker,
+                    ..
+                } = &baseline
+                {
+                    Some(wait_for_restart_marker(
+                        &worker_server,
+                        *index,
+                        token,
+                        marker,
+                        deadline,
+                        || {
+                            maybe_cancel_query_near_deadline(
+                                &worker_server,
+                                &worker_fault_state,
+                                query_connection_id,
+                                deadline,
+                                &mut deadline_cancel_sent,
+                            )?;
+                            Ok(worker_fault_state.query_is_done())
+                        },
+                    )?)
+                } else {
+                    None
+                };
                 let mut server = worker_server
                     .lock()
                     .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
@@ -825,6 +852,9 @@ where
                 let action_result = (|| -> Result<()> {
                     match fault.clone() {
                         PostQueryFault::RestartBackendAfterEstablishContext(index) => {
+                            if worker_fault_state.query_is_done() {
+                                bail!("query completed before backend restart");
+                            }
                             let FaultBaseline::BackendInit {
                                 token,
                                 process_id,
@@ -840,6 +870,9 @@ where
                                 token,
                                 *process_id,
                                 marker,
+                                restart_marker
+                                    .as_deref()
+                                    .expect("restart marker was awaited"),
                                 TASK_RESTART_CONTRACT,
                                 deadline,
                             )?);
@@ -1063,6 +1096,53 @@ fn fresh_lifecycle_phase_execution(
     Ok(Some(first.clone()))
 }
 
+/// The socket arrival precedes asynchronous durable-log ingestion. Wait for
+/// the exact marker without holding the role owner across cancellation or sleep.
+fn wait_for_restart_marker(
+    server: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    index: usize,
+    token: &str,
+    marker: &str,
+    deadline: Instant,
+    mut cancelled: impl FnMut() -> Result<bool>,
+) -> Result<String> {
+    loop {
+        if cancelled()? {
+            bail!("query completed before the durable restart marker was observed");
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "original deadline expired waiting for {marker} for token={token} on BE[{index}]"
+            );
+        }
+        let observed = {
+            let server = server
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+            server.be_current_live_log_line(index, &|line| {
+                line.contains(marker) && marker_field(line, "token").as_deref() == Some(token)
+            })?
+        };
+        if cancelled()? {
+            bail!("query completed before the durable restart marker was observed");
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            bail!(
+                "original deadline expired waiting for {marker} for token={token} on BE[{index}]"
+            );
+        }
+        if let Some(line) = observed {
+            return Ok(line);
+        }
+        sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(POST_FRAGMENT_START_POLL_INTERVAL),
+        );
+    }
+}
+
 /// Replaces one backend process at its rendezvous and proves the fresh
 /// process did not resume the attempt the old one was holding.
 ///
@@ -1078,15 +1158,13 @@ fn restart_backend_and_prove_no_restore(
     token: &str,
     process_id: novarocks_types::BackendProcessId,
     marker: &'static str,
+    rendezvous: &str,
     contract: RestartNonRestoreContract,
     deadline: Instant,
 ) -> Result<String> {
-    let old_log = server.be_log_contents(index)?;
-    let rendezvous = old_log
-        .lines()
-        .rev()
-        .find(|line| line.contains(marker) && line.contains(&format!("token={token}")))
-        .with_context(|| format!("{marker} for token={token} is missing from BE[{index}]"))?;
+    if !rendezvous.contains(marker) || marker_field(rendezvous, "token").as_deref() != Some(token) {
+        bail!("restart marker does not identify the exact token on BE[{index}]");
+    }
     let old_execution = marker_field(rendezvous, "execution_id")
         .context("restart marker is missing execution_id")?;
     let observed_process_id = marker_field(rendezvous, "process_id")
@@ -1097,6 +1175,9 @@ fn restart_backend_and_prove_no_restore(
         bail!(
             "restart marker process identity differs from SHOW BACKENDS: expected={process_id} observed={observed_process_id}"
         );
+    }
+    if Instant::now() >= deadline {
+        bail!("original deadline expired before backend restart");
     }
     server.restart_be_until(index, deadline)?;
     let new_process_id = server.backend_process_id(index)?;
@@ -1926,6 +2007,206 @@ mod tests {
 
     fn restart_process_id(seed: &str) -> novarocks_types::BackendProcessId {
         seed.parse().expect("fixture UUIDv7 backend process id")
+    }
+
+    struct DurableRestartServer {
+        log: PathBuf,
+        first_empty_read: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        original_deadline: Instant,
+        restarts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ServerHandle for DurableRestartServer {
+        fn target_host(&self) -> Option<&str> {
+            None
+        }
+        fn target_port(&self) -> Option<u16> {
+            None
+        }
+        fn be_current_live_log_line(
+            &self,
+            _index: usize,
+            matches: &dyn Fn(&str) -> bool,
+        ) -> Result<Option<String>> {
+            let log = std::fs::read_to_string(&self.log)?;
+            let line = log.lines().find(|line| matches(line)).map(str::to_owned);
+            if line.is_none()
+                && let Some(signal) = self.first_empty_read.lock().unwrap().take()
+            {
+                signal.send(()).unwrap();
+            }
+            Ok(line)
+        }
+        fn restart_be_until(&mut self, _index: usize, deadline: Instant) -> Result<()> {
+            assert_eq!(deadline, self.original_deadline);
+            self.restarts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn backend_process_id(&self, _index: usize) -> Result<novarocks_types::BackendProcessId> {
+            Ok(restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc"))
+        }
+        fn be_current_log_contents(&self, _index: usize) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn durable_restart_server(
+        log: PathBuf,
+        original_deadline: Instant,
+        first_empty_read: Option<std::sync::mpsc::Sender<()>>,
+    ) -> (
+        Arc<Mutex<Box<dyn ServerHandle>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = DurableRestartServer {
+            log,
+            first_empty_read: Mutex::new(first_empty_read),
+            original_deadline,
+            restarts: Arc::clone(&restarts),
+        };
+        (Arc::new(Mutex::new(Box::new(server))), restarts)
+    }
+
+    #[test]
+    fn restart_socket_arrival_waits_for_delayed_durable_marker_before_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("be.log");
+        std::fs::write(&log, "").unwrap();
+        let token = format!("durable-{}", novarocks_types::BackendProcessId::new_v7());
+        let rendezvous = RestartAfterEstablishRendezvous::bind(&token).unwrap();
+        let path = rendezvous.path.clone();
+        let original = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
+        let marker = format!(
+            "{TASK_ESTABLISH_CONTEXT_OBSERVED} execution_id=10:20:1 backend_index=1 process_id={original} token={token}\n"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (first_read, empty_read) = std::sync::mpsc::channel();
+        let (server, restarts) = durable_restart_server(log.clone(), deadline, Some(first_read));
+        let notifying_token = token.clone();
+        let writer = thread::spawn(move || {
+            let mut socket = UnixStream::connect(path).unwrap();
+            socket.write_all(notifying_token.as_bytes()).unwrap();
+            socket.shutdown(Shutdown::Write).unwrap();
+            // Publication follows the runner's first empty durable read, so
+            // the socket notification cannot accidentally imply log visibility.
+            empty_read.recv_timeout(Duration::from_secs(2)).unwrap();
+            std::fs::write(log, marker).unwrap();
+            let mut released = Vec::new();
+            socket.read_to_end(&mut released).unwrap();
+        });
+        let held = rendezvous.wait_for_trigger(deadline).unwrap().unwrap();
+        let observed = wait_for_restart_marker(
+            &server,
+            1,
+            &token,
+            TASK_ESTABLISH_CONTEXT_OBSERVED,
+            deadline,
+            || {
+                assert!(
+                    server.try_lock().is_ok(),
+                    "cancellation must not hold the role owner"
+                );
+                assert_eq!(restarts.load(Ordering::SeqCst), 0);
+                Ok(false)
+            },
+        )
+        .unwrap();
+        let execution = restart_backend_and_prove_no_restore(
+            &mut **server.lock().unwrap(),
+            1,
+            &token,
+            original,
+            TASK_ESTABLISH_CONTEXT_OBSERVED,
+            &observed,
+            TASK_RESTART_CONTRACT,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(execution, "10:20:1");
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        drop(held);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn restart_marker_wait_keeps_original_deadline_and_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("be.log");
+        std::fs::write(&log, "").unwrap();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let (server, restarts) = durable_restart_server(log, deadline, None);
+        let error = wait_for_restart_marker(
+            &server,
+            1,
+            "selected",
+            TASK_ESTABLISH_CONTEXT_OBSERVED,
+            deadline,
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("original deadline expired"));
+        assert_eq!(restarts.load(Ordering::SeqCst), 0);
+        let error = wait_for_restart_marker(
+            &server,
+            1,
+            "selected",
+            TASK_ESTABLISH_CONTEXT_OBSERVED,
+            Instant::now() + Duration::from_secs(2),
+            || {
+                assert!(server.try_lock().is_ok());
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("query completed"));
+        assert_eq!(restarts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn restart_marker_wait_does_not_ignore_foreign_or_malformed_process_identity() {
+        let original = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
+        for (process, expected) in [
+            ("invalid", "invalid process_id"),
+            (
+                "018f3d8a-2b4c-7d6f-8f90-123456789abc",
+                "process identity differs",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("be.log");
+            // Ignore a sibling token, but reject the first exact-token line
+            // even when a later exact-token line has a more favorable identity.
+            std::fs::write(&log, format!(
+                "{TASK_ESTABLISH_CONTEXT_OBSERVED} execution_id=10:20:1 process_id={original} token=selected-other\n\
+                 {TASK_ESTABLISH_CONTEXT_OBSERVED} execution_id=10:20:1 process_id={process} token=selected\n\
+                 {TASK_ESTABLISH_CONTEXT_OBSERVED} execution_id=10:20:1 process_id={original} token=selected\n"
+            )).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (server, restarts) = durable_restart_server(log, deadline, None);
+            let observed = wait_for_restart_marker(
+                &server,
+                1,
+                "selected",
+                TASK_ESTABLISH_CONTEXT_OBSERVED,
+                deadline,
+                || Ok(false),
+            )
+            .unwrap();
+            let error = restart_backend_and_prove_no_restore(
+                &mut **server.lock().unwrap(),
+                1,
+                "selected",
+                original,
+                TASK_ESTABLISH_CONTEXT_OBSERVED,
+                &observed,
+                TASK_RESTART_CONTRACT,
+                deadline,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(restarts.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

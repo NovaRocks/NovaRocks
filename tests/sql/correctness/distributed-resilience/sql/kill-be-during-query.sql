@@ -52,6 +52,7 @@ VALUES (3, 1);
 
 -- query 2
 -- @kill_be_after_be_log_contains=1,NOVAROCKS_TASK_CREATE_APPLIED
+-- @native_observation_attempts=1,2
 -- The aggregate does not expose a result before every input completes. The
 -- killed attempt is therefore replaceable on the two surviving backends from
 -- the same frozen semantic description.

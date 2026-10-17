@@ -30,13 +30,13 @@ pub(super) fn add_months_to_datetime(date: NaiveDateTime, months: i32) -> NaiveD
         date, months,
     )
 }
-fn eval_with_factor(
-    arena: &ExprArena,
+fn eval_with_factor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     factor: i32,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = arena.eval(args[0], chunk)?;
     let interval = arena.eval(args[1], chunk)?;
     legacy_validate_datetime_source(&date)?;
@@ -47,73 +47,73 @@ fn eval_with_factor(
         .data_type(expr)
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::MonthsShift(factor),
         &[date, interval],
         &output_type,
         rows,
-    )
+    ))?)
 }
 
-pub fn eval_add_months(
-    arena: &ExprArena,
+pub fn eval_add_months<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, 1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, 1))?)
 }
 
-pub fn eval_months_add(
-    arena: &ExprArena,
+pub fn eval_months_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, 1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, 1))?)
 }
 
-pub fn eval_months_sub(
-    arena: &ExprArena,
+pub fn eval_months_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, -1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, -1))?)
 }
 
-pub fn eval_quarters_add(
-    arena: &ExprArena,
+pub fn eval_quarters_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, 3)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, 3))?)
 }
 
-pub fn eval_quarters_sub(
-    arena: &ExprArena,
+pub fn eval_quarters_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, -3)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, -3))?)
 }
 
-pub fn eval_years_add(
-    arena: &ExprArena,
+pub fn eval_years_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, 12)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, 12))?)
 }
 
-pub fn eval_years_sub(
-    arena: &ExprArena,
+pub fn eval_years_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, -12)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, -12))?)
 }

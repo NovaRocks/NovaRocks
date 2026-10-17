@@ -1438,6 +1438,22 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
+    // The frozen non-null Null key domain is uninhabited. Preserve this
+    // original Map and the independent evaluated probe, without key coercion.
+    add(
+        m,
+        "__map_element_at",
+        Signature::new(
+            vec![
+                TypeSpec::MapWithUninhabitedKey {
+                    map: "M",
+                    value: "V",
+                },
+                TypeSpec::AnyType,
+            ],
+            TypeSpec::Any("V"),
+        ),
+    );
     // __map_element_at(Map<K, V>, K) -> V
     add(
         m,
@@ -1594,6 +1610,14 @@ fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 TypeSpec::Binary,
             ),
         );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Bitmap, TypeSpec::Int64, TypeSpec::Int64],
+                TypeSpec::Binary,
+            ),
+        );
     }
 
     // bitmap-producing functions: -> Binary.
@@ -1623,6 +1647,11 @@ fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "bitmap_to_base64",
         Signature::new(vec![TypeSpec::Binary], TypeSpec::Utf8),
     );
+    add(
+        m,
+        "bitmap_to_base64",
+        Signature::new(vec![TypeSpec::Bitmap], TypeSpec::Utf8),
+    );
     // Boolean queries.
     for name in ["bitmap_contains", "bitmap_has_any"] {
         add(
@@ -1634,6 +1663,16 @@ fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
             ),
         );
     }
+    add(
+        m,
+        "bitmap_contains",
+        Signature::new(vec![TypeSpec::Bitmap, TypeSpec::Int64], TypeSpec::Boolean),
+    );
+    add(
+        m,
+        "bitmap_has_any",
+        Signature::new(vec![TypeSpec::Bitmap, TypeSpec::Bitmap], TypeSpec::Boolean),
+    );
     // Int64-returning.
     for name in [
         "bitmap_min",
@@ -1667,6 +1706,14 @@ fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "bitmap_to_array",
         Signature::new(
             vec![TypeSpec::Binary],
+            TypeSpec::List(Box::new(TypeSpec::Int64)),
+        ),
+    );
+    add(
+        m,
+        "bitmap_to_array",
+        Signature::new(
+            vec![TypeSpec::Bitmap],
             TypeSpec::List(Box::new(TypeSpec::Int64)),
         ),
     );
@@ -2136,5 +2183,237 @@ fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
         );
+    }
+}
+
+#[cfg(test)]
+mod bitmap_consumer_domain_tests {
+    use crate::{
+        EngineFunctionCatalog, FunctionArgument, FunctionArgumentType, FunctionBindingRequest,
+        FunctionKind, FunctionResultType, FunctionValueType,
+    };
+    use arrow_schema::{DataType, Field};
+    use novarocks_type_contract::ValueLogicalType;
+    use std::sync::Arc;
+
+    fn argument(value_type: FunctionValueType) -> FunctionArgument {
+        FunctionArgument::Value {
+            value_type,
+            constant: None,
+        }
+    }
+    fn integer() -> FunctionArgument {
+        argument(FunctionValueType::new(DataType::Int64, true))
+    }
+    fn producer(catalog: &EngineFunctionCatalog) -> FunctionValueType {
+        let arguments = [integer()];
+        let bound = catalog
+            .resolve_bound_user(
+                "to_bitmap",
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                    expected_result_type: None,
+                },
+                crate::binding_test_control(),
+            )
+            .unwrap();
+        let FunctionResultType::Scalar(value) = bound.selected.result_type else {
+            panic!("to_bitmap must author a scalar value")
+        };
+        assert_eq!(value, bitmap());
+        value
+    }
+    fn bitmap() -> FunctionValueType {
+        FunctionValueType::try_with_logical_type(DataType::Binary, true, ValueLogicalType::Bitmap)
+            .unwrap()
+    }
+    fn check(
+        catalog: &EngineFunctionCatalog,
+        name: &str,
+        arguments: &[FunctionArgument],
+        expected: FunctionValueType,
+    ) {
+        let request = || FunctionBindingRequest {
+            arguments,
+            logical_argument_count: arguments.len(),
+            expected_result_type: None,
+        };
+        let bound = catalog
+            .resolve_bound_user(
+                name,
+                FunctionKind::Scalar,
+                request(),
+                crate::binding_test_control(),
+            )
+            .unwrap();
+        assert_eq!(
+            bound.function_id.as_str(),
+            format!("builtin.scalar/{name}/v1")
+        );
+        let expected_arguments = arguments
+            .iter()
+            .map(|argument| {
+                let FunctionArgument::Value { value_type, .. } = argument else {
+                    panic!("bitmap consumers have value arguments")
+                };
+                FunctionArgumentType::Value(value_type.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bound.selected.argument_types.as_ref(),
+            expected_arguments.as_slice()
+        );
+        assert_eq!(
+            bound.selected.result_type,
+            FunctionResultType::Scalar(expected)
+        );
+        catalog
+            .validate_bound(&bound, request(), crate::binding_test_control())
+            .unwrap();
+    }
+
+    #[test]
+    fn public_bitmap_producer_reaches_subset_consumers_with_integer_positions() {
+        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+        let value = producer(&catalog);
+        for name in [
+            "sub_bitmap",
+            "bitmap_subset_limit",
+            "bitmap_subset_in_range",
+        ] {
+            check(
+                &catalog,
+                name,
+                &[argument(value.clone()), integer(), integer()],
+                bitmap(),
+            );
+        }
+    }
+    #[test]
+    fn public_bitmap_producer_reaches_base64_text_consumer() {
+        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+        check(
+            &catalog,
+            "bitmap_to_base64",
+            &[argument(producer(&catalog))],
+            FunctionValueType::new(DataType::Utf8, true),
+        );
+    }
+    #[test]
+    fn public_bitmap_producer_reaches_array_consumer() {
+        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+        check(
+            &catalog,
+            "bitmap_to_array",
+            &[argument(producer(&catalog))],
+            FunctionValueType::new(
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+        );
+    }
+    #[test]
+    fn public_bitmap_producer_reaches_contains_with_integer_member() {
+        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+        check(
+            &catalog,
+            "bitmap_contains",
+            &[argument(producer(&catalog)), integer()],
+            FunctionValueType::new(DataType::Boolean, true),
+        );
+    }
+    #[test]
+    fn public_bitmap_producers_reach_has_any_as_two_bitmap_values() {
+        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+        check(
+            &catalog,
+            "bitmap_has_any",
+            &[argument(producer(&catalog)), argument(producer(&catalog))],
+            FunctionValueType::new(DataType::Boolean, true),
+        );
+    }
+    #[test]
+    fn bitmap_consumers_preserve_the_existing_raw_binary_overloads() {
+        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+        let raw = || argument(FunctionValueType::new(DataType::Binary, true));
+        for name in [
+            "sub_bitmap",
+            "bitmap_subset_limit",
+            "bitmap_subset_in_range",
+        ] {
+            check(&catalog, name, &[raw(), integer(), integer()], bitmap());
+        }
+        check(
+            &catalog,
+            "bitmap_to_base64",
+            &[raw()],
+            FunctionValueType::new(DataType::Utf8, true),
+        );
+        check(
+            &catalog,
+            "bitmap_to_array",
+            &[raw()],
+            FunctionValueType::new(
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+        );
+        check(
+            &catalog,
+            "bitmap_contains",
+            &[raw(), integer()],
+            FunctionValueType::new(DataType::Boolean, true),
+        );
+        check(
+            &catalog,
+            "bitmap_has_any",
+            &[raw(), raw()],
+            FunctionValueType::new(DataType::Boolean, true),
+        );
+    }
+    #[test]
+    fn bitmap_consumers_refuse_unrelated_nominal_binary_domains() {
+        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+        for domain in [ValueLogicalType::Hll, ValueLogicalType::Percentile] {
+            for name in [
+                "sub_bitmap",
+                "bitmap_subset_limit",
+                "bitmap_subset_in_range",
+                "bitmap_to_base64",
+                "bitmap_to_array",
+                "bitmap_contains",
+                "bitmap_has_any",
+            ] {
+                let foreign = argument(
+                    FunctionValueType::try_with_logical_type(DataType::Binary, true, domain)
+                        .unwrap(),
+                );
+                let arguments = match name {
+                    "sub_bitmap" | "bitmap_subset_limit" | "bitmap_subset_in_range" => {
+                        vec![foreign, integer(), integer()]
+                    }
+                    "bitmap_contains" => vec![foreign, integer()],
+                    "bitmap_has_any" => vec![foreign.clone(), foreign],
+                    _ => vec![foreign],
+                };
+                assert!(
+                    catalog
+                        .resolve_bound_user(
+                            name,
+                            FunctionKind::Scalar,
+                            FunctionBindingRequest {
+                                arguments: &arguments,
+                                logical_argument_count: arguments.len(),
+                                expected_result_type: None
+                            },
+                            crate::binding_test_control()
+                        )
+                        .is_err(),
+                    "{name} must reject {domain:?}"
+                );
+            }
+        }
     }
 }

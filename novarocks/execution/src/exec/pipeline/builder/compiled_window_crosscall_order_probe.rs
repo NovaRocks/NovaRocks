@@ -68,7 +68,8 @@ fn by_window_compiled_function_major_error_order_across_partitions() {
             ]
         })
         .collect::<Vec<_>>();
-    let actual = novarocks_functions::builtin::catalogue::by_window_private_test_catalog();
+    let actual =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let catalogue =
         crate::exec::pipeline::builder::compiled::window_fixture::window_catalog_from_actual(
             &[

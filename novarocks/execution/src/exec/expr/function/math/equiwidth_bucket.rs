@@ -73,12 +73,12 @@ fn const_i64_arg(arr: IntArgArray<'_>, name: &str) -> Result<i64, String> {
     Ok(first)
 }
 
-pub fn eval_equiwidth_bucket(
-    arena: &ExprArena,
+pub fn eval_equiwidth_bucket<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let size_eval = arena.eval(args[0], chunk)?;
     let min_eval = arena.eval(args[1], chunk)?;
     let max_eval = arena.eval(args[2], chunk)?;
@@ -94,10 +94,10 @@ pub fn eval_equiwidth_bucket(
     let buckets = const_i64_arg(buckets_arr, "argument[buckets]")?;
 
     if min >= max {
-        return Err("equiwidth_bucket requirement: min < max".to_string());
+        return Err(("equiwidth_bucket requirement: min < max".to_string()).into());
     }
     if buckets <= 0 {
-        return Err("equiwidth_bucket requirement: buckets > 0".to_string());
+        return Err(("equiwidth_bucket requirement: buckets > 0".to_string()).into());
     }
 
     let width = ((max - min) / buckets).max(1);
@@ -109,15 +109,15 @@ pub fn eval_equiwidth_bucket(
         }
         let size = size_arr.value(row);
         if size < min {
-            return Err("equiwidth_bucket requirement: size >= min".to_string());
+            return Err(("equiwidth_bucket requirement: size >= min".to_string()).into());
         }
         if size > max {
-            return Err("equiwidth_bucket requirement: size <= max".to_string());
+            return Err(("equiwidth_bucket requirement: size <= max".to_string()).into());
         }
         out.push(Some((size - min) / width));
     }
     let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    super::common::cast_output(out, arena.data_type(expr))
+    Ok((super::common::cast_output(out, arena.data_type(expr)))?)
 }
 
 #[cfg(test)]

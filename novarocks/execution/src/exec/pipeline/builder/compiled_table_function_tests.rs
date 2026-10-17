@@ -829,8 +829,11 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
 }
 
 /// Prepare and run the program with an explicit chunk size; a preparation
-/// or execution failure is returned as text.
-fn try_run_single(program: &Arc<LocalProgram>, batch_size: i32) -> Result<Vec<Chunk>, String> {
+/// or execution failure retains its original typed cause.
+fn try_run_single(
+    program: &Arc<LocalProgram>,
+    batch_size: i32,
+) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
     let state = Arc::new(RuntimeState::new(
         Some(QueryOptions {
             batch_size: Some(batch_size),
@@ -856,9 +859,8 @@ fn try_run_single(program: &Arc<LocalProgram>, batch_size: i32) -> Result<Vec<Ch
         dop,
         state,
         Arc::new(NoopFragmentEventSink),
-    )
-    .map_err(|error| error.to_string())?;
-    prepared.start().join().map_err(|error| error.to_string())?;
+    )?;
+    prepared.start().join()?;
     Ok(output.take_chunks())
 }
 
@@ -1036,14 +1038,15 @@ fn unnest_over_a_global_sort_keeps_the_pass_through_ordering() {
     assert_eq!(output, oracle(&sorted, &spec));
 }
 
-/// A row error inside an argument root needs a List-valued expression that
-/// can fail. The only such shape is a guarded one (CASE over a List), and the
-/// compiled evaluator admits no guarded List result yet. The argument root
-/// compiles onto the argument Project, and that Project refuses it by name
-/// on its first batch: it is never evaluated by another owner, and no row
-/// reaches the table cursor.
+/// A guarded List argument is evaluated by its argument Project. Its CASE
+/// condition overflows on the first input row, and that required row error
+/// keeps the original expression root, selected row and pipeline operation.
 #[test]
-fn a_guarded_list_argument_root_is_refused_by_its_argument_project() {
+fn a_guarded_list_argument_preserves_its_required_project_row_error() {
+    use crate::runtime::fragment::{
+        ExecutionFailureCause, ExecutionFailureContext, PipelineOperation,
+    };
+    use novarocks_local_program::{ProgramExpressionRootSite, ProgramNodeExpressionRole};
     let spec = Spec {
         args: vec![Arg::Faulty(0)],
         ..Spec::unnest(false)
@@ -1060,9 +1063,29 @@ fn a_guarded_list_argument_root_is_refused_by_its_argument_project() {
     };
     assert_eq!(exprs.len(), 2, "the key read and the guarded argument root");
     let error = try_run_single(&program, 4096).unwrap_err();
-    assert!(
-        error.contains("Push") && error.contains("dedicated compiled protocol"),
-        "{error}"
+    assert_eq!(
+        error.context(),
+        Some(ExecutionFailureContext {
+            operator_ordinal: 1,
+            operation: PipelineOperation::Push,
+        }),
+        "{error:?}"
+    );
+    let ExecutionFailureCause::RequiredRow(required) = error.cause() else {
+        panic!("the argument Project must preserve its required row error: {error:?}");
+    };
+    assert_eq!(
+        required.root(),
+        ProgramExpressionRootSite::Node {
+            node: *input,
+            role: ProgramNodeExpressionRole::ProjectOutput { expression: 1 },
+        }
+    );
+    assert_eq!(required.batch_row(), 0);
+    assert_eq!(required.error().selected_ordinal(), 0);
+    assert_eq!(
+        required.error().message(),
+        "Arithmetic overflow: Overflow happened on: 1 + 9223372036854775807"
     );
 }
 

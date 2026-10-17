@@ -310,9 +310,8 @@ fn native_bitnot_intrinsic_actual_sql_largeint_full128_and_nullable_constant_sou
         Some((1_i128 << 100) + 5),
         None,
     ] {
-        // The original analyzer produces LargeInt for a numeric literal which
-        // does not fit Int64. It has no declared Utf8 -> LargeInt conversion;
-        // quoting this integer would author an unrelated refused SQL source.
+        // Numeric literals exercise full-width authoring independently of the
+        // explicit Utf8 -> LargeInt conversion covered below.
         let operand = match value {
             Some(value) => value.to_string(),
             None => "CAST(NULL AS LARGEINT)".to_owned(),
@@ -428,24 +427,79 @@ fn native_bitnot_intrinsic_actual_frame_every_constructor_and_runtime_callback_k
 }
 
 #[test]
-fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_has_actual_binder_refusal() {
+fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_keeps_conversion_and_frame_result()
+ {
+    use novarocks_functions::builtin::value_conversion::{
+        VALUE_CONVERSION_FUNCTION_ID, resolve_value_conversion,
+    };
+    use novarocks_functions::{FunctionArgumentType, FunctionValueType};
+    use novarocks_physical_plan::ExprKind;
+    use novarocks_type_contract::ValueLogicalType;
+
+    let sql = "SELECT ~CAST('-170141183460469231731687303715884105728' AS LARGEINT)";
+    let expected_type = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
     for mode in [SqlPhysicalEmissionMode::OriginalNativeV1, EXACT] {
-        let refused = std::panic::catch_unwind(|| {
-            sql_source(
-                "SELECT ~CAST('-170141183460469231731687303715884105728' AS LARGEINT)",
-                DataType::Int64,
-                mode,
-            )
-        })
-        .unwrap_err();
-        let message = refused
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| refused.downcast_ref::<&str>().copied())
-            .unwrap();
-        assert!(
-            message.contains("no matching declared overload"),
-            "original logical conversion admission: {message}"
+        let source = sql_source(sql, DataType::Int64, mode);
+        assert_eq!(
+            source.plan().result_port().unwrap().fields[0].ty,
+            expected_type
         );
+        let mut conversions = 0;
+        for fragment in source.plan().fragments().values() {
+            for (_, expression) in fragment.expressions().iter() {
+                let ExprKind::FunctionCall { function, args } = &expression.kind else {
+                    continue;
+                };
+                if function.function_id.as_str() != VALUE_CONVERSION_FUNCTION_ID {
+                    continue;
+                }
+                conversions += 1;
+                assert_eq!(
+                    function.overload.as_str(),
+                    "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/v1"
+                );
+                assert_eq!(expression.ty, expected_type);
+                assert_eq!(args.len(), 1);
+                let input = &fragment.expressions().get(args[0]).unwrap().ty;
+                assert_eq!(input, &FunctionValueType::new(DataType::Utf8, false));
+                assert_eq!(
+                    function.argument_types.as_ref(),
+                    &[FunctionArgumentType::Value(input.clone())]
+                );
+                assert_eq!(function.result_type, expected_type);
+            }
+        }
+        assert_eq!(
+            conversions, 1,
+            "the original declared conversion remains explicit"
+        );
+    }
+    // The installed owner, package author, LocalCompiler and Frame execute the
+    // frozen conversion before BitwiseNot. MIN's complement is independently MAX.
+    let outputs = constant_outputs(sql);
+    assert_eq!(outputs.len(), 1);
+    let expected = novarocks_types::largeint::array_from_i128(&[Some(i128::MAX)]).unwrap();
+    assert_eq!(outputs[0].to_data(), expected.to_data());
+
+    // Equal-width bytes are not authorization for either the conversion or
+    // the exact BitwiseNot recipe. Only the explicit nominal source is admitted.
+    for source in [
+        FunctionValueType::new(DataType::FixedSizeBinary(16), true),
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap(),
+    ] {
+        assert!(resolve_value_conversion(&source, &expected_type, &Control).is_err());
+        assert!(!novarocks_functions::native_bitnot_source_supported(
+            &source
+        ));
     }
 }

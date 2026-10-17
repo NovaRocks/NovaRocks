@@ -34,19 +34,19 @@ fn datetime_value_at(
 ) -> Option<chrono::NaiveDateTime> {
     scalar_extrema::datetime_value_at(values, row, len)
 }
-fn eval_greatest_least(
-    arena: &ExprArena,
+fn eval_greatest_least<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     greatest: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     // Legacy owns eager child evaluation and its original output carrier lookup.
     let mut arrays = Vec::with_capacity(args.len());
     for arg in args {
         arrays.push(arena.eval(*arg, chunk)?);
     }
-    scalar_extrema::evaluate_legacy(
+    Ok((scalar_extrema::evaluate_legacy(
         if greatest {
             ExtremaOperation::Greatest
         } else {
@@ -55,23 +55,23 @@ fn eval_greatest_least(
         &arrays,
         chunk.len(),
         arena.data_type(expr),
-    )
+    ))?)
 }
-pub fn eval_greatest(
-    arena: &ExprArena,
+pub fn eval_greatest<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_greatest_least(arena, expr, args, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_greatest_least(arena, expr, args, chunk, true))?)
 }
-pub fn eval_least(
-    arena: &ExprArena,
+pub fn eval_least<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_greatest_least(arena, expr, args, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_greatest_least(arena, expr, args, chunk, false))?)
 }
 #[cfg(test)]
 mod legacy_extrema_contract_tests {

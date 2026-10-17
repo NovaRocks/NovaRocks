@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::calendar_sec_to_time::evaluate_legacy_sec_to_time;
 pub use novarocks_functions::builtin::calendar_sec_to_time::format_sec_to_time;
-pub fn eval_sec_to_time(
-    arena: &ExprArena,
+pub fn eval_sec_to_time<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(args[0], chunk)?;
-    evaluate_legacy_sec_to_time(&array)
+    Ok((evaluate_legacy_sec_to_time(&array))?)
 }

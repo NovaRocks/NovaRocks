@@ -21,12 +21,12 @@ use novarocks_functions::{
     Selection,
     builtin::map_projection_core::{MapPart, ProjectionFailure, project_observed},
 };
-pub fn eval_map_values(
-    arena: &ExprArena,
+pub fn eval_map_values<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let map_arr = arena.eval(args[0], chunk)?;
     let map = map_arr
         .as_any()
@@ -53,5 +53,5 @@ pub fn eval_map_values(
         ProjectionFailure::Data(s) | ProjectionFailure::Control(s) => s,
         ProjectionFailure::Take(s) => format!("map_values: failed to reorder values: {s}"),
     })?;
-    super::common::cast_output(out, arena.data_type(expr), "map_values")
+    Ok((super::common::cast_output(out, arena.data_type(expr), "map_values"))?)
 }

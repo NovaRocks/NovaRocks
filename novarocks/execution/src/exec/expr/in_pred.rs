@@ -33,13 +33,13 @@ use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 // IN predicate for Arrow arrays
-pub fn eval_in(
-    arena: &ExprArena,
+pub fn eval_in<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     child: ExprId,
     values: &[ExprId],
     is_not_in: bool,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(child, chunk)?;
     let lhs_is_literal_like = !expr_contains_slot(arena, child);
     let single_candidate = values.len() == 1;
@@ -855,7 +855,10 @@ fn compare_map_values_for_in(
     Ok(result)
 }
 
-fn expr_contains_slot(arena: &ExprArena, id: ExprId) -> bool {
+fn expr_contains_slot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    id: ExprId,
+) -> bool {
     match arena.node(id) {
         Some(ExprNode::SlotId(_)) => true,
         Some(ExprNode::ArrayExpr { elements }) => elements

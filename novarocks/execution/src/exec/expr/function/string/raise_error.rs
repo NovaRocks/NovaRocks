@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use std::sync::Arc;
 
-pub fn eval_raise_error(
-    arena: &ExprArena,
+pub fn eval_raise_error<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let input = arena.eval(args[0], chunk)?;
     let arr = input
@@ -34,7 +34,7 @@ pub fn eval_raise_error(
     // Any non-null value raises an error with that message.
     for i in 0..arr.len() {
         if !arr.is_null(i) {
-            return Err(arr.value(i).to_string());
+            return Err((arr.value(i).to_string()).into());
         }
     }
     // All inputs are NULL: return a null boolean column of the same length.

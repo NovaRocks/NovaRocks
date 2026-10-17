@@ -17,33 +17,35 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
-fn eval_char_length_impl(
-    arena: &ExprArena,
+fn eval_char_length_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     utf8: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(args[0], chunk)?;
-    novarocks_functions::builtin::string_measure::evaluate_legacy_length(
-        &array,
-        utf8,
-        arena.data_type(expr),
+    Ok(
+        (novarocks_functions::builtin::string_measure::evaluate_legacy_length(
+            &array,
+            utf8,
+            arena.data_type(expr),
+        ))?,
     )
 }
-pub fn eval_length(
-    arena: &ExprArena,
+pub fn eval_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_char_length_impl(arena, expr, args, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_char_length_impl(arena, expr, args, chunk, false))?)
 }
-pub fn eval_char_length(
-    arena: &ExprArena,
+pub fn eval_char_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_char_length_impl(arena, expr, args, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_char_length_impl(arena, expr, args, chunk, true))?)
 }

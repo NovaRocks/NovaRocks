@@ -59,64 +59,64 @@ pub fn bool_and_state_visible(s: &[u8]) -> Result<Option<bool>, String> {
     }
 }
 
-pub fn eval_bool_or_state_union(
-    arena: &ExprArena,
+pub fn eval_bool_or_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_bool_state_union(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_bool_state_union(
         "bool_or_state_union",
         bool_or_state_union,
         arena,
         args,
         chunk,
-    )
+    ))?)
 }
 
-pub fn eval_bool_and_state_union(
-    arena: &ExprArena,
+pub fn eval_bool_and_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_bool_state_union(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_bool_state_union(
         "bool_and_state_union",
         bool_and_state_union,
         arena,
         args,
         chunk,
-    )
+    ))?)
 }
 
-pub fn eval_bool_or_state_visible(
-    arena: &ExprArena,
+pub fn eval_bool_or_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_bool_state_visible(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_bool_state_visible(
         "bool_or_state_visible",
         bool_or_state_visible,
         arena,
         args,
         chunk,
-    )
+    ))?)
 }
 
-pub fn eval_bool_and_state_visible(
-    arena: &ExprArena,
+pub fn eval_bool_and_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_bool_state_visible(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_bool_state_visible(
         "bool_and_state_visible",
         bool_and_state_visible,
         arena,
         args,
         chunk,
-    )
+    ))?)
 }
 
 fn bool_state_union(a: &[u8], b: &[u8], fn_name: &str) -> Result<Vec<u8>, String> {
@@ -137,33 +137,33 @@ fn bool_state_union(a: &[u8], b: &[u8], fn_name: &str) -> Result<Vec<u8>, String
 
 type BoolStateOp = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
 
-fn eval_bool_state_union(
+fn eval_bool_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
     op: BoolStateOp,
-    arena: &ExprArena,
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!("{fn_name} expects 2 arguments, got {}", args.len()));
+        return Err((format!("{fn_name} expects 2 arguments, got {}", args.len())).into());
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    eval_bool_state_union_arrays(fn_name, op, &lhs, &rhs)
+    Ok((eval_bool_state_union_arrays(fn_name, op, &lhs, &rhs))?)
 }
 
-fn eval_bool_state_visible(
+fn eval_bool_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
     op: fn(&[u8]) -> Result<Option<bool>, String>,
-    arena: &ExprArena,
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!("{fn_name} expects 1 argument, got {}", args.len()));
+        return Err((format!("{fn_name} expects 1 argument, got {}", args.len())).into());
     }
     let input = arena.eval(args[0], chunk)?;
-    eval_bool_state_visible_array(fn_name, op, &input)
+    Ok((eval_bool_state_visible_array(fn_name, op, &input))?)
 }
 
 fn eval_bool_state_union_arrays(

@@ -2546,6 +2546,29 @@ fn a_split_receipt_reports_the_queue_depth_the_offer_left_behind() {
     );
 }
 
+#[cfg(novarocks_dev_controls)]
+#[test]
+fn an_opted_in_replay_gate_fails_explicitly_on_a_host_without_that_capability() {
+    let fixture = Fixture::new();
+    fixture.establish(1);
+    let identity = fixture.identity(1, 1, 1);
+    fixture.create(identity, 5);
+    let request = UpdateTask::try_new(
+        TaskOperationId::new_v7(),
+        identity,
+        vec![split_update(3, 1, 3, true, 21)],
+    )
+    .unwrap();
+    let control = crate::test_controls::tests::controlled_replay(10_000);
+    let grant = control.role.scope().grants_for("native").pop().unwrap();
+    let error = fixture
+        .registry
+        .reserve_test_update_consumption(&request, grant.cancellation())
+        .err()
+        .expect("an unsupported host cannot silently omit the declared gate");
+    assert!(error.detail().as_str().contains("does not support"));
+}
+
 #[test]
 fn a_replayed_split_assignment_is_answered_as_a_duplicate_that_still_reports_its_queue_depth() {
     // What this catches: the receiver classifying a retransmitted split batch

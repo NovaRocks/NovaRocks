@@ -281,6 +281,8 @@ struct TaskRuntime {
     exchange_retirement: Mutex<Option<ExchangeReceiverRetirement>>,
     edges: Arc<ExchangeEdgeGates>,
     splits: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+    #[cfg(novarocks_dev_controls)]
+    replay_gate: Mutex<Option<Arc<super::task_update_replay_gate::TaskUpdateReplayGate>>>,
     read_context: Arc<TypedReadAttemptContext>,
     /// Retains preparation accounting until activation or receiver rollback.
     registration: Mutex<Option<NativeFragmentRegistrationLease>>,
@@ -925,6 +927,8 @@ impl NativeTaskExecutionHost {
                 exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
+                #[cfg(novarocks_dev_controls)]
+                replay_gate: Mutex::new(None),
                 read_context,
                 registration: Mutex::new(Some(registration)),
                 operator_statistics,
@@ -1007,6 +1011,9 @@ impl NativeTaskExecutionHost {
         identity: TaskIdentity,
         fragment_instance_id: UniqueId,
         assignment: &SplitAssignment,
+        #[cfg(novarocks_dev_controls)] operation: Option<
+            novarocks_execution_contract::TaskOperationId,
+        >,
     ) -> Result<u64, HostRejection> {
         let node = assignment.plan_node_id();
         let queue = runtime.splits.queue(node);
@@ -1140,6 +1147,30 @@ impl NativeTaskExecutionHost {
         // how full this node's queue is now, not how full it was before it
         // sent. Defaulting it to zero would tell the sender the task is idle
         // and invite it to keep filling a queue that is already full.
+        // Only this successful, open-queue duplicate path can release input.
+        // Closed/retired answers and an Idempotent registry verdict cannot.
+        #[cfg(novarocks_dev_controls)]
+        if let Some(operation) = operation {
+            if let Some(gate) = runtime
+                .replay_gate
+                .lock()
+                .expect("task replay gate lock")
+                .as_ref()
+            {
+                if assignment.no_more_splits()
+                    && !sequences.is_empty()
+                    && preflight.duplicate_sequences().len() == sequences.len()
+                {
+                    gate.observe_duplicate(
+                        identity,
+                        operation,
+                        node,
+                        sequences.first().expect("nonempty").sequence_id(),
+                        sequences.last().expect("nonempty").sequence_id(),
+                    );
+                }
+            }
+        }
         Ok(queue.stats().queued_splits as u64)
     }
 
@@ -1498,6 +1529,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
+                #[cfg(novarocks_dev_controls)]
+                replay_gate: Mutex::new(None),
                 read_context,
                 registration: Mutex::new(Some(registration)),
                 operator_statistics,
@@ -1705,6 +1738,70 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         Ok(task)
     }
 
+    #[cfg(novarocks_dev_controls)]
+    fn reserve_test_update_consumption(
+        &self,
+        request: &novarocks_execution_contract::UpdateTask,
+        control: novarocks_failpoint::scope::ControlCancellation,
+    ) -> Result<Box<dyn novarocks_worker::TestTaskUpdateConsumptionReservation>, HostRejection>
+    {
+        let runtime = self
+            .task_runtime(request.identity())
+            .ok_or_else(|| internal("controlled replay gate requires the actual installed task"))?;
+        let controls = self
+            .test_controls
+            .as_ref()
+            .ok_or_else(|| internal("controlled replay gate has no installed Native controls"))?;
+        let mut slot = runtime.replay_gate.lock().expect("task replay gate lock");
+        if slot.as_ref().is_some_and(|gate| gate.is_held()) {
+            return Err(internal("task already has an active exact replay gate"));
+        }
+        let gate = super::task_update_replay_gate::TaskUpdateReplayGate::reserve(
+            request,
+            &runtime.splits,
+            control,
+            runtime.stop.view(),
+        )
+        .map_err(internal)?;
+        *slot = Some(Arc::clone(&gate));
+        Ok(Box::new(
+            super::task_update_replay_gate::ReplayReservation::new(
+                gate,
+                Arc::clone(controls),
+                self.scan_stream_host.runtime().clone(),
+            ),
+        ))
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    fn apply_task_domain_for_operation(
+        &self,
+        descriptor: &TaskDescriptor,
+        domain: &TaskDomainUpdate,
+        operation: novarocks_execution_contract::TaskOperationId,
+    ) -> Result<Option<u64>, HostRejection> {
+        let TaskDomainUpdate::SplitAssignment(intent) = domain else {
+            return self.apply_task_domain(descriptor, domain);
+        };
+        let runtime = self
+            .task_runtime(descriptor.identity())
+            .ok_or_else(|| internal("split update has no actual installed task"))?;
+        let assignment = Self::split_assignment(intent.payload().as_ref())?;
+        if assignment.plan_node_id() != intent.node().get() {
+            return Err(protocol(
+                "split intent and payload name different plan nodes",
+            ));
+        }
+        self.deliver_splits(
+            &runtime,
+            descriptor.identity(),
+            descriptor.fragment_instance_id(),
+            &assignment,
+            Some(operation),
+        )
+        .map(Some)
+    }
+
     fn apply_task_domain(
         &self,
         descriptor: &TaskDescriptor,
@@ -1731,6 +1828,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     identity,
                     descriptor.fragment_instance_id(),
                     &assignment,
+                    #[cfg(novarocks_dev_controls)]
+                    None,
                 )
                 .map(Some)
             }

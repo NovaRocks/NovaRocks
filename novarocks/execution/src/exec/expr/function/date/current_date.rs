@@ -20,24 +20,24 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Date32Array};
 use std::sync::Arc;
 
-pub fn eval_current_date(
-    _arena: &ExprArena,
+pub fn eval_current_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    _arena: &__Eval,
     _expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = datetime_from_local_now().date();
     let days = naive_to_date32(date);
     let values = vec![Some(days); chunk.len()];
     Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
 }
 
-pub fn eval_curdate(
-    _arena: &ExprArena,
+pub fn eval_curdate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    _arena: &__Eval,
     _expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = datetime_from_local_now().date();
     let days = naive_to_date32(date);
     let values = vec![Some(days); chunk.len()];

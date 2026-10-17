@@ -29,104 +29,104 @@ use novarocks_type_contract::DecimalOverflowPolicy;
 use novarocks_types::largeint;
 use std::sync::Arc;
 
-pub fn eval_add(
-    arena: &ExprArena,
+pub fn eval_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     a: ExprId,
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    novarocks_functions::legacy_arithmetic::eval_add_arrays(
+    Ok((novarocks_functions::legacy_arithmetic::eval_add_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    )
+    ))?)
 }
 
-pub fn eval_sub(
-    arena: &ExprArena,
+pub fn eval_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     a: ExprId,
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    novarocks_functions::legacy_arithmetic::eval_sub_arrays(
+    Ok((novarocks_functions::legacy_arithmetic::eval_sub_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    )
+    ))?)
 }
 
-pub fn eval_mul(
-    arena: &ExprArena,
+pub fn eval_mul<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     a: ExprId,
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    novarocks_functions::legacy_arithmetic::eval_mul_arrays(
+    Ok((novarocks_functions::legacy_arithmetic::eval_mul_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    )
+    ))?)
 }
 
-pub fn eval_div(
-    arena: &ExprArena,
+pub fn eval_div<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     a: ExprId,
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).unwrap_or(&DataType::Null);
-    novarocks_functions::legacy_arithmetic::eval_div_arrays(
+    Ok((novarocks_functions::legacy_arithmetic::eval_div_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    )
+    ))?)
 }
 
-pub fn eval_mod(
-    arena: &ExprArena,
+pub fn eval_mod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     a: ExprId,
     b: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
-    novarocks_functions::legacy_arithmetic::eval_mod_arrays(
+    Ok((novarocks_functions::legacy_arithmetic::eval_mod_arrays(
         lhs,
         rhs,
         output_type,
         arena.allow_throw_exception(),
         decimal_overflow_policy,
-    )
+    ))?)
 }
 #[cfg(test)]
 mod tests {

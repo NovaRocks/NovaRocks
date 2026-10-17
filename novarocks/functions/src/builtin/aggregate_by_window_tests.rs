@@ -17,7 +17,6 @@
 
 //! Actual tracked window instances through the already-resolved BY owner.
 use super::*;
-use crate::builtin::aggregate_by_window;
 use crate::opaque_memory::OpaqueAllocationHost;
 use arrow_array::{Array, Float64Array, Int32Array, NullArray};
 use std::sync::Mutex;
@@ -92,13 +91,8 @@ fn prepared(
     value: FunctionValueType,
     key: FunctionValueType,
 ) -> Arc<dyn PreparedWindowKernel> {
-    let aggregate = Arc::new(kernel(name, value, key, AggregateKernelPhase::Single));
-    let options = WindowCallOptions::try_new(None, false, &Compile).unwrap();
-    let window = Arc::new(
-        WindowCallContract::try_aggregate(Arc::clone(aggregate.contract()), options, &Compile)
-            .unwrap(),
-    );
-    aggregate_by_window::prepare(aggregate, window, &Compile).unwrap()
+    let catalog = super::super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+    window_kernel_with_catalog(name, value, key, &catalog)
 }
 fn input<'a>(
     call: &'a WindowCallContract,
@@ -1021,7 +1015,8 @@ fn by_window_tracked_actual_original_large_utf8_data_is_lossless() {
     .unwrap_err();
     assert_eq!(raw.to_string(), "unsupported scalar output type: LargeUtf8");
     for name in ["max_by", "min_by"] {
-        let catalog = super::super::super::catalogue::by_window_private_test_catalog();
+        let catalog =
+            super::super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
         let prepared = window_kernel_with_catalog(
             name,
             FunctionValueType::new(DataType::LargeUtf8, true),

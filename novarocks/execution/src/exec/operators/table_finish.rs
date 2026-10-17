@@ -1020,6 +1020,7 @@ impl TableFinishOperator {
                     })?;
                     Box::new(GroupedUnpivotDriver::try_new(
                         arena,
+                        self.construction.clone(),
                         plan,
                         Arc::clone(self.prepared_root_schema()?.chunk_schema()),
                         final_chunk,
@@ -1165,6 +1166,7 @@ fn build_final_aggregate(
 
 struct GroupedUnpivotDriver {
     arena: Arc<ExprArena>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
     plan: WriterGroupedUnpivotPlan,
     root_schema: crate::exec::chunk::ChunkSchemaRef,
     final_chunk: Chunk,
@@ -1179,6 +1181,7 @@ struct GroupedUnpivotDriver {
 impl GroupedUnpivotDriver {
     fn try_new(
         arena: Arc<ExprArena>,
+        construction: Option<Arc<dyn InputConstructionFactory>>,
         plan: WriterGroupedUnpivotPlan,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         mut final_chunk: Chunk,
@@ -1230,6 +1233,7 @@ impl GroupedUnpivotDriver {
         }
         Ok(Self {
             arena,
+            construction,
             plan,
             root_schema,
             final_chunk,
@@ -1334,6 +1338,9 @@ impl GroupedUnpivotDriver {
             self.plan.max_output_bytes,
         )?;
         let mut active = factory.create(1, 0);
+        if let Some(construction) = self.construction.as_ref() {
+            active.set_construction_factory(Arc::clone(construction));
+        }
         if let Some(tracker) = self.tracker.as_ref() {
             active.set_mem_tracker(Arc::clone(tracker));
         }
@@ -1856,12 +1863,12 @@ impl Operator for TableFinishOperator {
                 profiles.operator.child("TableFinishFinalAggregate"),
             ));
         }
-        if aggregate.creates_typed_storage() {
-            let factory = self
-                .construction
-                .as_ref()
-                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        if let Some(factory) = self.construction.as_ref() {
+            // Expression input construction uses this same caller-owned scope
+            // even when the child retains a legacy output declaration.
             aggregate.set_construction_factory(Arc::clone(factory));
+        } else if aggregate.creates_typed_storage() {
+            return Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into());
         }
         aggregate.prepare()?;
         aggregate.bind_runtime_state(state)?;
@@ -2921,6 +2928,22 @@ mod tests {
         )
     }
 
+    fn install_composite_input_creator(
+        operator: &mut dyn Operator,
+        state: &RuntimeState,
+        tracker: Arc<MemTracker>,
+    ) {
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile()
+                .expect("actual runtime construction profile"),
+            tracker,
+            state.error_state(),
+        )
+        .expect("actual composite input construction factory");
+        operator.set_construction_factory(factory);
+    }
+
     fn scripted_final_chunk(
         factory: &TableFinishOperatorFactory,
         rows: Vec<(i32, Vec<Option<Vec<u8>>>)>,
@@ -3584,6 +3607,11 @@ mod tests {
     {
         let (factory, state, writer_schema) = composite_fixture(2, 2, 1);
         let mut operator = factory.create(1, 0);
+        install_composite_input_creator(
+            operator.as_mut(),
+            &state,
+            MemTracker::new_root("table-finish-interleaved-input-creator"),
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind aggregate");
         let processor = operator.as_processor_mut().expect("processor");
@@ -3941,6 +3969,7 @@ mod tests {
             scripted_final_chunk(&factory, vec![(0, vec![Some(b"complete".to_vec())])]);
         let mut grouped = GroupedUnpivotDriver::try_new(
             Arc::clone(&factory.arena),
+            None,
             factory
                 .final_plan
                 .unpivot
@@ -4220,6 +4249,11 @@ mod tests {
             TableWriteAggregateBoundary::FinalFinalize,
         ));
         let mut operator = factory.create_operator(1, 0);
+        install_composite_input_creator(
+            &mut operator,
+            &state,
+            MemTracker::new_root("table-finish-finalize-guard-input-creator"),
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator
@@ -4263,7 +4297,8 @@ mod tests {
         let (factory, state, writer_schema) = composite_fixture(1, channels, 64);
         let tracker = MemTracker::new_root("table-finish-wide-unpivot");
         let mut operator = factory.create_operator(1, 0);
-        operator.set_mem_tracker(Arc::clone(&tracker));
+        install_composite_input_creator(&mut operator, &state, Arc::clone(&tracker));
+        let creator_bytes = tracker.current();
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator
@@ -4312,6 +4347,12 @@ mod tests {
         drop(outputs);
         assert_eq!(
             tracker.current(),
+            creator_bytes,
+            "only the live operator's original creator metadata remains"
+        );
+        drop(operator);
+        assert_eq!(
+            tracker.current(),
             0,
             "all final/Unpivot/output memory released"
         );
@@ -4322,6 +4363,11 @@ mod tests {
     fn composite_finish_fails_closed_on_missing_channel_coverage_at_eos() {
         let (factory, state, writer_schema) = composite_fixture(1, 2, 16);
         let mut operator = factory.create(1, 0);
+        install_composite_input_creator(
+            operator.as_mut(),
+            &state,
+            MemTracker::new_root("table-finish-channel-coverage-input-creator"),
+        );
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind aggregate");
         operator
@@ -4412,7 +4458,7 @@ mod tests {
             Some(Arc::clone(&tracker)),
         );
         let mut operator = factory.create(1, 0);
-        operator.set_mem_tracker(Arc::clone(&tracker));
+        install_composite_input_creator(operator.as_mut(), &state, Arc::clone(&tracker));
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind aggregate");
         operator

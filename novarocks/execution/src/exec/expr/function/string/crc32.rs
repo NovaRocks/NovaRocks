@@ -18,14 +18,14 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 
-pub fn eval_crc32(
-    arena: &ExprArena,
+pub fn eval_crc32<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
-    novarocks_functions::builtin::crc32::evaluate_legacy(&input)
+    Ok((novarocks_functions::builtin::crc32::evaluate_legacy(&input))?)
 }
 
 #[cfg(test)]

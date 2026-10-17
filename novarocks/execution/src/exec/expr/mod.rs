@@ -143,6 +143,7 @@ pub struct ExprArena {
     types: Vec<DataType>,
     field_schemas: Vec<Option<ChunkFieldSchema>>,
     complete_types: Vec<Option<novarocks_functions::FunctionValueType>>,
+    regexp_count_sources: Vec<Option<novarocks_type_contract::RegexpCountPatternSource>>,
     allow_throw_exception: bool,
     query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
     session_time_zone: Option<String>,
@@ -208,6 +209,7 @@ impl ExprArena {
         self.types.push(data_type);
         self.field_schemas.push(None);
         self.complete_types.push(None);
+        self.regexp_count_sources.push(None);
         id
     }
 
@@ -278,6 +280,72 @@ impl ExprArena {
         self.complete_types.get(id.0).and_then(Option::as_ref)
     }
 
+    /// Attach an existing emitted-source fact to this exact legacy call.
+    /// Raw Literal/Constant construction never creates such a fact.
+    pub fn set_regexp_count_pattern_source(
+        &mut self,
+        id: ExprId,
+        source: novarocks_type_contract::RegexpCountPatternSource,
+    ) -> Result<(), String> {
+        self.validate_regexp_count_pattern_source(id, source)?;
+        let slot = &mut self.regexp_count_sources[id.0];
+        if slot.is_some_and(|previous| previous != source) {
+            return Err("regexp_count pattern source is already bound".into());
+        }
+        *slot = Some(source);
+        Ok(())
+    }
+
+    pub fn regexp_count_pattern_source(
+        &self,
+        id: ExprId,
+    ) -> Option<novarocks_type_contract::RegexpCountPatternSource> {
+        self.regexp_count_sources.get(id.0).copied().flatten()
+    }
+
+    pub(crate) fn validate_regexp_count_pattern_source(
+        &self,
+        id: ExprId,
+        source: novarocks_type_contract::RegexpCountPatternSource,
+    ) -> Result<(), String> {
+        let Some(ExprNode::FunctionCall {
+            kind: function::FunctionKind::String("regexp_count"),
+            args,
+        }) = self.node(id)
+        else {
+            return Err("regexp_count pattern source belongs to a different call".into());
+        };
+        let [_, pattern] = args.as_slice() else {
+            return Err("regexp_count pattern source requires two arguments".into());
+        };
+        let exact_physical_utf8 = |ty: &novarocks_functions::FunctionValueType| {
+            ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && ty.data_type() == &DataType::Utf8
+        };
+        // A declared complete type cannot hide a checked constant's own domain.
+        // Both facts must independently satisfy this call-local source contract.
+        if self.data_type(*pattern) != Some(&DataType::Utf8)
+            || self
+                .value_type(*pattern)
+                .is_some_and(|ty| !exact_physical_utf8(ty))
+            || self.field_schema(*pattern).is_some_and(|schema| {
+                !matches!(schema.kind(), novarocks_type_contract::ValueKind::String)
+            })
+            || matches!(self.node(*pattern), Some(ExprNode::Constant(value)) if !exact_physical_utf8(value.value_type()))
+        {
+            return Err("regexp_count pattern source requires exact Physical Utf8".into());
+        }
+        if source.invalid_pattern_is_error()
+            && !matches!(
+                self.node(*pattern),
+                Some(ExprNode::Constant(_)) | Some(ExprNode::Literal(LiteralValue::Utf8(_)))
+            )
+        {
+            return Err("regexp_count native literal fact has a dynamic pattern definition".into());
+        }
+        Ok(())
+    }
+
     pub fn node(&self, id: ExprId) -> Option<&ExprNode> {
         self.nodes.get(id.0)
     }
@@ -335,20 +403,26 @@ impl ExprArena {
     }
 
     pub fn eval(&self, id: ExprId, chunk: &Chunk) -> Result<ArrayRef, String> {
-        let node = self
-            .nodes
-            .get(id.0)
-            .ok_or_else(|| "invalid ExprId".to_string())?;
-        match node {
+        evaluate(self, id, chunk)
+    }
+}
+
+fn evaluate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    id: ExprId,
+    chunk: &Chunk,
+) -> Result<ArrayRef, __Eval::Error> {
+    let node = arena.node(id).ok_or_else(|| "invalid ExprId".to_string())?;
+    match node {
             ExprNode::Constant(value) => {
-                if !self.data_type(id).is_some_and(|ty| novarocks_type_contract::arrow_data_types_exact(ty, &value.value_type().data_type())) {
+                if !arena.data_type(id).is_some_and(|ty| novarocks_type_contract::arrow_data_types_exact(ty, &value.value_type().data_type())) {
                     return Err("constant pool carrier differs from expression metadata".into());
                 }
-                constant_eval::broadcast(value, chunk.len())
+                Ok((constant_eval::broadcast(value, chunk.len()))?)
             }
             ExprNode::Literal(v) => {
                 if matches!(v, LiteralValue::Null) {
-                    let target_type = self.data_type(id).cloned().unwrap_or(DataType::Null);
+                    let target_type = arena.data_type(id).cloned().unwrap_or(DataType::Null);
                     if !matches!(target_type, DataType::Null) {
                         // StarRocks plans may materialize `NULL` directly into typed slots (e.g. `slot: NULL`)
                         // without an explicit `cast(NULL as <type>)`. We must preserve the declared slot/expr type
@@ -357,7 +431,7 @@ impl ExprArena {
                     }
                 }
                 let mut out = literal::eval(v, chunk.len())?;
-                let target_type = self.data_type(id).cloned().unwrap_or(DataType::Null);
+                let target_type = arena.data_type(id).cloned().unwrap_or(DataType::Null);
                 if !matches!(target_type, DataType::Null) && out.data_type() != &target_type {
                     out = cast::cast_with_special_rules(&out, &target_type).map_err(|e| {
                         format!(
@@ -370,50 +444,50 @@ impl ExprArena {
                 }
                 Ok(out)
             }
-            ExprNode::SlotId(slot_id) => slot::eval_slot_id(*slot_id, chunk),
-            ExprNode::ArrayExpr { elements } => array_expr::eval_array_expr(self, id, elements, chunk),
+            ExprNode::SlotId(slot_id) => Ok((slot::eval_slot_id(*slot_id, chunk))?),
+            ExprNode::ArrayExpr { elements } => Ok((array_expr::eval_array_expr(arena, id, elements, chunk))?),
             ExprNode::StructExpr { fields } => {
-                struct_expr::eval_struct_expr(self, id, fields, chunk)
+                Ok((struct_expr::eval_struct_expr(arena, id, fields, chunk))?)
             }
             ExprNode::LambdaFunction { .. } => Err(
-                "lambda function expression can only be used as an argument to higher-order functions"
-                    .to_string(),
+                ("lambda function expression can only be used as an argument to higher-order functions"
+                    .to_string()).into(),
             ),
             ExprNode::DictDecode { child, dict } => {
-                dict_decode::eval_dict_decode(self, id, *child, dict, chunk)
+                Ok((dict_decode::eval_dict_decode(arena, id, *child, dict, chunk))?)
             }
-            ExprNode::Cast(child, policy) => cast::eval(self, id, *child, *policy, chunk),
-            ExprNode::CastTime(child, _) => cast::eval_time(self, id, *child, chunk),
+            ExprNode::Cast(child, policy) => Ok((cast::eval(arena, id, *child, *policy, chunk))?),
+            ExprNode::CastTime(child, _) => Ok((cast::eval_time(arena, id, *child, chunk))?),
             ExprNode::CastTimeFromDatetime(child, _) => {
-                cast::eval_time_from_datetime(self, id, *child, chunk)
+                Ok((cast::eval_time_from_datetime(arena, id, *child, chunk))?)
             }
-            ExprNode::Add(a, b, policy) => arithmetic::eval_add(self, id, *a, *b, *policy, chunk),
-            ExprNode::Sub(a, b, policy) => arithmetic::eval_sub(self, id, *a, *b, *policy, chunk),
-            ExprNode::Mul(a, b, policy) => arithmetic::eval_mul(self, id, *a, *b, *policy, chunk),
-            ExprNode::Div(a, b, policy) => arithmetic::eval_div(self, id, *a, *b, *policy, chunk),
-            ExprNode::Mod(a, b, policy) => arithmetic::eval_mod(self, id, *a, *b, *policy, chunk),
-            ExprNode::Eq(a, b) => comparison::eval_eq(self, *a, *b, chunk),
-            ExprNode::EqForNull(a, b) => comparison::eval_eq_for_null(self, *a, *b, chunk),
-            ExprNode::Ne(a, b) => comparison::eval_ne(self, *a, *b, chunk),
-            ExprNode::Lt(a, b) => comparison::eval_lt(self, *a, *b, chunk),
-            ExprNode::Le(a, b) => comparison::eval_le(self, *a, *b, chunk),
-            ExprNode::Gt(a, b) => comparison::eval_gt(self, *a, *b, chunk),
-            ExprNode::Ge(a, b) => comparison::eval_ge(self, *a, *b, chunk),
-            ExprNode::And(a, b) => comparison::eval_and(self, *a, *b, chunk),
-            ExprNode::Or(a, b) => comparison::eval_or(self, *a, *b, chunk),
-            ExprNode::Not(child) => comparison::eval_not(self, *child, chunk),
-            ExprNode::IsNull(child) => function::eval_is_null(self, *child, chunk),
-            ExprNode::IsNotNull(child) => function::eval_is_not_null(self, *child, chunk),
+            ExprNode::Add(a, b, policy) => Ok((arithmetic::eval_add(arena, id, *a, *b, *policy, chunk))?),
+            ExprNode::Sub(a, b, policy) => Ok((arithmetic::eval_sub(arena, id, *a, *b, *policy, chunk))?),
+            ExprNode::Mul(a, b, policy) => Ok((arithmetic::eval_mul(arena, id, *a, *b, *policy, chunk))?),
+            ExprNode::Div(a, b, policy) => Ok((arithmetic::eval_div(arena, id, *a, *b, *policy, chunk))?),
+            ExprNode::Mod(a, b, policy) => Ok((arithmetic::eval_mod(arena, id, *a, *b, *policy, chunk))?),
+            ExprNode::Eq(a, b) => Ok((comparison::eval_eq(arena, *a, *b, chunk))?),
+            ExprNode::EqForNull(a, b) => Ok((comparison::eval_eq_for_null(arena, *a, *b, chunk))?),
+            ExprNode::Ne(a, b) => Ok((comparison::eval_ne(arena, *a, *b, chunk))?),
+            ExprNode::Lt(a, b) => Ok((comparison::eval_lt(arena, *a, *b, chunk))?),
+            ExprNode::Le(a, b) => Ok((comparison::eval_le(arena, *a, *b, chunk))?),
+            ExprNode::Gt(a, b) => Ok((comparison::eval_gt(arena, *a, *b, chunk))?),
+            ExprNode::Ge(a, b) => Ok((comparison::eval_ge(arena, *a, *b, chunk))?),
+            ExprNode::And(a, b) => Ok((comparison::eval_and(arena, *a, *b, chunk))?),
+            ExprNode::Or(a, b) => Ok((comparison::eval_or(arena, *a, *b, chunk))?),
+            ExprNode::Not(child) => Ok((comparison::eval_not(arena, *child, chunk))?),
+            ExprNode::IsNull(child) => Ok((function::eval_is_null(arena, *child, chunk))?),
+            ExprNode::IsNotNull(child) => Ok((function::eval_is_not_null(arena, *child, chunk))?),
             ExprNode::In {
                 child,
                 values,
                 is_not_in,
-            } => in_pred::eval_in(self, *child, values, *is_not_in, chunk),
+            } => Ok((in_pred::eval_in(arena, *child, values, *is_not_in, chunk))?),
             ExprNode::Case {
                 has_case_expr,
                 has_else_expr,
                 children,
-            } => case::eval_case(self, *has_case_expr, *has_else_expr, children, chunk),
+            } => Ok((case::eval_case(arena, *has_case_expr, *has_else_expr, children, chunk))?),
             ExprNode::FunctionCall { kind, args } => {
                 let metadata = function::function_metadata(*kind);
                 let arity = novarocks_functions::invocation_arity::InvocationArity {
@@ -421,106 +495,106 @@ impl ExprArena {
                     maximum: metadata.max_args,
                 };
                 if let Some(failure) = arity.failure(args.len()) {
-                    return Err(failure.with_original_message(metadata.name, std::fmt::format));
+                    return Err((failure.with_original_message(metadata.name, std::fmt::format)).into());
                 }
                 match kind {
-                    FunctionKind::Abs => function::eval_abs(self, id, args[0], chunk),
-                    FunctionKind::ArrayMap => function::eval_array_map(self, id, args, chunk),
-                    FunctionKind::Year => function::eval_year(self, id, chunk),
-                    FunctionKind::HourFromUnixtime => function::eval_hour_from_unixtime(self, id, args, chunk),
-                    FunctionKind::AssertTrue => function::eval_assert_true(self, args, chunk),
+                    FunctionKind::Abs => Ok((function::eval_abs(arena, id, args[0], chunk))?),
+                    FunctionKind::ArrayMap => Ok((function::eval_array_map(arena, id, args, chunk))?),
+                    FunctionKind::Year => Ok((function::eval_year(arena, id, chunk))?),
+                    FunctionKind::HourFromUnixtime => Ok((function::eval_hour_from_unixtime(arena, id, args, chunk))?),
+                    FunctionKind::AssertTrue => Ok((function::eval_assert_true(arena, args, chunk))?),
                     FunctionKind::Substring => {
                         let length_expr = if args.len() == 3 { Some(args[2]) } else { None };
-                        function::eval_substring(self, args[0], args[1], length_expr, chunk)
+                        Ok((function::eval_substring(arena, args[0], args[1], length_expr, chunk))?)
                     }
-                    FunctionKind::Like => function::eval_like(self, args[0], args[1], chunk),
-                    FunctionKind::Upper => function::eval_upper(self, args[0], chunk),
-                    FunctionKind::Split => function::eval_split(self, args[0], args[1], chunk),
+                    FunctionKind::Like => Ok((function::eval_like(arena, args[0], args[1], chunk))?),
+                    FunctionKind::Upper => Ok((function::eval_upper(arena, args[0], chunk))?),
+                    FunctionKind::Split => Ok((function::eval_split(arena, args[0], args[1], chunk))?),
                     FunctionKind::If => {
-                        function::eval_if(self, id, args[0], args[1], args[2], chunk)
+                        Ok((function::eval_if(arena, id, args[0], args[1], args[2], chunk))?)
                     }
-                    FunctionKind::IfNull => function::eval_ifnull(self, args[0], args[1], chunk),
-                    FunctionKind::Coalesce => function::eval_coalesce(self, id, args, chunk),
-                    FunctionKind::IsNull => function::eval_is_null(self, args[0], chunk),
-                    FunctionKind::IsNotNull => function::eval_is_not_null(self, args[0], chunk),
+                    FunctionKind::IfNull => Ok((function::eval_ifnull(arena, args[0], args[1], chunk))?),
+                    FunctionKind::Coalesce => Ok((function::eval_coalesce(arena, id, args, chunk))?),
+                    FunctionKind::IsNull => Ok((function::eval_is_null(arena, args[0], chunk))?),
+                    FunctionKind::IsNotNull => Ok((function::eval_is_not_null(arena, args[0], chunk))?),
                     FunctionKind::Round => {
                         let decimals_expr = if args.len() == 2 { Some(args[1]) } else { None };
-                        function::eval_round(self, id, args[0], decimals_expr, chunk)
+                        Ok((function::eval_round(arena, id, args[0], decimals_expr, chunk))?)
                     }
                     FunctionKind::Array(name) => {
-                        function::eval_array_function(name, self, id, args, chunk)
+                        Ok((function::eval_array_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::Map(name) => {
-                        function::eval_map_function(name, self, id, args, chunk)
+                        Ok((function::eval_map_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::StructFn(name) => {
-                        function::eval_struct_function(name, self, id, args, chunk)
+                        Ok((function::eval_struct_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::Date(name) => {
-                        function::eval_date_function(name, self, id, args, chunk)
+                        Ok((function::eval_date_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::Math(name) => {
-                        function::eval_math_function(name, self, id, args, chunk)
+                        Ok((function::eval_math_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::String(name) => {
-                        function::eval_string_function(name, self, id, args, chunk)
+                        Ok((function::eval_string_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::Bit(name) => {
-                        function::eval_bit_function(name, self, id, args, chunk)
+                        Ok((function::eval_bit_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::Matching(name) => {
-                        function::eval_matching_function(name, self, id, args, chunk)
+                        Ok((function::eval_matching_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::Encryption(name) => {
-                        function::eval_encryption_function(name, self, id, args, chunk)
+                        Ok((function::eval_encryption_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::Variant(name) => {
-                        function::eval_variant_function(name, self, id, args, chunk)
+                        Ok((function::eval_variant_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::Object(name) => {
-                        function::eval_object_function(name, self, id, args, chunk)
+                        Ok((function::eval_object_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::MvState(name) => {
-                        function::eval_mv_state_function(name, self, id, args, chunk)
+                        Ok((function::eval_mv_state_function(name, arena, id, args, chunk))?)
                     }
                     FunctionKind::PercentileToBinary => {
-                        function::eval_percentile_to_binary(self, id, args, chunk)
+                        Ok((function::eval_percentile_to_binary(arena, id, args, chunk))?)
                     }
                     FunctionKind::JsonToText => {
-                        function::eval_json_to_text(self, id, args, chunk)
+                        Ok((function::eval_json_to_text(arena, id, args, chunk))?)
                     }
                     FunctionKind::NullIf => {
-                        function::eval_nullif(self, id, args[0], args[1], chunk)
+                        Ok((function::eval_nullif(arena, id, args[0], args[1], chunk))?)
                     }
                     FunctionKind::IcebergTransformIdentity => {
-                        function::eval_iceberg_identity(self, args[0], chunk)
+                        Ok((function::eval_iceberg_identity(arena, args[0], chunk))?)
                     }
                     FunctionKind::IcebergTransformVoid => {
-                        function::eval_iceberg_void(self, args[0], chunk)
+                        Ok((function::eval_iceberg_void(arena, args[0], chunk))?)
                     }
                     FunctionKind::IcebergTransformYear => {
-                        function::eval_iceberg_year(self, args[0], chunk)
+                        Ok((function::eval_iceberg_year(arena, args[0], chunk))?)
                     }
                     FunctionKind::IcebergTransformMonth => {
-                        function::eval_iceberg_month(self, args[0], chunk)
+                        Ok((function::eval_iceberg_month(arena, args[0], chunk))?)
                     }
                     FunctionKind::IcebergTransformDay => {
-                        function::eval_iceberg_day(self, args[0], chunk)
+                        Ok((function::eval_iceberg_day(arena, args[0], chunk))?)
                     }
                     FunctionKind::IcebergTransformHour => {
-                        function::eval_iceberg_hour(self, args[0], chunk)
+                        Ok((function::eval_iceberg_hour(arena, args[0], chunk))?)
                     }
                     FunctionKind::IcebergTransformBucket => {
-                        function::eval_iceberg_bucket(self, args[0], args[1], chunk)
+                        Ok((function::eval_iceberg_bucket(arena, args[0], args[1], chunk))?)
                     }
                     FunctionKind::IcebergTransformTruncate => {
-                        function::eval_iceberg_truncate(self, args[0], args[1], chunk)
+                        Ok((function::eval_iceberg_truncate(arena, args[0], args[1], chunk))?)
                     }
                 }
             }
             ExprNode::Clone(child) => {
                 // Evaluate the child expression
-                let child_array = self.eval(*child, chunk)?;
+                let child_array = arena.eval(*child, chunk)?;
 
                 // Implement Copy-On-Write semantics:
                 // Arrow arrays are already Arc-wrapped, so cloning the ArrayRef
@@ -537,8 +611,14 @@ impl ExprArena {
                 Ok(child_array)
             }
         }
-    }
 }
+
+mod evaluation_context;
+#[cfg(test)]
+mod evaluation_context_tests;
+pub use evaluation_context::ExprEvaluation;
+pub(crate) use evaluation_context::ExprEvaluationFailure;
+pub(crate) use evaluation_context::{ExprEvaluationContext, ExprEvaluationControl};
 
 pub fn cast_array_to_target(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef, String> {
     cast::cast_with_special_rules(array, target_type)
@@ -1828,3 +1908,6 @@ mod runtime_scalar_memory_actual_sql_bitwise_tests;
 
 #[cfg(test)]
 mod signed_cast_nullability_sql_tests;
+
+#[cfg(test)]
+mod regexp_count_source_tests;

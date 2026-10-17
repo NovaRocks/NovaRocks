@@ -838,7 +838,28 @@ fn try_fold_node(
         });
     }
 
+    // All arguments at this point are admitted literals/folded constants.
+    // The exact binding, rather than its spelling or CV payload, identifies
+    // the emitted-source contract that the real runtime will consume.
+    let regexp_count_pattern_source = match &node {
+        ScalarNode::FunctionCall { binding, .. }
+            if binding.function_id.as_str() == "builtin.scalar/regexp_count/v1" =>
+        {
+            let [_, pattern] = args.as_slice() else {
+                return Err("regexp_count fold source requires two arguments".into());
+            };
+            Some(
+                novarocks_type_contract::RegexpCountPatternSource::from_native_v1_emitted_shape(
+                    &pattern.value_type,
+                    true,
+                )
+                .map_err(str::to_owned)?,
+            )
+        }
+        _ => None,
+    };
     let request = FoldRequest {
+        regexp_count_pattern_source,
         kind,
         args,
         result_type: arena.value_type(id).clone(),

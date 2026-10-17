@@ -34,37 +34,39 @@ pub fn count_distinct_state_visible(s: &[u8]) -> Result<i64, String> {
     positive_entry_count(&entries)
 }
 
-pub fn eval_count_distinct_state_union(
-    arena: &ExprArena,
+pub fn eval_count_distinct_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!(
+        return Err((format!(
             "count_distinct_state_union expects 2 arguments, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    eval_count_distinct_state_union_arrays(&lhs, &rhs)
+    Ok((eval_count_distinct_state_union_arrays(&lhs, &rhs))?)
 }
 
-pub fn eval_count_distinct_state_visible(
-    arena: &ExprArena,
+pub fn eval_count_distinct_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!(
+        return Err((format!(
             "count_distinct_state_visible expects 1 argument, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
     let input = arena.eval(args[0], chunk)?;
-    eval_count_distinct_state_visible_array(&input)
+    Ok((eval_count_distinct_state_visible_array(&input))?)
 }
 
 fn eval_count_distinct_state_union_arrays(

@@ -23,12 +23,12 @@ use novarocks_functions::builtin::calendar_extended_shared::{
 };
 
 #[inline]
-fn eval_date_trunc_inner(
-    arena: &ExprArena,
+fn eval_date_trunc_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let unit = arena.eval(args[0], chunk)?;
     unit.as_any()
         .downcast_ref::<StringArray>()
@@ -39,35 +39,35 @@ fn eval_date_trunc_inner(
         .data_type(expr)
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    evaluate_legacy_calendar(CalendarOperation::Trunc, &[unit, date], &output_type, rows)
+    Ok((evaluate_legacy_calendar(CalendarOperation::Trunc, &[unit, date], &output_type, rows))?)
 }
 
-pub fn eval_date_trunc(
-    arena: &ExprArena,
+pub fn eval_date_trunc<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_date_trunc_inner(arena, expr, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_date_trunc_inner(arena, expr, args, chunk))?)
 }
 
-pub fn eval_date_floor(
-    arena: &ExprArena,
+pub fn eval_date_floor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_date_trunc_inner(arena, expr, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_date_trunc_inner(arena, expr, args, chunk))?)
 }
 
-pub fn eval_alignment_timestamp(
-    arena: &ExprArena,
+pub fn eval_alignment_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err("alignment_timestamp expects 2 args".to_string());
+        return Err(("alignment_timestamp expects 2 args".to_string()).into());
     }
-    eval_date_trunc_inner(arena, expr, args, chunk)
+    Ok((eval_date_trunc_inner(arena, expr, args, chunk))?)
 }

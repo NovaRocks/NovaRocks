@@ -39,25 +39,25 @@ pub fn metadata(name: &str) -> Option<FunctionMeta> {
     STRUCT_METADATA.iter().find(|m| m.name == name).copied()
 }
 
-pub fn eval_struct_function(
+pub fn eval_struct_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let canonical = STRUCT_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "row" => super::struct_func::eval_row(arena, expr, args, chunk),
-        "named_struct" => super::struct_func::eval_named_struct(arena, expr, args, chunk),
+        "row" => Ok((super::struct_func::eval_row(arena, expr, args, chunk))?),
+        "named_struct" => Ok((super::struct_func::eval_named_struct(arena, expr, args, chunk))?),
         "__struct_subfield" | "subfield" => {
-            super::subfield::eval_subfield(arena, expr, args, chunk)
+            Ok((super::subfield::eval_subfield(arena, expr, args, chunk))?)
         }
-        other => Err(format!("unsupported struct function: {}", other)),
+        other => Err((format!("unsupported struct function: {}", other)).into()),
     }
 }
 

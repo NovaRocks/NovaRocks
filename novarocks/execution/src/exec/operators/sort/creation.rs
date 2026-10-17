@@ -127,13 +127,39 @@ impl std::ops::DerefMut for CreatedSortConverter {
 pub(crate) struct SortCreation<'a> {
     factory: &'a dyn InputConstructionFactory,
     output: &'a crate::exec::chunk::ChunkSchemaRef,
+    evaluation_control: Option<&'a dyn crate::exec::expr::ExprEvaluationControl>,
 }
 impl<'a> SortCreation<'a> {
     pub(crate) fn new(
         factory: &'a dyn InputConstructionFactory,
         output: &'a crate::exec::chunk::ChunkSchemaRef,
     ) -> Self {
-        Self { factory, output }
+        Self {
+            factory,
+            output,
+            evaluation_control: None,
+        }
+    }
+
+    pub(crate) fn with_evaluation_control(
+        mut self,
+        control: &'a dyn crate::exec::expr::ExprEvaluationControl,
+    ) -> Self {
+        self.evaluation_control = Some(control);
+        self
+    }
+
+    pub(crate) fn expression_context<'b>(
+        &'b self,
+        arena: &'b crate::exec::expr::ExprArena,
+        owner: &'b dyn InputConstructionOwner,
+    ) -> ExecutionResult<crate::exec::expr::ExprEvaluationContext<'b>> {
+        Ok(crate::exec::expr::ExprEvaluationContext::new(
+            arena,
+            owner,
+            self.evaluation_control
+                .ok_or(ConstructionFailure::MissingOwner)?,
+        ))
     }
 
     pub(crate) fn row_converter<I>(

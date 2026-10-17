@@ -25,20 +25,20 @@ use novarocks_functions::builtin::calendar_extended_shared::{
 };
 use std::sync::Arc;
 
-fn eval_add_duration(
-    arena: &ExprArena,
+fn eval_add_duration<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     operation: CalendarDurationShift,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = arena.eval(args[0], chunk)?;
     let interval = arena.eval(args[1], chunk)?;
     legacy_validate_datetime_source(&date)?;
     let intervals = extract_i64_array(&interval, "duration add")?;
     // Preserve the original malformed-caller length error before all-row selection.
     if date.len() != intervals.len() && date.len() != 1 && intervals.len() != 1 {
-        return Err("duration add argument length mismatch".to_string());
+        return Err(("duration add argument length mismatch".to_string()).into());
     }
     let rows = date.len().max(intervals.len());
     let interval: ArrayRef = Arc::new(Int64Array::from(intervals));
@@ -46,124 +46,124 @@ fn eval_add_duration(
         .data_type(expr)
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::DurationShift(operation),
         &[date, interval],
         &output_type,
         rows,
-    )
+    ))?)
 }
 
-pub fn eval_seconds_add(
-    arena: &ExprArena,
+pub fn eval_seconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsAdd)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsAdd))?)
 }
 
-pub fn eval_seconds_sub(
-    arena: &ExprArena,
+pub fn eval_seconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsSub)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsSub))?)
 }
 
-pub fn eval_minutes_add(
-    arena: &ExprArena,
+pub fn eval_minutes_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesAdd)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesAdd))?)
 }
 
-pub fn eval_minutes_sub(
-    arena: &ExprArena,
+pub fn eval_minutes_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesSub)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesSub))?)
 }
 
-pub fn eval_hours_add(
-    arena: &ExprArena,
+pub fn eval_hours_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursAdd)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursAdd))?)
 }
 
-pub fn eval_hours_sub(
-    arena: &ExprArena,
+pub fn eval_hours_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursSub)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursSub))?)
 }
 
-pub fn eval_milliseconds_add(
-    arena: &ExprArena,
+pub fn eval_milliseconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(
         arena,
         expr,
         args,
         chunk,
         CalendarDurationShift::MillisecondsAdd,
-    )
+    ))?)
 }
 
-pub fn eval_milliseconds_sub(
-    arena: &ExprArena,
+pub fn eval_milliseconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(
         arena,
         expr,
         args,
         chunk,
         CalendarDurationShift::MillisecondsSub,
-    )
+    ))?)
 }
 
-pub fn eval_microseconds_add(
-    arena: &ExprArena,
+pub fn eval_microseconds_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(
         arena,
         expr,
         args,
         chunk,
         CalendarDurationShift::MicrosecondsAdd,
-    )
+    ))?)
 }
 
-pub fn eval_microseconds_sub(
-    arena: &ExprArena,
+pub fn eval_microseconds_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_add_duration(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_add_duration(
         arena,
         expr,
         args,
         chunk,
         CalendarDurationShift::MicrosecondsSub,
-    )
+    ))?)
 }

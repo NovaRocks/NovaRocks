@@ -19,14 +19,14 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::aes_rows::{self, Operation, Row};
 use novarocks_type_contract::ToBase64ByteSource;
-pub fn eval_aes_encrypt(
-    arena: &ExprArena,
+pub fn eval_aes_encrypt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 && args.len() != 4 && args.len() != 5 {
-        return Err("aes_encrypt expects 2, 4, or 5 arguments".to_string());
+        return Err(("aes_encrypt expects 2, 4, or 5 arguments".to_string()).into());
     }
 
     let src = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "aes_encrypt", 0)?;
@@ -86,9 +86,11 @@ pub fn eval_aes_encrypt(
         ) {
             Row::Value(value) => out.push(value),
             Row::Data(_) => {
-                return Err("aes_encrypt: requires GCM mode to use AAD parameter".to_string());
+                return Err(
+                    ("aes_encrypt: requires GCM mode to use AAD parameter".to_string()).into(),
+                );
             }
         }
     }
-    super::common::build_bytes_output_latin1(out, arena.data_type(expr))
+    Ok((super::common::build_bytes_output_latin1(out, arena.data_type(expr)))?)
 }

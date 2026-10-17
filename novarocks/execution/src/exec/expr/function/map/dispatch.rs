@@ -39,37 +39,39 @@ pub fn metadata(name: &str) -> Option<FunctionMeta> {
     MAP_METADATA.iter().find(|m| m.name == name).copied()
 }
 
-pub fn eval_map_function(
+pub fn eval_map_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let canonical = MAP_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "map" => super::map_literal::eval_map_literal(arena, expr, args, chunk),
-        "map_from_arrays" => super::map_from_arrays::eval_map_from_arrays(arena, expr, args, chunk),
-        "arrays_zip" => super::arrays_zip::eval_arrays_zip(arena, expr, args, chunk),
-        "map_size" => super::map_size::eval_map_size(arena, expr, args, chunk),
-        "map_keys" => super::map_keys::eval_map_keys(arena, expr, args, chunk),
-        "map_values" => super::map_values::eval_map_values(arena, expr, args, chunk),
-        "map_entries" => super::map_entries::eval_map_entries(arena, expr, args, chunk),
-        "map_filter" => super::map_filter::eval_map_filter(arena, expr, args, chunk),
+        "map" => Ok((super::map_literal::eval_map_literal(arena, expr, args, chunk))?),
+        "map_from_arrays" => {
+            Ok((super::map_from_arrays::eval_map_from_arrays(arena, expr, args, chunk))?)
+        }
+        "arrays_zip" => Ok((super::arrays_zip::eval_arrays_zip(arena, expr, args, chunk))?),
+        "map_size" => Ok((super::map_size::eval_map_size(arena, expr, args, chunk))?),
+        "map_keys" => Ok((super::map_keys::eval_map_keys(arena, expr, args, chunk))?),
+        "map_values" => Ok((super::map_values::eval_map_values(arena, expr, args, chunk))?),
+        "map_entries" => Ok((super::map_entries::eval_map_entries(arena, expr, args, chunk))?),
+        "map_filter" => Ok((super::map_filter::eval_map_filter(arena, expr, args, chunk))?),
         "distinct_map_keys" => {
-            super::distinct_map_keys::eval_distinct_map_keys(arena, expr, args, chunk)
+            Ok((super::distinct_map_keys::eval_distinct_map_keys(arena, expr, args, chunk))?)
         }
-        "map_concat" => super::map_concat::eval_map_concat(arena, expr, args, chunk),
-        "map_apply" => super::map_apply::eval_map_apply(arena, expr, args, chunk),
+        "map_concat" => Ok((super::map_concat::eval_map_concat(arena, expr, args, chunk))?),
+        "map_apply" => Ok((super::map_apply::eval_map_apply(arena, expr, args, chunk))?),
         "__map_element_at" | "element_at" => {
-            super::element_at::eval_element_at(arena, expr, args, chunk)
+            Ok((super::element_at::eval_element_at(arena, expr, args, chunk))?)
         }
-        "cardinality" => super::cardinality::eval_cardinality(arena, expr, args, chunk),
-        other => Err(format!("unsupported map function: {}", other)),
+        "cardinality" => Ok((super::cardinality::eval_cardinality(arena, expr, args, chunk))?),
+        other => Err((format!("unsupported map function: {}", other)).into()),
     }
 }
 

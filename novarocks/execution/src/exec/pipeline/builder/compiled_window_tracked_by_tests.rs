@@ -44,7 +44,8 @@ fn source(rows: &[Row], running: bool) -> (Arc<LocalProgram>, RecordBatch) {
             })
             .collect(),
     };
-    let actual = novarocks_functions::builtin::catalogue::by_window_private_test_catalog();
+    let actual =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let catalog = window_catalog_from_actual(
         &[
             ("max_by", FunctionKind::Aggregate),

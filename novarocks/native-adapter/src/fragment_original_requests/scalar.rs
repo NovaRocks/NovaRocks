@@ -257,6 +257,7 @@ pub(crate) enum NativeScalarActor {
     Registered(novarocks_execution::exec::expr::function::FunctionKind),
     ArrayLiteral,
     CarrierCast,
+    RegexpCount(novarocks_type_contract::RegexpCountPatternSource),
 }
 pub(crate) fn validate_default_scalar(
     expression: &expr::Expr,
@@ -533,5 +534,38 @@ pub(crate) fn validate_default_scalar(
         }
         NativeScalarActor::Registered(kind)
     };
+    if bound.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
+        let [
+            _,
+            novarocks_type_contract::FunctionArgumentType::Value(pattern_type),
+        ] = selected.argument_types.as_ref()
+        else {
+            return Err(invalid(
+                "regexp_count native source requires two exact value arguments",
+            ));
+        };
+        let [_, pattern] = call.args.as_slice() else {
+            return Err(invalid(
+                "regexp_count native source requires two actual definitions",
+            ));
+        };
+        let source =
+            novarocks_type_contract::RegexpCountPatternSource::from_native_v1_emitted_shape(
+                pattern_type,
+                matches!(pattern.kind, Some(expr::expr::Kind::ConstantReference(_))),
+            )
+            .map_err(invalid)?;
+        if !matches!(
+            actor,
+            NativeScalarActor::Registered(
+                novarocks_execution::exec::expr::function::FunctionKind::String("regexp_count")
+            )
+        ) {
+            return Err(invalid(
+                "regexp_count source differs from its validated runner",
+            ));
+        }
+        return Ok(NativeScalarActor::RegexpCount(source));
+    }
     Ok(actor)
 }

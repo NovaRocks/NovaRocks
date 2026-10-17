@@ -25,6 +25,38 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use arrow_select::take::take;
+/// This existing frozen Map has an uninhabited key. Its value type remains
+/// independent and complete, including nominal domains and nullability. It
+/// cannot contain an entry without violating the ordinary non-null key rule.
+/// This is a complete-type fact, independent of literal origin or row bytes.
+pub fn has_uninhabited_map_key(value: &crate::FunctionValueType) -> bool {
+    use novarocks_type_contract::{ValueKind, ValueLogicalType};
+    if value.logical_type() != ValueLogicalType::Physical
+        || !has_uninhabited_map_key_carrier(value.data_type())
+    {
+        return false;
+    }
+    let ValueKind::Map { key, .. } = value.value_type().kind() else {
+        return false;
+    };
+    !key.nullable() && matches!(key.kind(), ValueKind::Scalar(DataType::Null))
+}
+
+/// Signature-carrier constraint only; executable selection also checks the
+/// complete semantic declaration through `has_uninhabited_map_key`.
+pub(super) fn has_uninhabited_map_key_carrier(value: &DataType) -> bool {
+    let DataType::Map(entries, _) = value else {
+        return false;
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return false;
+    };
+    fields.len() == 2
+        && !entries.is_nullable()
+        && fields[0].data_type() == &DataType::Null
+        && !fields[0].is_nullable()
+}
+
 pub fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
 }
@@ -360,6 +392,11 @@ pub fn lookup_observed<E>(
     Ok(out)
 }
 fn apply_indices_nulls(out: &ArrayRef, indices: &UInt32Array) -> ArrayRef {
+    // NullArray already represents NULL at every position and cannot carry a
+    // physical validity buffer. The lookup still ran before this storage repair.
+    if out.data_type() == &DataType::Null {
+        return out.clone();
+    }
     let Some(idx_nulls) = indices.nulls() else {
         return out.clone();
     };

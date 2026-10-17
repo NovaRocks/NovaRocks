@@ -67,6 +67,57 @@ fn output(binding: &ResolvedFunctionBinding) -> &FunctionValueType {
 fn json() -> FunctionValueType {
     logical(DataType::Utf8, ValueLogicalType::Json)
 }
+
+#[test]
+fn variant_typeof_keeps_exact_json_and_variant_domains_for_fresh_and_frozen_binding() {
+    for nullable in [false, true] {
+        for (carrier, domain) in [
+            (DataType::Utf8, ValueLogicalType::Json),
+            (DataType::LargeBinary, ValueLogicalType::Variant),
+        ] {
+            let ty = FunctionValueType::try_with_logical_type(carrier, nullable, domain).unwrap();
+            let arguments = [value(ty.clone())];
+            let binding = resolve("variant_typeof", FunctionKind::Scalar, &arguments);
+            assert_eq!(
+                binding.selected.argument_types.as_ref(),
+                &[FunctionArgumentType::Value(ty)]
+            );
+            assert_eq!(output(&binding), &physical(DataType::Utf8));
+        }
+    }
+}
+
+#[test]
+fn variant_typeof_rejects_plain_carriers_and_cannot_thaw_json_as_text() {
+    let catalog = builtin_engine_function_catalog();
+    let original = [value(json())];
+    let binding = resolve("variant_typeof", FunctionKind::Scalar, &original);
+    for carrier in [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::Null,
+        DataType::Int64,
+    ] {
+        let arguments = [value(physical(carrier))];
+        assert!(
+            catalog
+                .resolve_bound_user(
+                    "variant_typeof",
+                    FunctionKind::Scalar,
+                    request(&arguments),
+                    crate::binding_test_control()
+                )
+                .is_err()
+        );
+        assert!(
+            catalog
+                .validate_bound(&binding, request(&arguments), crate::binding_test_control())
+                .is_err()
+        );
+    }
+}
 fn json_item(nullable: bool) -> Arc<Field> {
     Arc::new(
         Field::new("item", DataType::Utf8, nullable).with_metadata(
@@ -805,4 +856,108 @@ fn higher_order_array_result_carries_actual_lambda_result_domain() {
             )
             .is_err()
     );
+}
+
+fn variant_get_arguments(source: FunctionValueType, typed: bool) -> Vec<FunctionArgument> {
+    let text = |raw| {
+        let constant = super::constant_binding_tests::utf8(raw, false);
+        FunctionArgument::Value {
+            value_type: constant.value_type().clone(),
+            constant: Some(constant),
+        }
+    };
+    let mut args = vec![value(source), text("$.a")];
+    if typed {
+        args.push(text("bigint"));
+    }
+    args
+}
+
+#[test]
+fn variant_get_json_text_and_nominal_inputs_keep_complete_fresh_and_frozen_domains() {
+    let catalog = builtin_engine_function_catalog();
+    for name in ["variant_get", "try_variant_get"] {
+        for source in [
+            physical(DataType::Utf8),
+            json(),
+            logical(DataType::LargeBinary, ValueLogicalType::Variant),
+        ] {
+            for typed in [false, true] {
+                let args = variant_get_arguments(source.clone(), typed);
+                let binding = resolve(name, FunctionKind::Scalar, &args);
+                assert_eq!(
+                    binding.selected.argument_types[0],
+                    FunctionArgumentType::Value(source.clone())
+                );
+                catalog
+                    .validate_frozen_selection(
+                        &binding.function_id,
+                        binding.kind,
+                        &binding.selected,
+                        request(&args),
+                        crate::binding_test_control(),
+                    )
+                    .unwrap();
+                let expected = if typed {
+                    physical(DataType::Int64)
+                } else {
+                    logical(DataType::LargeBinary, ValueLogicalType::Variant)
+                };
+                assert_eq!(output(&binding), &expected);
+                // A binding for validated Json and a binding for ordinary text
+                // must never be replayed against one another's original fact.
+                if source.data_type() == &DataType::Utf8 {
+                    let other = if source.logical_type() == ValueLogicalType::Json {
+                        physical(DataType::Utf8)
+                    } else {
+                        json()
+                    };
+                    let foreign = variant_get_arguments(other, typed);
+                    assert!(
+                        catalog
+                            .validate_frozen_selection(
+                                &binding.function_id,
+                                binding.kind,
+                                &binding.selected,
+                                request(&foreign),
+                                crate::binding_test_control()
+                            )
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn variant_get_text_mode_does_not_admit_raw_bytes_wide_text_or_foreign_nominal_domains() {
+    let catalog = builtin_engine_function_catalog();
+    let rejected = [
+        physical(DataType::Binary),
+        physical(DataType::LargeBinary),
+        physical(DataType::LargeUtf8),
+        logical(DataType::Binary, ValueLogicalType::Hll),
+        logical(DataType::Binary, ValueLogicalType::Bitmap),
+        logical(DataType::Binary, ValueLogicalType::Percentile),
+        logical(DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+    ];
+    for name in ["variant_get", "try_variant_get"] {
+        for source in &rejected {
+            for typed in [false, true] {
+                let args = variant_get_arguments(source.clone(), typed);
+                assert!(
+                    catalog
+                        .resolve_bound_user(
+                            name,
+                            FunctionKind::Scalar,
+                            request(&args),
+                            crate::binding_test_control()
+                        )
+                        .is_err(),
+                    "{name}: {source:?}"
+                );
+            }
+        }
+    }
 }

@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use std::sync::Arc;
 
-fn eval_starts_ends_with_impl(
-    arena: &ExprArena,
+fn eval_starts_ends_with_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     starts: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
     let s_arr = str_arr
@@ -53,20 +53,20 @@ fn eval_starts_ends_with_impl(
     Ok(Arc::new(BooleanArray::from(out)) as ArrayRef)
 }
 
-pub fn eval_starts_with(
-    arena: &ExprArena,
+pub fn eval_starts_with<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_starts_ends_with_impl(arena, args, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_starts_ends_with_impl(arena, args, chunk, true))?)
 }
 
-pub fn eval_ends_with(
-    arena: &ExprArena,
+pub fn eval_ends_with<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_starts_ends_with_impl(arena, args, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_starts_ends_with_impl(arena, args, chunk, false))?)
 }

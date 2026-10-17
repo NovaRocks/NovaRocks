@@ -120,13 +120,13 @@ fn build_datetime_values_array(
     }
 }
 
-fn eval_array_generate_numeric(
-    arena: &ExprArena,
+fn eval_array_generate_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     output_field: Arc<Field>,
     target_item_type: DataType,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let stop_arr = if args.len() == 1 {
         cast_to_i64(arena.eval(args[0], chunk)?, "stop")?
     } else {
@@ -218,7 +218,7 @@ fn eval_array_generate_numeric(
                 values.push(cur);
                 current_offset += 1;
                 if current_offset > i32::MAX as i64 {
-                    return Err("array_generate offset overflow".to_string());
+                    return Err(("array_generate offset overflow".to_string()).into());
                 }
                 let Some(next) = cur.checked_add(step_v) else {
                     break;
@@ -231,7 +231,7 @@ fn eval_array_generate_numeric(
                 values.push(cur);
                 current_offset += 1;
                 if current_offset > i32::MAX as i64 {
-                    return Err("array_generate offset overflow".to_string());
+                    return Err(("array_generate offset overflow".to_string()).into());
                 }
                 let Some(next) = cur.checked_add(step_v) else {
                     break;
@@ -263,13 +263,13 @@ fn eval_array_generate_numeric(
     Ok(Arc::new(out) as ArrayRef)
 }
 
-fn eval_array_generate_datetime(
-    arena: &ExprArena,
+fn eval_array_generate_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     output_field: Arc<Field>,
     target_item_type: DataType,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let start_arr = arena.eval(args[0], chunk)?;
     let stop_arr = arena.eval(args[1], chunk)?;
     let start_values = extract_datetime_array(&start_arr)?;
@@ -334,7 +334,9 @@ fn eval_array_generate_datetime(
             let step_row = super::common::row_index(row, steps.len());
             if steps.is_null(step_row) {
                 return Err(
-                    "array_generate requires step parameter must be a constant integer".to_string(),
+                    ("array_generate requires step parameter must be a constant integer"
+                        .to_string())
+                    .into(),
                 );
             }
             steps.value(step_row)
@@ -342,7 +344,9 @@ fn eval_array_generate_datetime(
             1_i64
         };
         if step_v < 0 {
-            return Err("array_generate requires step parameter must be non-negative.".to_string());
+            return Err(
+                ("array_generate requires step parameter must be non-negative.".to_string()).into(),
+            );
         }
 
         let unit_row = super::common::row_index(row, units.len());
@@ -360,7 +364,8 @@ fn eval_array_generate_datetime(
             )
         {
             return Err(
-                "array_generate DATE subday range requires frozen DATETIME bounds".to_string(),
+                ("array_generate DATE subday range requires frozen DATETIME bounds".to_string())
+                    .into(),
             );
         }
         if step_v == 0 {
@@ -383,7 +388,7 @@ fn eval_array_generate_datetime(
             values.push(current);
             current_offset += 1;
             if current_offset > i32::MAX as i64 {
-                return Err("array_generate offset overflow".to_string());
+                return Err(("array_generate offset overflow".to_string()).into());
             }
             let next = add_datetime_unit(current, actual_step, unit.as_str())?;
             if next == current {
@@ -406,19 +411,19 @@ fn eval_array_generate_datetime(
     Ok(Arc::new(out) as ArrayRef)
 }
 
-pub fn eval_array_generate(
-    arena: &ExprArena,
+pub fn eval_array_generate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.is_empty() || args.len() > 4 {
-        return Err("array_generate expects 1 to 4 arguments".to_string());
+        return Err(("array_generate expects 1 to 4 arguments".to_string()).into());
     }
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => return Err("array_generate requires a frozen List output type".to_string()),
+        _ => return Err(("array_generate requires a frozen List output type".to_string()).into()),
     };
     let target_item_type = output_field.data_type().clone();
     let argument_types = args
@@ -433,16 +438,18 @@ pub fn eval_array_generate(
     let expected = novarocks_type_contract::array_generate_item_type(&argument_types)
         .ok_or_else(|| "array_generate requires normalized frozen bounds".to_string())?;
     if expected != target_item_type {
-        return Err("array_generate frozen output differs from its bound domain".to_string());
+        return Err(
+            ("array_generate frozen output differs from its bound domain".to_string()).into(),
+        );
     }
     let is_date_mode = matches!(
         target_item_type,
         DataType::Date32 | DataType::Timestamp(_, _)
     );
     if is_date_mode {
-        eval_array_generate_datetime(arena, output_field, target_item_type, args, chunk)
+        Ok((eval_array_generate_datetime(arena, output_field, target_item_type, args, chunk))?)
     } else {
-        eval_array_generate_numeric(arena, output_field, target_item_type, args, chunk)
+        Ok((eval_array_generate_numeric(arena, output_field, target_item_type, args, chunk))?)
     }
 }
 

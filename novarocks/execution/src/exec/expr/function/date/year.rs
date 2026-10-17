@@ -21,11 +21,11 @@ use arrow::datatypes::DataType;
 use novarocks_functions::{Selection, builtin::calendar_parts_shared::legacy_year_array};
 
 // YEAR function for Arrow arrays
-pub fn eval_year(
-    arena: &ExprArena,
+pub fn eval_year<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     year_expr_id: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     // Get the child expression (input date/timestamp)
     // For FunctionCall, the first argument is the input
     let child_expr_id = match arena.node(year_expr_id) {
@@ -33,7 +33,7 @@ pub fn eval_year(
             .first()
             .copied()
             .ok_or_else(|| "year: missing argument".to_string())?,
-        _ => return Err("Year expression node type mismatch".to_string()),
+        _ => return Err(("Year expression node type mismatch".to_string()).into()),
     };
 
     let array = arena.eval(child_expr_id, chunk)?;
@@ -44,5 +44,5 @@ pub fn eval_year(
         .cloned()
         .unwrap_or(DataType::Int64);
 
-    legacy_year_array(&array, &expected_type, Selection::all(array.len()))
+    Ok((legacy_year_array(&array, &expected_type, Selection::all(array.len())))?)
 }

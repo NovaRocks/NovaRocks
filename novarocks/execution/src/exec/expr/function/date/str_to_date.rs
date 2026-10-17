@@ -22,12 +22,12 @@ use novarocks_functions::builtin::calendar_extended_shared::{
     CalendarOperation, evaluate_legacy_calendar,
 };
 
-fn eval_str_to_date_inner(
-    arena: &ExprArena,
+fn eval_str_to_date_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let text = arena.eval(args[0], chunk)?;
     let format = arena.eval(args[1], chunk)?;
     text.as_any()
@@ -39,28 +39,28 @@ fn eval_str_to_date_inner(
         .ok_or_else(|| "str_to_date expects string".to_string())?;
     let rows = text.len();
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Date32);
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::StrToDate,
         &[text, format],
         &output_type,
         rows,
-    )
+    ))?)
 }
 
-pub fn eval_str_to_date(
-    arena: &ExprArena,
+pub fn eval_str_to_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_str_to_date_inner(arena, expr, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_str_to_date_inner(arena, expr, args, chunk))?)
 }
 
-pub fn eval_str2date(
-    arena: &ExprArena,
+pub fn eval_str2date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_str_to_date_inner(arena, expr, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_str_to_date_inner(arena, expr, args, chunk))?)
 }

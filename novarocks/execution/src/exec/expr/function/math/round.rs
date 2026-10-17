@@ -89,13 +89,13 @@ fn round_decimal(value: i128, original_scale: i8, target_scale: i8) -> Result<i1
 /// - round(x): round double to nearest integer (returns BIGINT)
 /// - round(x, d): round double to d decimal places (returns DOUBLE)
 /// - round(decimal, d): round decimal to d decimal places (returns Decimal128)
-pub fn eval_round(
-    arena: &ExprArena,
+pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     value_expr: ExprId,
     decimals_expr: Option<ExprId>,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let value_arr = arena.eval(value_expr, chunk)?;
     let output_type = arena
         .data_type(expr)
@@ -142,10 +142,11 @@ pub fn eval_round(
                 let (out_precision, out_scale) = match output_type {
                     DataType::Decimal128(p, s) => (*p, *s),
                     _ => {
-                        return Err(format!(
+                        return Err((format!(
                             "round: expected Decimal128 output type, got {:?}",
                             output_type
-                        ));
+                        ))
+                        .into());
                     }
                 };
 
@@ -190,7 +191,7 @@ pub fn eval_round(
     } else {
         // Two arguments: round(x, d)
         let Some(decimals_expr) = decimals_expr else {
-            return Err("round: missing decimal argument".to_string());
+            return Err(("round: missing decimal argument".to_string()).into());
         };
         let decimals_arr = arena.eval(decimals_expr, chunk)?;
 
@@ -200,11 +201,12 @@ pub fn eval_round(
         // Check if decimals is constant (length 1) or per-row (length matches value)
         let decimals_is_constant = decimals_arr.len() == 1;
         if !decimals_is_constant && decimals_arr.len() != len {
-            return Err(format!(
+            return Err((format!(
                 "round: decimals array length {} does not match value array length {}",
                 decimals_arr.len(),
                 len
-            ));
+            ))
+            .into());
         }
 
         // Cast decimals to Int64 for processing
@@ -233,10 +235,11 @@ pub fn eval_round(
                 let (out_precision, out_scale) = match output_type {
                     DataType::Decimal128(p, s) => (*p, *s),
                     _ => {
-                        return Err(format!(
+                        return Err((format!(
                             "round: expected Decimal128 output type, got {:?}",
                             output_type
-                        ));
+                        ))
+                        .into());
                     }
                 };
 

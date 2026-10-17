@@ -40,77 +40,85 @@ pub fn metadata(name: &str) -> Option<FunctionMeta> {
     MV_STATE_METADATA.iter().find(|m| m.name == name).copied()
 }
 
-pub fn eval_mv_state_function(
+pub fn eval_mv_state_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let canonical = MV_STATE_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "count_state_union" => super::count::eval_count_state_union(arena, expr, args, chunk),
-        "count_state_visible" => super::count::eval_count_state_visible(arena, expr, args, chunk),
-        "state_all_zero" => super::count::eval_state_all_zero(arena, expr, args, chunk),
-        "mv_group_row_id" => eval_mv_group_row_id(arena, expr, args, chunk),
+        "count_state_union" => {
+            Ok((super::count::eval_count_state_union(arena, expr, args, chunk))?)
+        }
+        "count_state_visible" => {
+            Ok((super::count::eval_count_state_visible(arena, expr, args, chunk))?)
+        }
+        "state_all_zero" => Ok((super::count::eval_state_all_zero(arena, expr, args, chunk))?),
+        "mv_group_row_id" => Ok((eval_mv_group_row_id(arena, expr, args, chunk))?),
         "count_distinct_state_union" => {
-            super::count_distinct::eval_count_distinct_state_union(arena, expr, args, chunk)
+            Ok((super::count_distinct::eval_count_distinct_state_union(arena, expr, args, chunk))?)
         }
-        "count_distinct_state_visible" => {
-            super::count_distinct::eval_count_distinct_state_visible(arena, expr, args, chunk)
-        }
-        "approx_count_distinct_state_union" => {
-            super::approx_count_distinct::eval_approx_count_distinct_state_union(
+        "count_distinct_state_visible" => Ok(
+            (super::count_distinct::eval_count_distinct_state_visible(arena, expr, args, chunk))?,
+        ),
+        "approx_count_distinct_state_union" => Ok(
+            (super::approx_count_distinct::eval_approx_count_distinct_state_union(
                 arena, expr, args, chunk,
-            )
-        }
-        "approx_count_distinct_state_visible" => {
-            super::approx_count_distinct::eval_approx_count_distinct_state_visible(
+            ))?,
+        ),
+        "approx_count_distinct_state_visible" => Ok(
+            (super::approx_count_distinct::eval_approx_count_distinct_state_visible(
                 arena, expr, args, chunk,
-            )
+            ))?,
+        ),
+        "avg_state_union" => Ok((super::avg::eval_avg_state_union(arena, expr, args, chunk))?),
+        "avg_state_visible" => Ok((super::avg::eval_avg_state_visible(arena, expr, args, chunk))?),
+        "sum_state_union" => Ok((super::sum::eval_sum_state_union(arena, expr, args, chunk))?),
+        "sum_state_visible" => Ok((super::sum::eval_sum_state_visible(arena, expr, args, chunk))?),
+        "min_state_union" => Ok((super::min_max::eval_min_state_union(arena, expr, args, chunk))?),
+        "min_state_visible" => {
+            Ok((super::min_max::eval_min_state_visible(arena, expr, args, chunk))?)
         }
-        "avg_state_union" => super::avg::eval_avg_state_union(arena, expr, args, chunk),
-        "avg_state_visible" => super::avg::eval_avg_state_visible(arena, expr, args, chunk),
-        "sum_state_union" => super::sum::eval_sum_state_union(arena, expr, args, chunk),
-        "sum_state_visible" => super::sum::eval_sum_state_visible(arena, expr, args, chunk),
-        "min_state_union" => super::min_max::eval_min_state_union(arena, expr, args, chunk),
-        "min_state_visible" => super::min_max::eval_min_state_visible(arena, expr, args, chunk),
-        "max_state_union" => super::min_max::eval_max_state_union(arena, expr, args, chunk),
-        "max_state_visible" => super::min_max::eval_max_state_visible(arena, expr, args, chunk),
+        "max_state_union" => Ok((super::min_max::eval_max_state_union(arena, expr, args, chunk))?),
+        "max_state_visible" => {
+            Ok((super::min_max::eval_max_state_visible(arena, expr, args, chunk))?)
+        }
         "bool_or_state_union" => {
-            super::bool_or_and::eval_bool_or_state_union(arena, expr, args, chunk)
+            Ok((super::bool_or_and::eval_bool_or_state_union(arena, expr, args, chunk))?)
         }
         "bool_or_state_visible" => {
-            super::bool_or_and::eval_bool_or_state_visible(arena, expr, args, chunk)
+            Ok((super::bool_or_and::eval_bool_or_state_visible(arena, expr, args, chunk))?)
         }
         "bool_and_state_union" => {
-            super::bool_or_and::eval_bool_and_state_union(arena, expr, args, chunk)
+            Ok((super::bool_or_and::eval_bool_and_state_union(arena, expr, args, chunk))?)
         }
         "bool_and_state_visible" => {
-            super::bool_or_and::eval_bool_and_state_visible(arena, expr, args, chunk)
+            Ok((super::bool_or_and::eval_bool_and_state_visible(arena, expr, args, chunk))?)
         }
-        other => Err(format!("unsupported mv_state function: {}", other)),
+        other => Err((format!("unsupported mv_state function: {}", other)).into()),
     }
 }
 
-fn eval_mv_group_row_id(
-    arena: &ExprArena,
+fn eval_mv_group_row_id<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.is_empty() {
-        return Err("mv_group_row_id expects at least 1 argument, got 0".to_string());
+        return Err(("mv_group_row_id expects at least 1 argument, got 0".to_string()).into());
     }
     let columns = args
         .iter()
         .map(|arg| arena.eval(*arg, chunk))
         .collect::<Result<Vec<_>, _>>()?;
-    crate::exec::mv::group_row_id::aggregate_group_row_id_array(&columns)
+    Ok((crate::exec::mv::group_row_id::aggregate_group_row_id_array(&columns))?)
 }
 
 static MV_STATE_FUNCTIONS: &[(&str, &str)] = &[

@@ -2776,6 +2776,15 @@ pub trait ServerHandle: Send {
     fn be_current_log_contents(&self, index: usize) -> Result<String> {
         self.be_log_contents(index)
     }
+    /// Observe current live-role output without retaining its lifecycle owner
+    /// across the caller's cancellation/deadline wait.
+    fn be_current_live_log_line(
+        &self,
+        index: usize,
+        _matches: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
+        bail!("live BE log observation is unsupported by this server mode (index={index})")
+    }
     #[allow(dead_code)]
     fn residual_process_ids(&self) -> Vec<u32> {
         Vec::new()
@@ -5281,6 +5290,15 @@ impl ServerHandle for CrossProcessServerHandle {
     fn be_current_log_contents(&self, index: usize) -> Result<String> {
         self.ensure_be_index(index)?;
         self.be_processes[index].log_contents()
+    }
+
+    fn be_current_live_log_line(
+        &self,
+        index: usize,
+        matches: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index].live_log_line(matches)
     }
 
     fn fe_log_count(&self, needle: &str) -> Result<usize> {

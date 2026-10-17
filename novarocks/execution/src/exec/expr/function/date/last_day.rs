@@ -22,12 +22,12 @@ use novarocks_functions::builtin::calendar_extended_shared::{
     CalendarOperation, evaluate_legacy_calendar,
 };
 
-pub fn eval_last_day(
-    arena: &ExprArena,
+pub fn eval_last_day<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = arena.eval(args[0], chunk)?;
     let rows = date.len();
     let mut values = vec![date];
@@ -38,5 +38,5 @@ pub fn eval_last_day(
             .ok_or_else(|| "last_day expects string".to_string())?;
         values.push(unit);
     }
-    evaluate_legacy_calendar(CalendarOperation::LastDay, &values, &DataType::Date32, rows)
+    Ok((evaluate_legacy_calendar(CalendarOperation::LastDay, &values, &DataType::Date32, rows))?)
 }

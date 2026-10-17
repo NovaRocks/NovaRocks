@@ -18,13 +18,13 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 
-pub fn eval_split(
-    arena: &ExprArena,
+pub fn eval_split<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     str_expr: ExprId,
     delim_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let str_array = arena.eval(str_expr, chunk)?;
     let delim_array = arena.eval(delim_expr, chunk)?;
-    novarocks_functions::builtin::string_split::evaluate_legacy(&str_array, &delim_array)
+    Ok((novarocks_functions::builtin::string_split::evaluate_legacy(&str_array, &delim_array))?)
 }

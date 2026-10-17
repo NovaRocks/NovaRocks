@@ -38,6 +38,12 @@ impl PreparedCall<'_> {
             Self::Invocation(prepared) => prepared.contract(),
         }
     }
+    pub(super) fn input_domain_policy(self) -> novarocks_functions::InvocationInputDomainPolicy {
+        match self {
+            Self::Kernel(_) => novarocks_functions::InvocationInputDomainPolicy::SelectedDemand,
+            Self::Invocation(prepared) => prepared.input_domain_policy(),
+        }
+    }
     pub(super) fn is_invocation(self) -> bool {
         matches!(self, Self::Invocation(_))
     }
@@ -104,6 +110,19 @@ pub(super) trait FrameFailure: From<KernelFailure> {
         allocator: Option<&Arc<dyn AggregateStateAllocator>>,
         work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self>;
+    fn invoke_scoped<'a>(
+        instance: &mut CallInstance,
+        scope: novarocks_functions::ScalarInvocationScope<'a>,
+        sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
+        activation: ScalarInvocationActivation,
+        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        work: &mut super::Work<'_, '_>,
+    ) -> Result<SelectedValues<'a>, Self>;
+    fn required(
+        root: novarocks_local_program::ProgramExpressionRootSite,
+        selection: Selection<'_>,
+        error: novarocks_functions::RowDataError,
+    ) -> Self;
     fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self>;
 }
 impl FrameFailure for KernelFailure {
@@ -123,32 +142,28 @@ impl FrameFailure for KernelFailure {
             )),
         }
     }
+    fn invoke_scoped<'a>(
+        _instance: &mut CallInstance,
+        _scope: novarocks_functions::ScalarInvocationScope<'a>,
+        _sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
+        _activation: ScalarInvocationActivation,
+        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        _work: &mut super::Work<'_, '_>,
+    ) -> Result<SelectedValues<'a>, Self> {
+        unreachable!("Kernel-only root entry rejects every invocation lifecycle before Frame")
+    }
+    fn required(
+        _root: novarocks_local_program::ProgramExpressionRootSite,
+        _selection: Selection<'_>,
+        _error: novarocks_functions::RowDataError,
+    ) -> Self {
+        unreachable!("Kernel-only root entry rejects every invocation lifecycle before Frame")
+    }
     fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
         work.finish(result)
     }
 }
-impl FrameFailure for ScalarInvocationFailure {
-    const ACTIVATE_EMPTY: bool = true;
-    fn invoke<'a>(
-        instance: &mut CallInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        activation: ScalarInvocationActivation,
-        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        work: &mut super::Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, Self> {
-        instance.evaluate(selection, arguments, activation, work.control)
-    }
-    fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
-        match result {
-            Err(Self::Data(data)) => Err(Self::Data(data)),
-            Err(Self::Kernel(cause)) => work.finish(Err(cause)).map_err(Self::Kernel),
-            Ok(value) => work.finish(Ok(value)).map_err(Self::Kernel),
-        }
-    }
-}
-
-impl FrameFailure for crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure {
+impl FrameFailure for crate::runtime::fragment::ExecutionFailure {
     const ACTIVATE_EMPTY: bool = true;
     fn invoke<'a>(
         instance: &mut CallInstance,
@@ -158,35 +173,87 @@ impl FrameFailure for crate::runtime::scalar_memory::RuntimeScalarEvaluationFail
         allocator: Option<&Arc<dyn AggregateStateAllocator>>,
         work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self> {
-        match instance {
-            CallInstance::Kernel(instance) => {
-                let scope = work.scalar_scope.as_mut().ok_or_else(|| {
-                    super::internal("runtime scalar Frame has no explicit operation scope")
-                })?;
-                scope.evaluate(instance, selection, arguments, work.control)
+        if let Some(scope) = work.scalar_scope.as_mut() {
+            match instance {
+                CallInstance::Kernel(instance) => scope
+                    .evaluate(instance, selection, arguments, work.control)
+                    .map_err(Into::into),
+                CallInstance::Invocation(instance) => scope
+                    .evaluate_invocation(
+                        instance,
+                        selection,
+                        arguments,
+                        activation,
+                        allocator,
+                        work.control,
+                    )
+                    .map_err(Into::into),
             }
-            CallInstance::Invocation(instance) => {
-                let scope = work.scalar_scope.as_mut().ok_or_else(|| {
-                    super::internal("runtime scalar Frame has no explicit operation scope")
-                })?;
-                scope.evaluate_invocation(
+        } else {
+            instance
+                .evaluate(selection, arguments, activation, work.control)
+                .map_err(Into::into)
+        }
+    }
+    fn invoke_scoped<'a>(
+        instance: &mut CallInstance,
+        scope: novarocks_functions::ScalarInvocationScope<'a>,
+        sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
+        activation: ScalarInvocationActivation,
+        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        work: &mut super::Work<'_, '_>,
+    ) -> Result<SelectedValues<'a>, Self> {
+        let CallInstance::Invocation(instance) = instance else {
+            return Err(super::internal(
+                "scoped Frame call differs from its prepared invocation lifecycle",
+            )
+            .into());
+        };
+        if let Some(runtime) = work.scalar_scope.as_mut() {
+            runtime
+                .evaluate_scoped_invocation(
                     instance,
-                    selection,
-                    arguments,
+                    scope,
+                    sources,
                     activation,
                     allocator,
                     work.control,
                 )
-            }
+                .map_err(Into::into)
+        } else {
+            instance
+                .evaluate_scoped(scope, sources, activation, work.control)
+                .map_err(Into::into)
+        }
+    }
+    fn required(
+        root: novarocks_local_program::ProgramExpressionRootSite,
+        selection: Selection<'_>,
+        error: novarocks_functions::RowDataError,
+    ) -> Self {
+        match crate::runtime::fragment::RequiredExpressionRowError::try_new(root, selection, error)
+        {
+            Ok(error) => error.into(),
+            Err(cause) => cause.into(),
         }
     }
     fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
         match result {
-            Err(Self::Data(data)) => Err(Self::Data(data)),
-            Err(Self::Source(error)) => Err(Self::Source(error)),
-            Err(Self::Host(cause)) => Err(Self::Host(cause)),
-            Err(Self::Kernel(cause)) => work.finish(Err(cause)).map_err(Self::Kernel),
-            Ok(value) => work.finish(Ok(value)).map_err(Self::Kernel),
+            Err(error) => {
+                if let crate::runtime::fragment::ExecutionFailureCause::Kernel(cause) =
+                    error.cause()
+                {
+                    // Keep the original Kernel footer policy; the existing
+                    // Work author decides whether completion may run.
+                    match work.finish::<()>(Err(cause.clone())) {
+                        Err(final_cause) if &final_cause != cause => Err(final_cause.into()),
+                        _ => Err(error),
+                    }
+                } else {
+                    Err(error)
+                }
+            }
+            Ok(value) => work.finish(Ok(value)).map_err(Into::into),
         }
     }
 }

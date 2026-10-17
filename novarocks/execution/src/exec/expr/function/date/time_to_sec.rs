@@ -37,7 +37,10 @@ fn parse_direct_string_array(array: &ArrayRef) -> Result<Option<Vec<Option<i64>>
     parse_from_strings(str_arr).map(Some)
 }
 
-fn strip_cast_wrappers(arena: &ExprArena, mut expr_id: ExprId) -> ExprId {
+fn strip_cast_wrappers<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    mut expr_id: ExprId,
+) -> ExprId {
     loop {
         match arena.node(expr_id) {
             Some(
@@ -50,11 +53,11 @@ fn strip_cast_wrappers(arena: &ExprArena, mut expr_id: ExprId) -> ExprId {
     }
 }
 
-fn parse_from_sec_to_time_source(
-    arena: &ExprArena,
+fn parse_from_sec_to_time_source<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     arg_expr: ExprId,
     chunk: &Chunk,
-) -> Result<Option<Vec<Option<i64>>>, String> {
+) -> Result<Option<Vec<Option<i64>>>, __Eval::Error> {
     let inner = strip_cast_wrappers(arena, arg_expr);
     let Some(ExprNode::FunctionCall { kind, args }) = arena.node(inner) else {
         return Ok(None);
@@ -67,16 +70,18 @@ fn parse_from_sec_to_time_source(
     }
 
     let source = arena.eval(args[0], chunk)?;
-    shared::sec_to_time_source(&source, &mut EvaluationCheckpoints::new(&LegacyControl))
-        .map(Some)
-        .map_err(TimeTextError::into_legacy)
+    Ok(
+        (shared::sec_to_time_source(&source, &mut EvaluationCheckpoints::new(&LegacyControl))
+            .map(Some)
+            .map_err(TimeTextError::into_legacy))?,
+    )
 }
 
-fn parse_from_immediate_cast_string_source(
-    arena: &ExprArena,
+fn parse_from_immediate_cast_string_source<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     arg_expr: ExprId,
     chunk: &Chunk,
-) -> Result<Option<Vec<Option<i64>>>, String> {
+) -> Result<Option<Vec<Option<i64>>>, __Eval::Error> {
     let child = match arena.node(arg_expr) {
         Some(
             ExprNode::Cast(child, _)
@@ -86,14 +91,14 @@ fn parse_from_immediate_cast_string_source(
         _ => return Ok(None),
     };
     let source = arena.eval(child, chunk)?;
-    parse_direct_string_array(&source)
+    Ok((parse_direct_string_array(&source))?)
 }
 
-pub fn parse_from_cast_source(
-    arena: &ExprArena,
+pub fn parse_from_cast_source<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     arg_expr: ExprId,
     chunk: &Chunk,
-) -> Result<Option<Vec<Option<i64>>>, String> {
+) -> Result<Option<Vec<Option<i64>>>, __Eval::Error> {
     let mut current = arg_expr;
     let mut seen_cast = false;
     while let Some(
@@ -109,30 +114,32 @@ pub fn parse_from_cast_source(
         return Ok(None);
     }
     let source = arena.eval(current, chunk)?;
-    shared::duration_cast_source(&source, &mut EvaluationCheckpoints::new(&LegacyControl))
-        .map_err(TimeTextError::into_legacy)
+    Ok(
+        (shared::duration_cast_source(&source, &mut EvaluationCheckpoints::new(&LegacyControl))
+            .map_err(TimeTextError::into_legacy))?,
+    )
 }
 
-pub fn eval_time_to_sec(
-    arena: &ExprArena,
+pub fn eval_time_to_sec<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arg_expr = args[0];
     let mut work = EvaluationCheckpoints::new(&LegacyControl);
     if let Some(out) = parse_from_sec_to_time_source(arena, arg_expr, chunk)? {
-        return shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy);
+        return Ok((shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy))?);
     }
     let arr = arena.eval(arg_expr, chunk)?;
     if let Some(out) = parse_direct_string_array(&arr)? {
-        return shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy);
+        return Ok((shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy))?);
     }
     let mut out = shared::datetime_seconds(&arr, &mut work).map_err(TimeTextError::into_legacy)?;
     if let Some(source_out) = parse_from_immediate_cast_string_source(arena, arg_expr, chunk)? {
         shared::merge_source(&mut out, &source_out, MergeMode::Override, &mut work)
             .map_err(TimeTextError::into_legacy)?;
-        return shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy);
+        return Ok((shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy))?);
     }
     if shared::any_null(&out, &mut work).map_err(TimeTextError::into_legacy)?
         && let Some(source_out) = parse_from_cast_source(arena, arg_expr, chunk)?
@@ -140,7 +147,7 @@ pub fn eval_time_to_sec(
         shared::merge_source(&mut out, &source_out, MergeMode::FillNull, &mut work)
             .map_err(TimeTextError::into_legacy)?;
     }
-    shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy)
+    Ok((shared::seconds_output(out, &mut work).map_err(TimeTextError::into_legacy))?)
 }
 
 #[cfg(test)]

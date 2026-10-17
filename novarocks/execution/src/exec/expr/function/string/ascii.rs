@@ -21,15 +21,15 @@ use arrow::array::ArrayRef;
 use arrow::array::{Array, StringArray};
 #[cfg(test)]
 use std::sync::Arc;
-pub fn eval_ascii(
-    arena: &ExprArena,
+pub fn eval_ascii<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let array = arena.eval(args[0], chunk)?;
-    novarocks_functions::builtin::string_measure::evaluate_legacy_ascii(&array)
+    Ok((novarocks_functions::builtin::string_measure::evaluate_legacy_ascii(&array))?)
 }
 #[cfg(test)]
 mod legacy_string_measure_contract_tests {

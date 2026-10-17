@@ -26,17 +26,14 @@ use novarocks_types::SlotId;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub fn eval_map_apply(
-    arena: &ExprArena,
+pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() < 2 {
-        return Err(format!(
-            "map_apply expects at least 2 arguments, got {}",
-            args.len()
-        ));
+        return Err((format!("map_apply expects at least 2 arguments, got {}", args.len())).into());
     }
 
     let (lambda_id, map_args) = match arena.node(args[0]) {
@@ -47,14 +44,16 @@ pub fn eval_map_apply(
             }
             _ => {
                 return Err(
-                    "map_apply expects a lambda function as the first or last argument".to_string(),
+                    ("map_apply expects a lambda function as the first or last argument"
+                        .to_string())
+                    .into(),
                 );
             }
         },
     };
 
     if map_args.is_empty() {
-        return Err("map_apply expects at least one map argument".to_string());
+        return Err(("map_apply expects at least one map argument".to_string()).into());
     }
 
     let output_type = arena
@@ -64,18 +63,19 @@ pub fn eval_map_apply(
     let (map_field, output_fields, ordered) = match output_type {
         DataType::Map(field, ordered) => {
             let DataType::Struct(fields) = field.data_type().clone() else {
-                return Err("map_apply output map entries type must be Struct".to_string());
+                return Err(
+                    ("map_apply output map entries type must be Struct".to_string()).into(),
+                );
             };
             if fields.len() != 2 {
-                return Err("map_apply output map entries type must have 2 fields".to_string());
+                return Err(
+                    ("map_apply output map entries type must have 2 fields".to_string()).into(),
+                );
             }
             (field, fields, ordered)
         }
         other => {
-            return Err(format!(
-                "map_apply output type must be Map, got {:?}",
-                other
-            ));
+            return Err((format!("map_apply output type must be Map, got {:?}", other)).into());
         }
     };
 
@@ -86,7 +86,7 @@ pub fn eval_map_apply(
             common_sub_exprs,
             ..
         }) => (*body, arg_slots.clone(), common_sub_exprs.clone()),
-        _ => return Err("map_apply expects lambda function expression".to_string()),
+        _ => return Err(("map_apply expects lambda function expression".to_string()).into()),
     };
 
     let expected_lambda_args = map_args
@@ -94,11 +94,12 @@ pub fn eval_map_apply(
         .checked_mul(2)
         .ok_or_else(|| "map_apply lambda argument count overflow".to_string())?;
     if lambda_args.len() != expected_lambda_args {
-        return Err(format!(
+        return Err((format!(
             "map_apply expects {} lambda arguments, got {}",
             expected_lambda_args,
             lambda_args.len()
-        ));
+        ))
+        .into());
     }
 
     let num_rows = chunk.len();
@@ -110,11 +111,12 @@ pub fn eval_map_apply(
             .downcast_ref::<MapArray>()
             .ok_or_else(|| format!("map_apply expects MapArray, got {:?}", array.data_type()))?;
         if map.len() != 1 && map.len() != num_rows {
-            return Err(format!(
+            return Err((format!(
                 "map_apply input length mismatch: expected 1 or {}, got {}",
                 num_rows,
                 map.len()
-            ));
+            ))
+            .into());
         }
         input_maps.push(array);
     }
@@ -139,9 +141,9 @@ pub fn eval_map_apply(
             let len = (offsets[map_row + 1] - offsets[map_row]) as usize;
             if let Some(prev) = len_opt {
                 if prev != len {
-                    return Err(
-                        "Input map element's size are not equal in map_apply().".to_string()
-                    );
+                    return Err(("Input map element's size are not equal in map_apply()."
+                        .to_string())
+                    .into());
                 }
             } else {
                 len_opt = Some(len);
@@ -162,7 +164,13 @@ pub fn eval_map_apply(
     }
 
     if total_elements == 0 {
-        return build_empty_output_map(output_fields, map_field, ordered, &row_valid, num_rows);
+        return Ok((build_empty_output_map(
+            output_fields,
+            map_field,
+            ordered,
+            &row_valid,
+            num_rows,
+        ))?);
     }
 
     let mut flat_columns = Vec::<ArrayRef>::with_capacity(input_maps.len() * 2);
@@ -174,7 +182,7 @@ pub fn eval_map_apply(
         let flat_keys = flatten_map_component(map, &row_valid, true)?;
         let flat_values = flatten_map_component(map, &row_valid, false)?;
         if flat_keys.len() != total_elements || flat_values.len() != total_elements {
-            return Err("map_apply flattened input length mismatch".to_string());
+            return Err(("map_apply flattened input length mismatch".to_string()).into());
         }
         flat_columns.push(flat_keys);
         flat_columns.push(flat_values);
@@ -192,7 +200,7 @@ pub fn eval_map_apply(
 
     for (idx, slot_id) in lambda_args.iter().enumerate() {
         if !seen.insert(*slot_id) {
-            return Err(format!("duplicate lambda argument slot id: {}", slot_id));
+            return Err((format!("duplicate lambda argument slot id: {}", slot_id)).into());
         }
         let col = flat_columns[idx].clone();
         fields.push(Field::new(
@@ -206,7 +214,7 @@ pub fn eval_map_apply(
 
     for (slot_id, col) in captured_columns {
         if !seen.insert(slot_id) {
-            return Err(format!("lambda captured slot id conflicts: {}", slot_id));
+            return Err((format!("lambda captured slot id conflicts: {}", slot_id)).into());
         }
         fields.push(Field::new(
             format!("lambda_capture_{slot_id}"),
@@ -221,18 +229,16 @@ pub fn eval_map_apply(
 
     for (idx, (slot_id, expr_id)) in common_sub_exprs.iter().enumerate() {
         if !seen.insert(*slot_id) {
-            return Err(format!(
-                "lambda common sub expr slot id conflicts: {}",
-                slot_id
-            ));
+            return Err((format!("lambda common sub expr slot id conflicts: {}", slot_id)).into());
         }
         let col = arena.eval(*expr_id, &lambda_chunk)?;
         if col.len() != total_elements {
-            return Err(format!(
+            return Err((format!(
                 "lambda common sub expr length mismatch: expected {}, got {}",
                 total_elements,
                 col.len()
-            ));
+            ))
+            .into());
         }
         fields.push(Field::new(
             format!("lambda_common_{idx}"),
@@ -246,11 +252,12 @@ pub fn eval_map_apply(
 
     let lambda_result = arena.eval(lambda_body, &lambda_chunk)?;
     if lambda_result.len() != total_elements {
-        return Err(format!(
+        return Err((format!(
             "lambda body length mismatch: expected {}, got {}",
             total_elements,
             lambda_result.len()
-        ));
+        ))
+        .into());
     }
     let lambda_map = lambda_result
         .as_any()
@@ -312,7 +319,8 @@ pub fn eval_map_apply(
             }
             if end - start != 1 {
                 return Err(
-                    "map_apply lambda result must contain exactly one key-value pair".to_string(),
+                    ("map_apply lambda result must contain exactly one key-value pair".to_string())
+                        .into(),
                 );
             }
             let key_row = start;
@@ -336,7 +344,7 @@ pub fn eval_map_apply(
             picked_key_rows.push(key_row);
             current += 1;
             if current > i32::MAX as i64 {
-                return Err("map_apply offset overflow".to_string());
+                return Err(("map_apply offset overflow".to_string()).into());
             }
         }
 
@@ -346,7 +354,7 @@ pub fn eval_map_apply(
     }
 
     if lambda_row_cursor != total_elements {
-        return Err("map_apply internal lambda cursor mismatch".to_string());
+        return Err(("map_apply internal lambda cursor mismatch".to_string()).into());
     }
 
     let out_keys = make_array(out_keys.freeze());
@@ -425,8 +433,8 @@ fn flatten_map_component(
     concat(&refs).map_err(|e| e.to_string())
 }
 
-fn collect_captured_slots(
-    arena: &ExprArena,
+fn collect_captured_slots<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     lambda_body: ExprId,
     common_sub_exprs: &[(SlotId, ExprId)],
     lambda_args: &[SlotId],
@@ -450,7 +458,11 @@ fn collect_captured_slots(
     captured
 }
 
-fn collect_slot_ids(arena: &ExprArena, expr_id: ExprId, out: &mut HashSet<SlotId>) {
+fn collect_slot_ids<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr_id: ExprId,
+    out: &mut HashSet<SlotId>,
+) {
     let mut stack = vec![expr_id];
     while let Some(id) = stack.pop() {
         let Some(node) = arena.node(id) else { continue };

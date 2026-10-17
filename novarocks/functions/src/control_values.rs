@@ -67,7 +67,7 @@ impl std::fmt::Display for AssemblyFailure {
 }
 impl std::error::Error for AssemblyFailure {}
 
-pub fn supports_indexed_result(ty: &DataType) -> bool {
+fn supports_flat_indexed_result(ty: &DataType) -> bool {
     matches!(
         ty,
         DataType::Boolean
@@ -76,6 +76,11 @@ pub fn supports_indexed_result(ty: &DataType) -> bool {
             | DataType::LargeUtf8
             | DataType::LargeBinary
     ) || ty.primitive_width().is_some()
+}
+/// Closed carriers handled by the same actual Arrow indexed interleave.
+/// Nested fields retain their complete names, metadata and NULL semantics.
+pub fn supports_indexed_result(ty: &DataType) -> bool {
+    crate::selected_copy::supports_guarded_result(ty)
 }
 fn reserve<T>(len: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T>, KernelFailure> {
     Layout::array::<T>(len).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -103,7 +108,7 @@ pub fn assemble_values(
             let mask =
                 is_not_null(left.as_ref()).map_err(|e| AssemblyFailure::Arrow(e.to_string()))?;
             work.flush()?;
-            if supports_indexed_result(left.data_type())
+            if supports_flat_indexed_result(left.data_type())
                 && left.data_type() == right.data_type()
                 && left.len() == right.len()
             {
@@ -145,7 +150,7 @@ pub fn assemble_values(
                     invalid("guarded result requires its dedicated carrier protocol").into(),
                 );
             }
-            crate::selected_copy::guarded_interleave_extent(result_type, choices.len())
+            crate::selected_copy::guarded_result_extent(result_type, choices.len())
                 .map_err(|_| KernelFailure::ResourceExhausted)?;
             let mut sources = reserve::<ArrayRef>(
                 children

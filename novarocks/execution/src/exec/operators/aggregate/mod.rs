@@ -976,7 +976,7 @@ impl AggregateProcessorOperator {
         session.fail(reason)
     }
 
-    fn process(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    fn process(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
         if self.finished {
             return Ok(None);
         }
@@ -990,10 +990,22 @@ impl AggregateProcessorOperator {
             return Ok(None);
         }
 
-        let group_arrays = self.eval_group_by_arrays(&chunk)?;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_input_construction(&chunk)?;
+        let mut control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+            state.error_state(),
+        );
+        control.bind_runtime_memory(state);
+        control.bind_construction_factory(factory.clone());
+        let evaluation =
+            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), &control);
+        let group_arrays = self.eval_group_by_arrays(&evaluation, &chunk)?;
         let group_arrays =
             normalize_aggregate_group_arrays(&self.expected_group_types()?, group_arrays)?;
-        let agg_arrays = self.eval_agg_arrays(&chunk)?;
+        let agg_arrays = self.eval_agg_arrays(&evaluation, &chunk)?;
 
         self.ensure_data_initialized(&group_arrays, &agg_arrays)
             .map_err(|e| e.to_string())?;
@@ -1363,24 +1375,24 @@ impl ProcessorOperator for AggregateProcessorOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        let result = (|| {
+        let result: ExecutionResult<()> = (|| {
             if self.finished {
                 return if self.final_domain_session_bound {
-                    Err("aggregate received input after set_finishing".to_string())
+                    Err("aggregate received input after set_finishing".into())
                 } else {
                     Ok(())
                 };
             }
             if self.finishing {
-                return Err("aggregate received input after set_finishing".to_string());
+                return Err("aggregate received input after set_finishing".into());
             }
             if self.pending_output.is_some() {
-                return Err("aggregate received input while output buffer is full".to_string());
+                return Err("aggregate received input while output buffer is full".into());
             }
             let num_rows = chunk.len();
-            let out = self.process(chunk)?;
+            let out = self.process(_state, chunk)?;
             if out.is_some() {
-                return Err("aggregate produced output before finishing".to_string());
+                return Err("aggregate produced output before finishing".into());
             }
             self.topn_rf_rows_since_publish += num_rows;
             self.try_submit_native_topn_bound()?;
@@ -1515,14 +1527,19 @@ impl AggregateProcessorOperator {
         self.output_schema = None;
     }
 
-    fn eval_group_by_arrays(&self, chunk: &Chunk) -> Result<Vec<ArrayRef>, String> {
+    fn eval_group_by_arrays<E: crate::exec::expr::ExprEvaluation + ?Sized>(
+        &self,
+        evaluation: &E,
+        chunk: &Chunk,
+    ) -> Result<Vec<ArrayRef>, E::Error> {
         if self.direct_input {
             if self.output_chunk_schema.slot_ids().len() < self.group_by.len() {
                 return Err(format!(
                     "aggregate direct input missing group by slot ids: group_by={} output_slots={}",
                     self.group_by.len(),
                     self.output_chunk_schema.slot_ids().len()
-                ));
+                )
+                .into());
             }
             let mut arrays = Vec::with_capacity(self.group_by.len());
             for slot_id in self
@@ -1541,13 +1558,17 @@ impl AggregateProcessorOperator {
         }
         let mut arrays = Vec::with_capacity(self.group_by.len());
         for expr in &self.group_by {
-            let array = self.arena.eval(*expr, chunk).map_err(|e| e.to_string())?;
+            let array = evaluation.eval(*expr, chunk)?;
             arrays.push(array);
         }
         Ok(arrays)
     }
 
-    fn eval_agg_arrays(&self, chunk: &Chunk) -> Result<Vec<Option<ArrayRef>>, String> {
+    fn eval_agg_arrays<E: crate::exec::expr::ExprEvaluation + ?Sized>(
+        &self,
+        evaluation: &E,
+        chunk: &Chunk,
+    ) -> Result<Vec<Option<ArrayRef>>, E::Error> {
         if self.direct_input {
             let start = self.group_by.len();
             if self.output_chunk_schema.slot_ids().len() < start + self.functions.len() {
@@ -1556,7 +1577,7 @@ impl AggregateProcessorOperator {
                     self.group_by.len(),
                     self.functions.len(),
                     self.output_chunk_schema.slot_ids().len()
-                ));
+                ).into());
             }
             let mut arrays = Vec::with_capacity(self.functions.len());
             for idx in 0..self.functions.len() {
@@ -1584,17 +1605,13 @@ impl AggregateProcessorOperator {
             let array = if func.inputs.is_empty() {
                 None
             } else if func.inputs.len() == 1 {
-                Some(
-                    self.arena
-                        .eval(func.inputs[0], chunk)
-                        .map_err(|e| e.to_string())?,
-                )
+                Some(evaluation.eval(func.inputs[0], chunk)?)
             } else {
                 return Err(format!(
                     "aggregate inputs must be packed into a single struct expression: {} has {} inputs",
                     func.name,
                     func.inputs.len()
-                ));
+                ).into());
             };
             arrays.push(array);
         }
@@ -2474,6 +2491,23 @@ mod tests {
         .expect("build aggregate factory")
     }
 
+    fn typed_fixture_input_schema(slot: SlotId, field: &Field) -> Result<ChunkSchema, String> {
+        let value = novarocks_type_contract::FunctionValueType::new(
+            field.data_type().clone(),
+            field.is_nullable(),
+        );
+        ChunkSchema::try_new_typed(
+            vec![ChunkSlotSchema::try_new_typed(
+                slot,
+                Arc::new(field.clone()),
+                value.typed_binding().clone(),
+                None,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )?],
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+    }
+
     fn group_chunk(values: impl IntoIterator<Item = i64>) -> Chunk {
         let field = Field::new("group_key", DataType::Int64, false);
         let values = values.into_iter().collect::<Vec<_>>();
@@ -2483,11 +2517,7 @@ mod tests {
         )
         .expect("aggregate input batch");
         let chunk_schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                ChunkSlotSchema::from_field(GROUP_SLOT, &field, None)
-                    .expect("aggregate input slot"),
-            ])
-            .expect("aggregate input schema"),
+            typed_fixture_input_schema(GROUP_SLOT, &field).expect("aggregate input schema"),
         );
         Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("aggregate input chunk")
     }
@@ -2500,11 +2530,8 @@ mod tests {
         )
         .expect("malformed aggregate input batch");
         let chunk_schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                ChunkSlotSchema::from_field(SlotId::new(99), &field, None)
-                    .expect("malformed aggregate input slot"),
-            ])
-            .expect("malformed aggregate input schema"),
+            typed_fixture_input_schema(SlotId::new(99), &field)
+                .expect("malformed aggregate input schema"),
         );
         Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("malformed aggregate chunk")
     }
@@ -2515,6 +2542,12 @@ mod tests {
         driver_id: i32,
     ) -> Box<dyn crate::exec::pipeline::operator::Operator> {
         let mut operator = factory.create(dop, driver_id);
+        let construction = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().expect("actual runtime construction profile"),
+            crate::runtime::mem_tracker::MemTracker::new_root("aggregate RF input construction fixture"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).expect("actual construction factory");
+        operator.set_construction_factory(construction);
         operator.prepare().expect("prepare aggregate");
         operator
     }

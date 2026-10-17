@@ -19,13 +19,13 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 // The original ilike consumer borrows the same sole matcher.
 pub use novarocks_functions::native_like::like_match;
-pub fn eval_like(
-    arena: &ExprArena,
+pub fn eval_like<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     str_expr: ExprId,
     pattern_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let str_array = arena.eval(str_expr, chunk)?;
     let pattern_array = arena.eval(pattern_expr, chunk)?;
-    novarocks_functions::native_like::evaluate_legacy(&str_array, &pattern_array)
+    Ok((novarocks_functions::native_like::evaluate_legacy(&str_array, &pattern_array))?)
 }

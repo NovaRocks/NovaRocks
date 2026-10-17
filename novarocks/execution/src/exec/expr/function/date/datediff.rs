@@ -171,12 +171,12 @@ fn eval_diff_value(lhs: NaiveDateTime, rhs: NaiveDateTime, unit: DiffUnit) -> i6
 }
 
 #[inline]
-fn eval_diff_unit(
-    arena: &ExprArena,
+fn eval_diff_unit<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     unit: DiffUnit,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let a = extract_datetime_array(&arena.eval(args[0], chunk)?)?;
     let b = extract_datetime_array(&arena.eval(args[1], chunk)?)?;
     let mut out = Vec::with_capacity(a.len());
@@ -190,29 +190,29 @@ fn eval_diff_unit(
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
 
-fn eval_shared_duration(
-    arena: &ExprArena,
+fn eval_shared_duration<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     operation: CalendarOperation,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let rows = left.len();
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         operation,
         &[left, right],
         &arrow::datatypes::DataType::Int64,
         rows,
-    )
+    ))?)
 }
 
-pub fn eval_datediff(
-    arena: &ExprArena,
+pub fn eval_datediff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let a = extract_date_array(&arena.eval(args[0], chunk)?)?;
     let b = extract_date_array(&arena.eval(args[1], chunk)?)?;
     let mut out = Vec::with_capacity(a.len());
@@ -223,12 +223,12 @@ pub fn eval_datediff(
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
 
-pub fn eval_date_diff(
-    arena: &ExprArena,
+pub fn eval_date_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let unit_arr = arena.eval(args[0], chunk)?;
     let unit_arr = unit_arr
         .as_any()
@@ -246,7 +246,8 @@ pub fn eval_date_diff(
 
         let Some(unit) = parse_diff_unit(&unit_arr.value(i).to_lowercase()) else {
             return Err(
-                "type column should be one of day/hour/minute/second/millisecond".to_string(),
+                ("type column should be one of day/hour/minute/second/millisecond".to_string())
+                    .into(),
             );
         };
 
@@ -268,83 +269,83 @@ pub fn eval_date_diff(
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
 
-pub fn eval_days_diff(
-    arena: &ExprArena,
+pub fn eval_days_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_datediff(arena, expr, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_datediff(arena, expr, args, chunk))?)
 }
 
-pub fn eval_seconds_diff(
-    arena: &ExprArena,
+pub fn eval_seconds_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_shared_duration(arena, args, chunk, CalendarOperation::SecondsDiff)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_shared_duration(arena, args, chunk, CalendarOperation::SecondsDiff))?)
 }
 
-pub fn eval_milliseconds_diff(
-    arena: &ExprArena,
+pub fn eval_milliseconds_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_diff_unit(arena, args, chunk, DiffUnit::Milliseconds)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_diff_unit(arena, args, chunk, DiffUnit::Milliseconds))?)
 }
 
-pub fn eval_minutes_diff(
-    arena: &ExprArena,
+pub fn eval_minutes_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_shared_duration(arena, args, chunk, CalendarOperation::MinutesDiff)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_shared_duration(arena, args, chunk, CalendarOperation::MinutesDiff))?)
 }
 
-pub fn eval_hours_diff(
-    arena: &ExprArena,
+pub fn eval_hours_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_shared_duration(arena, args, chunk, CalendarOperation::HoursDiff)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_shared_duration(arena, args, chunk, CalendarOperation::HoursDiff))?)
 }
 
-pub fn eval_weeks_diff(
-    arena: &ExprArena,
+pub fn eval_weeks_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_shared_duration(arena, args, chunk, CalendarOperation::WeeksDiff)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_shared_duration(arena, args, chunk, CalendarOperation::WeeksDiff))?)
 }
 
-pub fn eval_months_diff(
-    arena: &ExprArena,
+pub fn eval_months_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_diff_unit(arena, args, chunk, DiffUnit::Months)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_diff_unit(arena, args, chunk, DiffUnit::Months))?)
 }
 
-pub fn eval_quarters_diff(
-    arena: &ExprArena,
+pub fn eval_quarters_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_diff_unit(arena, args, chunk, DiffUnit::Quarters)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_diff_unit(arena, args, chunk, DiffUnit::Quarters))?)
 }
 
-pub fn eval_years_diff(
-    arena: &ExprArena,
+pub fn eval_years_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_diff_unit(arena, args, chunk, DiffUnit::Years)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_diff_unit(arena, args, chunk, DiffUnit::Years))?)
 }

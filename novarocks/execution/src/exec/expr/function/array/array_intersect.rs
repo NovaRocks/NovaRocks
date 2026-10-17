@@ -476,14 +476,14 @@ fn intersect_hash(value: &IntersectValue) -> u64 {
     hasher.finish()
 }
 
-pub fn eval_array_intersect(
-    arena: &ExprArena,
+pub fn eval_array_intersect<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() < 2 {
-        return Err("array_intersect expects at least two arguments".to_string());
+        return Err(("array_intersect expects at least two arguments".to_string()).into());
     }
 
     let mut list_arrays = Vec::with_capacity(args.len());
@@ -503,10 +503,9 @@ pub fn eval_array_intersect(
         _ => match list_arrays[0].data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_intersect output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_intersect output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -619,7 +618,7 @@ pub fn eval_array_intersect(
             current += 1;
         }
         if current > i32::MAX as i64 {
-            return Err("array_intersect offset overflow".to_string());
+            return Err(("array_intersect offset overflow".to_string()).into());
         }
         offsets.push(current as i32);
         null_builder.append_non_null();

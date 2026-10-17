@@ -130,6 +130,7 @@ fn original_column_charge_is_shared_until_the_last_chunk_alias_exits() {
             |step| Ok(slice_owner.observe(0, &[], step)?),
         )
         .unwrap();
+    drop(slice_owner);
     let like = Chunk::try_new_like(chunk.record_batch().slice(0, 1), &chunk).unwrap();
     assert_eq!(tracker.current(), charged, "sharing creates no new grant");
     drop(chunk);
@@ -369,9 +370,10 @@ fn pure_values_refuses_a_runtime_keeper_and_preserves_plain_values() {
         "StaticValues cannot retain runtime output column metadata"
     );
     assert_eq!(tracker.current(), 0);
+    let plain_schema = schema();
     let plain = Chunk::try_new_with_chunk_schema(
-        RecordBatch::new_empty(schema().arrow_schema_ref()),
-        schema(),
+        RecordBatch::new_empty(plain_schema.arrow_schema_ref()),
+        plain_schema,
     )
     .unwrap();
     assert_eq!(plain.try_into_static_batch().unwrap().num_columns(), 1);
@@ -393,14 +395,17 @@ fn fixed_root_inspection_counts_known_holders_without_granting_payload_authority
     chunk
         .inspect_root_holder_scaffolds(&mut inspection)
         .unwrap();
-    // The original inspector also counts the actual shared RecordBatch
-    // holder. This fixture previously failed before reaching this assertion
-    // because its schema lacked explicit value bindings.
-    let mut batch_holder = RootSchemaInspection::new(1 << 20, 32, 8);
-    batch_holder.charge_arc(chunk.record_batch()).unwrap();
+    // This fixture owns an ordinary Arc<RecordBatch>: its two counters and
+    // wrapper are known scaffolds, independent of any Arrow payload buffers.
+    let batch_holder = Layout::new::<[AtomicUsize; 2]>()
+        .extend(Layout::new::<RecordBatch>())
+        .unwrap()
+        .0
+        .pad_to_align()
+        .size();
     assert_eq!(
         inspection.bytes(),
-        std::mem::size_of::<Chunk>() + batch_holder.bytes() + holder
+        std::mem::size_of::<Chunk>() + batch_holder + holder
     );
     assert!(!chunk.source_authority().is_attached());
     drop(chunk);

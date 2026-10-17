@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::sha2_shared;
 
-pub fn eval_sha2(
-    arena: &ExprArena,
+pub fn eval_sha2<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "sha2", 0)?;
     let length = super::common::to_i64_array(&arena.eval(args[1], chunk)?, "sha2", 1)?;

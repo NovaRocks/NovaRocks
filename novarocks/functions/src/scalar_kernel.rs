@@ -573,12 +573,25 @@ pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
         )));
     }
     let output = result?;
+    validate_scalar_output_observed(&output, selection, contract, control)?;
+    control.checkpoint(0)?;
+    Ok(output)
+}
+
+/// The one successful scalar output validator, shared by both explicit
+/// invocation entries. Failure transport is decided before this author runs.
+pub(crate) fn validate_scalar_output_observed(
+    output: &SelectedValues<'_>,
+    selection: Selection<'_>,
+    contract: &ScalarCallContract,
+    control: &dyn KernelEvaluationControl,
+) -> Result<(), KernelFailure> {
     if !output.errors().is_empty()
         && contract.effects().own_row_error != FunctionIntrinsicRowError::MayRaise
     {
-        return Err(E::from(internal(
+        return Err(internal(
             "never-failing scalar implementation returned a row data error",
-        )));
+        ));
     }
     let mut work = EvaluationCheckpoints::new(control);
     if !output
@@ -590,9 +603,9 @@ pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
             || work.step(),
         )?
     {
-        return Err(E::from(internal(
+        return Err(internal(
             "scalar implementation returned an unrelated selection or type",
-        )));
+        ));
     }
     work.finish()?;
     if !contract.result_type().nullable() {
@@ -606,15 +619,14 @@ pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
                 errors.next();
                 work.step()?;
             } else if logical_is_null(output.values().as_ref(), row, 1, &mut work)? {
-                return Err(E::from(internal(
+                return Err(internal(
                     "non-null scalar implementation returned a successful SQL NULL",
-                )));
+                ));
             }
         }
         work.finish()?;
     }
-    control.checkpoint(0)?;
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]

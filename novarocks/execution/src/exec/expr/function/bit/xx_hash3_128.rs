@@ -18,12 +18,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::xx_hash3_128;
-pub fn eval_xx_hash3_128(
-    arena: &ExprArena,
+pub fn eval_xx_hash3_128<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     // Preserve interleaved evaluation and admission, including the original
     // first unsupported argument before any later child is evaluated.
     let mut inputs = Vec::with_capacity(args.len());
@@ -33,7 +33,7 @@ pub fn eval_xx_hash3_128(
             idx,
         )?);
     }
-    xx_hash3_128::evaluate_legacy(&inputs, chunk.len(), arena.data_type(expr))
+    Ok((xx_hash3_128::evaluate_legacy(&inputs, chunk.len(), arena.data_type(expr)))?)
 }
 #[cfg(test)]
 #[path = "legacy_xx_hash3_128_baseline_tests.rs"]

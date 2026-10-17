@@ -921,12 +921,10 @@ impl IcebergWriterHandle {
                 branch.as_str()
             )));
         }
-        let base_snapshot_id = table
-            .base_snapshot_id()
-            .ok_or_else(|| invalid("Iceberg row-level write requires a frozen target snapshot"))?;
+        let base_snapshot_id = table.base_snapshot_id();
         let mut frozen = BTreeMap::new();
         for target in old_deletes {
-            if target.base_snapshot_id() != base_snapshot_id {
+            if Some(target.base_snapshot_id()) != base_snapshot_id {
                 return Err(invalid(
                     "Iceberg old-delete merge target does not name the session's frozen base snapshot",
                 ));

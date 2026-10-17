@@ -111,7 +111,7 @@ pub(super) fn prepare(
     )
     .map(|result| result.into_prepared())
 }
-fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str); 5] {
+fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str); 7] {
     [
         (
             nominal(DataType::Utf8, nullable, ValueLogicalType::Json),
@@ -130,8 +130,18 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
         ),
         (
             large(nullable),
+            ty(DataType::Decimal256(41, 2), true),
+            value_conversion::LARGEINT_DECIMAL,
+        ),
+        (
+            large(nullable),
             ty(DataType::Float32, nullable),
             value_conversion::LARGEINT_FLOAT,
+        ),
+        (
+            ty(DataType::Utf8, nullable),
+            large(true),
+            value_conversion::UTF8_LARGEINT,
         ),
         (
             ty(DataType::Null, true),
@@ -142,7 +152,7 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
 }
 
 #[test]
-fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_seven_implementation_records() {
+fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_nine_implementation_records() {
     let owner = owner();
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
     let actual = catalog
@@ -172,12 +182,20 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_seven_implementat
             "builtin.scalar/value_domain_conversion/largeint_to_signed_null_overflow/selected-v1",
         ),
         (
+            value_conversion::LARGEINT_DECIMAL,
+            "builtin.scalar/value_domain_conversion/largeint_to_decimal_exact/selected-v1",
+        ),
+        (
             value_conversion::LARGEINT_FLOAT,
             "builtin.scalar/value_domain_conversion/largeint_to_float_round/selected-v1",
         ),
         (
             value_conversion::LARGEINT_TEXT,
             "builtin.scalar/value_domain_conversion/largeint_to_utf8_text/selected-v1",
+        ),
+        (
+            value_conversion::UTF8_LARGEINT,
+            "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/selected-v1",
         ),
         (
             value_conversion::NULL_LIFT,
@@ -197,7 +215,7 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_seven_implementat
                 .declaration
                 .effect_declaration(&record.overload)
                 .unwrap(),
-            &value_conversion::effects()
+            &value_conversion::overload_effects(record.overload.as_str())
         );
     }
     // An actual owner attachment is not a whole Server installed-manifest seal.
@@ -254,7 +272,7 @@ fn every_conversion_fresh_frozen_keeps_full_source_target_policy_scope_and_canon
                 assert!(std::ptr::eq(canonical.selected(), selected.as_ref()));
                 assert_eq!(canonical.decimal_overflow_policy(), policy);
                 let facts = canonical.effects().clone();
-                assert_eq!(facts, owner.call_effects(exact.proof_scope));
+                assert_eq!(facts, owner.call_effects(exact));
                 let frozen = specialize_frozen_scalar(
                     &owner,
                     exact,
@@ -622,5 +640,84 @@ fn null_lift_prepares_complete_target_but_only_an_empty_strict_active_mask_is_va
             instance.evaluate(Selection::all(2), &args, &EvaluationControl),
             Err(KernelFailure::InvalidProgram(_))
         ));
+    }
+}
+
+#[test]
+fn largeint_decimal_effects_refine_exact_range_and_freeze_overflow_policy() {
+    let owner = owner();
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let uses = [Some(ExpressionUseId::new(42))];
+    for (target, can_overflow) in [
+        (ty(DataType::Decimal128(38, 0), true), true),
+        (ty(DataType::Decimal128(38, -1), true), false),
+        (ty(DataType::Decimal256(41, 2), true), false),
+        (ty(DataType::Decimal256(38, 2), true), true),
+        (ty(DataType::Decimal256(76, 76), true), true),
+    ] {
+        let source = large(true);
+        let args = arguments(&source);
+        let selected = Arc::new(
+            owner
+                .resolve(request(&args, &target), crate::binding_test_control())
+                .unwrap(),
+        );
+        for policy in [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ] {
+            let exact = input(
+                &owner,
+                &selected,
+                &args,
+                &target,
+                &parameters,
+                &uses,
+                policy,
+            );
+            let fresh = specialize_scalar(
+                &owner,
+                exact,
+                selected.clone(),
+                ScopedExpressionEffects::pure_value(context()),
+                crate::binding_test_control(),
+            )
+            .unwrap();
+            let contract = fresh.prepared().contract();
+            let expected = if can_overflow && policy == DecimalOverflowPolicy::ReportError {
+                crate::FunctionIntrinsicRowError::MayRaise
+            } else {
+                crate::FunctionIntrinsicRowError::NoRowError
+            };
+            assert_eq!(contract.effects().own_row_error, expected);
+            let other = if policy == DecimalOverflowPolicy::OutputNull {
+                DecimalOverflowPolicy::ReportError
+            } else {
+                DecimalOverflowPolicy::OutputNull
+            };
+            let foreign = input(&owner, &selected, &args, &target, &parameters, &uses, other);
+            assert!(
+                owner
+                    .prepare_scalar(foreign, contract.clone(), crate::binding_test_control())
+                    .is_err()
+            );
+            let mut forged = contract.effects().clone();
+            forged.own_row_error = if expected == crate::FunctionIntrinsicRowError::MayRaise {
+                crate::FunctionIntrinsicRowError::NoRowError
+            } else {
+                crate::FunctionIntrinsicRowError::MayRaise
+            };
+            assert!(
+                specialize_frozen_scalar(
+                    &owner,
+                    exact,
+                    selected.clone(),
+                    &forged,
+                    ScopedExpressionEffects::pure_value(context()),
+                    crate::binding_test_control()
+                )
+                .is_err()
+            );
+        }
     }
 }

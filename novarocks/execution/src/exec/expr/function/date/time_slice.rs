@@ -21,22 +21,20 @@ use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::builtin::calendar_slice::{CalendarSliceDomain, evaluate_legacy_slice};
 #[inline]
-fn eval_time_slice_inner(
-    arena: &ExprArena,
+fn eval_time_slice_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     date_output: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let name = if date_output {
         "date_slice"
     } else {
         "time_slice"
     };
     if !matches!(args.len(), 3 | 4) {
-        return Err(format!(
-            "{name} expects value, count, unit and optional boundary"
-        ));
+        return Err((format!("{name} expects value, count, unit and optional boundary")).into());
     }
     let output_type = if date_output {
         DataType::Date32
@@ -44,9 +42,7 @@ fn eval_time_slice_inner(
         DataType::Timestamp(TimeUnit::Microsecond, None)
     };
     if arena.data_type(expr) != Some(&output_type) {
-        return Err(format!(
-            "{name} result type differs from its frozen temporal domain"
-        ));
+        return Err((format!("{name} result type differs from its frozen temporal domain")).into());
     }
     // SQL materializes temporal coercions before binding.
     let dt_arr = arena.eval(args[0], chunk)?;
@@ -58,9 +54,9 @@ fn eval_time_slice_inner(
         None
     };
     if dt_arr.data_type() != &output_type || interval_arr.data_type() != &DataType::Int32 {
-        return Err(format!(
-            "{name} arguments differ from their frozen temporal/INT32 domains"
-        ));
+        return Err(
+            (format!("{name} arguments differ from their frozen temporal/INT32 domains")).into(),
+        );
     }
     let dts = extract_datetime_array(&dt_arr)?;
     let interval_values = extract_i64_array(&interval_arr, "time_slice")
@@ -83,10 +79,10 @@ fn eval_time_slice_inner(
         .chain(boundary_arr.map(|array| array.len()))
     {
         if length != 1 && length != dts.len() {
-            return Err(format!("{name} argument lengths differ"));
+            return Err((format!("{name} argument lengths differ")).into());
         }
     }
-    evaluate_legacy_slice(
+    Ok((evaluate_legacy_slice(
         if date_output {
             CalendarSliceDomain::Date
         } else {
@@ -96,23 +92,23 @@ fn eval_time_slice_inner(
         &interval_values,
         unit_arr,
         boundary_arr,
-    )
+    ))?)
 }
 
-pub fn eval_time_slice(
-    arena: &ExprArena,
+pub fn eval_time_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_time_slice_inner(arena, expr, args, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_time_slice_inner(arena, expr, args, chunk, false))?)
 }
 
-pub fn eval_date_slice(
-    arena: &ExprArena,
+pub fn eval_date_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_time_slice_inner(arena, expr, args, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_time_slice_inner(arena, expr, args, chunk, true))?)
 }

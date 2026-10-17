@@ -23,12 +23,12 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_map_filter(
-    arena: &ExprArena,
+pub fn eval_map_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let map_arr = arena.eval(args[0], chunk)?;
     let filter_arr = arena.eval(args[1], chunk)?;
     let map = map_arr
@@ -54,10 +54,10 @@ pub fn eval_map_filter(
         "map_filter",
     )?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err("map_filter map entries type must be Struct".to_string());
+        return Err(("map_filter map entries type must be Struct".to_string()).into());
     };
     if fields.len() != 2 {
-        return Err("map_filter map entries type must have 2 fields".to_string());
+        return Err(("map_filter map entries type must have 2 fields".to_string()).into());
     }
     if keys.data_type() != fields[0].data_type() {
         keys = cast(&keys, fields[0].data_type()).map_err(|e| {
@@ -139,7 +139,7 @@ pub fn eval_map_filter(
             filter_idx += 1;
         }
         if current > i32::MAX as i64 {
-            return Err("map_filter offset overflow".to_string());
+            return Err(("map_filter offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

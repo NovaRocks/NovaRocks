@@ -110,6 +110,7 @@ fn decimal(value: i128, precision: u8, scale: i8) -> FoldArg {
 }
 fn request(kind: FoldNodeKind, args: Vec<FoldArg>, result: DataType) -> FoldRequest {
     FoldRequest {
+        regexp_count_pattern_source: None,
         kind,
         args,
         constant_policy: policy(),
@@ -730,5 +731,165 @@ fn malformed_selected_utf8_bytes_decline_without_constructing_invalid_str() {
             CompileCheckpoints::try_new(&good, CompilePhase::FunctionSpecialization).unwrap();
         assert!(!utf8_output_fits(&output, &mut work).unwrap());
         work.finish().unwrap();
+    }
+}
+
+#[test]
+fn regexp_count_fold_receipt_reuses_literal_error_null_and_selected_pool_contract() {
+    use novarocks_type_contract::RegexpCountPatternSource as Source;
+    let selected = pool(
+        Arc::new(StringArray::from(vec!["a", "[0-9"])),
+        FunctionValueType::new(DataType::Utf8, false),
+    )
+    .value(1)
+    .unwrap();
+    let pattern = FoldArg {
+        value: selected,
+        value_type: FunctionValueType::new(DataType::Utf8, false),
+    };
+    let mut request = request(
+        FoldNodeKind::Function {
+            name: "regexp_count".into(),
+        },
+        vec![text("aaa"), pattern],
+        DataType::Int64,
+    );
+    // The same raw pooled calculator input without emitted provenance remains
+    // Dynamic. Installing the existing fact is the behavior-changing seam.
+    assert_eq!(evaluate(&request).try_i64().unwrap(), None);
+    request.regexp_count_pattern_source = Some(Source::NativeV1Utf8LiteralWhenPresent);
+    let error = constant_evaluator()
+        .eval_scalar(&request, &TestControl)
+        .unwrap_err();
+    assert!(
+        matches!(error, SqlConstantEvaluationError::Evaluation(ref message) if message.starts_with("Invalid regex expression: [0-9.")),
+        "{error:?}"
+    );
+    request.args[0] = arg(Arc::new(StringArray::from(vec![None::<&str>])), true);
+    assert_eq!(evaluate(&request).try_i64().unwrap(), None);
+    request.args[0] = text("aaa");
+    request.args[1] = arg(Arc::new(StringArray::from(vec![None::<&str>])), true);
+    assert_eq!(evaluate(&request).try_i64().unwrap(), None);
+    request.args[1] = text("a");
+    assert_eq!(evaluate(&request).try_i64().unwrap(), Some(3));
+    request.kind = FoldNodeKind::Function {
+        name: "concat".into(),
+    };
+    assert!(
+        constant_evaluator()
+            .eval_scalar(&request, &TestControl)
+            .is_err(),
+        "a foreign call cannot consume a regexp source fact"
+    );
+}
+
+#[test]
+fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_error_decline() {
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
+    use novarocks_sql::compiler::*;
+    use novarocks_type_contract::RegexpCountPatternSource as Source;
+    struct Recording;
+    static SEEN: Mutex<Vec<(Option<Source>, bool)>> = Mutex::new(Vec::new());
+    impl SqlConstantEvaluator for Recording {
+        fn eval_scalar(
+            &self,
+            request: &FoldRequest,
+            control: &dyn PureCompileControl,
+        ) -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
+            let result = constant_evaluator().eval_scalar(request, control);
+            if matches!(&request.kind, FoldNodeKind::Function { name } if name.eq_ignore_ascii_case("regexp_count"))
+            {
+                let failed = matches!(&result, Err(SqlConstantEvaluationError::Evaluation(message)) if message.starts_with("Invalid regex expression:"));
+                SEEN.lock()
+                    .unwrap()
+                    .push((request.regexp_count_pattern_source, failed));
+            }
+            result
+        }
+    }
+    static RECORDER: Recording = Recording;
+    SEEN.lock().unwrap().clear();
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let control = SqlCompileControl::unbounded();
+    let request = SqlFinalPlanCompileRequest::new(
+        PlanVersionId::try_new([87; 16]).unwrap(),
+        SqlStatementInput::sql("SELECT regexp_count('test string','[0-9')"),
+        SqlCompileIntent::Query,
+        SqlSessionContext {
+            sql_semantics: Default::default(),
+            current_catalog: None,
+            current_database: "fixture".into(),
+            optimizer_settings: SessionOptimizerSettings {
+                enable_materialized_view_rewrite: Some(false),
+                ..Default::default()
+            },
+        },
+        SqlPlanningEnvironment::Distributed,
+        catalog.snapshot(),
+        &RECORDER,
+        policy(),
+        SqlPhysicalEmissionMode::OriginalNativeV1,
+        control.clone(),
+        PipelineDopDomain {
+            min: 1,
+            max: 8,
+            requires_power_of_two: true,
+        },
+        ScanReadBudget {
+            max_batch_rows: 64,
+            max_batch_bytes: 1 << 20,
+        },
+        DEFAULT_COMPLETION_LIMITS,
+    )
+    .try_into_completion()
+    .unwrap();
+    let owner = SqlCompiler::start(request, &control)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .into_plan();
+    let seen = SEEN.lock().unwrap();
+    assert!(
+        !seen.is_empty(),
+        "ordinary SQL must exercise the real fold author"
+    );
+    assert!(
+        seen.iter()
+            .all(|row| *row == (Some(Source::NativeV1Utf8LiteralWhenPresent), true))
+    );
+    assert!(owner.plan().fragments().values().any(|fragment| fragment.expressions().iter().any(|(_,expression)| matches!(&expression.kind,novarocks_physical_plan::ExprKind::FunctionCall {function,..} if function.function_id.as_str()=="builtin.scalar/regexp_count/v1"))), "failed literal evaluation must retain the actual call, never fold to NULL");
+}
+
+#[test]
+fn variant_typeof_preserves_the_staged_nominal_json_fold_decline_without_retagging() {
+    let json_type =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
+    for input in [
+        Some("{}"),
+        Some("[]"),
+        Some("null"),
+        Some("128"),
+        Some("2147483648"),
+        Some("not-json"),
+        None,
+    ] {
+        let argument = typed_arg(Arc::new(StringArray::from(vec![input])), json_type.clone());
+        let request = request(
+            FoldNodeKind::Function {
+                name: "variant_typeof".into(),
+            },
+            vec![argument],
+            DataType::Utf8,
+        );
+        // This adapter intentionally declines non-Physical domains. The real
+        // typed Native call must remain, rather than a fabricated folded NULL.
+        assert!(
+            constant_evaluator()
+                .eval_scalar(&request, &TestControl)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(request.args[0].value.value_type(), &json_type);
     }
 }

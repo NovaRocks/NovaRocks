@@ -21,12 +21,12 @@ use arrow::array::{ArrayRef, Float64Array};
 use rand::prelude::*;
 use std::sync::Arc;
 
-fn eval_rand_impl(
-    arena: &ExprArena,
+fn eval_rand_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let len = chunk.len();
     let mut values = Vec::with_capacity(len);
     if args.is_empty() {
@@ -44,14 +44,14 @@ fn eval_rand_impl(
         }
     }
     let out = Arc::new(Float64Array::from(values)) as ArrayRef;
-    cast_output(out, arena.data_type(expr))
+    Ok((cast_output(out, arena.data_type(expr)))?)
 }
 
-pub fn eval_rand(
-    arena: &ExprArena,
+pub fn eval_rand<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_rand_impl(arena, expr, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_rand_impl(arena, expr, args, chunk))?)
 }

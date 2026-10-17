@@ -22,25 +22,29 @@ use arrow::array::{Array, StringArray};
 use novarocks_functions::builtin::string_case::{StringCaseOp, evaluate_legacy_case};
 #[cfg(test)]
 use std::sync::Arc;
-fn eval_lower_impl(arena: &ExprArena, args: &[ExprId], chunk: &Chunk) -> Result<ArrayRef, String> {
+fn eval_lower_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
-    evaluate_legacy_case(StringCaseOp::Lower, &input)
+    Ok((evaluate_legacy_case(StringCaseOp::Lower, &input))?)
 }
-pub fn eval_lower(
-    arena: &ExprArena,
+pub fn eval_lower<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_lower_impl(arena, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_lower_impl(arena, args, chunk))?)
 }
-pub fn eval_lcase(
-    arena: &ExprArena,
+pub fn eval_lcase<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_lower_impl(arena, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_lower_impl(arena, args, chunk))?)
 }
 #[cfg(test)]
 #[path = "legacy_string_case_baseline_tests.rs"]

@@ -144,6 +144,17 @@ impl RuntimeKernelControl {
         Ok(host)
     }
 }
+impl crate::exec::expr::ExprEvaluationControl for RuntimeKernelControl {
+    fn checkpoint(&self) -> ExecutionResult<()> {
+        match self.error.error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    fn wait(&self, duration: Duration) -> ExecutionResult<()> {
+        self.error.wait_interruptibly(duration)
+    }
+}
 impl KernelEvaluationControl for RuntimeKernelControl {
     fn checkpoint(&self, _work_units: u32) -> Result<(), KernelFailure> {
         if self.error.is_stopped() {
@@ -525,6 +536,7 @@ pub(crate) fn project_chunk_with_source_observer(
     let tracker =
         crate::runtime::mem_tracker::MemTracker::new_root("slot source fixture construction");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    processor.control.bind_mem_tracker(tracker.clone());
     processor.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
         tracker, Arc::new(RuntimeErrorState::default()),

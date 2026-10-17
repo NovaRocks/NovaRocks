@@ -22,12 +22,12 @@ use arrow::datatypes::DataType;
 use chrono::NaiveDate;
 use std::sync::Arc;
 
-pub fn eval_timediff(
-    arena: &ExprArena,
+pub fn eval_timediff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let dt1 = extract_datetime_array(&arena.eval(args[0], chunk)?)?;
     let dt2 = extract_datetime_array(&arena.eval(args[1], chunk)?)?;
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Utf8);

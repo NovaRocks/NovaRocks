@@ -1551,7 +1551,8 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
     for name in ["max_by", "min_by"] {
         for frozen in [false, true] {
             for window_first in [false, true] {
-                let catalog = crate::builtin::catalogue::by_window_private_test_catalog();
+                let catalog =
+                    crate::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
                 let arguments = [DataType::LargeUtf8, DataType::Utf8].map(|data_type| {
                     FunctionArgument::Value {
                         value_type: FunctionValueType::new(data_type, true),
@@ -1619,8 +1620,8 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                             options: aggregate_options(AggregateKernelPhase::Single),
                         }
                     };
-                    // Exercise the actual registered frozen/fresh author without
-                    // installing this private capability in production.
+                    // Exercise the installed public frozen/fresh author at the
+                    // original aggregate or window preparation use point.
                     let result = prepare_selected(
                         &catalog,
                         input,
@@ -1677,17 +1678,18 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                 &COMPILE,
             )
             .unwrap();
-        assert_eq!(profile.implementation().abi, PureKernelAbi::AggregateV1);
-        assert!(
-            profile
-                .admit_selected_lifecycle_observed(
-                    &bound.selected,
-                    2,
-                    PureCallLifecycle::AggregateWindow,
-                    &COMPILE
-                )
-                .is_err()
+        assert_eq!(
+            profile.implementation().abi,
+            PureKernelAbi::AggregateWindowV1
         );
+        for lifecycle in [
+            PureCallLifecycle::Aggregate,
+            PureCallLifecycle::AggregateWindow,
+        ] {
+            profile
+                .admit_selected_lifecycle_observed(&bound.selected, 2, lifecycle, &COMPILE)
+                .unwrap();
+        }
     }
 }
 

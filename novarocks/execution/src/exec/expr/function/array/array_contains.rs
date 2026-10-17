@@ -23,7 +23,10 @@ use arrow::datatypes::DataType;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-fn is_row_constant_expr(arena: &ExprArena, expr: ExprId) -> bool {
+fn is_row_constant_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr: ExprId,
+) -> bool {
     match arena.node(expr) {
         Some(ExprNode::Constant(_) | ExprNode::Literal(_)) => true,
         Some(ExprNode::SlotId(_)) => false,
@@ -74,19 +77,19 @@ fn is_row_constant_expr(arena: &ExprArena, expr: ExprId) -> bool {
     }
 }
 
-pub fn eval_array_contains(
-    arena: &ExprArena,
+pub fn eval_array_contains<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     if chunk.is_empty() {
         return Ok(Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())) as ArrayRef);
     }
     let arr_is_const = is_row_constant_expr(arena, args[0]);
     let target_is_const = is_row_constant_expr(arena, args[1]);
-    let const_chunk = chunk.slice(0, 1);
+    let const_chunk = arena.slice_input(chunk, 0, 1)?;
     let arr_eval_chunk = if arr_is_const { &const_chunk } else { chunk };
     let target_eval_chunk = if target_is_const { &const_chunk } else { chunk };
     let arr = arena.eval(args[0], arr_eval_chunk)?;

@@ -127,7 +127,6 @@ fn e08s1_missing_aggregate_window_and_over_keep_unavailable_span_before_any_fold
             "SELECT session_number(1, 2) OVER (ORDER BY 1)",
             "builtin.window/session_number/",
         ),
-        ("SELECT max_by(1, 2) OVER ()", "builtin.aggregate/max_by/"),
     ] {
         reset();
         analyze(sql, SqlPhysicalEmissionMode::OriginalNativeV1).unwrap();
@@ -151,6 +150,8 @@ fn e08s1_supported_over_and_invalid_regexp_data_are_not_evaluated_by_static_gate
     let _serial = SERIAL.lock().unwrap();
     for sql in [
         "SELECT count(1) OVER ()",
+        "SELECT max_by(1, 2) OVER ()",
+        "SELECT min_by(1, 2) OVER ()",
         "SELECT row_number() OVER ()",
         "SELECT regexp_count('x', '[')",
     ] {

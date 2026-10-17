@@ -29,6 +29,8 @@ use super::search::{JoinSelection, ProbeMask, SearchStats};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::IntArrayView;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
 use crate::exec::hash_table::key_builder::{
     GroupKeyArrayView, build_compressed_flags, build_group_key_hashes, build_group_key_views,
     build_one_number_hashes,
@@ -42,6 +44,9 @@ const DIRECT_RANGE_MAX_LEN: u64 = 16 * 1024 * 1024;
 const DIRECT_SET_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DIRECT_SET_BUCKET_BYTE_FACTOR: u64 = 64;
 const ROW_NONE: u32 = u32::MAX;
+
+pub(crate) type ExprEvaluationCallback<'a> =
+    dyn FnMut(ExprId, &Chunk) -> ExecutionResult<ArrayRef> + 'a;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinHashMapBuildPurpose {
@@ -340,74 +345,171 @@ impl JoinHashMap {
         }
     }
 
+    pub(crate) fn lookup_selection_evaluated(
+        &self,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(Vec<Option<usize>>, JoinSelection), ExecutionFailure> {
+        match self {
+            Self::Chained(map) => {
+                Ok((map.lookup_selection_evaluated(probe_keys, probe, evaluate))?)
+            }
+            Self::DirectInt(map) => {
+                Ok((map.lookup_selection_evaluated(probe_keys, probe, evaluate))?)
+            }
+            Self::DirectIntSet(_) => Err(
+                ("presence-only direct integer join set cannot enumerate build rows".to_string())
+                    .into(),
+            ),
+        }
+    }
+
+    pub(crate) fn lookup_membership_evaluated(
+        &self,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<Vec<bool>, ExecutionFailure> {
+        Ok(self
+            .search_membership_evaluated(probe_keys, probe, evaluate)?
+            .0
+            .into_vec())
+    }
+
+    pub(crate) fn search_membership_evaluated(
+        &self,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
+        match self {
+            Self::Chained(map) => {
+                Ok((map.search_membership_evaluated(probe_keys, probe, evaluate))?)
+            }
+            Self::DirectInt(map) => {
+                Ok((map.search_membership_evaluated(probe_keys, probe, evaluate))?)
+            }
+            Self::DirectIntSet(map) => {
+                Ok((map.search_membership_evaluated(probe_keys, probe, evaluate))?)
+            }
+        }
+    }
+
+    pub(crate) fn lookup_group_ids_evaluated(
+        &self,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
+        match self {
+            Self::Chained(map) => {
+                Ok((map.lookup_group_ids_evaluated(probe_keys, probe, evaluate))?)
+            }
+            Self::DirectInt(map) => {
+                Ok((map.lookup_group_ids_evaluated(probe_keys, probe, evaluate))?)
+            }
+            Self::DirectIntSet(_) => Err(
+                ("presence-only direct integer join set cannot return group ids".to_string())
+                    .into(),
+            ),
+        }
+    }
+
+    pub(crate) fn search_pairs_evaluated(
+        &self,
+        probe_keys: &[ExprId],
+        probe: &Chunk,
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
+        match self {
+            Self::Chained(map) => Ok((map.search_pairs_evaluated(probe_keys, probe, evaluate))?),
+            Self::DirectInt(map) => Ok((map.search_pairs_evaluated(probe_keys, probe, evaluate))?),
+            Self::DirectIntSet(_) => Err(
+                ("presence-only direct integer join set cannot enumerate build rows".to_string())
+                    .into(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn lookup_selection(
         &self,
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
     ) -> Result<(Vec<Option<usize>>, JoinSelection), String> {
-        match self {
-            Self::Chained(map) => map.lookup_selection(arena, probe_keys, probe),
-            Self::DirectInt(map) => map.lookup_selection(arena, probe_keys, probe),
-            Self::DirectIntSet(_) => {
-                Err("presence-only direct integer join set cannot enumerate build rows".to_string())
-            }
+        if probe.chunk_schema().is_typed() {
+            return Err("reference join-key evaluation requires an untyped input".into());
         }
+        self.lookup_selection_evaluated(probe_keys, probe, &mut |id, input| {
+            arena.eval(id, input).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup_membership(
         &self,
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
     ) -> Result<Vec<bool>, String> {
-        Ok(self
-            .search_membership(arena, probe_keys, probe)?
-            .0
-            .into_vec())
+        if probe.chunk_schema().is_typed() {
+            return Err("reference join-key evaluation requires an untyped input".into());
+        }
+        self.lookup_membership_evaluated(probe_keys, probe, &mut |id, input| {
+            arena.eval(id, input).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn search_membership(
         &self,
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
     ) -> Result<(ProbeMask, SearchStats), String> {
-        match self {
-            Self::Chained(map) => map.search_membership(arena, probe_keys, probe),
-            Self::DirectInt(map) => map.search_membership(arena, probe_keys, probe),
-            Self::DirectIntSet(map) => map.search_membership(arena, probe_keys, probe),
+        if probe.chunk_schema().is_typed() {
+            return Err("reference join-key evaluation requires an untyped input".into());
         }
+        self.search_membership_evaluated(probe_keys, probe, &mut |id, input| {
+            arena.eval(id, input).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup_group_ids(
         &self,
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
     ) -> Result<Vec<Option<usize>>, String> {
-        match self {
-            Self::Chained(map) => map.lookup_group_ids(arena, probe_keys, probe),
-            Self::DirectInt(map) => map.lookup_group_ids(arena, probe_keys, probe),
-            Self::DirectIntSet(_) => {
-                Err("presence-only direct integer join set cannot return group ids".to_string())
-            }
+        if probe.chunk_schema().is_typed() {
+            return Err("reference join-key evaluation requires an untyped input".into());
         }
+        self.lookup_group_ids_evaluated(probe_keys, probe, &mut |id, input| {
+            arena.eval(id, input).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn search_pairs(
         &self,
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
     ) -> Result<(JoinSelection, SearchStats), String> {
-        match self {
-            Self::Chained(map) => map.search_pairs(arena, probe_keys, probe),
-            Self::DirectInt(map) => map.search_pairs(arena, probe_keys, probe),
-            Self::DirectIntSet(_) => {
-                Err("presence-only direct integer join set cannot enumerate build rows".to_string())
-            }
+        if probe.chunk_schema().is_typed() {
+            return Err("reference join-key evaluation requires an untyped input".into());
         }
+        self.search_pairs_evaluated(probe_keys, probe, &mut |id, input| {
+            arena.eval(id, input).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
     }
 
     /// Membership of `probe_len` probe rows whose key arrays are already
@@ -480,13 +582,13 @@ fn check_probe_key_arrays(probe_keys: &[ArrayRef], probe_len: usize) -> Result<(
     reason = "Selection lookup remains available for the chained join-map implementation."
 )]
 impl ChainedJoinHashMap {
-    fn lookup_selection(
+    fn lookup_selection_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(Vec<Option<usize>>, JoinSelection), String> {
-        let group_ids = self.lookup_group_ids(arena, probe_keys, probe)?;
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(Vec<Option<usize>>, JoinSelection), ExecutionFailure> {
+        let group_ids = self.lookup_group_ids_evaluated(probe_keys, probe, evaluate)?;
         let mut selection = JoinSelection::new();
         for (probe_row, group_id_opt) in group_ids.iter().enumerate() {
             let Some(group_id) = group_id_opt else {
@@ -500,14 +602,14 @@ impl ChainedJoinHashMap {
         Ok((group_ids, selection))
     }
 
-    fn search_pairs(
+    fn search_pairs_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(JoinSelection, SearchStats), String> {
-        let group_ids = self.lookup_group_ids(arena, probe_keys, probe)?;
-        self.pairs_from_group_ids(group_ids)
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
+        let group_ids = self.lookup_group_ids_evaluated(probe_keys, probe, evaluate)?;
+        Ok((self.pairs_from_group_ids(group_ids))?)
     }
 
     fn search_pairs_arrays(
@@ -537,14 +639,14 @@ impl ChainedJoinHashMap {
         Ok((selection, stats))
     }
 
-    fn search_membership(
+    fn search_membership_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(ProbeMask, SearchStats), String> {
-        let group_ids = self.lookup_group_ids(arena, probe_keys, probe)?;
-        Self::membership_from_group_ids(group_ids)
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
+        let group_ids = self.lookup_group_ids_evaluated(probe_keys, probe, evaluate)?;
+        Ok((Self::membership_from_group_ids(group_ids))?)
     }
 
     fn search_membership_arrays(
@@ -569,25 +671,25 @@ impl ChainedJoinHashMap {
         Ok((mask, stats))
     }
 
-    pub(crate) fn lookup_group_ids(
+    pub(crate) fn lookup_group_ids_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<Vec<Option<usize>>, String> {
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         let probe_len = probe.len();
         if probe_len == 0 {
             return Ok(Vec::new());
         }
         if probe_keys.is_empty() {
-            return Err("join hash table does not support empty keys".to_string());
+            return Err(("join hash table does not support empty keys".to_string()).into());
         }
 
         let mut probe_key_arrays = Vec::with_capacity(probe_keys.len());
         for expr in probe_keys {
-            probe_key_arrays.push(arena.eval(*expr, probe).map_err(|e| e.to_string())?);
+            probe_key_arrays.push(evaluate(*expr, probe)?);
         }
-        self.lookup_group_ids_arrays(&probe_key_arrays, probe_len)
+        Ok((self.lookup_group_ids_arrays(&probe_key_arrays, probe_len))?)
     }
 
     /// The group lookup over already evaluated probe key arrays.
@@ -761,18 +863,19 @@ impl DirectIntJoinHashMap {
         Ok(())
     }
 
-    fn lookup_group_ids(
+    fn lookup_group_ids_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<Vec<Option<usize>>, String> {
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         let probe_len = probe.len();
         if probe_len == 0 {
             return Ok(Vec::new());
         }
-        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
-        self.lookup_group_ids_array(&probe_array, probe_len)
+        let probe_array =
+            eval_single_probe_int_key_evaluated(probe_keys, probe, &self.data_type, evaluate)?;
+        Ok((self.lookup_group_ids_array(&probe_array, probe_len))?)
     }
 
     fn lookup_group_ids_arrays(
@@ -804,17 +907,18 @@ impl DirectIntJoinHashMap {
         Ok(group_ids)
     }
 
-    fn lookup_selection(
+    fn lookup_selection_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(Vec<Option<usize>>, JoinSelection), String> {
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(Vec<Option<usize>>, JoinSelection), ExecutionFailure> {
         let probe_len = probe.len();
         if probe_len == 0 {
             return Ok((Vec::new(), JoinSelection::new()));
         }
-        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
+        let probe_array =
+            eval_single_probe_int_key_evaluated(probe_keys, probe, &self.data_type, evaluate)?;
         let probe_view = IntArrayView::new(&probe_array)?;
         let mut group_ids = Vec::with_capacity(probe_len);
         let mut selection = JoinSelection::new();
@@ -837,18 +941,19 @@ impl DirectIntJoinHashMap {
         Ok((group_ids, selection))
     }
 
-    fn search_pairs(
+    fn search_pairs_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(JoinSelection, SearchStats), String> {
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
         let probe_len = probe.len();
         if probe_len == 0 {
             return Ok(empty_pairs());
         }
-        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
-        self.search_pairs_array(&probe_array, probe_len)
+        let probe_array =
+            eval_single_probe_int_key_evaluated(probe_keys, probe, &self.data_type, evaluate)?;
+        Ok((self.search_pairs_array(&probe_array, probe_len))?)
     }
 
     fn search_pairs_arrays(
@@ -900,18 +1005,19 @@ impl DirectIntJoinHashMap {
         ))
     }
 
-    fn search_membership(
+    fn search_membership_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(ProbeMask, SearchStats), String> {
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
         let probe_len = probe.len();
         if probe_len == 0 {
             return Ok(empty_membership());
         }
-        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
-        self.search_membership_array(&probe_array, probe_len)
+        let probe_array =
+            eval_single_probe_int_key_evaluated(probe_keys, probe, &self.data_type, evaluate)?;
+        Ok((self.search_membership_array(&probe_array, probe_len))?)
     }
 
     fn search_membership_arrays(
@@ -1098,18 +1204,19 @@ impl DirectIntJoinHashSet {
         Ok(())
     }
 
-    fn search_membership(
+    fn search_membership_evaluated(
         &self,
-        arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(ProbeMask, SearchStats), String> {
+        evaluate: &mut ExprEvaluationCallback<'_>,
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
         let probe_len = probe.len();
         if probe_len == 0 {
             return Ok(empty_membership());
         }
-        let probe_array = eval_single_probe_int_key(arena, probe_keys, probe, &self.data_type)?;
-        self.search_membership_array(&probe_array, probe_len)
+        let probe_array =
+            eval_single_probe_int_key_evaluated(probe_keys, probe, &self.data_type, evaluate)?;
+        Ok((self.search_membership_array(&probe_array, probe_len))?)
     }
 
     fn search_membership_arrays(
@@ -1318,18 +1425,16 @@ fn fallback_hash_seed(key_types: &[DataType], null_safe_eq: &[bool]) -> Result<u
     ))
 }
 
-fn eval_single_probe_int_key(
-    arena: &ExprArena,
+fn eval_single_probe_int_key_evaluated(
     probe_keys: &[ExprId],
     probe: &Chunk,
     data_type: &DataType,
-) -> Result<ArrayRef, String> {
+    evaluate: &mut ExprEvaluationCallback<'_>,
+) -> Result<ArrayRef, ExecutionFailure> {
     if probe_keys.len() != 1 {
-        return Err("direct integer join requires one probe key".to_string());
+        return Err(("direct integer join requires one probe key".to_string()).into());
     }
-    let array = arena
-        .eval(probe_keys[0], probe)
-        .map_err(|e| e.to_string())?;
+    let array = evaluate(probe_keys[0], probe)?;
     single_probe_int_key(std::slice::from_ref(&array), data_type)?;
     Ok(array)
 }
@@ -2375,5 +2480,89 @@ mod tests {
 
         assert_eq!(selection.probe, vec![0, 2]);
         assert_eq!(selection.build, vec![1, 0]);
+    }
+    #[test]
+    fn evaluated_join_map_ports_preserve_runtime_causes_and_key_calls() {
+        use crate::exec::expr::ExprId;
+        use crate::runtime::fragment::{ExecutionFailure, PipelineOperation};
+        use novarocks_functions::{KernelDiagnostic, KernelFailure};
+        let build = int32_chunk(vec![Some(1), Some(2), Some(1), None]);
+        let mut chained = JoinHashMap::new_chained(vec![DataType::Int32], vec![false]).unwrap();
+        chained
+            .add_build_rows(build.columns(), build.len())
+            .unwrap();
+        chained.finalize().unwrap();
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).unwrap();
+        let direct = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            std::slice::from_ref(&batch),
+            JoinHashMapBuildOptions::default(),
+        )
+        .unwrap();
+        let set = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions {
+                purpose: JoinHashMapBuildPurpose::PresenceOnly,
+                ..JoinHashMapBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let probe = int32_chunk(vec![Some(1), Some(3), None, Some(2), Some(1)]);
+        let key = ExprId(37);
+        let mut failures: Vec<ExecutionFailure> = vec![
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InstanceFailed,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("exact invalid")),
+            KernelFailure::Internal(KernelDiagnostic::new("exact internal")),
+            KernelFailure::Operational(KernelDiagnostic::new("exact operational")),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        failures.push(ExecutionFailure::from("cancelled").at_operator(41, PipelineOperation::Push));
+        for map in [&chained, &direct, &set] {
+            let mut calls = Vec::new();
+            let actual = map
+                .search_membership_evaluated(&[key], &probe, &mut |id, input| {
+                    calls.push((id, input.len()));
+                    Ok(input.columns()[0].clone())
+                })
+                .unwrap();
+            assert_eq!(calls, vec![(key, probe.len())]);
+            let expected = map
+                .search_membership_arrays(probe.columns(), probe.len())
+                .unwrap();
+            assert_eq!(actual.0.as_slice(), expected.0.as_slice());
+            assert_eq!(actual.1, expected.1);
+            for original in &failures {
+                let mut calls = 0;
+                let actual = map
+                    .search_membership_evaluated(&[key], &probe, &mut |_, _| {
+                        calls += 1;
+                        assert_eq!(calls, 1);
+                        Err(original.clone())
+                    })
+                    .unwrap_err();
+                assert_eq!(&actual, original);
+                assert_eq!(calls, 1);
+            }
+        }
+        let empty = int32_chunk(Vec::new());
+        for map in [&chained, &direct, &set] {
+            let mut calls = 0;
+            let actual = map
+                .search_membership_evaluated(&[key], &empty, &mut |_, _| {
+                    calls += 1;
+                    panic!("empty probe must not evaluate a key")
+                })
+                .unwrap();
+            assert!(actual.0.as_slice().is_empty());
+            assert_eq!(calls, 0);
+        }
     }
 }

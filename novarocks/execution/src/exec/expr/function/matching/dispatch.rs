@@ -39,22 +39,22 @@ pub fn metadata(name: &str) -> Option<FunctionMeta> {
     MATCHING_METADATA.iter().find(|m| m.name == name).copied()
 }
 
-pub fn eval_matching_function(
+pub fn eval_matching_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let canonical = MATCHING_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "ilike" => super::ilike::eval_ilike(arena, expr, args, chunk),
-        "regexp" => super::regexp::eval_regexp(arena, expr, args, chunk),
-        other => Err(format!("unsupported matching function: {}", other)),
+        "ilike" => Ok((super::ilike::eval_ilike(arena, expr, args, chunk))?),
+        "regexp" => Ok((super::regexp::eval_regexp(arena, expr, args, chunk))?),
+        other => Err((format!("unsupported matching function: {}", other)).into()),
     }
 }
 

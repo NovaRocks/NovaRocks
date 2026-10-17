@@ -69,37 +69,43 @@ fn hash_multiset_key_for_hll(key_type: &DataType, key_bytes: &[u8]) -> Result<u6
     }
 }
 
-pub fn eval_approx_count_distinct_state_union(
-    arena: &ExprArena,
+pub fn eval_approx_count_distinct_state_union<
+    __Eval: crate::exec::expr::ExprEvaluation + ?Sized,
+>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!(
+        return Err((format!(
             "approx_count_distinct_state_union expects 2 arguments, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    eval_approx_count_distinct_state_union_arrays(&lhs, &rhs)
+    Ok((eval_approx_count_distinct_state_union_arrays(&lhs, &rhs))?)
 }
 
-pub fn eval_approx_count_distinct_state_visible(
-    arena: &ExprArena,
+pub fn eval_approx_count_distinct_state_visible<
+    __Eval: crate::exec::expr::ExprEvaluation + ?Sized,
+>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!(
+        return Err((format!(
             "approx_count_distinct_state_visible expects 1 argument, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
     let input = arena.eval(args[0], chunk)?;
-    eval_approx_count_distinct_state_visible_array(&input)
+    Ok((eval_approx_count_distinct_state_visible_array(&input))?)
 }
 
 fn eval_approx_count_distinct_state_union_arrays(

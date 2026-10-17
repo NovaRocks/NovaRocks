@@ -19,7 +19,7 @@
 use super::boolean_region::BooleanRows;
 use super::input_source::CompiledInputLoan;
 use super::*;
-use crate::runtime::fragment::{ExecutionResult, RequiredExpressionRowError};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use novarocks_local_program::{ProgramNodeExpressionRole, ProgramNodeKind};
 use novarocks_type_contract::EvaluationDemand;
 
@@ -208,6 +208,7 @@ impl CompiledFilterConjunctionInstance {
                     let output = root.evaluate_input_controlled::<E>(
                         input,
                         selection,
+                        selection,
                         novarocks_functions::ScalarInvocationActivation::ValidateOnly,
                         work.control,
                         work.scalar_scope.as_mut().map(|scope| &mut **scope as &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope),
@@ -232,6 +233,7 @@ impl CompiledFilterConjunctionInstance {
                 Selection::try_sparse_observed(input.num_rows(), &batch_rows, || work.step())?;
             let output = root.evaluate_input_controlled::<E>(
                 input,
+                selection,
                 actual_selection,
                 novarocks_functions::ScalarInvocationActivation::Activated,
                 work.control,
@@ -288,7 +290,7 @@ impl CompiledFilterConjunctionInstance {
         selection: Selection<'_>,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<ArrayRef> {
-        self.evaluate_required_controlled::<novarocks_functions::ScalarInvocationFailure>(
+        self.evaluate_required_controlled::<ExecutionFailure>(
             CompiledInputLoan::RecordBatch(input),
             selection,
             control,
@@ -318,7 +320,12 @@ impl CompiledFilterConjunctionInstance {
         control: &dyn KernelEvaluationControl,
         scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
     ) -> ExecutionResult<ArrayRef> {
-        self.evaluate_required_controlled::<crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure>(input,selection,control,Some(scope))
+        self.evaluate_required_controlled::<ExecutionFailure>(
+            input,
+            selection,
+            control,
+            Some(scope),
+        )
     }
     fn evaluate_required_controlled<
         E: scalar_invocation::FrameFailure + Into<crate::runtime::fragment::ExecutionFailure>,

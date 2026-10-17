@@ -46,53 +46,44 @@ pub fn state_all_zero(s: &[u8]) -> Result<bool, String> {
     count_state_visible(s).map(|count| count == 0)
 }
 
-pub fn eval_count_state_union(
-    arena: &ExprArena,
+pub fn eval_count_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!(
-            "count_state_union expects 2 arguments, got {}",
-            args.len()
-        ));
+        return Err((format!("count_state_union expects 2 arguments, got {}", args.len())).into());
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    eval_count_state_union_arrays(&lhs, &rhs)
+    Ok((eval_count_state_union_arrays(&lhs, &rhs))?)
 }
 
-pub fn eval_count_state_visible(
-    arena: &ExprArena,
+pub fn eval_count_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!(
-            "count_state_visible expects 1 argument, got {}",
-            args.len()
-        ));
+        return Err((format!("count_state_visible expects 1 argument, got {}", args.len())).into());
     }
     let input = arena.eval(args[0], chunk)?;
-    eval_count_state_visible_array(&input)
+    Ok((eval_count_state_visible_array(&input))?)
 }
 
-pub fn eval_state_all_zero(
-    arena: &ExprArena,
+pub fn eval_state_all_zero<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!(
-            "state_all_zero expects 1 argument, got {}",
-            args.len()
-        ));
+        return Err((format!("state_all_zero expects 1 argument, got {}", args.len())).into());
     }
     let input = arena.eval(args[0], chunk)?;
-    eval_state_all_zero_array(&input)
+    Ok((eval_state_all_zero_array(&input))?)
 }
 
 pub fn eval_count_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {

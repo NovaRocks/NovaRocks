@@ -156,11 +156,17 @@ impl OperatorFactory for BroadcastJoinProbeProcessorFactory {
             buffered_rows: 0,
             profile_initialized: false,
             profiles: None,
+            evaluation_arena: Arc::clone(&self.arena),
+            construction: None,
+            evaluation_control: None,
         })
     }
 }
 
 struct BroadcastJoinProbeProcessorOperator {
+    evaluation_arena: Arc<ExprArena>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    evaluation_control: Option<super::super::compiled_expression::RuntimeKernelControl>,
     name: String,
     state: Arc<BroadcastJoinSharedState>,
     driver_id: i32,
@@ -179,6 +185,20 @@ struct BroadcastJoinProbeProcessorOperator {
 }
 
 impl Operator for BroadcastJoinProbeProcessorOperator {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.evaluation_control =
+            Some(super::super::compiled_expression::RuntimeKernelControl::new(state.error_state()));
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -309,16 +329,63 @@ impl BroadcastJoinProbeProcessorOperator {
         }
     }
 
-    fn process_one(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    fn join_probe_chunks_created(&mut self, chunks: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
+        let arena = &self.evaluation_arena;
+        let factory = &self.construction;
+        let control = &self.evaluation_control;
+        self.core.join_probe_chunks_evaluated(
+            chunks,
+            factory
+                .as_deref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+            &mut |expr, input| {
+                let owner = factory
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+                    .begin_input_construction(input)?;
+                let control = control
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), control)
+                    .eval(expr, input)
+            },
+        )
+    }
+
+    fn finish_core_created(&mut self, chunks: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
+        let arena = &self.evaluation_arena;
+        let factory = &self.construction;
+        let control = &self.evaluation_control;
+        self.core.finish_evaluated(
+            chunks,
+            None,
+            factory
+                .as_deref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+            &mut |expr, input| {
+                let owner = factory
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+                    .begin_input_construction(input)?;
+                let control = control
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), control)
+                    .eval(expr, input)
+            },
+        )
+    }
+
+    fn process_one(&mut self, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
         if !chunk.is_empty() {
             self.input_rows = self.input_rows.saturating_add(chunk.len());
             self.input_chunks = self.input_chunks.saturating_add(1);
         }
         let probe_chunks = self.collect_probe_chunks(Some(chunk));
-        self.core.join_probe_chunks(probe_chunks)
+        self.join_probe_chunks_created(probe_chunks)
     }
 
-    fn finish_one(&mut self) -> Result<Option<Chunk>, String> {
+    fn finish_one(&mut self) -> ExecutionResult<Option<Chunk>> {
         if !self.core.is_build_loaded() {
             self.load_build_side()?;
         }
@@ -329,13 +396,17 @@ impl BroadcastJoinProbeProcessorOperator {
                 || (self.core.probe_is_left()
                     && matches!(join_type, JoinType::RightAnti | JoinType::RightSemi));
         let out = if emits_build_side_output {
-            let probe_out = self.core.join_probe_chunks(probe_chunks)?;
+            let probe_out = self.join_probe_chunks_created(probe_chunks)?;
             let local_flags = self.core.take_build_matched().unwrap_or_default();
             match self.state.merge_build_matched(local_flags)? {
-                Some(merged) => {
-                    self.core
-                        .finish_from_probe_output(probe_out, Some(merged), false)?
-                }
+                Some(merged) => self.core.finish_from_probe_output_evaluated(
+                    probe_out,
+                    Some(merged),
+                    false,
+                    self.construction.as_deref().ok_or(
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                    )?,
+                )?,
                 None if self.core.probe_is_left()
                     && matches!(join_type, JoinType::RightAnti | JoinType::RightSemi) =>
                 {
@@ -344,7 +415,7 @@ impl BroadcastJoinProbeProcessorOperator {
                 None => probe_out,
             }
         } else {
-            self.core.finish(probe_chunks, None)?
+            self.finish_core_created(probe_chunks)?
         };
 
         self.log_stats();
@@ -398,6 +469,20 @@ impl BroadcastJoinProbeProcessorOperator {
 
 #[cfg(test)]
 mod tests {
+    fn install_evaluation_runtime(
+        operator: &mut dyn crate::exec::pipeline::operator::Operator,
+        runtime: &RuntimeState,
+    ) {
+        operator.set_construction_factory(
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root("hash probe evaluation construction"),
+                runtime.error_state(),
+            ).unwrap(),
+        );
+        operator.bind_runtime_state(runtime).unwrap();
+    }
+
     use std::sync::Arc;
 
     use arrow::array::Int32Array;
@@ -422,15 +507,14 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[slot_id],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        }
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[slot_id],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
     }
 
     fn chunk_of_two(
@@ -448,20 +532,41 @@ mod tests {
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[k_slot_id, v_slot_id],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        }
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[k_slot_id, v_slot_id],
+            &[
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+            ],
+        )
     }
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
-        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
-            .expect("chunk schema")
+        let types = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                assert_eq!(
+                    field.data_type(),
+                    &DataType::Int32,
+                    "fixed original join fixture declaration"
+                );
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::Int32,
+                    field.is_nullable(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let layout = crate::exec::chunk::typed_fixture::layout(schema.clone(), slot_ids, &types);
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("join fixture schema construction"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap()
+        .create_compiled_chunk_schema(&layout)
+        .expect("actual declared join fixture schema")
     }
 
     fn append_pairs(chunk: Chunk, pairs: &mut Vec<(i32, i32)>) {
@@ -557,6 +662,7 @@ mod tests {
         let probe_right = chunk_of(SlotId::new(1), &[4]);
 
         let mut probe_op_left = probe_factory.create(2, 0);
+        install_evaluation_runtime(probe_op_left.as_mut(), &rt);
         let Some(proc_left) = probe_op_left.as_processor_mut() else {
             panic!("probe operator missing processor");
         };
@@ -566,6 +672,7 @@ mod tests {
             .expect("build dependency");
 
         let mut build_op = build_factory.create(1, 0);
+        install_evaluation_runtime(build_op.as_mut(), &rt);
         let Some(sink) = build_op.as_processor_mut() else {
             panic!("build operator missing processor");
         };
@@ -589,6 +696,7 @@ mod tests {
         }
 
         let mut probe_op_right = probe_factory.create(2, 1);
+        install_evaluation_runtime(probe_op_right.as_mut(), &rt);
         let Some(proc_right) = probe_op_right.as_processor_mut() else {
             panic!("probe operator missing processor");
         };
@@ -672,6 +780,7 @@ mod tests {
         );
 
         let mut probe_op = probe_factory.create(1, 0);
+        install_evaluation_runtime(probe_op.as_mut(), &rt);
         let Some(proc) = probe_op.as_processor_mut() else {
             panic!("probe operator missing processor");
         };
@@ -679,6 +788,7 @@ mod tests {
         let dep = proc.precondition_dependency().expect("build dependency");
 
         let mut build_op = build_factory.create(1, 0);
+        install_evaluation_runtime(build_op.as_mut(), &rt);
         let Some(sink) = build_op.as_processor_mut() else {
             panic!("build operator missing processor");
         };
@@ -777,6 +887,7 @@ mod tests {
         );
 
         let mut probe_op = probe_factory.create(1, 0);
+        install_evaluation_runtime(probe_op.as_mut(), &rt);
         let Some(proc) = probe_op.as_processor_mut() else {
             panic!("probe operator missing processor");
         };
@@ -784,6 +895,7 @@ mod tests {
         let dep = proc.precondition_dependency().expect("build dependency");
 
         let mut build_op = build_factory.create(1, 0);
+        install_evaluation_runtime(build_op.as_mut(), &rt);
         let Some(sink) = build_op.as_processor_mut() else {
             panic!("build operator missing processor");
         };

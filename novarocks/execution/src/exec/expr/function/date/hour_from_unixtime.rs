@@ -25,12 +25,12 @@ fn project_local(seconds: i64) -> Option<NaiveDateTime> {
         .single()
         .map(|dt| dt.naive_local())
 }
-pub fn eval_hour_from_unixtime(
-    arena: &ExprArena,
+pub fn eval_hour_from_unixtime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let values = extract_i64_array(&arr, "hour_from_unixtime")?;
     Ok(

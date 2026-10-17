@@ -22,7 +22,7 @@
 -- 3. Verify FE rejects column expressions (not plain column refs) as default.
 -- 4. Verify FE rejects type-mismatched column default (INT col, VARCHAR default).
 -- 5. Validate VARCHAR column type with column defaults.
--- 6. Verify ARRAY column defaults are rejected by the current analyzer contract.
+-- 6. Validate same-type ARRAY column defaults and preserve NULL target values.
 -- @order_sensitive=true
 
 -- query 1
@@ -132,14 +132,12 @@ SELECT col_1, col_2, LAG(col_2, 2, col_3) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_varchar_default;
 
 -- query 8
--- ARRAY<INT>: column default is rejected by the current analyzer contract.
--- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
+-- ARRAY<INT>: same-type column default applies only to missing target rows.
 SELECT col_1, arr1, LAG(arr1, 2, arr2) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_array_int ORDER BY col_1;
 
 -- query 9
--- ARRAY<INT>: column default is rejected by the current analyzer contract.
--- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
+-- ARRAY<INT>: same-type column default applies only to missing target rows.
 SELECT col_1, arr1, LEAD(arr1, 2, arr2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_array_int ORDER BY col_1;
 
@@ -154,13 +152,11 @@ SELECT col_1, v1, LEAD(v1, 2, v2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_varchar ORDER BY col_1;
 
 -- query 12
--- ARRAY<VARCHAR>: column default is rejected by the current analyzer contract.
--- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
+-- ARRAY<VARCHAR>: same-type column default applies only to missing target rows.
 SELECT col_1, arr1, LAG(arr1, 2, arr2) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_array_varchar ORDER BY col_1;
 
 -- query 13
--- ARRAY<VARCHAR>: column default is rejected by the current analyzer contract.
--- @expect_error=The type of the third parameter of LEAD/LAG not match the type UNKNOWN.
+-- ARRAY<VARCHAR>: same-type column default applies only to missing target rows.
 SELECT col_1, arr1, LEAD(arr1, 2, arr2) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_array_varchar ORDER BY col_1;

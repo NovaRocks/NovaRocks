@@ -29,12 +29,12 @@ fn legacy_error(error: AppendFailure<Infallible>) -> String {
         AppendFailure::Control(never) => match never {},
     }
 }
-pub fn eval_array_append(
-    arena: &ExprArena,
+pub fn eval_array_append<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let target = arena.eval(args[1], chunk)?;
     let output = match arena.data_type(expr) {
@@ -44,12 +44,12 @@ pub fn eval_array_append(
     let mut observer = |_| Ok::<(), Infallible>(());
     let inputs =
         ArrayAppendInputs::new(arr, target, output, &mut observer).map_err(legacy_error)?;
-    append_observed(
+    Ok((append_observed(
         &inputs,
         novarocks_functions::Selection::all(chunk.len()),
         |_, row| Ok::<_, Infallible>(inputs.legacy_rows(row)),
         |_, _, _, _| Ok::<(), Infallible>(()),
         &mut observer,
     )
-    .map_err(legacy_error)
+    .map_err(legacy_error))?)
 }

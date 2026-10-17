@@ -20,8 +20,8 @@ use arrow::array::{Array, ArrayRef, Int64Array, ListArray};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-fn try_eval_cast_literal_json_array_length(
-    arena: &ExprArena,
+fn try_eval_cast_literal_json_array_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     out_expr: ExprId,
     arg_expr: ExprId,
     num_rows: usize,
@@ -65,21 +65,21 @@ fn try_eval_cast_literal_json_array_length(
     ))
 }
 
-pub fn eval_array_length(
-    arena: &ExprArena,
+pub fn eval_array_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if let Some(result) = try_eval_cast_literal_json_array_length(arena, expr, args[0], chunk.len())
     {
-        return result;
+        return Ok((result)?);
     }
 
     let arr = arena.eval(args[0], chunk)?;
     if arr.data_type() == &arrow::datatypes::DataType::Null {
         let out = Arc::new(Int64Array::from(vec![None; chunk.len()])) as ArrayRef;
-        return super::common::cast_output(out, arena.data_type(expr), "array_length");
+        return Ok((super::common::cast_output(out, arena.data_type(expr), "array_length"))?);
     }
     let list = arr
         .as_any()
@@ -97,5 +97,5 @@ pub fn eval_array_length(
     }
 
     let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    super::common::cast_output(out, arena.data_type(expr), "array_length")
+    Ok((super::common::cast_output(out, arena.data_type(expr), "array_length"))?)
 }

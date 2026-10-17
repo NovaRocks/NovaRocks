@@ -367,12 +367,12 @@ fn encode_array(arr: &ArrayRef, digests: &mut [Sha256]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn eval_encode_fingerprint_sha256(
-    arena: &ExprArena,
+pub fn eval_encode_fingerprint_sha256<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let mut digests: Vec<Sha256> = (0..chunk.len()).map(|_| Sha256::new()).collect();
     for arg in args {
         let arr = arena.eval(*arg, chunk)?;
@@ -385,5 +385,5 @@ pub fn eval_encode_fingerprint_sha256(
     }
 
     let out = Arc::new(builder.finish()) as ArrayRef;
-    super::common::cast_output(out, arena.data_type(expr), "encode_fingerprint_sha256")
+    Ok((super::common::cast_output(out, arena.data_type(expr), "encode_fingerprint_sha256"))?)
 }

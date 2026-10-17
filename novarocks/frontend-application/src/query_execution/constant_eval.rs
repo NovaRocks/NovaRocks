@@ -107,6 +107,9 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
                 return Ok(None);
             };
             let root = arena.push_typed(root_node, request.result_type.data_type().clone());
+            if let Some(source) = request.regexp_count_pattern_source {
+                arena.set_regexp_count_pattern_source(root, source)?;
+            }
             work.flush()?;
             let chunk = single_row_chunk()?;
             work.flush()?;

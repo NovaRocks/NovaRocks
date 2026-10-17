@@ -22,12 +22,12 @@ use arrow::datatypes::DataType;
 use arrow_buffer::OffsetBuffer;
 use std::sync::Arc;
 
-pub fn eval_array_cum_sum(
-    arena: &ExprArena,
+pub fn eval_array_cum_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let list = arr
         .as_any()
@@ -39,10 +39,9 @@ pub fn eval_array_cum_sum(
         _ => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_cum_sum output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_cum_sum output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -111,10 +110,9 @@ pub fn eval_array_cum_sum(
             Arc::new(Float64Array::from(out))
         }
         other => {
-            return Err(format!(
-                "array_cum_sum unsupported output element type: {:?}",
-                other
-            ));
+            return Err(
+                (format!("array_cum_sum unsupported output element type: {:?}", other)).into(),
+            );
         }
     };
 

@@ -84,6 +84,13 @@ pub enum TypeSpec {
     List(Box<TypeSpec>),
     /// `Map<key, value>`.
     Map(Box<TypeSpec>, Box<TypeSpec>),
+    /// Match an existing Map<Null(non-null), V> with its complete value type.
+    /// Bind its original complete Map and value independently of a probe.
+    /// This adds no execution type and never authors a guessed key type.
+    MapWithUninhabitedKey {
+        map: &'static str,
+        value: &'static str,
+    },
     /// Type variable, e.g. `Any("T")`. Binds to the corresponding concrete
     /// argument type during polymorphic resolution.
     Any(&'static str),
@@ -220,6 +227,13 @@ impl TypeSpec {
                 value.write_canonical(output);
                 output.push('>');
             }
+            Self::MapWithUninhabitedKey { map, value } => {
+                output.push_str("map-with-uninhabited-key<");
+                output.push_str(map);
+                output.push(',');
+                output.push_str(value);
+                output.push('>');
+            }
             Self::AnyType => output.push_str("any"),
             Self::LargeInt => output.push_str("largeint"),
             Self::Decimal128Of(name) => {
@@ -331,7 +345,7 @@ fn bind_nothing_with_construction<E>(
 /// Whether this spec names a concrete type rather than standing for one.
 fn names_a_type(spec: &TypeSpec) -> bool {
     match spec {
-        TypeSpec::Any(_) => false,
+        TypeSpec::Any(_) | TypeSpec::MapWithUninhabitedKey { .. } => false,
         // A wildcard stands for no type in particular, so a NULL literal at
         // this position decides nothing either.
         TypeSpec::AnyType => false,
@@ -368,6 +382,9 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Decimal128Of(name) => bindings
             .lookup(name)
             .ok_or_else(|| format!("decimal type variable {name} is unbound in the return type"))?,
+        TypeSpec::MapWithUninhabitedKey { map, .. } => bindings
+            .lookup(map)
+            .ok_or_else(|| format!("uninhabited-key Map variable {map} is unbound"))?,
         TypeSpec::AnyType => {
             return Err(
                 "AnyType cannot appear as a return type — it stands for no type at all".to_string(),
@@ -810,6 +827,21 @@ pub(super) fn unify_with_construction<E>(
         // decides nothing, so any variable inside the spec is left open for a
         // later position to decide -- `arrays_overlap(a, NULL)` takes its
         // element type from `a`.
+        TypeSpec::MapWithUninhabitedKey { map, value } => {
+            super::map_lookup_core::has_uninhabited_map_key_carrier(dt)
+                && bindings.bind_with_construction(map, dt, creation)?
+                && match dt {
+                    DataType::Map(entries, _) => match entries.data_type() {
+                        DataType::Struct(fields) => bindings.bind_with_construction(
+                            value,
+                            fields[1].data_type(),
+                            creation,
+                        )?,
+                        _ => false,
+                    },
+                    _ => false,
+                }
+        }
         TypeSpec::List(inner_spec) if matches!(dt, DataType::Null) => {
             bind_nothing_with_construction(inner_spec, bindings, creation)?;
             true
@@ -1142,6 +1174,29 @@ pub(super) fn unify_value_with_construction<E>(
     Ok(match spec {
         TypeSpec::Any(name) => bindings.bind_value_with_construction(name, ty, mode, creation)?,
         TypeSpec::AnyType => true,
+        TypeSpec::MapWithUninhabitedKey { map, value } => {
+            if !super::map_lookup_core::has_uninhabited_map_key(ty) {
+                false
+            } else {
+                let actual_value = creation.child(ty, 1)?;
+                match actual_value {
+                    Some(actual_value) => {
+                        bindings.bind_value_with_construction(
+                            map,
+                            ty,
+                            BindMode::Strict,
+                            creation,
+                        )? && bindings.bind_value_with_construction(
+                            value,
+                            &actual_value,
+                            BindMode::Strict,
+                            creation,
+                        )?
+                    }
+                    None => false,
+                }
+            }
+        }
         TypeSpec::Decimal128Of(name) => {
             ty.logical_type() == ValueLogicalType::Physical
                 && matches!(ty.data_type(), DataType::Decimal128(..))

@@ -145,12 +145,12 @@ fn avg_decimal_rows(
     Ok(out)
 }
 
-pub fn eval_array_avg(
-    arena: &ExprArena,
+pub fn eval_array_avg<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let list = arr
         .as_any()
@@ -258,8 +258,8 @@ pub fn eval_array_avg(
                 |a, idx| a.value(idx),
             ))) as ArrayRef
         }
-        other => return Err(format!("array_avg unsupported element type: {:?}", other)),
+        other => return Err((format!("array_avg unsupported element type: {:?}", other)).into()),
     };
 
-    super::common::cast_output(out, arena.data_type(expr), "array_avg")
+    Ok((super::common::cast_output(out, arena.data_type(expr), "array_avg"))?)
 }

@@ -124,11 +124,11 @@ fn format_joda_datetime(dt: NaiveDateTime, tokens: &[JodaFormatToken]) -> String
 }
 
 #[inline]
-fn eval_date_format_inner(
-    arena: &ExprArena,
+fn eval_date_format_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = arena.eval(args[0], chunk)?;
     let format = arena.eval(args[1], chunk)?;
     format
@@ -136,38 +136,40 @@ fn eval_date_format_inner(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "date_format expects string format".to_string())?;
     let rows = date.len();
-    novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
-        novarocks_functions::builtin::calendar_extended_shared::CalendarOperation::DateFormat,
-        &[date, format],
-        &arrow::datatypes::DataType::Utf8,
-        rows,
+    Ok(
+        (novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
+            novarocks_functions::builtin::calendar_extended_shared::CalendarOperation::DateFormat,
+            &[date, format],
+            &arrow::datatypes::DataType::Utf8,
+            rows,
+        ))?,
     )
 }
 
-pub fn eval_date_format(
-    arena: &ExprArena,
+pub fn eval_date_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_date_format_inner(arena, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_date_format_inner(arena, args, chunk))?)
 }
 
-pub fn eval_strftime(
-    arena: &ExprArena,
+pub fn eval_strftime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_date_format_inner(arena, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_date_format_inner(arena, args, chunk))?)
 }
 
-pub fn eval_jodatime_format(
-    arena: &ExprArena,
+pub fn eval_jodatime_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date_arr = arena.eval(args[0], chunk)?;
     let fmt_arr = arena.eval(args[1], chunk)?;
     let fmt_arr = fmt_arr

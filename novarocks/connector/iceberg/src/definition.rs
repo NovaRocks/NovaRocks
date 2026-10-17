@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn iceberg_contract_uses_one_descriptor_and_revision() {
-        assert_eq!(crate::contract_revision::ICEBERG_CONTRACT_REVISION, 7);
+        assert_eq!(crate::contract_revision::ICEBERG_CONTRACT_REVISION, 8);
         let contract = iceberg_contract_definition().expect("static Iceberg contract");
         assert_eq!(contract.provider_id().as_str(), PROVIDER_ID);
         assert!(contract.write().is_some());

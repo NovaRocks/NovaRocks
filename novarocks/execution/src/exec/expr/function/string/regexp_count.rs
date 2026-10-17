@@ -19,26 +19,35 @@ use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::regexp_count::{self, PatternSource};
 
-pub fn eval_regexp_count(
-    arena: &ExprArena,
+pub fn eval_regexp_count<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    let _ = expr;
+) -> Result<ArrayRef, __Eval::Error> {
     let len = chunk.len();
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
     // Preserve both original type admissions before observing the source node.
     regexp_count::string_or_null(&str_arr)?;
     regexp_count::string_or_null(&pat_arr)?;
-    let source = if matches!(
-        arena.node(args[1]),
-        Some(ExprNode::Literal(LiteralValue::Utf8(_)))
-    ) {
+    let literal_policy = if let Some(source) = arena.arena().regexp_count_pattern_source(expr) {
+        arena
+            .arena()
+            .validate_regexp_count_pattern_source(expr, source)?;
+        source.invalid_pattern_is_error()
+    } else {
+        // Raw reference construction preserves its historical Literal vs pool
+        // distinction. Only real emitted-source authors install a receipt.
+        matches!(
+            arena.node(args[1]),
+            Some(ExprNode::Literal(LiteralValue::Utf8(_)))
+        )
+    };
+    let source = if literal_policy {
         PatternSource::Utf8Literal
     } else {
         PatternSource::Other
     };
-    regexp_count::evaluate_legacy(&[str_arr, pat_arr], len, source)
+    Ok((regexp_count::evaluate_legacy(&[str_arr, pat_arr], len, source))?)
 }

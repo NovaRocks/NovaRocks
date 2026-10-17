@@ -51,7 +51,11 @@ fn cast_largeint_output(
         .map_err(|error| error.legacy_message(fn_name))
 }
 
-fn use_largeint_path(arena: &ExprArena, expr: ExprId, args: &[ExprId]) -> bool {
+fn use_largeint_path<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr: ExprId,
+    args: &[ExprId],
+) -> bool {
     if arena
         .data_type(expr)
         .map(largeint::is_largeint_data_type)
@@ -67,14 +71,14 @@ fn use_largeint_path(arena: &ExprArena, expr: ExprId, args: &[ExprId]) -> bool {
     })
 }
 
-fn eval_unary_i64<F>(
+fn eval_unary_i64<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, String>
+) -> Result<ArrayRef, __Eval::Error>
 where
     F: Fn(i64) -> i64,
 {
@@ -87,20 +91,22 @@ where
         func,
         &mut |_| Ok(()),
     )?;
-    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
-        Ok::<(), String>(())
-    })?
-    .map_err(|error| error.legacy_message(fn_name))
+    Ok((novarocks_functions::bit_array::finish_i64_observed(
+        out,
+        arena.data_type(expr),
+        &mut |_| Ok::<(), String>(()),
+    )?
+    .map_err(|error| error.legacy_message(fn_name)))?)
 }
 
-fn eval_unary_i128<F>(
+fn eval_unary_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, String>
+) -> Result<ArrayRef, __Eval::Error>
 where
     F: Fn(i128) -> i128,
 {
@@ -112,17 +118,17 @@ where
         func,
         &mut |_| Ok(()),
     )?;
-    cast_largeint_output(&out, arena.data_type(expr), fn_name)
+    Ok((cast_largeint_output(&out, arena.data_type(expr), fn_name))?)
 }
 
-fn eval_binary_i64<F>(
+fn eval_binary_i64<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, String>
+) -> Result<ArrayRef, __Eval::Error>
 where
     F: Fn(i64, i64) -> i64,
 {
@@ -143,20 +149,22 @@ where
         |(left, right)| func(left, right),
         &mut |_| Ok(()),
     )?;
-    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
-        Ok::<(), String>(())
-    })?
-    .map_err(|error| error.legacy_message(fn_name))
+    Ok((novarocks_functions::bit_array::finish_i64_observed(
+        out,
+        arena.data_type(expr),
+        &mut |_| Ok::<(), String>(()),
+    )?
+    .map_err(|error| error.legacy_message(fn_name)))?)
 }
 
-fn eval_binary_i128<F>(
+fn eval_binary_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, String>
+) -> Result<ArrayRef, __Eval::Error>
 where
     F: Fn(i128, i128) -> i128,
 {
@@ -176,17 +184,17 @@ where
         |(left, right)| func(left, right),
         &mut |_| Ok(()),
     )?;
-    cast_largeint_output(&out, arena.data_type(expr), fn_name)
+    Ok((cast_largeint_output(&out, arena.data_type(expr), fn_name))?)
 }
 
-fn eval_shift_i64<F>(
+fn eval_shift_i64<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, String>
+) -> Result<ArrayRef, __Eval::Error>
 where
     F: Fn(i64, u32) -> i64,
 {
@@ -208,21 +216,23 @@ where
         &mut |_| Ok::<_, std::convert::Infallible>(()),
     )
     .unwrap_or_else(|never| match never {});
-    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
-        Ok::<_, std::convert::Infallible>(())
-    })
+    Ok((novarocks_functions::bit_array::finish_i64_observed(
+        out,
+        arena.data_type(expr),
+        &mut |_| Ok::<_, std::convert::Infallible>(()),
+    )
     .unwrap_or_else(|never| match never {})
-    .map_err(|error| error.legacy_message(fn_name))
+    .map_err(|error| error.legacy_message(fn_name)))?)
 }
 
-fn eval_shift_i128<F>(
+fn eval_shift_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, String>
+) -> Result<ArrayRef, __Eval::Error>
 where
     F: Fn(i128, u32) -> i128,
 {
@@ -243,129 +253,147 @@ where
         &mut |_| Ok::<_, std::convert::Infallible>(()),
     )
     .unwrap_or_else(|never| match never {});
-    cast_largeint_output(&out, arena.data_type(expr), fn_name)
+    Ok((cast_largeint_output(&out, arena.data_type(expr), fn_name))?)
 }
 
-pub fn eval_bit_shift_left(
-    arena: &ExprArena,
+pub fn eval_bit_shift_left<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if use_largeint_path(arena, expr, args) {
-        return eval_shift_i128("bit_shift_left", arena, expr, args, chunk, |a, b| {
-            ShiftOp::Left.apply_i128(a, i64::from(b))
-        });
+        return Ok(
+            (eval_shift_i128("bit_shift_left", arena, expr, args, chunk, |a, b| {
+                ShiftOp::Left.apply_i128(a, i64::from(b))
+            }))?,
+        );
     }
-    eval_shift_i64("bit_shift_left", arena, expr, args, chunk, |a, b| {
-        ShiftOp::Left.apply_i64(a, i64::from(b))
-    })
+    Ok(
+        (eval_shift_i64("bit_shift_left", arena, expr, args, chunk, |a, b| {
+            ShiftOp::Left.apply_i64(a, i64::from(b))
+        }))?,
+    )
 }
 
-pub fn eval_bit_shift_right(
-    arena: &ExprArena,
+pub fn eval_bit_shift_right<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if use_largeint_path(arena, expr, args) {
-        return eval_shift_i128("bit_shift_right", arena, expr, args, chunk, |a, b| {
-            ShiftOp::Right.apply_i128(a, i64::from(b))
-        });
+        return Ok(
+            (eval_shift_i128("bit_shift_right", arena, expr, args, chunk, |a, b| {
+                ShiftOp::Right.apply_i128(a, i64::from(b))
+            }))?,
+        );
     }
-    eval_shift_i64("bit_shift_right", arena, expr, args, chunk, |a, b| {
-        ShiftOp::Right.apply_i64(a, i64::from(b))
-    })
+    Ok(
+        (eval_shift_i64("bit_shift_right", arena, expr, args, chunk, |a, b| {
+            ShiftOp::Right.apply_i64(a, i64::from(b))
+        }))?,
+    )
 }
 
-pub fn eval_bit_shift_right_logical(
-    arena: &ExprArena,
+pub fn eval_bit_shift_right_logical<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if use_largeint_path(arena, expr, args) {
-        return eval_shift_i128(
+        return Ok((eval_shift_i128(
             "bit_shift_right_logical",
             arena,
             expr,
             args,
             chunk,
             |a, b| ShiftOp::RightLogical.apply_i128(a, i64::from(b)),
-        );
+        ))?);
     }
-    eval_shift_i64(
+    Ok((eval_shift_i64(
         "bit_shift_right_logical",
         arena,
         expr,
         args,
         chunk,
         |a, b| ShiftOp::RightLogical.apply_i64(a, i64::from(b)),
+    ))?)
+}
+
+pub fn eval_bitand<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, __Eval::Error> {
+    if use_largeint_path(arena, expr, args) {
+        return Ok(
+            (eval_binary_i128("bitand", arena, expr, args, chunk, |a, b| {
+                BitwiseOp::And.apply_i128(a, b)
+            }))?,
+        );
+    }
+    Ok(
+        (eval_binary_i64("bitand", arena, expr, args, chunk, |a, b| {
+            BitwiseOp::And.apply_i64(a, b)
+        }))?,
     )
 }
 
-pub fn eval_bitand(
-    arena: &ExprArena,
+pub fn eval_bitnot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if use_largeint_path(arena, expr, args) {
-        return eval_binary_i128("bitand", arena, expr, args, chunk, |a, b| {
-            BitwiseOp::And.apply_i128(a, b)
-        });
-    }
-    eval_binary_i64("bitand", arena, expr, args, chunk, |a, b| {
-        BitwiseOp::And.apply_i64(a, b)
-    })
-}
-
-pub fn eval_bitnot(
-    arena: &ExprArena,
-    expr: ExprId,
-    args: &[ExprId],
-    chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    if use_largeint_path(arena, expr, args) {
-        return eval_unary_i128("bitnot", arena, expr, args, chunk, |a| {
+        return Ok((eval_unary_i128("bitnot", arena, expr, args, chunk, |a| {
             BitwiseOp::Not.apply_i128(a, 0)
-        });
+        }))?);
     }
-    eval_unary_i64("bitnot", arena, expr, args, chunk, |a| {
+    Ok((eval_unary_i64("bitnot", arena, expr, args, chunk, |a| {
         BitwiseOp::Not.apply_i64(a, 0)
-    })
+    }))?)
 }
 
-pub fn eval_bitor(
-    arena: &ExprArena,
+pub fn eval_bitor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if use_largeint_path(arena, expr, args) {
-        return eval_binary_i128("bitor", arena, expr, args, chunk, |a, b| {
-            BitwiseOp::Or.apply_i128(a, b)
-        });
+        return Ok(
+            (eval_binary_i128("bitor", arena, expr, args, chunk, |a, b| {
+                BitwiseOp::Or.apply_i128(a, b)
+            }))?,
+        );
     }
-    eval_binary_i64("bitor", arena, expr, args, chunk, |a, b| {
+    Ok((eval_binary_i64("bitor", arena, expr, args, chunk, |a, b| {
         BitwiseOp::Or.apply_i64(a, b)
-    })
+    }))?)
 }
 
-pub fn eval_bitxor(
-    arena: &ExprArena,
+pub fn eval_bitxor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if use_largeint_path(arena, expr, args) {
-        return eval_binary_i128("bitxor", arena, expr, args, chunk, |a, b| {
-            BitwiseOp::Xor.apply_i128(a, b)
-        });
+        return Ok(
+            (eval_binary_i128("bitxor", arena, expr, args, chunk, |a, b| {
+                BitwiseOp::Xor.apply_i128(a, b)
+            }))?,
+        );
     }
-    eval_binary_i64("bitxor", arena, expr, args, chunk, |a, b| {
-        BitwiseOp::Xor.apply_i64(a, b)
-    })
+    Ok(
+        (eval_binary_i64("bitxor", arena, expr, args, chunk, |a, b| {
+            BitwiseOp::Xor.apply_i64(a, b)
+        }))?,
+    )
 }
 
 #[cfg(test)]

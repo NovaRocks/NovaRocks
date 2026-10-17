@@ -212,6 +212,7 @@ impl IcebergCleanupMaintenanceAdapter {
         payload: &PlanPayload,
         context: &ConnectorRequestContext,
     ) -> Result<Arc<[ManifestRecord]>, ConnectorError> {
+        plan.manifest().validate_owner(&self.key)?;
         self.runtime
             .control_state()
             .invalidate_table(&payload.namespace, &payload.table);
@@ -1732,6 +1733,8 @@ mod tests {
         );
         let mut wrong_owner = plan.owner().clone();
         wrong_owner.instance_id = ConnectorInstanceId::parse("another-catalog").unwrap();
+        let mut previous_generation = plan.owner().clone();
+        previous_generation.incarnation = ProviderBindingEpoch::new();
         let bad_payloads = [
             ConnectorProcessLocalPayload::new(
                 plan.owner().clone(),
@@ -1746,8 +1749,9 @@ mod tests {
                     manifest_digest: [0; 32],
                 }),
             ),
+            ConnectorProcessLocalPayload::new(previous_generation, content.clone()),
         ];
-        for payload in bad_payloads {
+        for (case, payload) in bad_payloads.into_iter().enumerate() {
             let bad_plan = with_manifest(&plan, payload);
             for result in [
                 adapter
@@ -1778,7 +1782,21 @@ mod tests {
                     )
                     .map(|_| ()),
             ] {
-                assert_eq!(result.unwrap_err().kind(), ConnectorErrorKind::Internal);
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if case == 2 || case == 4 {
+                        ConnectorErrorKind::InvalidRequest
+                    } else {
+                        ConnectorErrorKind::Internal
+                    }
+                );
+                if case == 4 {
+                    assert_eq!(
+                        error.message(),
+                        "process-local payload belongs to another connector generation"
+                    );
+                }
             }
             assert!(root.join("data/orphan.parquet").exists());
             assert!(!root.join("_novarocks").exists());

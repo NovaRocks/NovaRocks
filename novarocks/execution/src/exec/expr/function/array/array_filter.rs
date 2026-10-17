@@ -23,12 +23,12 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_array_filter(
-    arena: &ExprArena,
+pub fn eval_array_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let src_arr = arena.eval(args[0], chunk)?;
     let filter_arr = arena.eval(args[1], chunk)?;
     if src_arr.data_type() == &DataType::Null || filter_arr.data_type() == &DataType::Null {
@@ -66,10 +66,9 @@ pub fn eval_array_filter(
         _ => match src.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_filter output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_filter output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -145,7 +144,7 @@ pub fn eval_array_filter(
         }
 
         if current > i32::MAX as i64 {
-            return Err("array_filter offset overflow".to_string());
+            return Err(("array_filter offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

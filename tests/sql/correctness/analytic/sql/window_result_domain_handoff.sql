@@ -24,15 +24,15 @@ INSERT INTO ${case_db}.window_result_domains VALUES (1),(2);
 
 -- query 3
 -- @order_sensitive=true
--- The legacy row API returns raw Variant bytes; the typed Host gate is still closed.
--- Observe the unchanged window values through the admitted Variant accessor.
+-- Construct nominal Variant with the selected accessor before exercising its
+-- identity CAST and window handoff. Observe values through the typed accessor.
 SELECT id,
        variant_get(first_variant, '$', 'bigint') AS first_variant,
        variant_get(next_variant, '$', 'bigint') AS next_variant
 FROM (
   SELECT id,
-         first_value(CAST(parse_json(CAST(id AS VARCHAR)) AS VARIANT)) OVER (ORDER BY id) AS first_variant,
-         lead(CAST(parse_json(CAST(id AS VARCHAR)) AS VARIANT), 1, CAST(NULL AS VARIANT)) OVER (ORDER BY id) AS next_variant
+         first_value(CAST(variant_get(parse_json(CAST(id AS VARCHAR)), '$') AS VARIANT)) OVER (ORDER BY id) AS first_variant,
+         lead(CAST(variant_get(parse_json(CAST(id AS VARCHAR)), '$') AS VARIANT), 1, CAST(NULL AS VARIANT)) OVER (ORDER BY id) AS next_variant
   FROM ${case_db}.window_result_domains
 ) window_values ORDER BY id;
 

@@ -313,15 +313,16 @@ pub(crate) fn source_loan_test_projector(
         &[novarocks_types::SlotId(100)],
         &[value_type],
     );
-    let control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("writer source-loan construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let mut control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+    control.bind_mem_tracker(tracker.clone());
     let mut slots = None;
     instances(&mut slots, &program, &[site], &control).unwrap();
     if let Some(observer) = observer {
         slots.as_mut().unwrap()[0].observe_slot_source(observer);
     }
-    let tracker =
-        crate::runtime::mem_tracker::MemTracker::new_root("writer source-loan construction");
-    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
         tracker,

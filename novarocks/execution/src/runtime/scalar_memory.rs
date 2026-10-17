@@ -124,6 +124,22 @@ pub trait RuntimeScalarOperationScope {
         allocator: Option<&Arc<dyn AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure>;
+    fn evaluate_scoped_invocation<'a>(
+        &mut self,
+        _instance: &mut InvocationScalarEvaluationInstance,
+        _scope: novarocks_functions::ScalarInvocationScope<'a>,
+        _sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
+        _activation: ScalarInvocationActivation,
+        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        _control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
+        Err(
+            KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+                "runtime scalar scope does not install explicit actual-domain invocation transport",
+            ))
+            .into(),
+        )
+    }
 }
 
 /// Fixed secondary disposition for every completed leaf, retained even when
@@ -270,6 +286,31 @@ impl<'a> RuntimeScalarMemoryScope<'a> {
     }
 }
 impl RuntimeScalarOperationScope for RuntimeScalarMemoryScope<'_> {
+    fn evaluate_scoped_invocation<'a>(
+        &mut self,
+        instance: &mut InvocationScalarEvaluationInstance,
+        scope: novarocks_functions::ScalarInvocationScope<'a>,
+        sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
+        activation: ScalarInvocationActivation,
+        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
+        self.journal.begin();
+        // The actual installed original-domain owners declare no retired
+        // measurement profile. They still use this real synchronous scope.
+        if !instance.is_failed() && instance.invocation_resource_profile().is_some() {
+            return Err(
+                KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+                    "scoped invocation has no installed measurement source transport",
+                ))
+                .into(),
+            );
+        }
+        instance
+            .evaluate_scoped(scope, sources, activation, control)
+            .map_err(Into::into)
+    }
+
     fn evaluate_invocation<'a>(
         &mut self,
         instance: &mut InvocationScalarEvaluationInstance,

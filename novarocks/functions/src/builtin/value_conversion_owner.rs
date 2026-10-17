@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One immutable owner binds, refines and prepares all six exact conversions.
+//! One immutable owner binds, refines and prepares all exact conversions.
 
 use std::sync::Arc;
 
 use novarocks_type_contract::{
-    CallEffects, CallProofScope, CompileCheckpoints, CompilePhase, FunctionEffectDeclaration,
-    PureCompileControl,
+    CallEffects, CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy,
+    FunctionEffectDeclaration, FunctionIntrinsicRowError, PureCompileControl,
 };
 
 use super::value_conversion::{self, ValueConversionResolver};
@@ -37,7 +37,7 @@ use crate::{
     SelectedValues,
 };
 
-fn implementation_pairs() -> [(&'static str, &'static str); 7] {
+fn implementation_pairs() -> [(&'static str, &'static str); 9] {
     [
         (
             value_conversion::JSON_TEXT,
@@ -56,12 +56,20 @@ fn implementation_pairs() -> [(&'static str, &'static str); 7] {
             "builtin.scalar/value_domain_conversion/largeint_to_signed_null_overflow/selected-v1",
         ),
         (
+            value_conversion::LARGEINT_DECIMAL,
+            "builtin.scalar/value_domain_conversion/largeint_to_decimal_exact/selected-v1",
+        ),
+        (
             value_conversion::LARGEINT_FLOAT,
             "builtin.scalar/value_domain_conversion/largeint_to_float_round/selected-v1",
         ),
         (
             value_conversion::LARGEINT_TEXT,
             "builtin.scalar/value_domain_conversion/largeint_to_utf8_text/selected-v1",
+        ),
+        (
+            value_conversion::UTF8_LARGEINT,
+            "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/selected-v1",
         ),
         (
             value_conversion::NULL_LIFT,
@@ -97,7 +105,6 @@ impl ValueConversionOwner {
         resolver: ValueConversionResolver,
     ) -> Result<Self, FunctionCatalogError> {
         let pairs = implementation_pairs();
-        let effects = value_conversion::effects();
         if declaration.function_id().as_str() != value_conversion::VALUE_CONVERSION_FUNCTION_ID
             || declaration.kind() != FunctionKind::Scalar
             || declaration.overloads().len() != pairs.len()
@@ -106,7 +113,10 @@ impl ValueConversionOwner {
                     .iter()
                     .any(|(id, _)| overload.identity.as_str() == *id)
                     || overload.aggregate.is_some()
-                    || overload.effects.as_ref() != Some(&effects)
+                    || overload.effects.as_ref()
+                        != Some(&value_conversion::overload_effects(
+                            overload.identity.as_str(),
+                        ))
             })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
@@ -139,8 +149,24 @@ impl ValueConversionOwner {
         })
     }
 
-    fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = value_conversion::effects();
+    fn call_effects(&self, input: CallEffectInput<'_>) -> CallEffects {
+        let mut base = value_conversion::overload_effects(input.selected.overload.as_str());
+        if input.selected.overload.as_str() == value_conversion::LARGEINT_DECIMAL {
+            let can_overflow = match &input.selected.result_type {
+                crate::FunctionResultType::Scalar(target) => {
+                    value_conversion::largeint_decimal::DecimalRecipe::try_new(target.data_type())
+                        .is_none_or(|recipe| recipe.can_overflow())
+                }
+                _ => true,
+            };
+            base.own_row_error = if can_overflow
+                && input.decimal_overflow_policy == DecimalOverflowPolicy::ReportError
+            {
+                FunctionIntrinsicRowError::MayRaise
+            } else {
+                FunctionIntrinsicRowError::NoRowError
+            };
+        }
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
@@ -150,7 +176,7 @@ impl ValueConversionOwner {
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
             environment: Box::default(),
-            proof_scope: scope,
+            proof_scope: input.proof_scope,
         }
     }
 }
@@ -356,7 +382,7 @@ impl ValueConversionOwner {
                 FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
-            Ok(self.call_effects(input.proof_scope))
+            Ok(self.call_effects(input))
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
             return result;
@@ -380,7 +406,7 @@ impl ValueConversionOwner {
                 && std::ptr::eq(contract.selected(), input.selected)
                 && contract.context() == input.context
                 && contract.decimal_overflow_policy() == input.decimal_overflow_policy
-                && contract.effects() == &self.call_effects(input.proof_scope)
+                && contract.effects() == &self.call_effects(input)
                 && input.environment.is_empty();
             work.step().map_err(compile_failure)?;
             if !exact {

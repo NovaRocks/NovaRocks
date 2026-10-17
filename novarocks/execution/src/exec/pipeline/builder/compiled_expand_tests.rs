@@ -551,20 +551,43 @@ fn compiled_unpivot_retains_original_column_metadata_through_actual_input_exit()
             while processor.has_output() {
                 output.push(processor.pull_chunk(&state).unwrap().unwrap());
             }
-            assert_eq!(tracker.current(), charged);
+            assert_eq!(
+                tracker.current(),
+                charged,
+                "nonempty outputs retain the original input's neutral storage hold"
+            );
             assert_eq!(
                 output.iter().map(Chunk::len).sum::<usize>(),
                 UNPIVOT_ROWS.len() * 2,
                 "every literal input row has both frozen mappings"
             );
+            let mut actual = unpivot_rows(&output);
+            let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+            let mut expected = Vec::new();
+            for (id, v1, v2) in UNPIVOT_ROWS {
+                expected.push((id, v1, "first".into(), vec![7, 8], vec![pair("a", "x")]));
+                expected.push((
+                    id,
+                    Some(v2),
+                    "second".into(),
+                    vec![9],
+                    vec![pair("b", "y"), pair("c", "z")],
+                ));
+            }
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected);
         }
         drop(operator);
-        if drain {
-            // Expanded outputs retain the original source storage independently
-            // of the exhausted processor and its construction owner.
-            assert_eq!(tracker.current(), charged);
-        }
+        assert_eq!(
+            tracker.current(),
+            if drain { charged } else { 0 },
+            "only published outputs can keep the original input charge after processor exit"
+        );
+        let last_output = output.last().cloned();
         drop(output);
+        assert_eq!(tracker.current(), if drain { charged } else { 0 });
+        drop(last_output);
         assert_eq!(tracker.current(), 0);
     }
 }

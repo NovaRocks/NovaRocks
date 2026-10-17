@@ -23,12 +23,12 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_map_from_arrays(
-    arena: &ExprArena,
+pub fn eval_map_from_arrays<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = chunk;
     let key_arr = arena.eval(args[0], chunk)?;
     let value_arr = arena.eval(args[1], chunk)?;
@@ -53,11 +53,12 @@ pub fn eval_map_from_arrays(
         })?;
 
     if key_list.len() != value_list.len() {
-        return Err(format!(
+        return Err((format!(
             "map_from_arrays length mismatch: keys={} values={}",
             key_list.len(),
             value_list.len()
-        ));
+        ))
+        .into());
     }
 
     let key_values = key_list.values();
@@ -90,7 +91,7 @@ pub fn eval_map_from_arrays(
         let key_len = key_end - key_start;
         let value_len = value_end - value_start;
         if key_len != value_len {
-            return Err("Key and value arrays must be the same length".to_string());
+            return Err(("Key and value arrays must be the same length".to_string()).into());
         }
 
         if key_len > 0 {
@@ -102,7 +103,7 @@ pub fn eval_map_from_arrays(
             }
             current += key_len as i64;
             if current > i32::MAX as i64 {
-                return Err("map_from_arrays offset overflow".to_string());
+                return Err(("map_from_arrays offset overflow".to_string()).into());
             }
         }
         offsets.push(current as i32);
@@ -118,10 +119,10 @@ pub fn eval_map_from_arrays(
         "map_from_arrays",
     )?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err("map_from_arrays map entries type must be Struct".to_string());
+        return Err(("map_from_arrays map entries type must be Struct".to_string()).into());
     };
     if fields.len() != 2 {
-        return Err("map_from_arrays map entries type must have 2 fields".to_string());
+        return Err(("map_from_arrays map entries type must have 2 fields".to_string()).into());
     }
 
     let key_field = fields[0].clone();

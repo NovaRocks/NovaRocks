@@ -21,12 +21,12 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-pub fn eval_array_join(
-    arena: &ExprArena,
+pub fn eval_array_join<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let list_arr = arena.eval(args[0], chunk)?;
     let sep_arr = arena.eval(args[1], chunk)?;
     let null_replace_arr = if args.len() == 3 {

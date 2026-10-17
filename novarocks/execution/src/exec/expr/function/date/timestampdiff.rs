@@ -22,12 +22,12 @@ use novarocks_functions::builtin::calendar_extended_shared::{
     CalendarOperation, evaluate_legacy_calendar,
 };
 
-pub fn eval_timestampdiff(
-    arena: &ExprArena,
+pub fn eval_timestampdiff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let unit = arena.eval(args[0], chunk)?;
     let start = arena.eval(args[1], chunk)?;
     let end = arena.eval(args[2], chunk)?;
@@ -35,10 +35,10 @@ pub fn eval_timestampdiff(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "timestampdiff expects unit string".to_string())?;
     let rows = start.len();
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::TimestampDiff,
         &[unit, start, end],
         &DataType::Int64,
         rows,
-    )
+    ))?)
 }

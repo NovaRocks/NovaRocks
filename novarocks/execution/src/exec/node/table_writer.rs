@@ -110,6 +110,7 @@ pub struct TableWriterInputProjection {
     _provider_layout: Option<novarocks_local_program::StaticLayout>,
     static_layout: Option<novarocks_local_program::StaticLayout>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    evaluation_control: Option<crate::exec::operators::compiled_expression::RuntimeKernelControl>,
 }
 
 impl TableWriterInputProjection {
@@ -119,7 +120,7 @@ impl TableWriterInputProjection {
         runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     ) -> Result<Self, String> {
         let mut arena = ExprArena::from_immutable(&projection.arena)?;
-        arena.bind_runtime_error(runtime_error);
+        arena.bind_runtime_error(runtime_error.clone());
         let exprs: Vec<ExprId> = projection
             .expressions
             .iter()
@@ -139,6 +140,11 @@ impl TableWriterInputProjection {
             _provider_layout: Some(provider_layout.clone()),
             static_layout: Some(projection.layout.clone()),
             construction: None,
+            evaluation_control: Some(
+                crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+                    runtime_error,
+                ),
+            ),
         })
     }
 
@@ -175,6 +181,7 @@ impl TableWriterInputProjection {
             _provider_layout: None,
             static_layout: None,
             construction: None,
+            evaluation_control: None,
         })
     }
 
@@ -229,6 +236,7 @@ impl TableWriterInputProjection {
             _provider_layout: None,
             static_layout: None,
             construction: None,
+            evaluation_control: None,
         })
     }
 
@@ -246,6 +254,20 @@ impl TableWriterInputProjection {
             self.construction = Some(factory.ok_or(ConstructionFailure::MissingOwner)?.clone());
         }
         Ok(())
+    }
+
+    pub(crate) fn bind_evaluation_runtime_state(
+        &mut self,
+        state: &crate::runtime::runtime_state::RuntimeState,
+    ) {
+        let mut control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+            state.error_state(),
+        );
+        control.bind_runtime_memory(state);
+        if let Some(factory) = &self.construction {
+            control.bind_construction_factory(factory.clone());
+        }
+        self.evaluation_control = Some(control);
     }
 
     pub(crate) fn project_created(
@@ -271,7 +293,13 @@ impl TableWriterInputProjection {
         let layout = std::alloc::Layout::array::<arrow::array::ArrayRef>(self.exprs.len())
             .map_err(|_| ConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
         owner.request(layout)?;
-        let columns = self.project_columns(chunk)?;
+        let control = self
+            .evaluation_control
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let evaluation =
+            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), control);
+        let columns = self.project_columns(&evaluation, chunk)?;
         validate_writer_projection_requiredness(&self.schema, &columns)?;
         let rows = columns.first().map_or(chunk.len(), |array| array.len());
         Ok(Chunk::try_new_typed_with_columns_owned_observed::<
@@ -334,19 +362,23 @@ impl TableWriterInputProjection {
         if self.chunk_schema().is_typed() {
             return Err("typed writer projection requires its actual construction owner".into());
         }
-        let arrays = self.project_columns(chunk)?;
+        let arrays = self.project_columns(&self.arena, chunk)?;
         let batch = arrow::record_batch::RecordBatch::try_new(Arc::clone(&self.schema), arrays)
             .map_err(|error| format!("build table writer projected batch: {error}"))?;
         Chunk::try_new_with_chunk_schema(batch, Arc::clone(self.chunk_schema()))
             .map_err(|error| format!("build table writer projected chunk: {error}"))
     }
-    fn project_columns(&self, chunk: &Chunk) -> Result<Vec<arrow::array::ArrayRef>, String> {
+    fn project_columns<E: crate::exec::expr::ExprEvaluation + ?Sized>(
+        &self,
+        evaluation: &E,
+        chunk: &Chunk,
+    ) -> Result<Vec<arrow::array::ArrayRef>, E::Error> {
         // Preserve the original ordering: evaluate every expression, then cast
         // each result in ordinal order. Reuse this actual output Vec rather
         // than creating a second container whose lifetime could be ambiguous.
         let mut arrays = Vec::with_capacity(self.exprs.len());
         for expr in &self.exprs {
-            arrays.push(self.arena.eval(*expr, chunk)?);
+            arrays.push(evaluation.eval(*expr, chunk)?);
         }
         for (index, (array, field)) in arrays.iter_mut().zip(self.schema.fields()).enumerate() {
             if array.data_type() == field.data_type() {

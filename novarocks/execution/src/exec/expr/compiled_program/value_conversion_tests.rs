@@ -78,15 +78,17 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
     builder
         .register(value_conversion_definition().unwrap())
         .unwrap();
-    // This independent installed manifest covers all seven real implementations
+    // This independent installed manifest covers all nine real implementations
     // of the original hidden definition, without claiming a Server catalogue.
     for stem in [
         "json_text_same_structure",
         "opaque_to_binary_same_structure",
         "signed_to_largeint",
         "largeint_to_signed_null_overflow",
+        "largeint_to_decimal_exact",
         "largeint_to_float_round",
         "largeint_to_utf8_text",
+        "utf8_to_largeint_null_invalid",
         "null_to_typed_nullable",
     ] {
         manifest.push(InstalledPureKernel {
@@ -879,3 +881,66 @@ fn actual_compiled_value_conversion_every_selected_callback_preserves_primary_ca
 
 #[path = "value_conversion_largeint_text_tests.rs"]
 mod largeint_text_tests;
+
+#[test]
+fn actual_compiled_largeint_decimal_keeps_exact_coefficients_and_frozen_report_error_rows() {
+    use arrow::array::{Decimal128Array, Decimal256Array};
+    use arrow::datatypes::i256;
+    use std::str::FromStr;
+    let source = wide(&[Some(i128::MAX), None, Some(i128::MIN), Some(42)]);
+    let target = FunctionValueType::new(DataType::Decimal256(41, 2), true);
+    let program = direct_program(largeint_type(), target.clone());
+    assert_eq!(result_type(&program), target);
+    let input = input_batch(&program, vec![source.clone()]);
+    let rows = [0, 2, 3];
+    let mut evaluator = instance(&program);
+    let output = evaluator
+        .evaluate(&input, Selection::try_sparse(4, &rows).unwrap(), &Control)
+        .unwrap();
+    assert!(output.errors().is_empty());
+    let values = output
+        .values()
+        .as_any()
+        .downcast_ref::<Decimal256Array>()
+        .unwrap();
+    assert_eq!(
+        values.values().as_ref(),
+        &[
+            i256::from_str("17014118346046923173168730371588410572700").unwrap(),
+            i256::from_str("-17014118346046923173168730371588410572800").unwrap(),
+            i256::from_i128(4200),
+        ]
+    );
+    let target = FunctionValueType::new(DataType::Decimal128(38, 0), true);
+    let program = direct_program(largeint_type(), target);
+    let input = input_batch(&program, vec![source]);
+    let mut evaluator = instance(&program);
+    let output = evaluator
+        .evaluate(&input, Selection::all(4), &Control)
+        .unwrap();
+    // This fixture authors and freezes ReportError in compile_checked_fragment;
+    // successful SQL NULL remains distinct from each failed numeric row.
+    assert_eq!(
+        output
+            .errors()
+            .iter()
+            .map(|error| error.selected_ordinal())
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert!(
+        output
+            .errors()
+            .iter()
+            .all(|error| error.message().contains("decimal overflows"))
+    );
+    let values = output
+        .values()
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        vec![None, None, None, Some(42)]
+    );
+}

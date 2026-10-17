@@ -378,15 +378,15 @@ fn normalize_dict_decode_output_type(
     }
 }
 
-pub fn eval_dict_decode(
-    arena: &ExprArena,
+pub fn eval_dict_decode<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     id: ExprId,
     child: ExprId,
     dict: &Arc<HashMap<i32, Vec<u8>>>,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(child, chunk)?;
     let output_type = arena.data_type(id).unwrap_or(&DataType::Utf8);
     let normalized_output_type = normalize_dict_decode_output_type(input.data_type(), output_type);
-    decode_array_with_dict(&input, dict, &normalized_output_type)
+    Ok((decode_array_with_dict(&input, dict, &normalized_output_type))?)
 }

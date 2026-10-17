@@ -150,15 +150,20 @@ def fixture_store_lock(
     """
     lock_path = store / ".provision.lock"
     try:
-        with lock_path.open("a+" if create else "r") as lock_file:
-            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            fcntl.flock(lock_file.fileno(), operation)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file = lock_path.open("a+" if create else "r")
     except OSError as error:
         raise FixtureInputError(f"cannot acquire fixture store lock: {lock_path}") from error
+    with lock_file:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(lock_file.fileno(), operation)
+        except OSError as error:
+            raise FixtureInputError(f"cannot acquire fixture store lock: {lock_path}") from error
+        # The protected body's failures belong to its owner, not lock acquisition.
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def require_relative(path: str) -> Path:
@@ -198,6 +203,8 @@ def run(
         raise FixtureInputError(
             f"command timed out after {timeout_seconds}s: {' '.join(command)}"
         ) from error
+    except OSError as error:
+        raise FixtureInputError(f"cannot start fixture command {command[0]}: {error}") from error
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip() if capture else ""
         raise FixtureInputError(f"command failed ({result.returncode}): {' '.join(command)} {detail}".strip())

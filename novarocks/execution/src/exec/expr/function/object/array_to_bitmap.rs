@@ -182,12 +182,12 @@ fn collect_set(values: &ArrayRef, start: usize, end: usize) -> Result<BTreeSet<u
     Ok(out)
 }
 
-pub fn eval_array_to_bitmap(
-    arena: &ExprArena,
+pub fn eval_array_to_bitmap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
     let list = input.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
         format!(

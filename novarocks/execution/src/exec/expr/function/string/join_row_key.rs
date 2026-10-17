@@ -45,12 +45,12 @@ impl BinaryInput<'_> {
     }
 }
 
-pub fn eval_join_row_key(
-    arena: &ExprArena,
+pub fn eval_join_row_key<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left_uuid_array = arena.eval(args[0], chunk)?;
     let left_row_id_array = arena.eval(args[1], chunk)?;
     let right_uuid_array = arena.eval(args[2], chunk)?;

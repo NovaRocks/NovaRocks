@@ -19,15 +19,15 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
 use std::sync::Arc;
 
-fn eval_locate_impl(
-    arena: &ExprArena,
+fn eval_locate_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     needle_arg: usize,
     haystack_arg: usize,
     start_arg: Option<usize>,
     fn_name: &str,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let haystack_arr = arena.eval(args[haystack_arg], chunk)?;
     let needle_arr = arena.eval(args[needle_arg], chunk)?;
     let start_raw = match start_arg {
@@ -53,25 +53,28 @@ fn eval_locate_impl(
     }
 
     if haystack_arr.len() != 1 && haystack_arr.len() != rows {
-        return Err(format!(
+        return Err((format!(
             "{fn_name} haystack length mismatch: {} vs {rows}",
             haystack_arr.len()
-        ));
+        ))
+        .into());
     }
     if needle_arr.len() != 1 && needle_arr.len() != rows {
-        return Err(format!(
+        return Err((format!(
             "{fn_name} needle length mismatch: {} vs {rows}",
             needle_arr.len()
-        ));
+        ))
+        .into());
     }
     if let Some(start) = &start_arr
         && start.len() != 1
         && start.len() != rows
     {
-        return Err(format!(
+        return Err((format!(
             "{fn_name} start position length mismatch: {} vs {rows}",
             start.len()
-        ));
+        ))
+        .into());
     }
 
     let mut out: Vec<Option<i32>> = Vec::with_capacity(rows);
@@ -133,32 +136,29 @@ fn locate_utf8(haystack: &str, needle: &str, start_pos: i64) -> i64 {
     (haystack[..abs_byte].chars().count() as i64) + 1
 }
 
-pub fn eval_locate(
-    arena: &ExprArena,
+pub fn eval_locate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     match args.len() {
-        2 => eval_locate_impl(arena, args, chunk, 0, 1, None, "locate"),
-        3 => eval_locate_impl(arena, args, chunk, 0, 1, Some(2), "locate"),
-        _ => Err(format!(
-            "locate expects 2 or 3 arguments, got {}",
-            args.len()
-        )),
+        2 => Ok((eval_locate_impl(arena, args, chunk, 0, 1, None, "locate"))?),
+        3 => Ok((eval_locate_impl(arena, args, chunk, 0, 1, Some(2), "locate"))?),
+        _ => Err((format!("locate expects 2 or 3 arguments, got {}", args.len())).into()),
     }
 }
 
-pub fn eval_instr(
-    arena: &ExprArena,
+pub fn eval_instr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!("instr expects 2 arguments, got {}", args.len()));
+        return Err((format!("instr expects 2 arguments, got {}", args.len())).into());
     }
-    eval_locate_impl(arena, args, chunk, 1, 0, None, "instr")
+    Ok((eval_locate_impl(arena, args, chunk, 1, 0, None, "instr"))?)
 }
 
 fn resolve_row_index(len: usize, rows: usize, row: usize, arg_name: &str) -> Result<usize, String> {
@@ -217,17 +217,14 @@ fn strpos_impl(haystack: &str, needle: &str, instance: i64) -> i64 {
     (positions[positions.len() - target_from_end] + 1) as i64
 }
 
-pub fn eval_strpos(
-    arena: &ExprArena,
+pub fn eval_strpos<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 && args.len() != 3 {
-        return Err(format!(
-            "strpos expects 2 or 3 arguments, got {}",
-            args.len()
-        ));
+        return Err((format!("strpos expects 2 or 3 arguments, got {}", args.len())).into());
     }
 
     let haystack_arr = arena.eval(args[0], chunk)?;

@@ -22,17 +22,18 @@ use arrow_buffer::OffsetBuffer;
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_map_literal(
-    arena: &ExprArena,
+pub fn eval_map_literal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if !args.len().is_multiple_of(2) {
-        return Err(format!(
+        return Err((format!(
             "map literal expects an even number of key/value arguments, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
 
     let num_rows = chunk.len();
@@ -61,10 +62,10 @@ pub fn eval_map_literal(
     let (map_field, ordered) =
         super::common::output_map_field(arena.data_type(expr), &key_hint, &value_hint, "map")?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err("map literal map entries type must be Struct".to_string());
+        return Err(("map literal map entries type must be Struct".to_string()).into());
     };
     if fields.len() != 2 {
-        return Err("map literal map entries type must have 2 fields".to_string());
+        return Err(("map literal map entries type must have 2 fields".to_string()).into());
     }
 
     let key_field = fields[0].clone();
@@ -78,7 +79,13 @@ pub fn eval_map_literal(
         "value",
     )?;
 
-    let entries_fields = entry_fields_for_arrays(fields, &keys, &values);
+    // These assembled keys contain exactly this invocation's rows and pairs.
+    // NULL values remain valid, but a NULL key cannot widen the frozen Map
+    // contract. Check after the original child evaluation and coercion order.
+    if keys.logical_null_count() > 0 {
+        return Err("map literal key must not be NULL".to_string().into());
+    }
+    let entries_fields = entry_fields_for_arrays(fields, &values);
     let entries = StructArray::new(entries_fields.clone(), vec![keys, values], None);
     let map_field = Arc::new(Field::new(
         map_field.name(),
@@ -92,7 +99,7 @@ pub fn eval_map_literal(
     for _ in 0..num_rows {
         current += pair_count as i64;
         if current > i32::MAX as i64 {
-            return Err("map literal offset overflow".to_string());
+            return Err(("map literal offset overflow".to_string()).into());
         }
         offsets.push(current as i32);
     }
@@ -168,9 +175,8 @@ fn build_values_array(
     Ok(make_array(mutable.freeze()))
 }
 
-fn entry_fields_for_arrays(fields: &Fields, keys: &ArrayRef, values: &ArrayRef) -> Fields {
+fn entry_fields_for_arrays(fields: &Fields, values: &ArrayRef) -> Fields {
     let mut adjusted = fields.iter().cloned().collect::<Vec<_>>();
-    adjusted[0] = field_with_actual_nullability(&adjusted[0], keys);
     adjusted[1] = field_with_actual_nullability(&adjusted[1], values);
     Fields::from(adjusted)
 }
@@ -212,7 +218,7 @@ mod tests {
 
     fn map_type() -> DataType {
         let entries = DataType::Struct(Fields::from(vec![
-            Arc::new(Field::new("key", DataType::Int32, true)),
+            Arc::new(Field::new("key", DataType::Int32, false)),
             Arc::new(Field::new("value", DataType::Int32, true)),
         ]));
         DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
@@ -241,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn map_literal_preserves_null_key_and_value_slots() {
+    fn map_literal_rejects_null_key_slots_without_widening_the_output() {
         let chunk = one_row_chunk();
         let mut arena = ExprArena::default();
         let null_key = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Int32);
@@ -254,10 +260,29 @@ mod tests {
             map_type(),
         );
 
-        let out = arena.eval(expr, &chunk).expect("map literal with null key");
-        let map = out.as_any().downcast_ref::<MapArray>().expect("map");
-        assert_eq!(map.value_length(0), 1);
-        assert!(map.keys().is_null(0));
-        assert!(map.values().is_null(0));
+        let error = arena
+            .eval(expr, &chunk)
+            .expect_err("map key must be present");
+        assert_eq!(error, "map literal key must not be NULL");
+    }
+    #[test]
+    fn map_literal_preserves_null_value_slots_under_the_nonnull_key_contract() {
+        let chunk = one_row_chunk();
+        let mut arena = ExprArena::default();
+        let key = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(1)), DataType::Int32);
+        let value = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Int32);
+        let expr = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Map("map"),
+                args: vec![key, value],
+            },
+            map_type(),
+        );
+        let output = arena.eval(expr, &chunk).unwrap();
+        let output = output.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(output.value_length(0), 1);
+        assert!(!output.keys().is_null(0));
+        assert!(output.values().is_null(0));
+        assert_eq!(output.data_type(), &map_type());
     }
 }

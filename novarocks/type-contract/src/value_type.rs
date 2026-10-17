@@ -48,6 +48,12 @@ impl ValueTypeStorageLifetime {
         Self(None)
     }
 
+    /// Whether this fact retains no storage lifetime. This grants no access,
+    /// capacity or permission to construct or capture another source.
+    pub const fn is_pure(&self) -> bool {
+        self.0.is_none()
+    }
+
     /// Actual Arc request when combining two distinct retained lifetimes.
     /// Reusing the same lifetime or a pure lifetime requires no allocation.
     pub fn retaining_allocation_layout()

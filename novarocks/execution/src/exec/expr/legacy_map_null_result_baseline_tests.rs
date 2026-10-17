@@ -101,24 +101,58 @@ fn ints(a: &ArrayRef) -> Vec<Option<i32>> {
 }
 
 #[test]
-fn original_map_null_result_miss_panics_with_exact_nullarray_bitmap_message() {
-    let m = map(
+fn original_map_null_result_preserves_exact_nullarray_storage_and_lookup_semantics() {
+    for (case, empty, map_valid, probe, present) in [
+        ("hit", false, true, Some(1), true),
+        ("miss", false, true, Some(2), false),
+        ("null probe", false, true, None, false),
+        ("null map", false, false, Some(1), false),
+        ("empty map", true, true, Some(1), false),
+    ] {
+        let entries = if empty { 0 } else { 1 };
+        let keys = if empty { vec![] } else { vec![1] };
+        let source = map(
+            Arc::new(Int32Array::from(keys)),
+            Arc::new(NullArray::new(entries)),
+            vec![0, entries as i32],
+            Some(vec![map_valid]),
+        );
+        // Exercise both the original value-derived result and exact frozen Null output.
+        for output in [None, Some(DataType::Null)] {
+            for strict in [false, true] {
+                let mut arguments: Vec<ArrayRef> =
+                    vec![source.clone(), Arc::new(Int32Array::from(vec![probe]))];
+                if strict {
+                    arguments.push(Arc::new(BooleanArray::from(vec![true])));
+                }
+                let result = lookup(arguments, output.clone());
+                if strict && map_valid && !present {
+                    assert_eq!(result.unwrap_err(), "Key not present in map", "{case}");
+                    continue;
+                }
+                let result = result.unwrap_or_else(|error| {
+                    panic!("original Null-valued Map lookup failed for {case}: {error}")
+                });
+                assert_eq!(result.data_type(), &DataType::Null, "{case}");
+                assert!(result.as_any().is::<NullArray>(), "{case}");
+                assert_eq!(result.len(), 1, "{case}");
+                assert_eq!(result.logical_null_count(), 1, "{case}");
+                assert!(result.to_data().nulls().is_none(), "{case}");
+            }
+        }
+    }
+    let source = map(
         Arc::new(Int32Array::from(vec![1])),
         Arc::new(NullArray::new(1)),
         vec![0, 1],
         None,
     );
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lookup(vec![m, Arc::new(Int32Array::from(vec![2]))], None)
-    }))
-    .expect_err("original apply_indices_nulls overlays NullArray bitmap");
-    let message = panic
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap();
     assert_eq!(
-        message,
-        "NullArray data should not contain a null buffer, as no buffers are required"
+        lookup(
+            vec![source, Arc::new(StringArray::from(vec!["1"]))],
+            Some(DataType::Null),
+        )
+        .unwrap_err(),
+        "map key type mismatch: Int32 vs Utf8"
     );
 }

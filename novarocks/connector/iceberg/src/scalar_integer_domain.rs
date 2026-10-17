@@ -495,7 +495,11 @@ pub(crate) fn metadata_sql_schema(
         schema,
         &domains,
     )?;
-    apply_source_logical_schema(arrow, schema, metadata.properties())
+    crate::schema_mapping::nominal_declaration::apply_to_arrow(
+        arrow,
+        schema,
+        &crate::schema_mapping::nominal_declaration::from_metadata(metadata)?,
+    )
 }
 
 #[cfg(test)]
@@ -509,113 +513,11 @@ pub(crate) fn sql_schema(
         schema,
         &domains,
     )?;
-    apply_source_logical_schema(arrow, schema, properties)
-}
-
-/// These legacy declarations address top-level names, not retained field IDs.
-/// They cannot prove a renamed historical field or a domain from its carrier.
-fn apply_source_logical_schema(
-    arrow: SchemaRef,
-    schema: &Schema,
-    properties: &HashMap<String, String>,
-) -> Result<SchemaRef, ConnectorError> {
-    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType, field_logical_type};
-
-    let storage_fields = schema.as_struct().fields();
-    if arrow.fields().len() != storage_fields.len() {
-        return Err(corrupt("Iceberg logical source schema arity differs"));
-    }
-    let mut declared = BTreeMap::new();
-    for (key, value) in properties {
-        let Some(name) = key.strip_prefix(LEGACY_PREFIX) else {
-            continue;
-        };
-        let logical = match value.to_ascii_lowercase().as_str() {
-            "hll" => ValueLogicalType::Hll,
-            "bitmap" => ValueLogicalType::Bitmap,
-            "largeint" => ValueLogicalType::LargeInt,
-            // Scalar integers retain their existing field-ID/history rules.
-            // Other properties do not author one of these opaque domains.
-            _ => continue,
-        };
-        let mut matches = storage_fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| field.name.eq_ignore_ascii_case(name));
-        let Some((ordinal, storage)) = matches.next() else {
-            // Current metadata can declare a column absent from a historical
-            // schema. Its name proves nothing about another historical field.
-            continue;
-        };
-        if matches.next().is_some() || declared.insert(ordinal, logical).is_some() {
-            return Err(corrupt("Iceberg logical source declaration is ambiguous"));
-        }
-        let expected_storage = match logical {
-            ValueLogicalType::Hll | ValueLogicalType::Bitmap => PrimitiveType::Binary,
-            ValueLogicalType::LargeInt => PrimitiveType::Fixed(16),
-            _ => unreachable!("only declared opaque domains reach storage validation"),
-        };
-        if storage.field_type.as_ref() != &Type::Primitive(expected_storage) {
-            return Err(corrupt(
-                "Iceberg logical declaration differs from its exact storage carrier",
-            ));
-        }
-    }
-    let mut fields = Vec::with_capacity(arrow.fields().len());
-    for (ordinal, (field, storage)) in arrow.fields().iter().zip(storage_fields).enumerate() {
-        if field.name() != &storage.name || field.is_nullable() == storage.required {
-            return Err(corrupt("Iceberg logical source field identity differs"));
-        }
-        let logical =
-            declared
-                .get(&ordinal)
-                .copied()
-                .unwrap_or_else(|| match storage.field_type.as_ref() {
-                    Type::Primitive(PrimitiveType::Uuid) => ValueLogicalType::Uuid,
-                    Type::Variant(_) => ValueLogicalType::Variant,
-                    _ => ValueLogicalType::Physical,
-                });
-        let expected_carrier = match logical {
-            ValueLogicalType::Hll | ValueLogicalType::Bitmap => Some(DataType::Binary),
-            ValueLogicalType::LargeInt => Some(DataType::FixedSizeBinary(16)),
-            _ => None,
-        };
-        if expected_carrier
-            .as_ref()
-            .is_some_and(|expected| field.data_type() != expected)
-        {
-            return Err(corrupt("Iceberg logical source SQL carrier differs"));
-        }
-        if field.metadata().contains_key(NR_LOGICAL_TYPE_KEY)
-            && field_logical_type(field).map_err(|error| corrupt(error.to_string()))? != logical
-        {
-            return Err(corrupt(
-                "Iceberg logical source metadata conflicts with its declaration",
-            ));
-        }
-        logical
-            .validate_carrier(field.data_type())
-            .map_err(|error| corrupt(error.to_string()))?;
-        if declared.contains_key(&ordinal) {
-            // This is the provider's SQL schema projection. Runtime value
-            // domains are authored separately from frozen source declarations.
-            let mut authored = field.as_ref().clone();
-            authored.metadata_mut().insert(
-                NR_LOGICAL_TYPE_KEY.into(),
-                logical
-                    .metadata_value()
-                    .expect("declared opaque domain")
-                    .into(),
-            );
-            fields.push(Arc::new(authored));
-        } else {
-            fields.push(field.clone());
-        }
-    }
-    Ok(Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        fields,
-        arrow.metadata().clone(),
-    )))
+    crate::schema_mapping::nominal_declaration::apply_to_arrow(
+        arrow,
+        schema,
+        &crate::schema_mapping::nominal_declaration::from_properties(schema, properties)?,
+    )
 }
 
 pub(crate) fn apply_schema(
@@ -1032,6 +934,11 @@ mod tests {
     fn source_domain_authoring_keeps_actual_field_annotations_and_dictionary_identity() {
         use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType, field_logical_type};
         let storage = opaque_source_schema();
+        let declarations = crate::schema_mapping::nominal_declaration::from_properties(
+            &storage,
+            &opaque_source_properties(),
+        )
+        .unwrap();
         let base = crate::schema_mapping::sql_read_schema_from_iceberg(&storage).unwrap();
         let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
         let mut annotations = fields[0].metadata().clone();
@@ -1060,9 +967,12 @@ mod tests {
             fields,
             HashMap::from([("schema.annotation".into(), "retained".into())]),
         ));
-        let projected =
-            apply_source_logical_schema(annotated.clone(), &storage, &opaque_source_properties())
-                .unwrap();
+        let projected = crate::schema_mapping::nominal_declaration::apply_to_arrow(
+            annotated.clone(),
+            &storage,
+            &declarations,
+        )
+        .unwrap();
         annotations.insert(NR_LOGICAL_TYPE_KEY.into(), "hll".into());
         assert_eq!(projected.field(0).metadata(), &annotations);
         assert_eq!(projected.field(5).dict_id(), Some(93));
@@ -1076,7 +986,12 @@ mod tests {
         assert_eq!(projected.metadata(), annotated.metadata());
         // An identical explicit declaration is checked, not overwritten.
         assert!(
-            apply_source_logical_schema(projected, &storage, &opaque_source_properties()).is_ok()
+            crate::schema_mapping::nominal_declaration::apply_to_arrow(
+                projected,
+                &storage,
+                &declarations
+            )
+            .is_ok()
         );
     }
 
@@ -1084,6 +999,11 @@ mod tests {
     fn source_domain_declarations_reject_wrong_storage_carrier_and_explicit_metadata() {
         use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
         let storage = opaque_source_schema();
+        let declarations = crate::schema_mapping::nominal_declaration::from_properties(
+            &storage,
+            &opaque_source_properties(),
+        )
+        .unwrap();
         for (name, value) in [("json", "hll"), ("fixed", "bitmap"), ("plain", "largeint")] {
             let error = sql_schema(
                 &storage,
@@ -1098,10 +1018,10 @@ mod tests {
             let mut metadata = fields[ordinal].metadata().clone();
             metadata.insert(NR_LOGICAL_TYPE_KEY.into(), label.into());
             fields[ordinal] = Arc::new(fields[ordinal].as_ref().clone().with_metadata(metadata));
-            let error = apply_source_logical_schema(
+            let error = crate::schema_mapping::nominal_declaration::apply_to_arrow(
                 Arc::new(arrow::datatypes::Schema::new(fields)),
                 &storage,
-                &opaque_source_properties(),
+                &declarations,
             )
             .unwrap_err();
             assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
@@ -1110,10 +1030,10 @@ mod tests {
             let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
             fields[0] = Arc::new(fields[0].as_ref().clone().with_data_type(carrier));
             assert!(
-                apply_source_logical_schema(
+                crate::schema_mapping::nominal_declaration::apply_to_arrow(
                     Arc::new(arrow::datatypes::Schema::new(fields)),
                     &storage,
-                    &opaque_source_properties()
+                    &declarations
                 )
                 .is_err()
             );
@@ -1124,12 +1044,12 @@ mod tests {
     }
 
     #[test]
-    fn current_name_declarations_do_not_invent_historical_or_json_domains() {
+    fn current_field_id_declarations_do_not_invent_other_historical_or_json_domains() {
         use novarocks_type_contract::{ValueLogicalType, field_logical_type};
         let historical = Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::optional(
-                    10,
+                    99,
                     "old_h",
                     Type::Primitive(PrimitiveType::Binary),
                 )),
@@ -1143,13 +1063,43 @@ mod tests {
             .unwrap();
         let mut properties = opaque_source_properties();
         properties.insert(format!("{LEGACY_PREFIX}json"), "json".into());
-        let projected = sql_schema(&historical, &properties).unwrap();
+        let declarations = crate::schema_mapping::nominal_declaration::from_properties(
+            &opaque_source_schema(),
+            &properties,
+        )
+        .unwrap();
+        let projected = crate::schema_mapping::nominal_declaration::apply_to_arrow(
+            crate::schema_mapping::sql_read_schema_from_iceberg(&historical).unwrap(),
+            &historical,
+            &declarations,
+        )
+        .unwrap();
         for field in projected.fields() {
             assert_eq!(
                 field_logical_type(field).unwrap(),
                 ValueLogicalType::Physical
             );
         }
+        // A renamed historical occurrence with the same stable ID retains its
+        // independently authored domain; names do not erase field identity.
+        let renamed = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                10,
+                "old_h",
+                Type::Primitive(PrimitiveType::Binary),
+            ))])
+            .build()
+            .unwrap();
+        let projected = crate::schema_mapping::nominal_declaration::apply_to_arrow(
+            crate::schema_mapping::sql_read_schema_from_iceberg(&renamed).unwrap(),
+            &renamed,
+            &declarations,
+        )
+        .unwrap();
+        assert_eq!(
+            field_logical_type(projected.field(0)).unwrap(),
+            ValueLogicalType::Hll
+        );
     }
 }
 

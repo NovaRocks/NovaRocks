@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,9 +25,14 @@ use arrow::compute::{concat, filter};
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::{ExprArena, cast_array_to_target};
+use crate::exec::expr::{
+    ExprArena, ExprEvaluation, ExprEvaluationContext, ExprEvaluationControl, cast_array_to_target,
+};
 use crate::exec::node::change_event_expand::ChangeEventRuntimeSpec;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, InputConstructionOwner, Operator,
+    ProcessorOperator,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::SlotId;
@@ -81,6 +86,7 @@ impl OperatorFactory for ChangeEventExpandProcessorFactory {
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             output_slot_ids: self.output_slot_ids.clone(),
             effect_slot_id: self.effect_slot_id,
+            construction: None,
             pending_output: None,
             finishing: false,
             finished: false,
@@ -95,12 +101,31 @@ struct ChangeEventExpandProcessorOperator {
     output_chunk_schema: ChunkSchemaRef,
     output_slot_ids: Vec<SlotId>,
     effect_slot_id: SlotId,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
     pending_output: Option<Chunk>,
     finishing: bool,
     finished: bool,
 }
 
 impl Operator for ChangeEventExpandProcessorOperator {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        self.construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        if !self.output_chunk_schema.is_typed() {
+            return Err(ConstructionFailure::InvalidSource(
+                "change event output requires its complete typed declaration".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -138,7 +163,16 @@ impl ProcessorOperator for ChangeEventExpandProcessorOperator {
                     .into(),
             );
         }
-        self.pending_output = Some(self.process_one(&chunk)?);
+        let control = super::compiled_expression::RuntimeKernelControl::new(_state.error_state());
+        ExprEvaluationControl::checkpoint(&control)?;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_input_construction(&chunk)?;
+        let evaluation = ExprEvaluationContext::new(&self.arena, owner.as_ref(), &control);
+        self.pending_output = Some(self.process_one(&chunk, &evaluation, owner.as_ref())?);
+        ExprEvaluationControl::checkpoint(&control)?;
         Ok(())
     }
 
@@ -160,17 +194,22 @@ impl ProcessorOperator for ChangeEventExpandProcessorOperator {
 }
 
 impl ChangeEventExpandProcessorOperator {
-    fn process_one(&self, chunk: &Chunk) -> Result<Chunk, String> {
+    fn process_one(
+        &self,
+        chunk: &Chunk,
+        evaluation: &ExprEvaluationContext<'_>,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Chunk, ExecutionFailure> {
         self.validate_output_schema()?;
         if chunk.is_empty() {
-            return self.empty_output_chunk();
+            return Ok((self.empty_output_chunk(chunk, owner))?);
         }
 
         let masks = self
             .events
             .iter()
             .enumerate()
-            .map(|(event_idx, event)| self.predicate_mask(event_idx, event, chunk))
+            .map(|(event_idx, event)| self.predicate_mask(event_idx, event, chunk, evaluation))
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut event_chunks = Vec::new();
@@ -185,10 +224,12 @@ impl ChangeEventExpandProcessorOperator {
                 mask,
                 selected_count,
                 chunk,
+                evaluation,
+                owner,
             )?);
         }
 
-        self.concat_event_chunks(event_chunks)
+        Ok((self.concat_event_chunks(event_chunks, chunk, owner))?)
     }
 
     fn validate_output_schema(&self) -> Result<(), String> {
@@ -204,14 +245,16 @@ impl ChangeEventExpandProcessorOperator {
         event_idx: usize,
         event: &ChangeEventRuntimeSpec,
         chunk: &Chunk,
-    ) -> Result<BooleanArray, String> {
+        evaluation: &ExprEvaluationContext<'_>,
+    ) -> Result<BooleanArray, ExecutionFailure> {
         let Some(predicate) = event.predicate else {
             return Ok(BooleanArray::from(vec![true; chunk.len()]));
         };
-        let array = self
-            .arena
-            .eval(predicate, chunk)
-            .map_err(|err| format!("change event expand predicate {event_idx} failed: {err}"))?;
+        let array = ExprEvaluation::eval(evaluation, predicate, chunk).map_err(|error| {
+            evaluation.annotate_error(error, |message| {
+                format!("change event expand predicate {event_idx} failed: {message}")
+            })
+        })?;
         let mask = array
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -222,11 +265,12 @@ impl ChangeEventExpandProcessorOperator {
                 )
             })?;
         if mask.len() != chunk.len() {
-            return Err(format!(
+            return Err((format!(
                 "change event expand predicate {event_idx} length mismatch: mask={} input={}",
                 mask.len(),
                 chunk.len()
-            ));
+            ))
+            .into());
         }
         Ok(mask.clone())
     }
@@ -238,8 +282,12 @@ impl ChangeEventExpandProcessorOperator {
         mask: &BooleanArray,
         selected_count: usize,
         chunk: &Chunk,
-    ) -> Result<Chunk, String> {
-        let assignments = self.assignment_arrays(event_idx, event, mask, selected_count, chunk)?;
+        evaluation: &ExprEvaluationContext<'_>,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Chunk, ExecutionFailure> {
+        let assignments =
+            self.assignment_arrays(event_idx, event, mask, selected_count, chunk, evaluation)?;
+        owner.request(std::alloc::Layout::array::<ArrayRef>(self.output_chunk_schema.slots().len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         let mut columns = Vec::with_capacity(self.output_chunk_schema.slots().len());
 
         for slot_schema in self.output_chunk_schema.slots() {
@@ -254,9 +302,7 @@ impl ChangeEventExpandProcessorOperator {
             columns.push(array);
         }
 
-        Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), columns).map_err(|err| {
-            format!("change event expand build event {event_idx} chunk failed: {err}")
-        })
+        self.materialize_output(columns, selected_count, chunk, owner)
     }
 
     fn assignment_arrays(
@@ -266,37 +312,36 @@ impl ChangeEventExpandProcessorOperator {
         mask: &BooleanArray,
         selected_count: usize,
         chunk: &Chunk,
-    ) -> Result<HashMap<SlotId, ArrayRef>, String> {
+        evaluation: &ExprEvaluationContext<'_>,
+    ) -> Result<HashMap<SlotId, ArrayRef>, ExecutionFailure> {
         let mut arrays = HashMap::with_capacity(event.assignments.len());
         for assignment in &event.assignments {
             let slot_id = assignment.output_slot_id;
             if slot_id == self.effect_slot_id {
-                return Err(format!(
+                return Err((format!(
                     "change event expand event {event_idx} assignment targets generated route slot {}",
                     slot_id
-                ));
+                )).into());
             }
             let Some(slot_schema) = self.output_chunk_schema.slot(slot_id) else {
-                return Err(format!(
+                return Err((format!(
                     "change event expand event {event_idx} assignment output slot {} is not in output schema",
                     slot_id
-                ));
+                )).into());
             };
             let array = match assignment.expr {
                 Some(expr) => {
-                    let array = self.arena.eval(expr, chunk).map_err(|err| {
-                        format!(
-                            "change event expand event {event_idx} assignment for slot {} failed: {err}",
-                            slot_id
-                        )
-                    })?;
+                    let array = ExprEvaluation::eval(evaluation, expr, chunk)
+                        .map_err(|error| evaluation.annotate_error(error, |message| format!(
+                            "change event expand event {event_idx} assignment for slot {slot_id} failed: {message}"
+                        )))?;
                     if array.len() != chunk.len() {
-                        return Err(format!(
+                        return Err((format!(
                             "change event expand event {event_idx} assignment for slot {} length mismatch: array={} input={}",
                             slot_id,
                             array.len(),
                             chunk.len()
-                        ));
+                        )).into());
                     }
                     let filtered = filter_selected_rows(array, mask, selected_count)?;
                     cast_array_to_target(&filtered, slot_schema.data_type()).map_err(|err| {
@@ -310,23 +355,30 @@ impl ChangeEventExpandProcessorOperator {
                 None => new_null_array(slot_schema.data_type(), selected_count),
             };
             if arrays.insert(slot_id, array).is_some() {
-                return Err(format!(
+                return Err((format!(
                     "change event expand event {event_idx} has duplicate assignment for slot {}",
                     slot_id
-                ));
+                ))
+                .into());
             }
         }
         Ok(arrays)
     }
 
-    fn concat_event_chunks(&self, event_chunks: Vec<Chunk>) -> Result<Chunk, String> {
+    fn concat_event_chunks(
+        &self,
+        event_chunks: Vec<Chunk>,
+        source: &Chunk,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Chunk, ExecutionFailure> {
         if event_chunks.is_empty() {
-            return self.empty_output_chunk();
+            return Ok((self.empty_output_chunk(source, owner))?);
         }
         if event_chunks.len() == 1 {
             return Ok(event_chunks.into_iter().next().expect("event chunk"));
         }
 
+        owner.request(std::alloc::Layout::array::<ArrayRef>(self.output_chunk_schema.slots().len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         let mut columns = Vec::with_capacity(self.output_chunk_schema.slots().len());
         for column_idx in 0..self.output_chunk_schema.slots().len() {
             let parts = event_chunks
@@ -338,19 +390,45 @@ impl ChangeEventExpandProcessorOperator {
             })?);
         }
 
-        Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), columns)
-            .map_err(|err| format!("change event expand build concatenated chunk failed: {err}"))
+        let rows = event_chunks.iter().map(Chunk::len).sum();
+        self.materialize_output(columns, rows, source, owner)
     }
 
-    fn empty_output_chunk(&self) -> Result<Chunk, String> {
+    fn empty_output_chunk(
+        &self,
+        source: &Chunk,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Chunk, ExecutionFailure> {
+        owner.request(std::alloc::Layout::array::<ArrayRef>(self.output_chunk_schema.slots().len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         let columns = self
             .output_chunk_schema
             .slots()
             .iter()
             .map(|slot| new_null_array(slot.data_type(), 0))
             .collect();
-        Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), columns)
-            .map_err(|err| format!("change event expand build empty output chunk failed: {err}"))
+        self.materialize_output(columns, 0, source, owner)
+    }
+    fn materialize_output(
+        &self,
+        columns: Vec<ArrayRef>,
+        rows: usize,
+        source: &Chunk,
+        owner: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<Chunk> {
+        let storage = source
+            .source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+                owner.request(layout)
+            })?;
+        Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+            ExecutionFailure,
+            _,
+        >(
+            self.output_chunk_schema.clone(),
+            columns,
+            rows,
+            storage,
+            |step| Ok(owner.observe(0, &[], step)?),
+        )?)
     }
 }
 
@@ -431,15 +509,41 @@ mod tests {
     const EFFECT_SLOT: SlotId = SlotId::new(20);
     const VALUE_SLOT: SlotId = SlotId::new(21);
 
+    fn install_creator(operator: &mut dyn Operator, state: &RuntimeState) {
+        let factory =
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root(
+                    "change event actual creator fixture",
+                ),
+                state.error_state(),
+            )
+            .unwrap();
+        operator.set_construction_factory(factory);
+        operator.prepare().unwrap();
+    }
+
     fn schema(fields: Vec<(SlotId, Field)>) -> ChunkSchemaRef {
         Arc::new(
-            ChunkSchema::try_new(
+            ChunkSchema::try_new_typed(
                 fields
                     .into_iter()
                     .map(|(slot_id, field)| {
-                        ChunkSlotSchema::new_with_field(slot_id, field, None, None)
+                        let ty = novarocks_type_contract::FunctionValueType::new(
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        );
+                        ChunkSlotSchema::try_new_typed(
+                            slot_id,
+                            Arc::new(field),
+                            ty.typed_binding().clone(),
+                            None,
+                            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                        )
+                        .unwrap()
                     })
                     .collect(),
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
             )
             .expect("schema"),
         )
@@ -507,6 +611,7 @@ mod tests {
         .expect("factory");
         let state = RuntimeState::default();
         let mut operator = factory.create(1, 0);
+        install_creator(operator.as_mut(), &state);
         let processor = operator.as_processor_mut().expect("processor");
         processor.push_chunk(&state, input()).expect("push");
         let output = processor.pull_chunk(&state).expect("pull").expect("output");
@@ -548,6 +653,7 @@ mod tests {
         .expect("factory");
         let state = RuntimeState::default();
         let mut operator = factory.create(1, 0);
+        install_creator(operator.as_mut(), &state);
         let processor = operator.as_processor_mut().expect("processor");
         processor.push_chunk(&state, input()).expect("push");
         let output = processor
@@ -581,5 +687,126 @@ mod tests {
             err.contains("logical effect") && err.contains("Int8"),
             "{err}"
         );
+    }
+    #[test]
+    fn typed_change_event_predicate_and_assignment_use_the_installed_creator() {
+        use crate::exec::expr::function::FunctionKind;
+        use arrow::array::{Int64Builder, ListBuilder};
+        let mut values = ListBuilder::new(Int64Builder::new());
+        values.values().append_slice(&[1, 2]);
+        values.append(true);
+        values.values().append_value(3);
+        values.append(true);
+        let array = Arc::new(values.finish()) as ArrayRef;
+        let input_schema = schema(vec![(
+            INPUT_SLOT,
+            Field::new("values", array.data_type().clone(), false),
+        )]);
+        let input = Chunk::try_new_with_chunk_schema(
+            RecordBatch::try_new(input_schema.arrow_schema_ref(), vec![array.clone()]).unwrap(),
+            input_schema,
+        )
+        .unwrap();
+        let mut arena = ExprArena::default();
+        let source = arena.push_typed(ExprNode::SlotId(INPUT_SLOT), array.data_type().clone());
+        let two = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(2)), DataType::Int64);
+        let predicate = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Array("array_contains"),
+                args: vec![source, two],
+            },
+            DataType::Boolean,
+        );
+        let position = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Array("array_position"),
+                args: vec![source, two],
+            },
+            DataType::Int64,
+        );
+        let factory = ChangeEventExpandProcessorFactory::new(
+            10,
+            Arc::new(arena),
+            vec![ChangeEventRuntimeSpec {
+                predicate: Some(predicate),
+                effect: ConnectorRowMutationEffect::Insert,
+                assignments: vec![ChangeEventRuntimeOutputExpr {
+                    output_slot_id: VALUE_SLOT,
+                    expr: Some(position),
+                }],
+            }],
+            output_schema(),
+            vec![EFFECT_SLOT, VALUE_SLOT],
+            EFFECT_SLOT,
+        )
+        .unwrap();
+        let state = RuntimeState::default();
+        let mut operator = factory.create(1, 0);
+        install_creator(operator.as_mut(), &state);
+        let processor = operator.as_processor_mut().unwrap();
+        processor.push_chunk(&state, input).unwrap();
+        let output = processor.pull_chunk(&state).unwrap().unwrap();
+        assert_eq!(output.len(), 1);
+        let values = output.column_by_slot_id(VALUE_SLOT).unwrap();
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(2)]
+        );
+        assert!(output.chunk_schema().is_typed());
+        assert!(!output.construction_storage_lifetime().is_pure());
+    }
+
+    #[test]
+    fn change_event_runtime_first_failure_preserves_payload_and_driver_context() {
+        use crate::runtime::fragment::{ExecutionFailure, PipelineOperation};
+        use novarocks_functions::{KernelDiagnostic, KernelFailure};
+        let mut causes: Vec<ExecutionFailure> = vec![
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InstanceFailed,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("exact invalid")),
+            KernelFailure::Internal(KernelDiagnostic::new("exact internal")),
+            KernelFailure::Operational(KernelDiagnostic::new("exact operation")),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        causes.push(ExecutionFailure::from("cancelled").at_operator(43, PipelineOperation::Push));
+        for original in causes {
+            let mut arena = ExprArena::default();
+            let source = slot_expr(&mut arena);
+            let factory = ChangeEventExpandProcessorFactory::new(
+                11,
+                Arc::new(arena),
+                vec![ChangeEventRuntimeSpec {
+                    predicate: None,
+                    effect: ConnectorRowMutationEffect::Insert,
+                    assignments: vec![ChangeEventRuntimeOutputExpr {
+                        output_slot_id: VALUE_SLOT,
+                        expr: Some(source),
+                    }],
+                }],
+                output_schema(),
+                vec![EFFECT_SLOT, VALUE_SLOT],
+                EFFECT_SLOT,
+            )
+            .unwrap();
+            let state = RuntimeState::default();
+            let mut operator = factory.create(1, 0);
+            install_creator(operator.as_mut(), &state);
+            state.error_state().set_error(original.clone());
+            state
+                .error_state()
+                .set_error("later cause cannot replace the first");
+            let processor = operator.as_processor_mut().unwrap();
+            assert_eq!(processor.push_chunk(&state, input()).unwrap_err(), original);
+            assert!(!processor.has_output());
+        }
     }
 }

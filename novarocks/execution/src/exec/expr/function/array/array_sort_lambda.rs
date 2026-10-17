@@ -194,15 +194,15 @@ fn broadcast_array(array: &ArrayRef, len: usize) -> Result<ArrayRef, String> {
     take(array.as_ref(), &indices, None).map_err(|e| e.to_string())
 }
 
-fn eval_comparator_matrix(
-    arena: &ExprArena,
+fn eval_comparator_matrix<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     lambda_body: ExprId,
     lambda_args: &[SlotId],
     common_sub_exprs: &[(SlotId, ExprId)],
     values: &ArrayRef,
     start: usize,
     len: usize,
-) -> Result<Vec<i8>, String> {
+) -> Result<Vec<i8>, __Eval::Error> {
     let pair_count = len
         .checked_mul(len)
         .ok_or_else(|| "array_sort comparator pair count overflow".to_string())?;
@@ -262,7 +262,7 @@ fn eval_comparator_matrix(
                 let idx = left * len + right;
                 let rev_idx = right * len + left;
                 if typed.is_null(idx) || typed.is_null(rev_idx) {
-                    return Err("array_sort comparator returned NULL".to_string());
+                    return Err(("array_sort comparator returned NULL".to_string()).into());
                 }
                 let left_before_right = typed.value(idx);
                 let right_before_left = typed.value(rev_idx);
@@ -286,29 +286,32 @@ fn eval_comparator_matrix(
     Ok(matrix)
 }
 
-pub fn eval_array_sort_lambda(
-    arena: &ExprArena,
+pub fn eval_array_sort_lambda<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() < 2 {
-        return Err(format!(
+        return Err((format!(
             "array_sort_lambda expects at least 2 arguments, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
 
     let (array_id, lambda_id) = match arena.node(args[0]) {
         Some(ExprNode::LambdaFunction { .. }) => {
             if args.len() != 2 {
-                return Err("array_sort_lambda expects ARRAY and lambda arguments".to_string());
+                return Err(
+                    ("array_sort_lambda expects ARRAY and lambda arguments".to_string()).into(),
+                );
             }
             (args[1], args[0])
         }
         _ => match args.last().and_then(|id| arena.node(*id)) {
             Some(ExprNode::LambdaFunction { .. }) => (args[0], args[args.len() - 1]),
-            _ => return Err("array_sort_lambda expects a lambda function".to_string()),
+            _ => return Err(("array_sort_lambda expects a lambda function".to_string()).into()),
         },
     };
 
@@ -319,10 +322,16 @@ pub fn eval_array_sort_lambda(
             common_sub_exprs,
             ..
         }) => (*body, arg_slots.clone(), common_sub_exprs.clone()),
-        _ => return Err("array_sort_lambda expects lambda function expression".to_string()),
+        _ => {
+            return Err(
+                ("array_sort_lambda expects lambda function expression".to_string()).into(),
+            );
+        }
     };
     if lambda_args.len() != 2 {
-        return Err("array_sort_lambda expects comparator with exactly two arguments".to_string());
+        return Err(
+            ("array_sort_lambda expects comparator with exactly two arguments".to_string()).into(),
+        );
     }
 
     let arr = arena.eval(array_id, chunk)?;
@@ -338,10 +347,11 @@ pub fn eval_array_sort_lambda(
         _ => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
+                return Err((format!(
                     "array_sort_lambda output type must be List, got {:?}",
                     other
-                ));
+                ))
+                .into());
             }
         },
     };
@@ -407,7 +417,7 @@ pub fn eval_array_sort_lambda(
         }
 
         if current > i32::MAX as i64 {
-            return Err("array_sort_lambda offset overflow".to_string());
+            return Err(("array_sort_lambda offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

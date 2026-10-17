@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, StringArray};
 use std::sync::Arc;
 
-pub fn eval_hex(
-    arena: &ExprArena,
+pub fn eval_hex<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let input = arena.eval(args[0], chunk)?;
     let len = input.len();
@@ -63,7 +63,7 @@ pub fn eval_hex(
             }
         }
     } else {
-        return Err("hex expects string/binary or integer".to_string());
+        return Err(("hex expects string/binary or integer".to_string()).into());
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }

@@ -426,7 +426,7 @@ impl AggregateStreamingSinkOperator {
         session.fail(reason)
     }
 
-    fn process(&mut self, chunk: Chunk) -> Result<(), String> {
+    fn process(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
@@ -439,10 +439,22 @@ impl AggregateStreamingSinkOperator {
             return Ok(());
         }
 
-        let group_arrays = self.eval_group_by_arrays(&chunk)?;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_input_construction(&chunk)?;
+        let mut control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+            state.error_state(),
+        );
+        control.bind_runtime_memory(state);
+        control.bind_construction_factory(factory.clone());
+        let evaluation =
+            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), &control);
+        let group_arrays = self.eval_group_by_arrays(&evaluation, &chunk)?;
         let group_arrays =
             normalize_aggregate_group_arrays(&self.expected_group_types()?, group_arrays)?;
-        let agg_arrays = self.eval_agg_arrays(&chunk)?;
+        let agg_arrays = self.eval_agg_arrays(&evaluation, &chunk)?;
 
         self.ensure_data_initialized(&group_arrays, &agg_arrays)
             .map_err(|e| e.to_string())?;
@@ -833,32 +845,36 @@ impl AggregateStreamingSinkOperator {
         Ok(())
     }
 
-    fn eval_group_by_arrays(&self, chunk: &Chunk) -> Result<Vec<ArrayRef>, String> {
+    fn eval_group_by_arrays<E: crate::exec::expr::ExprEvaluation + ?Sized>(
+        &self,
+        evaluation: &E,
+        chunk: &Chunk,
+    ) -> Result<Vec<ArrayRef>, E::Error> {
         let mut arrays = Vec::with_capacity(self.group_by.len());
         for expr in &self.group_by {
-            let array = self.arena.eval(*expr, chunk).map_err(|e| e.to_string())?;
+            let array = evaluation.eval(*expr, chunk)?;
             arrays.push(array);
         }
         Ok(arrays)
     }
 
-    fn eval_agg_arrays(&self, chunk: &Chunk) -> Result<Vec<Option<ArrayRef>>, String> {
+    fn eval_agg_arrays<E: crate::exec::expr::ExprEvaluation + ?Sized>(
+        &self,
+        evaluation: &E,
+        chunk: &Chunk,
+    ) -> Result<Vec<Option<ArrayRef>>, E::Error> {
         let mut arrays = Vec::with_capacity(self.functions.len());
         for func in &self.functions {
             let array = if func.inputs.is_empty() {
                 None
             } else if func.inputs.len() == 1 {
-                Some(
-                    self.arena
-                        .eval(func.inputs[0], chunk)
-                        .map_err(|e| e.to_string())?,
-                )
+                Some(evaluation.eval(func.inputs[0], chunk)?)
             } else {
                 return Err(format!(
                     "aggregate inputs must be packed into a single struct expression: {} has {} inputs",
                     func.name,
                     func.inputs.len()
-                ));
+                ).into());
             };
             arrays.push(array);
         }
@@ -1174,17 +1190,15 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        let result = (|| {
+        let result: ExecutionResult<()> = (|| {
             if self.finished {
                 return Ok(());
             }
             if self.finishing {
-                return Err(
-                    "aggregate streaming sink received input after set_finishing".to_string(),
-                );
+                return Err("aggregate streaming sink received input after set_finishing".into());
             }
             let num_rows = chunk.len();
-            self.process(chunk)?;
+            self.process(_state, chunk)?;
             self.topn_rf_rows_since_publish += num_rows;
             self.try_submit_native_topn_bound()?;
             Ok(())
@@ -1289,6 +1303,17 @@ mod retained_memory_tests {
     const INTERMEDIATE_SLOT: SlotId = SlotId::new(102);
     const FINAL_SLOT: SlotId = SlotId::new(103);
 
+    fn install_input_creator(operator: &mut dyn crate::exec::pipeline::operator::Operator) {
+        // This real construction host is distinct from the aggregate heap
+        // tracker whose retained-state/failed-mutation behavior is the oracle.
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().expect("actual runtime construction profile"),
+            MemTracker::new_root("streaming input construction fixture"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).expect("actual construction factory");
+        operator.set_construction_factory(factory);
+    }
+
     fn scalar_distinct_factory(
         input_slot: SlotId,
         input_type: DataType,
@@ -1354,13 +1379,64 @@ mod retained_memory_tests {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![values])
             .expect("streaming aggregate input batch");
         let schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                ChunkSlotSchema::from_field(slot, &field, None)
-                    .expect("streaming aggregate input slot"),
-            ])
+            ChunkSchema::try_new_typed(
+                vec![
+                    ChunkSlotSchema::try_new_typed(
+                        slot,
+                        Arc::new(field.clone()),
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false)
+                            .typed_binding()
+                            .clone(),
+                        None,
+                        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    )
+                    .expect("explicit typed streaming input"),
+                ],
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
             .expect("streaming aggregate input schema"),
         );
         Chunk::try_new_with_chunk_schema(batch, schema).expect("streaming aggregate input chunk")
+    }
+
+    fn typed_distinct_intermediate(source: Chunk) -> Chunk {
+        // The trusted DISTINCT COUNT fixture explicitly authors its Binary
+        // intermediate port; this is not an inferred or widened runtime type.
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let value = FunctionValueType::new(DataType::Binary, false);
+        let slot = ChunkSlotSchema::try_new_typed(
+            INTERMEDIATE_SLOT,
+            Arc::new(Field::new("distinct_count", DataType::Binary, false)),
+            value.typed_binding().clone(),
+            None,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let schema = Arc::new(
+            ChunkSchema::try_new_typed(vec![slot], ValueTypeStorageLifetime::pure()).unwrap(),
+        );
+        let factory=crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            MemTracker::new_root("distinct intermediate port fixture"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        let owner = factory.begin_typed_construction(&schema).unwrap();
+        let storage = source
+            .source_storage_lifetime_observed::<ConstructionFailure>(
+                owner.storage_lifetime(),
+                |layout| owner.request(layout),
+            )
+            .unwrap();
+        Chunk::try_new_typed_record_batch_owned_observed::<ConstructionFailure, _, _>(
+            source.record_batch().clone(),
+            schema,
+            storage,
+            owner.storage_lifetime(),
+            |layout| owner.request(layout),
+            |step| owner.observe(0, &[], step),
+        )
+        .unwrap()
     }
 
     fn finish_and_take_output(
@@ -1452,6 +1528,7 @@ mod retained_memory_tests {
         let tracker = MemTracker::new_root("streaming-update");
         let mut operator = factory.create(1, 0);
         operator.set_mem_tracker(Arc::clone(&tracker));
+        install_input_creator(operator.as_mut());
         operator.prepare().expect("prepare streaming aggregate");
         operator
             .as_processor_mut()
@@ -1482,13 +1559,15 @@ mod retained_memory_tests {
         let update_tracker = MemTracker::new_root("streaming-partial");
         let mut update = update_factory.create(1, 0);
         update.set_mem_tracker(Arc::clone(&update_tracker));
+        install_input_creator(update.as_mut());
         update.prepare().expect("prepare partial aggregate");
         update
             .as_processor_mut()
             .expect("partial aggregate processor")
             .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, 0..256))
             .expect("build partial distinct state");
-        let intermediate = finish_and_take_output(&mut update, &update_state);
+        let intermediate =
+            typed_distinct_intermediate(finish_and_take_output(&mut update, &update_state));
         drop(update);
         assert_eq!(update_tracker.current(), 0);
         assert!(
@@ -1504,6 +1583,7 @@ mod retained_memory_tests {
         let merge_tracker = MemTracker::new_root("streaming-merge");
         let mut merge = merge_factory.create(1, 0);
         merge.set_mem_tracker(Arc::clone(&merge_tracker));
+        install_input_creator(merge.as_mut());
         merge.prepare().expect("prepare merge aggregate");
         merge
             .as_processor_mut()
@@ -1530,6 +1610,7 @@ mod retained_memory_tests {
         let tracker = MemTracker::new_root("streaming-oom");
         let mut operator = factory.create(1, 0);
         operator.set_mem_tracker(Arc::clone(&tracker));
+        install_input_creator(operator.as_mut());
         operator.prepare().expect("prepare streaming aggregate");
         operator
             .as_processor_mut()

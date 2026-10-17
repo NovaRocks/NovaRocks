@@ -22,12 +22,12 @@ use arrow::datatypes::{DataType, TimeUnit};
 use chrono::Duration;
 use std::sync::Arc;
 
-pub fn eval_timestampadd(
-    arena: &ExprArena,
+pub fn eval_timestampadd<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let unit_arr = arena.eval(args[0], chunk)?;
     let interval_arr = arena.eval(args[1], chunk)?;
     let dt_arr = arena.eval(args[2], chunk)?;

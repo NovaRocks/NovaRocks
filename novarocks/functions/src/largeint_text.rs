@@ -14,10 +14,22 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! ONE original LARGEINT VARCHAR computation, with original full reader errors.
+//! Original LARGEINT text computations, with original parse and reader policy.
 use crate::largeint;
 use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, builder::StringBuilder};
 use std::sync::Arc;
+
+/// Original VARCHAR -> LARGEINT grammar. Parse failure is a successful NULL,
+/// including empty/sign-only text and values outside signed i128. No i64
+/// intermediate, saturation, extra syntax or error suppression is involved.
+/// Selected/runtime callers bracket this opaque std parser with their control.
+pub fn parse_utf8(value: &str) -> Option<i128> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<i128>().ok()
+}
 
 /// Same original signed big-endian reader and native i128 text conversion.
 pub fn value_text(source: &FixedSizeBinaryArray, row: usize) -> Result<String, String> {

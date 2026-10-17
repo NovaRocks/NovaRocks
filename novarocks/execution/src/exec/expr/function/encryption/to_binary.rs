@@ -19,14 +19,14 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, BinaryArray, StringArray};
 use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_legacy};
 
-pub fn eval_to_binary(
-    arena: &ExprArena,
+pub fn eval_to_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 && args.len() != 2 {
-        return Err("to_binary expects 1 or 2 arguments".to_string());
+        return Err(("to_binary expects 1 or 2 arguments".to_string()).into());
     }
 
     let input = arena.eval(args[0], chunk)?;
@@ -53,5 +53,5 @@ pub fn eval_to_binary(
         .iter()
         .map(|value| value.map(<[u8]>::to_vec))
         .collect();
-    super::common::build_bytes_output_latin1(values, arena.data_type(expr))
+    Ok((super::common::build_bytes_output_latin1(values, arena.data_type(expr)))?)
 }

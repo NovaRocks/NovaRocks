@@ -20,12 +20,12 @@ use arrow::array::{Array, ArrayRef, BooleanArray, ListArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-pub fn eval_array_contains_all(
-    arena: &ExprArena,
+pub fn eval_array_contains_all<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left_arr = arena.eval(args[0], chunk)?;
     let right_arr = arena.eval(args[1], chunk)?;
     if left_arr.data_type() == &DataType::Null || right_arr.data_type() == &DataType::Null {
@@ -64,10 +64,11 @@ pub fn eval_array_contains_all(
         {
             left_values = casted;
         } else {
-            return Err(format!(
+            return Err((format!(
                 "array_contains_all type mismatch after coercion attempts: {:?} vs {:?}",
                 left_type, right_type
-            ));
+            ))
+            .into());
         }
     }
     let left_offsets = left.value_offsets();

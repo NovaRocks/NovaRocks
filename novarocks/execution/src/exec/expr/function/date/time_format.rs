@@ -22,12 +22,12 @@ use novarocks_functions::{
     EvaluationCheckpoints,
     builtin::calendar_time_text_shared::{self as shared, LegacyControl, TimeTextError},
 };
-pub fn eval_time_format(
-    arena: &ExprArena,
+pub fn eval_time_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let mut work = EvaluationCheckpoints::new(&LegacyControl);
     let override_values = if let Some(ExprNode::Cast(child, _)) = arena.node(args[0]) {
         if matches!(arena.data_type(*child), Some(DataType::Utf8)) {
@@ -54,6 +54,8 @@ pub fn eval_time_format(
     } else {
         shared::format_argument(&time, &mut work).map_err(TimeTextError::into_legacy)?
     };
-    shared::format_output(&seconds, format, chunk.len(), &mut work)
-        .map_err(TimeTextError::into_legacy)
+    Ok(
+        (shared::format_output(&seconds, format, chunk.len(), &mut work)
+            .map_err(TimeTextError::into_legacy))?,
+    )
 }

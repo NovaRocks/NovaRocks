@@ -22,12 +22,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::percentile;
 
-pub fn eval_percentile_hash(
-    arena: &ExprArena,
+pub fn eval_percentile_hash<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
     let mut builder = BinaryBuilder::new();
     for row in 0..input.len() {
@@ -36,12 +36,12 @@ pub fn eval_percentile_hash(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_percentile_empty(
-    _arena: &ExprArena,
+pub fn eval_percentile_empty<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    _arena: &__Eval,
     _expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let mut builder = BinaryBuilder::new();
     for _ in 0..chunk.len() {
         builder.append_value(percentile::encode_empty_state());
@@ -49,15 +49,15 @@ pub fn eval_percentile_empty(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_percentile_approx_raw(
-    arena: &ExprArena,
+pub fn eval_percentile_approx_raw<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let payloads = arena.eval(args[0], chunk)?;
     let quantiles = arena.eval(args[1], chunk)?;
-    novarocks_functions::percentile_approx_raw_core::evaluate_legacy(&payloads, &quantiles)
+    Ok((novarocks_functions::percentile_approx_raw_core::evaluate_legacy(&payloads, &quantiles))?)
 }
 
 pub fn numeric_value_at(

@@ -79,6 +79,7 @@ impl OperatorFactory for LocalExchangeSinkFactory {
             exchanger: Arc::clone(&self.exchanger),
             finished: false,
             logged_first_input: false,
+            construction: None,
         })
     }
 
@@ -88,6 +89,7 @@ impl OperatorFactory for LocalExchangeSinkFactory {
 }
 
 struct LocalExchangeSinkOperator {
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     name: String,
     owner_node_id: i32,
     driver_id: i32,
@@ -97,6 +99,15 @@ struct LocalExchangeSinkOperator {
 }
 
 impl Operator for LocalExchangeSinkOperator {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -142,9 +153,12 @@ impl ProcessorOperator for LocalExchangeSinkOperator {
                 chunk.len()
             );
         }
-        Ok(self
-            .exchanger
-            .accept(state, chunk, self.driver_id as usize)?)
+        Ok(self.exchanger.accept_created(
+            state,
+            chunk,
+            self.driver_id as usize,
+            self.construction.as_deref(),
+        )?)
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
@@ -213,6 +227,19 @@ impl ProcessorOperator for LocalExchangeSinkOperator {
 
 #[cfg(test)]
 mod tests {
+    fn install_actual_creator(
+        operator: &mut dyn crate::exec::pipeline::operator::Operator,
+        state: &RuntimeState,
+    ) {
+        operator.set_construction_factory(
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root("local exchange fixture construction"),
+                state.error_state(),
+            ).unwrap(),
+        );
+    }
+
     use std::sync::Arc;
 
     use arrow::array::Int32Array;
@@ -233,15 +260,14 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        }
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
     }
 
     #[test]
@@ -254,6 +280,7 @@ mod tests {
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
 
         let mut sink = sink_factory.create(1, 0);
+        install_actual_creator(sink.as_mut(), &rt);
         let mut source = source_factory.create(1, 0);
 
         let c1 = chunk_of(&[1]);
@@ -369,6 +396,7 @@ mod tests {
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
+        install_actual_creator(sink.as_mut(), &rt);
         let mut consumers = (0..3)
             .map(|index| source_factory.create(3, index))
             .collect::<Vec<_>>();
@@ -404,6 +432,7 @@ mod tests {
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
+        install_actual_creator(sink.as_mut(), &rt);
         let consumers = (0..3)
             .map(|index| source_factory.create(3, index))
             .collect::<Vec<_>>();
@@ -460,7 +489,9 @@ mod tests {
         );
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let mut first = sink_factory.create(2, 0);
+        install_actual_creator(first.as_mut(), &rt);
         let mut second = sink_factory.create(2, 1);
+        install_actual_creator(second.as_mut(), &rt);
         let mut source =
             LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(1, 0);
         let readable = exchanger.source_observable();
@@ -571,6 +602,7 @@ mod tests {
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
+        install_actual_creator(sink.as_mut(), &rt);
         let mut first = source_factory.create(2, 0);
         let mut second = source_factory.create(2, 1);
         push(&mut sink, &rt, &[7]);
@@ -591,6 +623,7 @@ mod tests {
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
+        install_actual_creator(sink.as_mut(), &rt);
         let mut first = source_factory.create(2, 0);
         let mut second = source_factory.create(2, 1);
         push(&mut sink, &rt, &[1]);
@@ -762,6 +795,7 @@ mod tests {
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 2, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
+        install_actual_creator(sink.as_mut(), &state);
         let mut departed = source_factory.create(2, 0);
         let mut sibling = source_factory.create(2, 1);
         sink.as_processor_mut()

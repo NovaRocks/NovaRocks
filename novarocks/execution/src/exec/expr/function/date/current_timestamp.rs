@@ -22,12 +22,12 @@ use arrow::datatypes::{DataType, TimeUnit};
 use std::sync::Arc;
 
 #[inline]
-fn eval_current_timestamp_inner(
-    arena: &ExprArena,
+fn eval_current_timestamp_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     chunk: &Chunk,
     utc: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let dt = if utc {
         datetime_from_utc_now()
     } else {
@@ -43,47 +43,47 @@ fn eval_current_timestamp_inner(
     Ok(Arc::new(TimestampMicrosecondArray::from(values)) as ArrayRef)
 }
 
-pub fn eval_current_timestamp(
-    arena: &ExprArena,
+pub fn eval_current_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_current_timestamp_inner(arena, expr, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_current_timestamp_inner(arena, expr, chunk, false))?)
 }
 
-pub fn eval_localtime(
-    arena: &ExprArena,
+pub fn eval_localtime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_current_timestamp_inner(arena, expr, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_current_timestamp_inner(arena, expr, chunk, false))?)
 }
 
-pub fn eval_localtimestamp(
-    arena: &ExprArena,
+pub fn eval_localtimestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_current_timestamp_inner(arena, expr, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_current_timestamp_inner(arena, expr, chunk, false))?)
 }
 
-pub fn eval_now(
-    arena: &ExprArena,
+pub fn eval_now<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_current_timestamp_inner(arena, expr, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_current_timestamp_inner(arena, expr, chunk, false))?)
 }
 
-pub fn eval_utc_timestamp(
-    arena: &ExprArena,
+pub fn eval_utc_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_current_timestamp_inner(arena, expr, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_current_timestamp_inner(arena, expr, chunk, true))?)
 }

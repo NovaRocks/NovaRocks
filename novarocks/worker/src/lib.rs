@@ -123,6 +123,8 @@ pub use domain::{
     plan_task_domain_updates, task_domain_reaches_execution, validate_task_domain_membership,
 };
 pub use drain::WorkerDrainState;
+#[cfg(novarocks_dev_controls)]
+pub use host::TestTaskUpdateConsumptionReservation;
 pub use host::{
     HostRejection, PreparationControlLoan, PreparedTaskInstallation, QueryContextHost,
     ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,

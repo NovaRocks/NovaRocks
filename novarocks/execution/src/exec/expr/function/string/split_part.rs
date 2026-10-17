@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 use super::common::downcast_int_arg_array;
 
-pub fn eval_split_part(
-    arena: &ExprArena,
+pub fn eval_split_part<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let delim_arr = arena.eval(args[1], chunk)?;

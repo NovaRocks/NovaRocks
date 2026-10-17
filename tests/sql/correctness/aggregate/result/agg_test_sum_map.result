@@ -154,15 +154,15 @@ NULL
 
 -- query 51
 sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[NULL]
-15	20	30	150
+15	20	30	NULL
 
 -- query 53
 sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[4]	sum_map(m_nullable)[NULL]
-30	20	30	40	150
+30	20	30	40	NULL
 
 -- query 55
 sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[4]	sum_map(m_nullable)[5]	sum_map(m_nullable)[6]	sum_map(m_nullable)[NULL]
-30	20	30	40	NULL	60	175
+30	20	30	40	NULL	60	NULL
 
 -- query 56
 sum_map(m)[1]	sum_map(m)[2]

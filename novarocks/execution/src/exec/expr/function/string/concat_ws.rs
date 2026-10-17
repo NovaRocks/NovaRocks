@@ -24,12 +24,12 @@ use novarocks_functions::builtin::string_concat_core::{
 };
 use std::convert::Infallible;
 
-pub fn eval_concat_ws(
-    arena: &ExprArena,
+pub fn eval_concat_ws<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let sep_arr = arena.eval(args[0], chunk)?;
     let sep = sep_arr

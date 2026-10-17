@@ -22,12 +22,12 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_array_remove(
-    arena: &ExprArena,
+pub fn eval_array_remove<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let target_arr = arena.eval(args[1], chunk)?;
     let list = arr
@@ -40,10 +40,9 @@ pub fn eval_array_remove(
         _ => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_remove output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_remove output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -107,7 +106,7 @@ pub fn eval_array_remove(
             }
         }
         if current > i32::MAX as i64 {
-            return Err("array_remove offset overflow".to_string());
+            return Err(("array_remove offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

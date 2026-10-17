@@ -16,7 +16,10 @@
 // under the License.
 
 use super::*;
-use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
+    StringViewArray,
+};
 use arrow::datatypes::DataType;
 use novarocks_functions::{ConstantPool, ConstantValue};
 use novarocks_type_contract::{CompileControlError, FunctionValueType, ValueLogicalType};
@@ -247,4 +250,108 @@ fn every_selected_display_control_refusal_preserves_exact_prefix_without_publica
     }
     assert_eq!(pool.value(2).unwrap().ordinal(), 2);
     assert_eq!(pool.field().name(), "provider.original");
+}
+
+fn binary_source(ty: DataType) -> ConstantPool {
+    let values = vec![
+        Some(b"poison.unselected".as_slice()),
+        None,
+        Some(b"".as_slice()),
+        Some([0x00, 0xab, 0xff].as_slice()),
+    ];
+    let array: ArrayRef = match ty {
+        DataType::Binary => Arc::new(BinaryArray::from(values)),
+        DataType::LargeBinary => Arc::new(LargeBinaryArray::from(values)),
+        DataType::BinaryView => Arc::new(BinaryViewArray::from(values)),
+        _ => unreachable!(),
+    };
+    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    ConstantPool::try_new(
+        Arc::new(ty.try_to_field("provider.binary").unwrap()),
+        ty,
+        array.to_data(),
+        crate::constant::test_constant_policy(),
+        CompilePhase::Validate,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn binary_constant_display_preserves_selected_bytes_empty_and_null() {
+    for ty in [
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::BinaryView,
+    ] {
+        let pool = binary_source(ty);
+        for (ordinal, expected, diagnostic) in [
+            (1, "NULL", "NULL"),
+            (2, "X''", ""),
+            (3, "X'00ABFF'", "00abff"),
+        ] {
+            let value = pool.value(ordinal).unwrap();
+            let identity = value.pool().backing_identity();
+            assert_eq!(
+                typed_expr_display_name(&constant(value.clone()), &Control::default()).unwrap(),
+                expected
+            );
+            let mut streamed = String::new();
+            crate::constant::write_constant_observed(&value, &Control::default(), &mut streamed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(streamed, expected);
+            assert_eq!(
+                value
+                    .format_diagnostic_observed(CompilePhase::LowerProgram, &Control::default())
+                    .unwrap(),
+                diagnostic
+            );
+            assert_eq!(value.ordinal(), ordinal);
+            assert_eq!(value.pool().backing_identity(), identity);
+        }
+        assert_eq!(
+            pool.value(0).unwrap().try_binary().unwrap(),
+            Some(b"poison.unselected".as_slice())
+        );
+    }
+}
+
+#[test]
+fn binary_display_preserves_first_control_and_writer_refusal() {
+    let pool = binary_source(DataType::Binary);
+    let value = pool.value(3).unwrap();
+    let accepted = Control::default();
+    assert_eq!(
+        crate::constant::format_constant_observed(&value, &accepted).unwrap(),
+        "X'00ABFF'"
+    );
+    let expected = accepted.trace.lock().unwrap().clone();
+    for at in 0..expected.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let refused = Control {
+                refuse: Some((at, cause)),
+                ..Default::default()
+            };
+            assert_eq!(
+                crate::constant::format_constant_observed(&value, &refused),
+                Err(SqlCompileError::from(cause))
+            );
+            assert_eq!(*refused.trace.lock().unwrap(), expected[..=at]);
+        }
+    }
+    struct RefusingWriter;
+    impl std::fmt::Write for RefusingWriter {
+        fn write_str(&mut self, _: &str) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+    assert_eq!(
+        crate::constant::write_constant_observed(&value, &Control::default(), &mut RefusingWriter),
+        Ok(Err(std::fmt::Error))
+    );
 }

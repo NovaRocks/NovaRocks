@@ -19,14 +19,14 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, StringArray};
 use novarocks_functions::Selection;
 
-pub fn eval_parse_json(
-    arena: &ExprArena,
+pub fn eval_parse_json<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!("parse_json expects 1 argument, got {}", args.len()));
+        return Err((format!("parse_json expects 1 argument, got {}", args.len())).into());
     }
     let input = arena.eval(args[0], chunk)?;
     let arr = input

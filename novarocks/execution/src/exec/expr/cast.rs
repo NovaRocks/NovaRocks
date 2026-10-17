@@ -2514,11 +2514,7 @@ fn cast_largeint_binary_to_boolean(child_array: &ArrayRef) -> Result<ArrayRef, S
 }
 
 fn parse_utf8_to_largeint(value: &str) -> Option<i128> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.parse::<i128>().ok()
+    novarocks_functions::largeint_text::parse_utf8(value)
 }
 
 fn cast_utf8_to_largeint_binary(child_array: &ArrayRef) -> Result<ArrayRef, String> {
@@ -2605,13 +2601,13 @@ fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, Strin
 #[path = "cast_numeric_oracle_tests.rs"]
 mod cast_numeric_oracle_tests;
 
-pub fn eval(
-    arena: &ExprArena,
+pub fn eval<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     cast_expr: ExprId,
     child: ExprId,
     decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let target_type = arena
         .data_type(cast_expr)
         .ok_or_else(|| "CAST missing target data type".to_string())?
@@ -2623,33 +2619,35 @@ pub fn eval(
         .data_type(child)
         .ok_or_else(|| "CAST missing source data type".to_string())?;
     if !decimal_error_policy_cast_supported(source_type, &target_type, decimal_overflow_policy) {
-        return Err("ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST".to_string());
+        return Err(
+            ("ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST".to_string()).into(),
+        );
     }
 
     let child_array = arena.eval(child, chunk)?;
     if let (DataType::Decimal128(..), DataType::Decimal128(precision, scale)) =
         (child_array.data_type(), &target_type)
     {
-        return novarocks_functions::decimal128_rescale::evaluate_legacy(
+        return Ok((novarocks_functions::decimal128_rescale::evaluate_legacy(
             &child_array,
             *precision,
             *scale,
             decimal_overflow_policy,
             arena.allow_throw_exception(),
-        );
+        ))?);
     }
     if matches!(
         child_array.data_type(),
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
     ) && let DataType::Decimal128(precision, scale) = target_type
     {
-        return novarocks_functions::integral_decimal128::evaluate_legacy(
+        return Ok((novarocks_functions::integral_decimal128::evaluate_legacy(
             &child_array,
             precision,
             scale,
             decimal_overflow_policy,
             arena.allow_throw_exception(),
-        );
+        ))?);
     }
     if is_checked_decimal_numeric_cast(child_array.data_type(), &target_type) {
         let casted = if child_array.data_type() == &target_type {
@@ -2673,12 +2671,13 @@ pub fn eval(
                     && is_decimal_type(&target_type)))
         {
             return Err(
-                "Expr evaluate meet error: The numeric type cast involving decimal overflows"
-                    .to_string(),
+                ("Expr evaluate meet error: The numeric type cast involving decimal overflows"
+                    .to_string())
+                .into(),
             );
         }
-        return sanitize_non_finite_cast_result(casted, &target_type)
-            .map_err(|error| format_cast_error(child_array.data_type(), &target_type, &error));
+        return Ok((sanitize_non_finite_cast_result(casted, &target_type)
+            .map_err(|error| format_cast_error(child_array.data_type(), &target_type, &error)))?);
     }
     if child_array.data_type() == &target_type {
         return Ok(child_array);
@@ -2696,7 +2695,7 @@ pub fn eval(
                 target_type
             )
         });
-        return casted.and_then(|array| {
+        return Ok((casted.and_then(|array| {
             sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
                 format!(
                     "CAST failed: from {:?} to {:?}: {e}",
@@ -2704,7 +2703,7 @@ pub fn eval(
                     target_type
                 )
             })
-        });
+        }))?);
     }
 
     match (child_array.data_type(), &target_type) {
@@ -2727,7 +2726,7 @@ pub fn eval(
                     target_type
                 )
             });
-            return casted.and_then(|array| {
+            return Ok((casted.and_then(|array| {
                 sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
                     format!(
                         "CAST failed: from {:?} to {:?}: {e}",
@@ -2735,7 +2734,7 @@ pub fn eval(
                         target_type
                     )
                 })
-            });
+            }))?);
         }
         (DataType::Date32, DataType::Float32) => {
             let arr = child_array
@@ -2749,7 +2748,7 @@ pub fn eval(
                     target_type
                 )
             });
-            return casted.and_then(|array| {
+            return Ok((casted.and_then(|array| {
                 sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
                     format!(
                         "CAST failed: from {:?} to {:?}: {e}",
@@ -2757,7 +2756,7 @@ pub fn eval(
                         target_type
                     )
                 })
-            });
+            }))?);
         }
         (DataType::Float64, DataType::Float32) => {
             let arr = child_array
@@ -2785,7 +2784,7 @@ pub fn eval(
                     target_type
                 )
             });
-            return casted.and_then(|array| {
+            return Ok((casted.and_then(|array| {
                 sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
                     format!(
                         "CAST failed: from {:?} to {:?}: {e}",
@@ -2793,7 +2792,7 @@ pub fn eval(
                         target_type
                     )
                 })
-            });
+            }))?);
         }
         (DataType::Float32, DataType::Date32) => {
             let arr = child_array
@@ -2807,7 +2806,7 @@ pub fn eval(
                     target_type
                 )
             });
-            return casted.and_then(|array| {
+            return Ok((casted.and_then(|array| {
                 sanitize_non_finite_cast_result(array, &target_type).map_err(|e| {
                     format!(
                         "CAST failed: from {:?} to {:?}: {e}",
@@ -2815,7 +2814,7 @@ pub fn eval(
                         target_type
                     )
                 })
-            });
+            }))?);
         }
         (DataType::FixedSizeBinary(width), DataType::Decimal128(precision, scale))
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
@@ -2828,13 +2827,15 @@ pub fn eval(
                         target_type
                     )
                 })?;
-            return sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            });
+            return Ok(
+                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
+                    format!(
+                        "CAST failed: from {:?} to {:?}: {e}",
+                        child_array.data_type(),
+                        target_type
+                    )
+                }))?,
+            );
         }
         (DataType::FixedSizeBinary(width), DataType::Decimal256(precision, scale))
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
@@ -2847,13 +2848,15 @@ pub fn eval(
                         target_type
                     )
                 })?;
-            return sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            });
+            return Ok(
+                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
+                    format!(
+                        "CAST failed: from {:?} to {:?}: {e}",
+                        child_array.data_type(),
+                        target_type
+                    )
+                }))?,
+            );
         }
         (DataType::FixedSizeBinary(width), DataType::Float64)
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
@@ -2865,13 +2868,15 @@ pub fn eval(
                     target_type
                 )
             })?;
-            return sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            });
+            return Ok(
+                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
+                    format!(
+                        "CAST failed: from {:?} to {:?}: {e}",
+                        child_array.data_type(),
+                        target_type
+                    )
+                }))?,
+            );
         }
         (DataType::FixedSizeBinary(width), DataType::Float32)
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
@@ -2883,34 +2888,40 @@ pub fn eval(
                     target_type
                 )
             })?;
-            return sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            });
+            return Ok(
+                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
+                    format!(
+                        "CAST failed: from {:?} to {:?}: {e}",
+                        child_array.data_type(),
+                        target_type
+                    )
+                }))?,
+            );
         }
         // Decimal256 → Float32/Float64: use our custom conversion that preserves +/-inf,
         // and return early to skip the sanitize_non_finite_cast_result step below which
         // would convert infinity to null.
         (DataType::Decimal256(_, source_scale), DataType::Float32) => {
-            return cast_decimal256_to_float32(&child_array, *source_scale).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            });
+            return Ok(
+                (cast_decimal256_to_float32(&child_array, *source_scale).map_err(|e| {
+                    format!(
+                        "CAST failed: from {:?} to {:?}: {e}",
+                        child_array.data_type(),
+                        target_type
+                    )
+                }))?,
+            );
         }
         (DataType::Decimal256(_, source_scale), DataType::Float64) => {
-            return cast_decimal256_to_float64(&child_array, *source_scale).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            });
+            return Ok(
+                (cast_decimal256_to_float64(&child_array, *source_scale).map_err(|e| {
+                    format!(
+                        "CAST failed: from {:?} to {:?}: {e}",
+                        child_array.data_type(),
+                        target_type
+                    )
+                }))?,
+            );
         }
         _ => {}
     }
@@ -2926,13 +2937,15 @@ pub fn eval(
                     target_type
                 )
             })?;
-        return sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-            format!(
-                "CAST failed: from {:?} to {:?}: {e}",
-                child_array.data_type(),
-                target_type
-            )
-        });
+        return Ok(
+            (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
+                format!(
+                    "CAST failed: from {:?} to {:?}: {e}",
+                    child_array.data_type(),
+                    target_type
+                )
+            }))?,
+        );
     }
 
     let casted =
@@ -2941,28 +2954,31 @@ pub fn eval(
     if arena.allow_throw_exception() {
         if let Some(value) = first_float_to_int_overflow_value(&child_array, &casted, &target_type)?
         {
-            return Err(format!(
+            return Err((format!(
                 "Expr evaluate meet error: CAST failed: from {:?} to {:?}: {} conflict with range of {}",
                 child_array.data_type(),
                 target_type,
                 value,
                 integral_target_name(&target_type)
-            ));
+            )).into());
         }
         if has_decimal_to_decimal_overflow(&child_array, &casted) {
             return Err(
-                "Expr evaluate meet error: The type cast from decimal to decimal overflows"
-                    .to_string(),
+                ("Expr evaluate meet error: The type cast from decimal to decimal overflows"
+                    .to_string())
+                .into(),
             );
         }
     }
-    sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-        format!(
-            "CAST failed: from {:?} to {:?}: {e}",
-            child_array.data_type(),
-            target_type
-        )
-    })
+    Ok(
+        (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
+            format!(
+                "CAST failed: from {:?} to {:?}: {e}",
+                child_array.data_type(),
+                target_type
+            )
+        }))?,
+    )
 }
 
 fn format_cast_error(source_type: &DataType, target_type: &DataType, err: &str) -> String {
@@ -2972,22 +2988,23 @@ fn format_cast_error(source_type: &DataType, target_type: &DataType, err: &str) 
     format!("CAST failed: from {source_type:?} to {target_type:?}: {err}")
 }
 
-fn eval_time_internal(
-    arena: &ExprArena,
+fn eval_time_internal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     cast_expr: ExprId,
     child: ExprId,
     chunk: &Chunk,
     source_is_datetime: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let target_type = arena
         .data_type(cast_expr)
         .ok_or_else(|| "CAST missing target data type".to_string())?
         .clone();
     if !matches!(target_type, DataType::Time64(TimeUnit::Microsecond)) {
-        return Err(format!(
+        return Err((format!(
             "CAST failed: TIME target must be Time64(Microsecond), got {:?}",
             target_type
-        ));
+        ))
+        .into());
     }
 
     let child_array = arena.eval(child, chunk)?;
@@ -3001,14 +3018,14 @@ fn eval_time_internal(
         if child_array.data_type() == &target_type {
             return Ok(child_array);
         }
-        return cast(&child_array, &target_type).map_err(|e| {
+        return Ok((cast(&child_array, &target_type).map_err(|e| {
             format!(
                 "CAST failed: from {:?} to {:?}: {}",
                 child_array.data_type(),
                 target_type,
                 e
             )
-        });
+        }))?);
     }
 
     if matches!(
@@ -3020,20 +3037,20 @@ fn eval_time_internal(
         } else {
             novarocks_functions::time_text_cast::TimeTextParseMode::Duration
         };
-        return novarocks_functions::time_text_cast::evaluate_arrays(
+        return Ok((novarocks_functions::time_text_cast::evaluate_arrays(
             &child_array,
             &target_type,
             mode,
-        );
+        ))?);
     }
     if matches!(
         child_array.data_type(),
         DataType::Date32 | DataType::Timestamp(_, _)
     ) {
-        return novarocks_functions::time_calendar_cast::evaluate_arrays(
+        return Ok((novarocks_functions::time_calendar_cast::evaluate_arrays(
             &child_array,
             &target_type,
-        );
+        ))?);
     }
     let mut seconds = Vec::with_capacity(child_array.len());
     match child_array.data_type() {
@@ -3158,35 +3175,37 @@ fn eval_time_internal(
                     target_type
                 )
             })?;
-            return sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
-                format!(
-                    "CAST failed: from {:?} to {:?}: {e}",
-                    child_array.data_type(),
-                    target_type
-                )
-            });
+            return Ok(
+                (sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
+                    format!(
+                        "CAST failed: from {:?} to {:?}: {e}",
+                        child_array.data_type(),
+                        target_type
+                    )
+                }))?,
+            );
         }
     }
 
-    seconds_to_time64_micro_array(seconds)
+    Ok((seconds_to_time64_micro_array(seconds))?)
 }
 
-pub fn eval_time(
-    arena: &ExprArena,
+pub fn eval_time<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     cast_expr: ExprId,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_time_internal(arena, cast_expr, child, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_time_internal(arena, cast_expr, child, chunk, false))?)
 }
 
-pub fn eval_time_from_datetime(
-    arena: &ExprArena,
+pub fn eval_time_from_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     cast_expr: ExprId,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_time_internal(arena, cast_expr, child, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_time_internal(arena, cast_expr, child, chunk, true))?)
 }
 
 fn cast_variant_array(

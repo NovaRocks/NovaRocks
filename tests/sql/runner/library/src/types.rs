@@ -355,6 +355,8 @@ pub struct QueryMeta {
     /// legacy scalar remains for existing programmatic callers and for the
     /// primary BE-log token, while parsed SQL directives populate this list.
     pub query_lifecycle_faults: Vec<QueryLifecycleFaultDirective>,
+    /// Keep the selected ACK-drop input unconsumed until its exact live replay.
+    pub task_update_replay_barrier: Option<bool>,
     /// Typed outcome/source assertion for RFO-8R2 resilience cases. It is
     /// intentionally separate from `expect_error` and log assertions.
     pub query_lifecycle_structured_assertion: Option<QueryLifecycleStructuredAssertion>,
@@ -402,6 +404,10 @@ pub struct QueryMeta {
     /// retained publication resolves B/D/L in current properties; count carried
     /// slot snapshots separately and reject document sidecar objects.
     pub mv_rest_document_graph: Option<String>,
+    /// Explicit finite logical attempt ordinals authorized for Native observation.
+    /// None preserves the single first-actual observation grant. These slots
+    /// neither authorize faults nor change the query's recovery policy/budget.
+    pub native_observation_attempts: Option<Vec<u64>>,
     /// Require a substring to occur in at least one runner-owned BE log.
     pub be_log_contains: Vec<String>,
     /// Reject a substring if it occurs in any runner-owned BE log after this step began.

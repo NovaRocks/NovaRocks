@@ -26,12 +26,12 @@ use crate::exec::expr::agg::cardinality_from_serialized_hll;
 use crate::exec::expr::{ExprArena, ExprId};
 use novarocks_types::value::hll::encode_hll_empty;
 
-pub fn eval_hll_empty(
-    _arena: &ExprArena,
+pub fn eval_hll_empty<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    _arena: &__Eval,
     _expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let mut builder = BinaryBuilder::new();
     for _ in 0..chunk.len() {
         builder.append_value(encode_hll_empty());
@@ -39,49 +39,40 @@ pub fn eval_hll_empty(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_hll_serialize(
-    arena: &ExprArena,
+pub fn eval_hll_serialize<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!(
-            "hll_serialize expects 1 argument, got {}",
-            args.len()
-        ));
+        return Err((format!("hll_serialize expects 1 argument, got {}", args.len())).into());
     }
     let input = arena.eval(args[0], chunk)?;
-    copy_as_binary(&input)
+    Ok((copy_as_binary(&input))?)
 }
 
-pub fn eval_hll_deserialize(
-    arena: &ExprArena,
+pub fn eval_hll_deserialize<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!(
-            "hll_deserialize expects 1 argument, got {}",
-            args.len()
-        ));
+        return Err((format!("hll_deserialize expects 1 argument, got {}", args.len())).into());
     }
     let input = arena.eval(args[0], chunk)?;
-    copy_as_binary(&input)
+    Ok((copy_as_binary(&input))?)
 }
 
-pub fn eval_hll_cardinality(
-    arena: &ExprArena,
+pub fn eval_hll_cardinality<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!(
-            "hll_cardinality expects 1 argument, got {}",
-            args.len()
-        ));
+        return Err((format!("hll_cardinality expects 1 argument, got {}", args.len())).into());
     }
 
     let input = arena.eval(args[0], chunk)?;

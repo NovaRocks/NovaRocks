@@ -934,13 +934,117 @@ mod data_stream_sink_hash_partition {
     }
 
     // Partition a chunk based on hash values without converting to rows
-    pub fn partition_chunk_by_hash(
+    fn take_partition_rows_with<E: From<String>>(
+        source: &Chunk,
+        rows: &[u32],
+        publish: impl FnOnce(&Chunk, Vec<ArrayRef>, usize) -> Result<Chunk, E>,
+    ) -> Result<Chunk, E> {
+        let indices = arrow::array::UInt32Array::from(rows.to_vec());
+        let indices_ref = Arc::new(indices) as ArrayRef;
+        let mut columns = Vec::with_capacity(source.record_batch().num_columns());
+        for column in source.record_batch().columns() {
+            columns.push(
+                take(column.as_ref(), &indices_ref, None)
+                    .map_err(|error| format!("Arrow take failed: {error}"))?,
+            );
+        }
+        publish(source, columns, rows.len())
+    }
+
+    pub(crate) fn take_partition_rows_created(
+        source: &Chunk,
+        rows: &[u32],
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        control: &dyn crate::exec::expr::ExprEvaluationControl,
+    ) -> crate::runtime::fragment::ExecutionResult<Chunk> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        control.checkpoint()?;
+        let owner = factory.begin_input_construction(source)?;
+        for layout in [
+            std::alloc::Layout::array::<u32>(rows.len()),
+            std::alloc::Layout::array::<ArrayRef>(source.columns().len()),
+        ] {
+            owner.request(layout.map_err(|_| {
+                ConstructionFailure::from(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)
+            })?)?;
+        }
+        owner.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                units: rows.len(),
+            },
+        )?;
+        let output = take_partition_rows_with::<crate::runtime::fragment::ExecutionFailure>(
+            source,
+            rows,
+            |source, columns, row_count| {
+                owner.observe(
+                    0,
+                    &[],
+                    crate::exec::chunk::ArrayNormalizationStep::OpaqueOperationFinished,
+                )?;
+                let storage = source.source_storage_lifetime_observed::<ConstructionFailure>(
+                    owner.storage_lifetime(),
+                    |layout| owner.request(layout),
+                )?;
+                Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+                    ConstructionFailure,
+                    _,
+                >(
+                    source.chunk_schema_ref(),
+                    columns,
+                    row_count,
+                    storage,
+                    |step| owner.observe(0, &[], step),
+                )?)
+            },
+        )?;
+        control.checkpoint()?;
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    pub fn partition_chunk_by_hash<E: crate::exec::expr::ExprEvaluation + ?Sized>(
+        chunk: &Chunk,
+        exprs: &[ExprId],
+        arena: &E,
+        partitions: usize,
+        crc: bool,
+    ) -> Result<Vec<Chunk>, E::Error> {
+        partition_chunk_by_hash_with(chunk, exprs, arena, partitions, crc, |source, rows| {
+            take_partition_rows_with(source, rows, |source, columns, _| {
+                Chunk::try_new_with_columns(source.chunk_schema_ref(), columns).map_err(Into::into)
+            })
+        })
+    }
+
+    pub(crate) fn partition_chunk_by_hash_created(
+        chunk: &Chunk,
+        exprs: &[ExprId],
+        evaluation: &crate::exec::expr::ExprEvaluationContext<'_>,
+        partitions: usize,
+        crc: bool,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        control: &dyn crate::exec::expr::ExprEvaluationControl,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
+        partition_chunk_by_hash_with(chunk, exprs, evaluation, partitions, crc, |source, rows| {
+            take_partition_rows_created(source, rows, factory, control)
+        })
+    }
+
+    fn partition_chunk_by_hash_with<
+        E: crate::exec::expr::ExprEvaluation + ?Sized,
+        F: From<E::Error> + From<String>,
+    >(
         chunk: &Chunk,
         partition_exprs: &[ExprId],
-        arena: &ExprArena,
+        arena: &E,
         num_partitions: usize,
         use_crc32: bool,
-    ) -> Result<Vec<Chunk>, String> {
+        take_rows: impl FnMut(&Chunk, &[u32]) -> Result<Chunk, F>,
+    ) -> Result<Vec<Chunk>, F> {
         if chunk.is_empty() {
             return Ok(vec![Chunk::default(); num_partitions]);
         }
@@ -948,19 +1052,59 @@ mod data_stream_sink_hash_partition {
         // Evaluate partition expressions to get arrays
         let mut partition_arrays = Vec::with_capacity(partition_exprs.len());
         for expr_id in partition_exprs {
-            let array = arena.eval(*expr_id, chunk)?;
+            let array = arena.eval(*expr_id, chunk).map_err(F::from)?;
             partition_arrays.push(array);
         }
 
-        partition_chunk_by_hash_arrays(chunk, &partition_arrays, num_partitions, use_crc32)
+        partition_chunk_by_hash_arrays_with(
+            chunk,
+            &partition_arrays,
+            num_partitions,
+            use_crc32,
+            take_rows,
+        )
     }
 
+    #[cfg(test)]
     pub fn partition_chunk_by_hash_arrays(
         chunk: &Chunk,
         partition_arrays: &[ArrayRef],
         num_partitions: usize,
         use_crc32: bool,
     ) -> Result<Vec<Chunk>, String> {
+        partition_chunk_by_hash_arrays_with(
+            chunk,
+            partition_arrays,
+            num_partitions,
+            use_crc32,
+            |source, rows| {
+                take_partition_rows_with(source, rows, |source, columns, _| {
+                    Chunk::try_new_with_columns(source.chunk_schema_ref(), columns)
+                })
+            },
+        )
+    }
+
+    pub(crate) fn partition_chunk_by_hash_arrays_created(
+        chunk: &Chunk,
+        arrays: &[ArrayRef],
+        partitions: usize,
+        crc: bool,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        control: &dyn crate::exec::expr::ExprEvaluationControl,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
+        partition_chunk_by_hash_arrays_with(chunk, arrays, partitions, crc, |source, rows| {
+            take_partition_rows_created(source, rows, factory, control)
+        })
+    }
+
+    fn partition_chunk_by_hash_arrays_with<E: From<String>>(
+        chunk: &Chunk,
+        partition_arrays: &[ArrayRef],
+        num_partitions: usize,
+        use_crc32: bool,
+        mut take_rows: impl FnMut(&Chunk, &[u32]) -> Result<Chunk, E>,
+    ) -> Result<Vec<Chunk>, E> {
         if chunk.is_empty() {
             return Ok(vec![Chunk::default(); num_partitions]);
         }
@@ -1014,19 +1158,7 @@ mod data_stream_sink_hash_partition {
             if rows.is_empty() {
                 partition_chunks.push(Chunk::default());
             } else {
-                // Use Arrow take to select rows for this partition
-                let indices = arrow::array::UInt32Array::from(rows.clone());
-                let indices_ref = Arc::new(indices) as arrow::array::ArrayRef;
-
-                let mut new_columns = Vec::with_capacity(chunk.record_batch().num_columns());
-                for col in chunk.record_batch().columns() {
-                    let taken = take(col.as_ref(), &indices_ref, None)
-                        .map_err(|e| format!("Arrow take failed: {}", e))?;
-                    new_columns.push(taken);
-                }
-
-                let new_chunk = Chunk::try_new_with_columns(chunk.chunk_schema_ref(), new_columns)
-                    .map_err(|e| format!("Failed to create partition chunk: {}", e))?;
+                let new_chunk = take_rows(chunk, rows)?;
 
                 partition_chunks.push(new_chunk);
             }
@@ -1036,8 +1168,14 @@ mod data_stream_sink_hash_partition {
     }
 }
 
+#[cfg(test)]
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
+#[cfg(test)]
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
+pub(crate) use data_stream_sink_hash_partition::{
+    partition_chunk_by_hash_arrays_created, partition_chunk_by_hash_created,
+    take_partition_rows_created,
+};
 
 /// The partition-key roots of one compiled stream branch, in key order.
 /// They are evaluated through compiled roots over the sink's input port; a
@@ -1882,7 +2020,7 @@ impl DataStreamSinkOperator {
         &mut self,
         chunk: &Chunk,
         compiled_keys: Option<&[ArrayRef]>,
-    ) -> Result<Vec<Vec<Chunk>>, String> {
+    ) -> ExecutionResult<Vec<Vec<Chunk>>> {
         // Get destinations first to avoid borrowing self
         let dests: Vec<FragmentDestination> = self.destinations().to_vec();
         if dests.is_empty() {
@@ -1921,20 +2059,13 @@ impl DataStreamSinkOperator {
                     if row_indices.is_empty() {
                         per_dest_chunks.push(Vec::new());
                     } else {
-                        let indices = arrow::array::UInt32Array::from(row_indices.clone());
-                        let indices_ref = Arc::new(indices) as arrow::array::ArrayRef;
-
-                        let mut new_columns =
-                            Vec::with_capacity(chunk.record_batch().num_columns());
-                        for col in chunk.record_batch().columns() {
-                            let taken = arrow::compute::take(col.as_ref(), &indices_ref, None)
-                                .map_err(|e| format!("Arrow take failed: {}", e))?;
-                            new_columns.push(taken);
-                        }
-
+                        let factory = self.construction_factory.as_deref().ok_or(
+                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                        )?;
+                        let control = RuntimeKernelControl::new(self.error_state.as_ref().ok_or(
+                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?.clone());
                         let new_chunk =
-                            Chunk::try_new_with_columns(chunk.chunk_schema_ref(), new_columns)
-                                .map_err(|e| format!("Failed to create partition chunk: {}", e))?;
+                            take_partition_rows_created(chunk, row_indices, factory, &control)?;
 
                         per_dest_chunks.push(vec![new_chunk]);
                     }
@@ -1952,13 +2083,41 @@ impl DataStreamSinkOperator {
                 let partition_chunks = match compiled_keys {
                     // Compiled keys feed the same hash and placement as the
                     // legacy arena keys; only their evaluation differs.
-                    Some(keys) => partition_chunk_by_hash_arrays(chunk, keys, n, use_crc32)?,
+                    Some(keys) => {
+                        let factory = self.construction_factory.as_deref().ok_or(
+                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                        )?;
+                        let control = RuntimeKernelControl::new(self.error_state.as_ref().ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?.clone());
+                        partition_chunk_by_hash_arrays_created(
+                            chunk, keys, n, use_crc32, factory, &control,
+                        )?
+                    }
                     None => {
                         if self.expr_ids.is_empty() {
-                            return Err("HASH_PARTITIONED missing partition_exprs".to_string());
+                            return Err("HASH_PARTITIONED missing partition_exprs".into());
                         }
-                        partition_chunk_by_hash(chunk, &self.expr_ids, &self.arena, n, use_crc32)
-                            .map_err(|e| e.to_string())?
+                        let factory = self.construction_factory.as_ref().ok_or(
+                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                        )?;
+                        let owner = factory.begin_input_construction(chunk)?;
+                        let error = self.error_state.as_ref().ok_or(
+                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                        )?;
+                        let control = RuntimeKernelControl::new(error.clone());
+                        let evaluation = crate::exec::expr::ExprEvaluationContext::new(
+                            &self.arena,
+                            owner.as_ref(),
+                            &control,
+                        );
+                        partition_chunk_by_hash_created(
+                            chunk,
+                            &self.expr_ids,
+                            &evaluation,
+                            n,
+                            use_crc32,
+                            factory.as_ref(),
+                            &control,
+                        )?
                     }
                 };
 
@@ -4582,5 +4741,96 @@ mod tests {
             drop(factory);
             assert_eq!(tracker.current(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod created_partition_regressions {
+    use super::*;
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{Field, Schema};
+    use novarocks_types::SlotId;
+
+    fn input() -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![7, 2, 9, 2, 11])) as ArrayRef],
+        )
+        .unwrap();
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
+    }
+    fn factory() -> Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory> {
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("partition regression construction"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap()
+    }
+    fn values(chunk: &Chunk) -> Vec<i32> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+        chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+    #[test]
+    fn real_partition_creator_preserves_hash_placement_order_and_binding() {
+        let source = input();
+        let factory = factory();
+        let state = RuntimeState::default();
+        let control = RuntimeKernelControl::new(state.error_state());
+        for crc in [false, true] {
+            let keys = vec![source.columns()[0].clone()];
+            let expected = partition_chunk_by_hash_arrays(&source, &keys, 3, crc).unwrap();
+            let actual = partition_chunk_by_hash_arrays_created(
+                &source,
+                &keys,
+                3,
+                crc,
+                factory.as_ref(),
+                &control,
+            )
+            .unwrap();
+            for (expected, actual) in expected.iter().zip(actual.iter()) {
+                assert_eq!(values(actual), values(expected));
+                if !actual.is_empty() {
+                    assert_eq!(
+                        actual.chunk_schema().slots()[0].typed_binding(),
+                        source.chunk_schema().slots()[0].typed_binding()
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn actual_partition_creator_preserves_original_stopped_failure() {
+        let source = input();
+        let factory = factory();
+        let state = RuntimeState::default();
+        state
+            .error_state()
+            .set_error("partition fragment failed".to_string());
+        let control = RuntimeKernelControl::new(state.error_state());
+        let error =
+            take_partition_rows_created(&source, &[1, 3], factory.as_ref(), &control).unwrap_err();
+        assert_eq!(
+            error,
+            crate::runtime::fragment::ExecutionFailure::from(
+                "partition fragment failed".to_string()
+            )
+        );
     }
 }

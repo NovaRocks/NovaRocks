@@ -18,13 +18,13 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 
-pub fn eval_ifnull(
-    arena: &ExprArena,
+pub fn eval_ifnull<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr1: ExprId,
     expr2: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left = arena.eval(expr1, chunk)?;
     let right = arena.eval(expr2, chunk)?;
-    novarocks_functions::control_values::ifnull_legacy(left, right)
+    Ok((novarocks_functions::control_values::ifnull_legacy(left, right))?)
 }

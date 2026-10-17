@@ -96,10 +96,10 @@ fn table_with_metadata_root_policy(
     let mut fields = creation.reserve(count)?;
     let mut bindings = creation.reserve(count)?;
     for field in declaration.as_struct().fields() {
-        let value = super::typed_value::from_declaration(
-            &field.field_type,
+        let value = super::typed_value::from_field(
+            field,
             !field.required,
-            nominals.get(&field.id).map(|value| value.logical_type()),
+            &nominals,
             integers.get(&field.id).copied(),
             creation,
         )?

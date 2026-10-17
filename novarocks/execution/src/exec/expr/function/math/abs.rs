@@ -26,18 +26,24 @@ use arrow_buffer::i256;
 use novarocks_types::largeint;
 use std::sync::Arc;
 
-pub fn eval_abs(
-    arena: &ExprArena,
+pub fn eval_abs<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     value_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let value = arena.eval(value_expr, chunk)?;
     let output = arena
         .data_type(expr)
         .ok_or_else(|| "abs: missing output type".to_string())?;
-    novarocks_functions::builtin::abs_core::evaluate_abs_core(value, output, &mut |_| Ok(()))
-        .map_err(|error| error.to_string())
+    Ok(
+        (novarocks_functions::builtin::abs_core::evaluate_abs_core(
+            value,
+            output,
+            &mut |_| Ok(()),
+        )
+        .map_err(|error| error.to_string()))?,
+    )
 }
 #[cfg(test)]
 mod tests {

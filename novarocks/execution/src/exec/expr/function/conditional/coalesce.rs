@@ -19,14 +19,14 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::control_values::CoalesceStep;
 
-pub fn eval_coalesce(
-    arena: &ExprArena,
+pub fn eval_coalesce<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.is_empty() {
-        return Err("coalesce: requires at least one argument".to_string());
+        return Err(("coalesce: requires at least one argument".to_string()).into());
     }
     let mut arrays = Vec::with_capacity(args.len());
     for &arg in args {
@@ -40,7 +40,7 @@ pub fn eval_coalesce(
         CoalesceStep::ReevaluateTail(keep_alive) => {
             let result = eval_coalesce(arena, expr, &args[1..], chunk);
             drop(keep_alive);
-            result
+            Ok((result)?)
         }
     }
 }

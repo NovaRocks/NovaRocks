@@ -193,21 +193,9 @@ fn write_support_denial(
     if matches!(
         request.input,
         ConnectorWriteInputRequest::EqualityDelete { .. }
-    ) {
-        if metadata.format_version() == FormatVersion::V1 {
-            return Some(invalid(
-                "ADD EQUALITY DELETE requires an Iceberg v2 or v3 table".to_string(),
-            ));
-        }
-        if let Err(error) = ensure_equality_delete_single_partition_spec_from_metadata(metadata) {
-            return Some(invalid(error));
-        }
-        if !metadata.default_partition_spec().fields().is_empty() {
-            return Some(invalid(
-                "ADD EQUALITY DELETE currently supports only unpartitioned iceberg tables"
-                    .to_string(),
-            ));
-        }
+    ) && let Some(denied) = equality_delete_support_denial(metadata)
+    {
+        return Some(denied);
     }
 
     let insert_shaped = matches!(
@@ -230,6 +218,27 @@ fn write_support_denial(
         request.target_ref.as_str(),
         target_fqn,
     )
+}
+
+/// Existing ADD EQUALITY DELETE table-shape policy. Both preparation and the
+/// ordinary session call this before projecting an equality-key recipe, so the
+/// caller cannot bypass a table-level refusal by skipping preparation.
+pub(crate) fn equality_delete_support_denial(metadata: &TableMetadata) -> Option<ConnectorError> {
+    let invalid = |message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
+    if metadata.format_version() == FormatVersion::V1 {
+        return Some(invalid(
+            "ADD EQUALITY DELETE requires an Iceberg v2 or v3 table".to_string(),
+        ));
+    }
+    if let Err(error) = ensure_equality_delete_single_partition_spec_from_metadata(metadata) {
+        return Some(invalid(error));
+    }
+    if !metadata.default_partition_spec().fields().is_empty() {
+        return Some(invalid(
+            "ADD EQUALITY DELETE currently supports only unpartitioned iceberg tables".to_string(),
+        ));
+    }
+    None
 }
 
 /// INSERT-only metadata/ref policy shared by preparation and ordinary data

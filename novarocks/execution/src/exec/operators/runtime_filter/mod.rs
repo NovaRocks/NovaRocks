@@ -203,7 +203,63 @@ impl NativeOrderedLiveConsumerSet {
         chunk: Chunk,
         event_sink: Option<&Arc<dyn FragmentEventSink>>,
     ) -> Result<Option<Chunk>, String> {
-        let (output, effects) = self.apply_chunk_inner(chunk)?;
+        self.apply_latest_chunk_with(
+            chunk,
+            event_sink,
+            |expr, input| self.inner.arena.eval(expr, input),
+            |input| crate::exec::chunk::hydrate_dictionary_columns_except(&input, |_, _| false),
+            |input, mask| {
+                let batch = filter_record_batch(input.record_batch(), mask)
+                    .map_err(|error| error.to_string())?;
+                Chunk::try_new_like(batch, input)
+            },
+        )
+    }
+
+    pub(crate) fn apply_latest_chunk_created(
+        &self,
+        chunk: Chunk,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        control: &dyn crate::exec::expr::ExprEvaluationControl,
+        event_sink: Option<&Arc<dyn FragmentEventSink>>,
+    ) -> ExecutionResult<Option<Chunk>> {
+        self.apply_latest_chunk_with(
+            chunk,
+            event_sink,
+            |expr, input| {
+                let owner = factory.begin_input_construction(input)?;
+                crate::exec::expr::ExprEvaluationContext::new(
+                    &self.inner.arena,
+                    owner.as_ref(),
+                    control,
+                )
+                .eval(expr, input)
+            },
+            |input| {
+                let owner = factory.begin_input_construction(&input)?;
+                input.hydrate_for_evaluation(owner.as_ref(), |_, _| false)
+            },
+            |input, mask| {
+                let owner = factory.begin_input_construction(input)?;
+                input.filter_for_evaluation(mask, owner.as_ref())
+            },
+        )
+    }
+
+    fn apply_latest_chunk_with<E: From<String>, F, H, C>(
+        &self,
+        chunk: Chunk,
+        event_sink: Option<&Arc<dyn FragmentEventSink>>,
+        evaluate: F,
+        hydrate: H,
+        filter: C,
+    ) -> Result<Option<Chunk>, E>
+    where
+        F: FnMut(ExprId, &Chunk) -> Result<ArrayRef, E>,
+        H: FnMut(Chunk) -> Result<Chunk, E>,
+        C: FnMut(&Chunk, &arrow::array::BooleanArray) -> Result<Chunk, E>,
+    {
+        let (output, effects) = self.apply_chunk_inner(chunk, evaluate, hydrate, filter)?;
         if let Some(event_sink) = event_sink {
             for effect in effects {
                 event_sink.record(FragmentEvent::RuntimeFilterRowEffect(effect));
@@ -290,10 +346,18 @@ impl NativeOrderedLiveConsumerSet {
         Ok(())
     }
 
-    fn apply_chunk_inner(
+    fn apply_chunk_inner<E: From<String>, F, H, C>(
         &self,
         chunk: Chunk,
-    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), String> {
+        mut evaluate: F,
+        mut hydrate: H,
+        mut filter: C,
+    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), E>
+    where
+        F: FnMut(ExprId, &Chunk) -> Result<ArrayRef, E>,
+        H: FnMut(Chunk) -> Result<Chunk, E>,
+        C: FnMut(&Chunk, &arrow::array::BooleanArray) -> Result<Chunk, E>,
+    {
         let active = {
             let bindings = self
                 .inner
@@ -317,14 +381,14 @@ impl NativeOrderedLiveConsumerSet {
         if active.is_empty() {
             return Ok((Some(chunk), Vec::new()));
         }
-        let chunk = crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)?;
+        let chunk = hydrate(chunk)?;
         let mut current = Some(chunk);
         let mut effects = Vec::new();
         for (expr_id, predicate) in active {
             let Some(input) = current else {
                 return Ok((None, effects));
             };
-            let array = self.inner.arena.eval(expr_id, &input)?;
+            let array = evaluate(expr_id, &input)?;
             let mask = match predicate {
                 NativeOrderedPredicateForApply::Execution(snapshot) => {
                     let outcome = execution::evaluator::evaluate_rows(
@@ -355,9 +419,7 @@ impl NativeOrderedLiveConsumerSet {
             } else if mask.iter().all(|value| value != Some(true)) {
                 current = None;
             } else {
-                let filtered = filter_record_batch(&input.record_batch(), &mask)
-                    .map_err(|error| error.to_string())?;
-                current = Some(Chunk::try_new_like(filtered, &input)?);
+                current = Some(filter(&input, &mask)?);
             }
         }
         Ok((current, effects))
@@ -414,6 +476,22 @@ fn apply_legacy_runtime_filter_snapshot<E: From<String>>(
     array: &ArrayRef,
     snapshot: &execution::RuntimeFilterSnapshot,
 ) -> Result<RuntimeFilterApplication, E> {
+    apply_runtime_filter_snapshot_with(input, array, snapshot, |input, mask| {
+        let batch =
+            filter_record_batch(input.record_batch(), mask).map_err(|error| error.to_string())?;
+        Ok(Chunk::try_new_like(batch, input)?)
+    })
+}
+
+fn apply_runtime_filter_snapshot_with<E: From<String>, F>(
+    input: Chunk,
+    array: &ArrayRef,
+    snapshot: &execution::RuntimeFilterSnapshot,
+    mut filter: F,
+) -> Result<RuntimeFilterApplication, E>
+where
+    F: FnMut(&Chunk, &arrow::array::BooleanArray) -> Result<Chunk, E>,
+{
     let outcome = execution::evaluator::evaluate_rows(
         snapshot.binding_id(),
         snapshot.logical_version(),
@@ -432,9 +510,7 @@ fn apply_legacy_runtime_filter_snapshot<E: From<String>>(
     } else if mask.iter().all(|value| value != Some(true)) {
         None
     } else {
-        let filtered =
-            filter_record_batch(&input.record_batch(), mask).map_err(|error| error.to_string())?;
-        Some(Chunk::try_new_like(filtered, &input)?)
+        Some(filter(&input, mask)?)
     };
     Ok(RuntimeFilterApplication::Evaluated { output, effect })
 }
@@ -975,6 +1051,47 @@ impl RuntimeFilterKeyProvider for &ArenaRuntimeFilterKeys {
     }
 }
 
+struct CreatedArenaRuntimeFilterKeys<'a> {
+    keys: &'a ArenaRuntimeFilterKeys,
+    factory: &'a dyn crate::exec::pipeline::operator::InputConstructionFactory,
+    control: &'a dyn crate::exec::expr::ExprEvaluationControl,
+}
+impl RuntimeFilterKeyProvider for CreatedArenaRuntimeFilterKeys<'_> {
+    type Error = crate::runtime::fragment::ExecutionFailure;
+
+    fn apply_snapshot(
+        &mut self,
+        input: Chunk,
+        array: &ArrayRef,
+        snapshot: &execution::RuntimeFilterSnapshot,
+    ) -> ExecutionResult<RuntimeFilterApplication> {
+        apply_runtime_filter_snapshot_with(input, array, snapshot, |input, mask| {
+            let owner = self.factory.begin_input_construction(input)?;
+            input.filter_for_evaluation(mask, owner.as_ref())
+        })
+    }
+
+    fn prepare_input(&mut self, chunk: Chunk) -> ExecutionResult<Chunk> {
+        let owner = self.factory.begin_input_construction(&chunk)?;
+        chunk.hydrate_for_evaluation(owner.as_ref(), |_, _| false)
+    }
+
+    fn evaluate_key(&mut self, binding: usize, input: &Chunk) -> ExecutionResult<ArrayRef> {
+        let expr = *self
+            .keys
+            .expr_ids
+            .get(binding)
+            .ok_or("native runtime-filter binding index drifted")?;
+        let owner = self.factory.begin_input_construction(input)?;
+        crate::exec::expr::ExprEvaluationContext::new(
+            &self.keys.arena,
+            owner.as_ref(),
+            self.control,
+        )
+        .eval(expr, input)
+    }
+}
+
 #[allow(
     dead_code,
     reason = "The direct consumer API remains available for non-polling integration callers."
@@ -1034,6 +1151,22 @@ impl RuntimeFilterConsumerSet {
 
     pub(crate) fn set_wait_timeout(&self, timeout: Duration) {
         self.state.set_wait_timeout(timeout);
+    }
+
+    pub(crate) fn apply_chunk_created(
+        &self,
+        chunk: Chunk,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        control: &dyn crate::exec::expr::ExprEvaluationControl,
+        event_sink: Option<&Arc<dyn FragmentEventSink>>,
+    ) -> ExecutionResult<Option<Chunk>> {
+        let mut keys = CreatedArenaRuntimeFilterKeys {
+            keys: &self.keys,
+            factory,
+            control,
+        };
+        self.state
+            .apply_chunk_observed(chunk, &mut keys, event_sink)
     }
 
     pub(crate) fn apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
@@ -1232,11 +1365,17 @@ impl RuntimeFilterProcessorConsumers {
         &mut self,
         chunk: Chunk,
         event_sink: Option<&Arc<dyn FragmentEventSink>>,
+        factory: Option<&dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+        control: &dyn crate::exec::expr::ExprEvaluationControl,
     ) -> ExecutionResult<Option<Chunk>> {
         match self {
-            Self::Arena(value) => value
-                .apply_chunk_observed(chunk, event_sink)
-                .map_err(Into::into),
+            Self::Arena(value) => value.apply_chunk_created(
+                chunk,
+                factory
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+                control,
+                event_sink,
+            ),
             Self::Compiled { state, keys } => state.apply_chunk_observed(chunk, keys, event_sink),
         }
     }
@@ -1306,6 +1445,7 @@ impl OperatorFactory for NativeRuntimeFilterProcessorFactory {
             output: None,
             finishing: false,
             event_sink: Arc::new(NoopFragmentEventSink),
+            construction: None,
         })
     }
 }
@@ -1316,9 +1456,22 @@ struct NativeRuntimeFilterProcessor {
     output: Option<Chunk>,
     finishing: bool,
     event_sink: Arc<dyn FragmentEventSink>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
 impl Operator for NativeRuntimeFilterProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        if let RuntimeFilterProcessorConsumers::Compiled { keys, .. } = &mut self.consumers {
+            keys.bind_construction_factory(factory.clone());
+        }
+        self.construction = Some(factory);
+    }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.consumers.bind_mem_tracker(tracker);
     }
@@ -1387,9 +1540,12 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
                 "native runtime-filter processor received input before its gate opened".into(),
             );
         }
-        self.output = self
-            .consumers
-            .apply_chunk_observed(chunk, Some(&self.event_sink))?;
+        self.output = self.consumers.apply_chunk_observed(
+            chunk,
+            Some(&self.event_sink),
+            self.construction.as_deref(),
+            &super::compiled_expression::RuntimeKernelControl::new(_state.error_state()),
+        )?;
         Ok(())
     }
 
@@ -1428,6 +1584,20 @@ mod tests {
     use novarocks_spi::connector::ConnectorScalarValue;
 
     use super::*;
+
+    fn actual_evaluation_factory(
+        state: &RuntimeState,
+    ) -> Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory> {
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root(
+                "runtime filter evaluation construction",
+            ),
+            state.error_state(),
+        )
+        .unwrap()
+    }
+
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprNode;
     use crate::runtime::runtime_state::RuntimeState;
@@ -1615,6 +1785,7 @@ mod tests {
         });
         let state = RuntimeState::default().with_runtime_filter_session(Some(session));
         let mut processor = factory.create(1, 0);
+        processor.set_construction_factory(actual_evaluation_factory(&state));
 
         processor.prepare().expect("prepare processor");
         processor
@@ -1875,6 +2046,54 @@ mod tests {
         (consumers, subscription)
     }
 
+    #[test]
+    fn created_keys_preserve_the_original_fragment_failure() {
+        let (consumers, subscription) = controlled_consumers(Duration::from_secs(5));
+        subscription.publish(accepting(2));
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Open));
+        let creation_runtime = RuntimeState::default();
+        let factory = actual_evaluation_factory(&creation_runtime);
+        let runtime = RuntimeState::default();
+        runtime
+            .error_state()
+            .set_error("runtime-filter fragment failed".to_string());
+        let control =
+            super::super::compiled_expression::RuntimeKernelControl::new(runtime.error_state());
+        let error = consumers
+            .apply_chunk_created(
+                created_int_chunk(&[1, 2, 3]),
+                factory.as_ref(),
+                &control,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            crate::runtime::fragment::ExecutionFailure::from(
+                "runtime-filter fragment failed".to_string()
+            )
+        );
+    }
+
+    fn created_int_chunk(values: &[i32]) -> Chunk {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("v", DataType::Int32, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(values.to_vec())) as ArrayRef],
+        )
+        .unwrap();
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
+    }
+
     fn int_chunk(values: &[i32]) -> Chunk {
         let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             &arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
@@ -2131,6 +2350,7 @@ mod tests {
             .with_runtime_filter_session(session),
         );
         let mut processor = factory.create(1, 0);
+        processor.set_construction_factory(actual_evaluation_factory(&state));
         processor
             .bind_runtime_state(&state)
             .expect("bind processor");
@@ -2186,7 +2406,7 @@ mod tests {
             .chunks
             .lock()
             .expect("chunks lock")
-            .push_back(int_chunk(&[1, 2, 3]));
+            .push_back(created_int_chunk(&[1, 2, 3]));
         pipeline.source.notify_observers();
 
         let arrived = Instant::now();

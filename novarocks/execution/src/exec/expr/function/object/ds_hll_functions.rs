@@ -24,12 +24,12 @@ use arrow::array::ArrayRef;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
-pub fn eval_ds_hll_count_distinct_state(
-    arena: &ExprArena,
+pub fn eval_ds_hll_count_distinct_state<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let values = arena.eval(args[0], chunk)?;
     let log_ks = if args.len() >= 2 {
         Some(arena.eval(args[1], chunk)?)
@@ -42,7 +42,7 @@ pub fn eval_ds_hll_count_distinct_state(
         None
     };
 
-    novarocks_functions::builtin::ds_hll_state_core::evaluate(&values, log_ks, target_types)
+    Ok((novarocks_functions::builtin::ds_hll_state_core::evaluate(&values, log_ks, target_types))?)
 }
 
 #[cfg(test)]

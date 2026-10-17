@@ -615,12 +615,20 @@ fn compare_public(
         ));
     }
     let value_declaration = opaque_source(work, || parse_type(column.type_json(), "type_json"))?;
+    let empty_nominals = Default::default();
+    let nominals = typed_compare::nominal_declarations(relation).unwrap_or(&empty_nominals);
+    let value_id = column
+        .field_id_path()
+        .last()
+        .copied()
+        .unwrap_or(column.base_field_id());
     typed_compare::value(
         &value_declaration,
         actual.value_type(),
         actual.data_type(),
-        typed_compare::nominal(relation, column),
+        nominals.get(&value_id).map(|domain| domain.logical_type()),
         column.scalar_integer_domain(),
+        nominals,
         work,
     )?;
     if let Some(declaration) = declaration {

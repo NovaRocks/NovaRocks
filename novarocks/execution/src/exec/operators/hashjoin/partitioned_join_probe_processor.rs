@@ -174,11 +174,17 @@ impl OperatorFactory for PartitionedJoinProbeProcessorFactory {
             input_chunks: 0,
             profile_initialized: false,
             profiles: None,
+            evaluation_arena: Arc::clone(&self.arena),
+            construction: None,
+            evaluation_control: None,
         })
     }
 }
 
 struct PartitionedJoinProbeProcessorOperator {
+    evaluation_arena: Arc<ExprArena>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    evaluation_control: Option<super::super::compiled_expression::RuntimeKernelControl>,
     name: String,
     node_id: i32,
     driver_id: i32,
@@ -200,6 +206,20 @@ struct PartitionedJoinProbeProcessorOperator {
 }
 
 impl Operator for PartitionedJoinProbeProcessorOperator {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.evaluation_control =
+            Some(super::super::compiled_expression::RuntimeKernelControl::new(state.error_state()));
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -371,17 +391,64 @@ fn parse_join_node_id_from_dep_key(dep_key: &str) -> i32 {
 }
 
 impl PartitionedJoinProbeProcessorOperator {
-    fn process_one(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
-        let probe_chunks = self.collect_probe_chunks(Some(chunk), false);
-        self.core.join_probe_chunks(probe_chunks)
+    fn join_probe_chunks_created(&mut self, chunks: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
+        let arena = &self.evaluation_arena;
+        let factory = &self.construction;
+        let control = &self.evaluation_control;
+        self.core.join_probe_chunks_evaluated(
+            chunks,
+            factory
+                .as_deref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+            &mut |expr, input| {
+                let owner = factory
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+                    .begin_input_construction(input)?;
+                let control = control
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), control)
+                    .eval(expr, input)
+            },
+        )
     }
 
-    fn finish_one(&mut self) -> Result<Option<Chunk>, String> {
+    fn finish_core_created(&mut self, chunks: Vec<Chunk>) -> ExecutionResult<Option<Chunk>> {
+        let arena = &self.evaluation_arena;
+        let factory = &self.construction;
+        let control = &self.evaluation_control;
+        self.core.finish_evaluated(
+            chunks,
+            None,
+            factory
+                .as_deref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+            &mut |expr, input| {
+                let owner = factory
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+                    .begin_input_construction(input)?;
+                let control = control
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), control)
+                    .eval(expr, input)
+            },
+        )
+    }
+
+    fn process_one(&mut self, chunk: Chunk) -> ExecutionResult<Option<Chunk>> {
+        let probe_chunks = self.collect_probe_chunks(Some(chunk), false);
+        self.join_probe_chunks_created(probe_chunks)
+    }
+
+    fn finish_one(&mut self) -> ExecutionResult<Option<Chunk>> {
         if !self.core.is_build_loaded() {
             self.load_build_side()?;
         }
         let probe_chunks = self.collect_probe_chunks(None, true);
-        let out = self.core.finish(probe_chunks, None)?;
+        let out = self.finish_core_created(probe_chunks)?;
         self.log_stats();
         Ok(out)
     }
@@ -437,9 +504,9 @@ impl PartitionedJoinProbeProcessorOperator {
         );
     }
 
-    fn join_buffered(&mut self, drain_all: bool) -> Result<Option<Chunk>, String> {
+    fn join_buffered(&mut self, drain_all: bool) -> ExecutionResult<Option<Chunk>> {
         let probe_chunks = self.collect_probe_chunks(None, drain_all);
-        self.core.join_probe_chunks(probe_chunks)
+        self.join_probe_chunks_created(probe_chunks)
     }
 
     fn collect_probe_chunks(&mut self, chunk: Option<Chunk>, drain_all: bool) -> Vec<Chunk> {
@@ -474,6 +541,50 @@ impl PartitionedJoinProbeProcessorOperator {
 
 #[cfg(test)]
 mod tests {
+    fn partition_declared_keys(
+        input: &Chunk,
+        expressions: &[crate::exec::expr::ExprId],
+        arena: &ExprArena,
+        partitions: usize,
+        crc: bool,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
+        let runtime = RuntimeState::default();
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("join fixture partition evaluation"),
+            runtime.error_state(),
+        ).unwrap();
+        let owner = factory.begin_input_construction(input)?;
+        let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+            runtime.error_state(),
+        );
+        let evaluation =
+            crate::exec::expr::ExprEvaluationContext::new(arena, owner.as_ref(), &control);
+        crate::exec::operators::data_stream_sink::partition_chunk_by_hash_created(
+            input,
+            expressions,
+            &evaluation,
+            partitions,
+            crc,
+            factory.as_ref(),
+            &control,
+        )
+    }
+
+    fn install_evaluation_runtime(
+        operator: &mut dyn crate::exec::pipeline::operator::Operator,
+        runtime: &RuntimeState,
+    ) {
+        operator.set_construction_factory(
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root("hash probe evaluation construction"),
+                runtime.error_state(),
+            ).unwrap(),
+        );
+        operator.bind_runtime_state(runtime).unwrap();
+    }
+
     use std::sync::Arc;
 
     use arrow::array::{Array, Int32Array};
@@ -538,8 +649,30 @@ mod tests {
     }
 
     fn chunk_schema_of(schema: &SchemaRef, slot_ids: &[SlotId]) -> ChunkSchemaRef {
-        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
-            .expect("chunk schema")
+        let types = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                assert_eq!(
+                    field.data_type(),
+                    &DataType::Int32,
+                    "fixed original join fixture declaration"
+                );
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::Int32,
+                    field.is_nullable(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let layout = crate::exec::chunk::typed_fixture::layout(schema.clone(), slot_ids, &types);
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("join fixture schema construction"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap()
+        .create_compiled_chunk_schema(&layout)
+        .expect("actual declared join fixture schema")
     }
 
     fn push_expect_consumed(op: &mut dyn ProcessorOperator, rt: &RuntimeState, chunk: Chunk) {
@@ -553,15 +686,14 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[k_slot_id],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        }
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[k_slot_id],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
     }
 
     fn chunk_of_two(
@@ -579,15 +711,14 @@ mod tests {
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[k_slot_id, v_slot_id],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        }
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[k_slot_id, v_slot_id],
+            &[
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+            ],
+        )
     }
 
     fn chunk_of_two_nullable(
@@ -605,15 +736,14 @@ mod tests {
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[k_slot_id, v_slot_id],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        }
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[k_slot_id, v_slot_id],
+            &[
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+            ],
+        )
     }
 
     fn append_quads(chunk: Chunk, out: &mut Vec<(i32, i32, i32, i32)>) {
@@ -792,7 +922,9 @@ mod tests {
         .with_max_buffered_probe_chunks(2);
 
         let mut build = build_factory.create(1, 0);
+        install_evaluation_runtime(build.as_mut(), &rt);
         let mut probe = probe_factory.create(1, 0);
+        install_evaluation_runtime(probe.as_mut(), &rt);
 
         let probe_proc = probe.as_processor_mut().expect("probe processor");
         assert!(probe_proc.need_input());
@@ -881,7 +1013,9 @@ mod tests {
         let row_count = 20_000usize;
         let values = (0..row_count as i32).collect::<Vec<_>>();
         let mut build = build_factory.create(1, 0);
+        install_evaluation_runtime(build.as_mut(), &rt);
         let mut probe = probe_factory.create(1, 0);
+        install_evaluation_runtime(probe.as_mut(), &rt);
 
         {
             let probe_proc = probe.as_processor_mut().expect("probe processor");
@@ -988,26 +1122,15 @@ mod tests {
         let build = chunk_of(&[1, 2, 4], RIGHT_K_SLOT_ID);
         let probe = chunk_of(&[2, 3, 4], LEFT_K_SLOT_ID);
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         // Build per partition.
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             if let Some(sink) = op.as_processor_mut() {
                 let c = build_part.clone();
                 if !c.is_empty() {
@@ -1023,6 +1146,7 @@ mod tests {
         let mut pairs = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
 
             let Some(proc) = op.as_processor_mut() else {
@@ -1138,25 +1262,14 @@ mod tests {
         );
         let probe = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[3, 9], LEFT_V_SLOT_ID, "v");
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -1170,6 +1283,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -1255,25 +1369,14 @@ mod tests {
             "v",
         );
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -1287,6 +1390,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -1366,25 +1470,14 @@ mod tests {
             "v",
         );
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -1398,6 +1491,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -1471,25 +1565,14 @@ mod tests {
         let build = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 20], LEFT_V_SLOT_ID, "l");
         let probe = chunk_of_two(&[2, 3], RIGHT_K_SLOT_ID, &[200, 300], RIGHT_W_SLOT_ID, "r");
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -1503,6 +1586,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -1575,25 +1659,14 @@ mod tests {
         let build = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 20], LEFT_V_SLOT_ID, "l");
         let probe = chunk_of_two(&[2, 3], RIGHT_K_SLOT_ID, &[200, 300], RIGHT_W_SLOT_ID, "r");
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -1607,6 +1680,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1694,25 +1768,14 @@ mod tests {
             "v",
         );
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -1726,6 +1789,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -1803,25 +1867,14 @@ mod tests {
         let build = chunk_of_two(&[1, 1], RIGHT_K_SLOT_ID, &[5, 20], RIGHT_W_SLOT_ID, "w");
         let probe = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 7], LEFT_V_SLOT_ID, "v");
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -1835,6 +1888,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -1918,25 +1972,14 @@ mod tests {
             "v",
         );
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -1950,6 +1993,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -2023,25 +2067,14 @@ mod tests {
         let build = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 20], LEFT_V_SLOT_ID, "l");
         let probe = chunk_of_two(&[2, 3], RIGHT_K_SLOT_ID, &[200, 300], RIGHT_W_SLOT_ID, "r");
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -2055,6 +2088,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -2133,25 +2167,14 @@ mod tests {
             "v",
         );
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -2165,6 +2188,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -2256,25 +2280,14 @@ mod tests {
             "v",
         );
 
-        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &build,
-            &[build_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition build");
-        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
-            &probe,
-            &[probe_key],
-            &arena,
-            2,
-            false,
-        )
-        .expect("partition probe");
+        let build_parts = partition_declared_keys(&build, &[build_key], &arena, 2, false)
+            .expect("partition build");
+        let probe_parts = partition_declared_keys(&probe, &[probe_key], &arena, 2, false)
+            .expect("partition probe");
 
         for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
@@ -2288,6 +2301,7 @@ mod tests {
         let mut rows = Vec::new();
         for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
+            install_evaluation_runtime(op.as_mut(), &rt);
             let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");

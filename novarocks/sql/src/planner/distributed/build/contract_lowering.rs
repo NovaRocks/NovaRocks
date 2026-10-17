@@ -6446,6 +6446,76 @@ impl<'a> ContractLoweringVisitor<'a> {
         })
     }
 
+    /// Prove NULL from the actual selected checked constants, never from a
+    /// nullable declaration or a computation that could fail when evaluated.
+    fn set_op_value_is_constant_null(
+        &mut self,
+        value: ValueId,
+    ) -> Result<bool, ContractLoweringError> {
+        self.work.step()?;
+        let origin = self
+            .fragment_mut()
+            .value(value)
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))?
+            .origin
+            .clone();
+        match origin {
+            ValueOrigin::Expr { expr, .. } => self.lowered_expression_is_constant_null(expr),
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal,
+            } => {
+                let definition = self.fragments[&self.current_fragment]
+                    .construction_node(node)
+                    .ok_or(ContractLoweringError::IdentitySpaceExhausted("node"))?;
+                let NodeKind::Values { rows } = &definition.kind else {
+                    return Ok(false);
+                };
+                if rows.is_empty() {
+                    return Ok(false);
+                }
+                let mut expressions = Vec::new();
+                for row in rows {
+                    self.work.step()?;
+                    expressions.push(*row.get(output_ordinal as usize).ok_or(
+                        ContractLoweringError::IdentitySpaceExhausted("Values column"),
+                    )?);
+                }
+                for expression in expressions {
+                    if !self.lowered_expression_is_constant_null(expression)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn lowered_expression_is_constant_null(
+        &mut self,
+        expression: ExprId,
+    ) -> Result<bool, ContractLoweringError> {
+        self.work.step()?;
+        let definition = self
+            .fragment_mut()
+            .expressions()
+            .get(expression)
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
+        let ContractExprKind::Constant(reference) = definition.kind else {
+            return Ok(false);
+        };
+        let ty = definition.ty.clone();
+        let value =
+            self.plan_builder
+                .constants()
+                .resolve_observed(reference, &ty, &mut self.work)?;
+        self.work.flush()?;
+        let null = value.is_null_observed(CompilePhase::Validate, self.control)?;
+        self.work.flush()?;
+        Ok(null)
+    }
+
     /// Cast one set-operation branch's columns to the types the operation
     /// publishes.
     ///
@@ -6488,23 +6558,37 @@ impl<'a> ContractLoweringVisitor<'a> {
                 ContractLoweringError::UnknownColumnReference(column.column_id),
             )?;
             let source_type = self.value_declared_type(source)?;
-            let expression = self.fragment_mut().add_expression(
-                node,
-                source_type.clone(),
-                ContractExprKind::Value(source),
-            )?;
             let published_type = (value_type(published))
                 .with_nullable(source_type.nullable())
                 .expect("validated root NULL contract");
+            // A selected checked NULL has no payload to convert. Keep the
+            // branch itself evaluated, but author its aligned output in the
+            // published type, just as lower_expression_as does for syntax NULL.
+            // Nullable types and computed expressions do not establish this fact.
+            let known_null =
+                source_type != published_type && self.set_op_value_is_constant_null(source)?;
+            let expression = if known_null {
+                self.author_literal_expression(node, &LiteralValue::Null, published_type.clone())?
+            } else {
+                self.fragment_mut().add_expression(
+                    node,
+                    source_type.clone(),
+                    ContractExprKind::Value(source),
+                )?
+            };
             let (expression, value) = if source_type == published_type {
                 (expression, source)
             } else {
-                let expression = self.convert_expression_to(
-                    node,
-                    expression,
-                    &published_type,
-                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                )?;
+                let expression = if known_null {
+                    expression
+                } else {
+                    self.convert_expression_to(
+                        node,
+                        expression,
+                        &published_type,
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    )?
+                };
                 let value = self.fragment_mut().add_value(
                     published_type,
                     ValueOrigin::Expr {
@@ -9949,10 +10033,12 @@ impl<'a> ContractLoweringVisitor<'a> {
         let intermediate =
             intermediate.map_err(|error| ContractLoweringError::InvalidFunctionBinding {
                 detail: format!(
-                    "{error} (assignment fragment={:?}, owner={owner:?}, expression={expression:?}, source-domain={:?}, target-domain={:?}; source={source:?}, target={target:?})",
+                    "{error} (assignment fragment={:?}, owner={owner:?}, expression={expression:?}, source-domain={:?}, target-domain={:?}, source-carrier={:?}, target-carrier={:?}; source={source:?}, target={target:?})",
                     self.current_fragment,
                     source.logical_type(),
                     target.logical_type(),
+                    source.data_type(),
+                    target.data_type(),
                 ),
             })?;
         let expression = if let Some(intermediate) = intermediate {
@@ -13084,6 +13170,65 @@ mod tests {
             original.pool().backing_identity()
         );
         assert_eq!(selected.ordinal(), original.ordinal());
+    }
+
+    #[test]
+    fn binary_result_labels_keep_selected_display_and_original_statement_alias() {
+        use arrow::array::{Array, BinaryArray};
+        use novarocks_constant_contract::ConstantPool;
+        use std::sync::Arc;
+        for (selected, expected) in [
+            (None, "NULL"),
+            (Some(b"".as_slice()), "X''"),
+            (Some([0x00, 0xab, 0xff].as_slice()), "X'00ABFF'"),
+        ] {
+            let ty = novarocks_type_contract::FunctionValueType::new(DataType::Binary, true);
+            let pool = ConstantPool::try_new(
+                Arc::new(ty.try_to_field("provider.binary").unwrap()),
+                ty.clone(),
+                BinaryArray::from(vec![Some(b"poison.unselected".as_slice()), selected]).to_data(),
+                crate::constant::test_constant_policy(),
+                CompilePhase::Validate,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let mut source = selected_result_label_fixture();
+            let PhysicalPlanKind::Project(project) = &mut source.kind else {
+                unreachable!()
+            };
+            project.items[0].expr = TypedExpr {
+                kind: ExprKind::Constant(pool.value(1).unwrap()),
+                value_type: ty,
+            };
+            project.items[0].output_name = "to_binary('', 'hex')".into();
+            source.output_columns =
+                vec![column(801, "to_binary('', 'hex')", DataType::Binary, true)];
+            let plan = finish_for_test(&source).unwrap();
+            let field = &plan.result_port().unwrap().fields[0];
+            assert_eq!(field.name.as_ref(), expected);
+            assert_eq!(field.alias.as_deref(), Some("to_binary('', 'hex')"));
+            let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+            let reference = fragment
+                .expressions()
+                .iter()
+                .find_map(|(_, definition)| {
+                    if let ContractExprKind::Constant(reference) = &definition.kind {
+                        Some((*reference, definition.ty.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+            let actual = plan
+                .constants()
+                .resolve_observed(reference.0, &reference.1, &mut work)
+                .unwrap();
+            work.finish().unwrap();
+            assert_eq!(actual.ordinal(), 1);
+            assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        }
     }
 
     #[test]
@@ -17310,6 +17455,119 @@ mod tests {
         assert_eq!(root.output.columns[0], root.output.columns[1]);
         assert_eq!(input_mappings[0][0], input_mappings[0][1]);
         assert_eq!(input_mappings[1][0], input_mappings[1][1]);
+    }
+
+    fn union_with_selected_variant_constant(ordinal: u32, project: bool) -> PhysicalPlanNode {
+        use arrow::array::{Array, LargeBinaryArray};
+        use novarocks_constant_contract::ConstantPool;
+        let ty = ValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Variant,
+        )
+        .unwrap();
+        // The other ordinal is deliberately non-NULL: the proof must read the
+        // selected value, not infer the pool or nominal domain is all NULL.
+        let array = LargeBinaryArray::from(vec![Some(&b"opaque"[..]), None]);
+        let pool = ConstantPool::try_new(
+            Arc::new(ty.try_to_field("variant").unwrap()),
+            ty.clone(),
+            array.to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let selected = TypedExpr {
+            kind: ExprKind::Constant(pool.value(ordinal).unwrap()),
+            value_type: ty.clone(),
+        };
+        let mut right = column(2, "right", DataType::LargeBinary, true);
+        right.value_type = ty;
+        let branch = if project {
+            PhysicalPlanNode {
+                kind: PhysicalPlanKind::Project(PlanProjectNode {
+                    items: vec![ProjectItem {
+                        expr: selected,
+                        output_name: right.name.clone(),
+                        output_column_id: right.column_id,
+                    }],
+                    output_qualifier: None,
+                }),
+                children: vec![values(vec![], vec![vec![]])],
+                output_columns: vec![right.clone()],
+                stats: stats(),
+                probe_runtime_filters: vec![],
+            }
+        } else {
+            values(vec![right.clone()], vec![vec![selected]])
+        };
+        let left = column(1, "left", DataType::Utf8, false);
+        let published = column(3, "result", DataType::Utf8, true);
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::SetOp(crate::planner::physical::PhysicalSetOpNode {
+                kind: PlanSetOpKind::UnionAll,
+                output_columns: vec![published.clone()],
+                child_output_columns: vec![vec![left.clone()], vec![right]],
+            }),
+            children: vec![
+                values(
+                    vec![left],
+                    vec![vec![TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::String("text".into())),
+                        value_type: ValueType::new(DataType::Utf8, false),
+                    }]],
+                ),
+                branch,
+            ],
+            output_columns: vec![published],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    #[test]
+    fn union_all_retypes_only_selected_checked_nulls_at_branch_alignment() {
+        for project in [false, true] {
+            let plan = finish_for_test(&union_with_selected_variant_constant(1, project)).unwrap();
+            let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+            let root = fragment.nodes().get(&fragment.root()).unwrap();
+            let NodeKind::SetOp { input_mappings, .. } = &root.kind else {
+                panic!("SetOp root");
+            };
+            let aligned = fragment.values().get(&input_mappings[1][0]).unwrap();
+            assert_eq!(aligned.ty, ValueType::new(DataType::Utf8, true));
+            let ValueOrigin::Expr { expr, .. } = aligned.origin else {
+                panic!("typed NULL projection");
+            };
+            let expression = fragment.expressions().get(expr).unwrap();
+            assert!(matches!(expression.kind, ContractExprKind::Constant(_)));
+            assert!(
+                checked_constant_for_test(&plan, expression)
+                    .is_null_observed(
+                        CompilePhase::Validate,
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
+                    .unwrap()
+            );
+            assert!(matches!(
+                fragment.nodes().get(&root.inputs[1]).unwrap().kind,
+                NodeKind::Project { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn union_all_does_not_retype_a_nullable_nonnull_variant_as_text() {
+        for project in [false, true] {
+            let error =
+                finish_for_test(&union_with_selected_variant_constant(0, project)).unwrap_err();
+            assert!(
+                matches!(&error, ContractLoweringError::InvalidFunctionBinding { .. }),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("target-carrier=Utf8"), "{error}");
+        }
     }
 
     #[test]

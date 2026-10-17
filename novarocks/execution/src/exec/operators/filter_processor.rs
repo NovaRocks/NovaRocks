@@ -33,7 +33,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::BooleanArray;
-use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
@@ -80,6 +79,7 @@ impl OperatorFactory for FilterProcessorFactory {
             arena: Arc::clone(&self.arena),
             predicate: self.predicate,
             encoding_policy: self.encoding_policy.clone(),
+            construction: None,
             pending_output: None,
             finishing: false,
             finished: false,
@@ -301,12 +301,22 @@ struct FilterProcessorOperator {
     arena: Arc<ExprArena>,
     predicate: ExprId,
     encoding_policy: FilterEncodingPolicy,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     pending_output: Option<Chunk>,
     finishing: bool,
     finished: bool,
 }
 
 impl Operator for FilterProcessorOperator {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -333,7 +343,7 @@ impl ProcessorOperator for FilterProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
@@ -348,10 +358,15 @@ impl ProcessorOperator for FilterProcessorOperator {
         }
 
         // Vectorized implementation: use eval to compute predicate on entire chunk
-        let predicate_array = self
-            .arena
-            .eval(self.predicate, &chunk)
-            .map_err(|e| e.to_string())?;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_input_construction(&chunk)?;
+        let control = super::compiled_expression::RuntimeKernelControl::new(state.error_state());
+        let predicate_array =
+            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), &control)
+                .eval(self.predicate, &chunk)?;
 
         // Downcast to BooleanArray
         let filter_mask = predicate_array
@@ -359,11 +374,8 @@ impl ProcessorOperator for FilterProcessorOperator {
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| "Filter predicate must return boolean array".to_string())?;
 
-        // Use Arrow filter kernel to filter the RecordBatch
-        let filtered_batch = filter_record_batch(chunk.record_batch(), filter_mask)
-            .map_err(|e| format!("Filter failed: {}", e))?;
-
-        self.pending_output = Some(Chunk::new_like(filtered_batch, &chunk));
+        // The same actual caller owns construction of the filtered output.
+        self.pending_output = Some(chunk.filter_for_evaluation(filter_mask, owner.as_ref())?);
         Ok(())
     }
 
@@ -398,6 +410,16 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_types::SlotId;
+
+    fn install_fixture_creator(op: &mut dyn Operator) {
+        use crate::exec::pipeline::pipeline::representation_construction_profile;
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            representation_construction_profile().expect("actual runtime construction profile"),
+            crate::runtime::mem_tracker::MemTracker::new_root("filter fixture"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).expect("actual runtime construction factory");
+        op.set_construction_factory(factory);
+    }
 
     fn dict_utf8_type() -> DataType {
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
@@ -438,7 +460,34 @@ mod tests {
                 None,
             ),
         ];
-        let chunk_schema = Arc::new(ChunkSchema::try_new(slots).expect("chunk schema"));
+        // The fixture authors each complete value/layout explicitly. Runtime
+        // evaluation then borrows the actual installed construction factory.
+        let actual_types = [status.data_type(), channel.data_type(), amount.data_type()];
+        let typed_slots = slots
+            .into_iter()
+            .zip(actual_types)
+            .map(|(slot, carrier)| {
+                let value = novarocks_type_contract::FunctionValueType::new(
+                    carrier.clone(),
+                    slot.field().is_nullable(),
+                );
+                ChunkSlotSchema::try_new_typed(
+                    slot.slot_id(),
+                    Arc::new(Field::new(slot.name(), carrier.clone(), value.nullable())),
+                    value.typed_binding().clone(),
+                    slot.unique_id(),
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                )
+                .expect("explicit typed fixture source")
+            })
+            .collect();
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new_typed(
+                typed_slots,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .expect("typed chunk schema"),
+        );
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("status", status.data_type().clone(), true),
@@ -474,6 +523,7 @@ mod tests {
         let state = RuntimeState::default();
         for input in [empty, original] {
             let mut first = factory.create(1, 0);
+            install_fixture_creator(first.as_mut());
             let processor = first.as_processor_mut().expect("filter processor");
             processor.push_chunk(&state, input).expect("filter");
             let filtered = processor
@@ -484,6 +534,7 @@ mod tests {
             let expected_schema = filtered.schema();
             let expected_slots = filtered.chunk_schema_ref();
             let mut second = factory.create(1, 0);
+            install_fixture_creator(second.as_mut());
             let processor = second.as_processor_mut().expect("second filter processor");
             processor
                 .push_chunk(&state, filtered)
@@ -609,6 +660,7 @@ mod tests {
         let arena = Arc::new(arena);
         let factory = FilterProcessorFactory::new(7, Arc::clone(&arena), predicate);
         let mut op = factory.create(1, 0);
+        install_fixture_creator(op.as_mut());
         let processor = op.as_processor_mut().expect("processor");
         let dict_type = dict_utf8_type();
 
@@ -685,6 +737,7 @@ mod tests {
         let predicate = arena.push_typed(ExprNode::Eq(status, paid), DataType::Boolean);
         let factory = FilterProcessorFactory::new(8, Arc::new(arena), predicate);
         let mut op = factory.create(1, 0);
+        install_fixture_creator(op.as_mut());
         let processor = op.as_processor_mut().expect("processor");
         let state = RuntimeState::default();
         processor

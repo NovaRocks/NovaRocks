@@ -64,7 +64,7 @@ insert into ss values (3,"May",NULL,NULL,[2],map{3:'3',4:'4'});
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (3,"Ti","English",98, [null],map{null:null});
+insert into ss values (3,"Ti","English",98, [null],map{5:null});
 
 -- query 9
 -- @skip_result_check=true

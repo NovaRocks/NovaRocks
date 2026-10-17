@@ -31,12 +31,12 @@ fn legacy_error(failure: ConstructionFailure<Infallible>) -> String {
         ConstructionFailure::Control(never) => match never {},
     }
 }
-pub fn eval_array_expr(
-    arena: &ExprArena,
+pub fn eval_array_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     id: ExprId,
     elements: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let mut observe = |_| Ok::<(), Infallible>(());
     let mut inputs = ArrayLiteralInputs::from_output(
         arena.data_type(id),
@@ -51,12 +51,12 @@ pub fn eval_array_expr(
             .push_evaluated(array, &mut observe)
             .map_err(legacy_error)?;
     }
-    inputs
+    Ok((inputs
         .finish(
             crate::exec::expr::cast::cast_with_special_rules,
             &mut observe,
         )
-        .map_err(legacy_error)
+        .map_err(legacy_error))?)
 }
 
 #[cfg(test)]

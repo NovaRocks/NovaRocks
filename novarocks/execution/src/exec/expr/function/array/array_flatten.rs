@@ -24,12 +24,12 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_array_flatten(
-    arena: &ExprArena,
+pub fn eval_array_flatten<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let outer = arr
         .as_any()
@@ -52,10 +52,9 @@ pub fn eval_array_flatten(
         _ => match inner.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_flatten output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_flatten output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -111,7 +110,7 @@ pub fn eval_array_flatten(
         }
 
         if current > i32::MAX as i64 {
-            return Err("array_flatten offset overflow".to_string());
+            return Err(("array_flatten offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

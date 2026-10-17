@@ -24,19 +24,19 @@ use novarocks_functions::builtin::numeric_elementary::{
 #[cfg(test)]
 use std::sync::Arc;
 
-pub fn eval_sign(
-    arena: &ExprArena,
+pub fn eval_sign<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arguments = [arena.eval(args[0], chunk)?];
     let out =
         evaluate_legacy_numeric_elementary(NumericElementaryOp::Sign, &arguments, chunk.len())
             .map_err(|error| error.to_string())?;
     // The shared core returns the original Int64 SIGN carrier before this
     // legacy cast; the selected owner separately projects the same value to f64.
-    super::common::cast_output(out, arena.data_type(expr))
+    Ok((super::common::cast_output(out, arena.data_type(expr)))?)
 }
 
 #[cfg(test)]

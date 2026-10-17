@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_legacy};
 
-pub fn eval_unhex(
-    arena: &ExprArena,
+pub fn eval_unhex<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let s_arr = str_arr
@@ -32,5 +32,5 @@ pub fn eval_unhex(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "unhex expects string".to_string())?;
     let rows = s_arr.len();
-    evaluate_legacy(StringOperation::Unhex, &[str_arr], rows)
+    Ok((evaluate_legacy(StringOperation::Unhex, &[str_arr], rows))?)
 }

@@ -110,7 +110,14 @@ pub fn apply_task_domain_updates(
     updates: &[TaskDomainUpdate],
 ) -> Result<(Vec<TaskDomainReceipt>, bool), DomainExecutionRejection> {
     let plan = plan_task_domain_execution_updates(descriptor, domains, updates)?;
-    let queued = apply_planned_task_domain_updates(host, descriptor, updates, &plan)?;
+    let queued = apply_planned_task_domain_updates(
+        host,
+        descriptor,
+        updates,
+        &plan,
+        #[cfg(novarocks_dev_controls)]
+        None,
+    )?;
     commit_task_domain_execution_updates(domains, updates, &queued)
 }
 
@@ -119,11 +126,21 @@ pub fn apply_planned_task_domain_updates(
     descriptor: &TaskDescriptor,
     updates: &[TaskDomainUpdate],
     plan: &[DomainProgression],
+    #[cfg(novarocks_dev_controls)] operation: Option<novarocks_execution_contract::TaskOperationId>,
 ) -> Result<Vec<Option<u64>>, DomainExecutionRejection> {
     let mut queued = Vec::with_capacity(updates.len());
     for (update, progression) in updates.iter().zip(plan) {
         if task_domain_reaches_execution(update, *progression) {
-            match host.apply_task_domain(descriptor, update) {
+            #[cfg(novarocks_dev_controls)]
+            let result = match operation {
+                Some(operation) => {
+                    host.apply_task_domain_for_operation(descriptor, update, operation)
+                }
+                None => host.apply_task_domain(descriptor, update),
+            };
+            #[cfg(not(novarocks_dev_controls))]
+            let result = host.apply_task_domain(descriptor, update);
+            match result {
                 Ok(depth) => queued.push(depth),
                 Err(rejection) => {
                     tracing::warn!(

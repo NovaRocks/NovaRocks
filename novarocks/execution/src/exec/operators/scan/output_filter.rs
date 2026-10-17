@@ -25,9 +25,8 @@ use compiled_ordered_output::CompiledOrderedOutputDriver;
 pub(super) use compiled_ordered_output::CompiledOrderedOutputFactory;
 
 use arrow::array::BooleanArray;
-use arrow::compute::filter_record_batch;
 
-use crate::exec::chunk::{Chunk, hydrate_dictionary_columns_except};
+use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::scan::ScanNode;
 use crate::exec::operators::FilterEncodingPolicy;
@@ -75,6 +74,8 @@ pub(super) struct ScanDriverFilter {
     filter: ScanOutputFilter,
     compiled_keys: Option<CompiledRuntimeFilterKeys>,
     compiled_ordered: Option<CompiledOrderedOutputDriver>,
+    evaluation_factory: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    evaluation_control: Option<super::super::compiled_expression::RuntimeKernelControl>,
 }
 
 /// A legacy scan conjunct and the arena it is evaluated against.
@@ -143,6 +144,8 @@ impl ScanOutputFilter {
         ScanDriverFilter {
             filter: self.clone(),
             compiled_keys,
+            evaluation_factory: None,
+            evaluation_control: None,
             compiled_ordered: self
                 .compiled_ordered
                 .as_ref()
@@ -164,6 +167,8 @@ impl ScanDriverFilter {
         &mut self,
         state: &crate::runtime::runtime_state::RuntimeState,
     ) -> ExecutionResult<()> {
+        self.evaluation_control =
+            Some(super::super::compiled_expression::RuntimeKernelControl::new(state.error_state()));
         if let Some(keys) = &mut self.compiled_keys {
             keys.bind_runtime_state(state);
         }
@@ -188,6 +193,7 @@ impl ScanDriverFilter {
         &mut self,
         factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) {
+        self.evaluation_factory = Some(Arc::clone(&factory));
         if let Some(keys) = &mut self.compiled_keys {
             keys.bind_construction_factory(Arc::clone(&factory));
         }
@@ -239,7 +245,13 @@ impl ScanDriverFilter {
         event_sink: &Arc<dyn FragmentEventSink>,
     ) -> ExecutionResult<Option<Chunk>> {
         let filter = &self.filter;
-        let Some(chunk) = filter.apply_conjunct_predicate(chunk, profiles)? else {
+        let Some(chunk) = filter.apply_conjunct_predicate_created(
+            chunk,
+            profiles,
+            self.evaluation_factory.as_deref(),
+            self.evaluation_control.as_ref(),
+        )?
+        else {
             return Ok(None);
         };
         let Some(chunk) = (match self.compiled_ordered.as_mut() {
@@ -249,15 +261,31 @@ impl ScanDriverFilter {
             return Ok(None);
         };
         let Some(chunk) = (match filter.ordered_live.as_ref() {
-            Some(consumers) => consumers.apply_latest_chunk_observed(chunk, Some(event_sink))?,
+            Some(consumers) => consumers.apply_latest_chunk_created(
+                chunk,
+                self.evaluation_factory
+                    .as_deref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+                self.evaluation_control
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+                Some(event_sink),
+            )?,
             None => Some(chunk),
         }) else {
             return Ok(None);
         };
         let Some(chunk) = (match (filter.blocking.as_ref(), self.compiled_keys.as_mut()) {
-            (Some(ScanBlockingConsumers::Arena(consumers)), _) => {
-                consumers.apply_chunk_observed(chunk, Some(event_sink))?
-            }
+            (Some(ScanBlockingConsumers::Arena(consumers)), _) => consumers.apply_chunk_created(
+                chunk,
+                self.evaluation_factory
+                    .as_deref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+                self.evaluation_control
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+                Some(event_sink),
+            )?,
             (Some(ScanBlockingConsumers::Compiled(consumers)), Some(keys)) => consumers
                 .state()
                 .apply_chunk_observed(chunk, keys, Some(event_sink))?,
@@ -273,11 +301,13 @@ impl ScanDriverFilter {
 }
 
 impl ScanOutputFilter {
-    fn apply_conjunct_predicate(
+    fn apply_conjunct_predicate_created(
         &self,
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
-    ) -> Result<Option<Chunk>, String> {
+        factory: Option<&dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+        control: Option<&super::super::compiled_expression::RuntimeKernelControl>,
+    ) -> ExecutionResult<Option<Chunk>> {
         let Some(conjunct) = self.conjunct.as_ref() else {
             return Ok(Some(chunk));
         };
@@ -287,22 +317,27 @@ impl ScanOutputFilter {
 
         let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
 
-        let chunk = hydrate_dictionary_columns_except(&chunk, |slot_id, data_type| {
-            conjunct
-                .encoding_policy
-                .accepts_encoded_column(slot_id, data_type)
-        })?;
-
-        let predicate_array = conjunct
-            .arena
-            .eval(conjunct.predicate, &chunk)
-            .map_err(|e| e.to_string())?;
+        let factory =
+            factory.ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let hydration_owner = factory.begin_input_construction(&chunk)?;
+        let chunk =
+            chunk.hydrate_for_evaluation(hydration_owner.as_ref(), |slot_id, data_type| {
+                conjunct
+                    .encoding_policy
+                    .accepts_encoded_column(slot_id, data_type)
+            })?;
+        let owner = factory.begin_input_construction(&chunk)?;
+        let evaluation = crate::exec::expr::ExprEvaluationContext::new(
+            &conjunct.arena,
+            owner.as_ref(),
+            control.ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?,
+        );
+        let predicate_array = evaluation.eval(conjunct.predicate, &chunk)?;
         let filter_mask = predicate_array
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| "scan conjunct predicate must return boolean array".to_string())?;
-        let filtered_batch = filter_record_batch(chunk.record_batch(), filter_mask)
-            .map_err(|e| format!("scan conjunct filter failed: {}", e))?;
+        let filtered_chunk = chunk.filter_for_evaluation(filter_mask, owner.as_ref())?;
         if let Some(profiles) = profiles {
             profiles
                 .common
@@ -310,13 +345,13 @@ impl ScanOutputFilter {
             profiles.common.counter_add(
                 SCAN_CONJUNCT_OUTPUT_ROWS,
                 ProfileUnit::Unit,
-                i64::try_from(filtered_batch.num_rows()).unwrap_or(i64::MAX),
+                i64::try_from(filtered_chunk.len()).unwrap_or(i64::MAX),
             );
         }
-        if filtered_batch.num_rows() == 0 {
+        if filtered_chunk.len() == 0 {
             return Ok(None);
         }
-        Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
+        Ok(Some(filtered_chunk))
     }
 }
 

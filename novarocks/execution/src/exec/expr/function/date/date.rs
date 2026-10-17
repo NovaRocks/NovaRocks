@@ -27,23 +27,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[inline]
-fn eval_to_date_inner(
-    arena: &ExprArena,
+fn eval_to_date_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
-    novarocks_functions::builtin::calendar_to_date::evaluate_legacy_to_date(&arr)
+    Ok((novarocks_functions::builtin::calendar_to_date::evaluate_legacy_to_date(&arr))?)
 }
 
 #[inline]
-fn eval_to_datetime_inner(
-    arena: &ExprArena,
+fn eval_to_datetime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     timezone_aware: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let output_type = arena
         .data_type(expr)
         .cloned()
@@ -59,12 +59,12 @@ fn eval_to_datetime_inner(
                 | DataType::FixedSizeBinary(16)
         ) {
             let rows = arr.len();
-            return novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
+            return Ok((novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
                 novarocks_functions::builtin::calendar_extended_shared::CalendarOperation::Timestamp,
                 &[arr],
                 &output_type,
                 rows,
-            );
+            ))?);
         }
 
         let values = extract_i64_array(&arr, "to_datetime")?;
@@ -469,32 +469,32 @@ pub fn parse_tera_datetime(input: &str, tokens: &[TeraToken]) -> Option<NaiveDat
     d.and_hms_opt(hour, minute, second)
 }
 
-pub fn eval_date(
-    arena: &ExprArena,
+pub fn eval_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_to_date_inner(arena, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_to_date_inner(arena, args, chunk))?)
 }
 
-pub fn eval_to_date(
-    arena: &ExprArena,
+pub fn eval_to_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_to_date_inner(arena, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_to_date_inner(arena, args, chunk))?)
 }
 
-pub fn eval_to_tera_date(
-    arena: &ExprArena,
+pub fn eval_to_tera_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() == 1 {
-        return eval_to_date_inner(arena, args, chunk);
+        return Ok((eval_to_date_inner(arena, args, chunk))?);
     }
 
     let value_arr = arena.eval(args[0], chunk)?;
@@ -548,48 +548,48 @@ pub fn eval_to_tera_date(
     Ok(Arc::new(Date32Array::from(out)) as ArrayRef)
 }
 
-pub fn eval_to_tera_timestamp(
-    arena: &ExprArena,
+pub fn eval_to_tera_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_timestamp_with_custom_format(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_timestamp_with_custom_format(
         arena,
         expr,
         args,
         chunk,
         "to_tera_timestamp expects string format",
         compile_tera_format,
-    )
+    ))?)
 }
 
-pub fn eval_str_to_jodatime(
-    arena: &ExprArena,
+pub fn eval_str_to_jodatime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_timestamp_with_custom_format(
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_timestamp_with_custom_format(
         arena,
         expr,
         args,
         chunk,
         "str_to_jodatime expects string format",
         compile_joda_format,
-    )
+    ))?)
 }
 
-fn eval_timestamp_with_custom_format(
-    arena: &ExprArena,
+fn eval_timestamp_with_custom_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     fmt_error: &'static str,
     compile_fn: fn(&str) -> Result<Vec<TeraToken>, String>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() == 1 {
-        return eval_to_datetime_inner(arena, expr, args, chunk, true);
+        return Ok((eval_to_datetime_inner(arena, expr, args, chunk, true))?);
     }
 
     let value_arr = arena.eval(args[0], chunk)?;
@@ -645,21 +645,21 @@ fn eval_timestamp_with_custom_format(
     Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef)
 }
 
-pub fn eval_to_datetime(
-    arena: &ExprArena,
+pub fn eval_to_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_to_datetime_inner(arena, expr, args, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_to_datetime_inner(arena, expr, args, chunk, true))?)
 }
 
-pub fn eval_to_datetime_ntz(
-    arena: &ExprArena,
+pub fn eval_to_datetime_ntz<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     use novarocks_functions::builtin::calendar_extended_shared::{
         CalendarOperation, evaluate_legacy_calendar,
     };
@@ -678,23 +678,23 @@ pub fn eval_to_datetime_ntz(
         )
     {
         let rows = source.len();
-        return evaluate_legacy_calendar(
+        return Ok((evaluate_legacy_calendar(
             CalendarOperation::Timestamp,
             &[source],
             &output_type,
             rows,
-        );
+        ))?);
     }
     if args.len() == 1 {
         let values = extract_i64_array(&source, "to_datetime")?;
         let rows = values.len();
         let source: ArrayRef = Arc::new(arrow::array::Int64Array::from(values));
-        return evaluate_legacy_calendar(
+        return Ok((evaluate_legacy_calendar(
             CalendarOperation::EpochNtz,
             &[source],
             &output_type,
             rows,
-        );
+        ))?);
     }
     let scale = arena.eval(args[1], chunk)?;
     let values = extract_i64_array(&source, "to_datetime")?;
@@ -702,19 +702,19 @@ pub fn eval_to_datetime_ntz(
     let rows = values.len();
     let source: ArrayRef = Arc::new(arrow::array::Int64Array::from(values));
     let scale: ArrayRef = Arc::new(arrow::array::Int64Array::from(scales));
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::EpochNtz,
         &[source, scale],
         &output_type,
         rows,
-    )
+    ))?)
 }
 
-pub fn eval_timestamp(
-    arena: &ExprArena,
+pub fn eval_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_to_datetime_inner(arena, expr, args, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_to_datetime_inner(arena, expr, args, chunk, true))?)
 }

@@ -1162,26 +1162,25 @@ impl ProjectProcessorOperator {
                 needs_hydration |= used;
             }
         }
-        let storage = chunk
-            .source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
-                owner.request(layout)
+        let (array, storage) = if needs_hydration {
+            let hydrated = chunk.hydrate_for_evaluation(owner, |slot, _| {
+                expression_uses_slot(&self.arena, expr_id, slot) == Some(false)
             })?;
-        let array = if needs_hydration {
-            let hydrated = crate::exec::chunk::hydrate_dictionary_columns_owned_observed::<
-                ConstructionFailure,
-                _,
-                _,
-                _,
-            >(
-                chunk,
-                storage.clone(),
-                |slot, _, _, _| expression_uses_slot(&self.arena, expr_id, slot) == Some(false),
-                |ordinal, path, step| owner.observe(ordinal, path, step),
-                |layout| owner.request(layout),
-            )?;
-            self.arena.eval(expr_id, &hydrated)?
+            let storage = hydrated
+                .source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+                    owner.request(layout)
+                })?;
+            let array = crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner, control)
+                .eval(expr_id, &hydrated)?;
+            (array, storage)
         } else {
-            self.arena.eval(expr_id, chunk)?
+            let storage = chunk
+                .source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+                    owner.request(layout)
+                })?;
+            let array = crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner, control)
+                .eval(expr_id, chunk)?;
+            (array, storage)
         };
         let array = if matches!(
             self.arena.node(expr_id),
@@ -1367,10 +1366,14 @@ impl ProjectProcessorOperator {
                 &mut opaque,
             );
             for target in output.slots() {
-                novarocks_functions::selected_copy::preflight_empty_construction(
+                crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+                novarocks_functions::selected_copy::preflight_empty_construction_observed(
                     target.typed_binding().layout(),
                     &mut creation,
-                    control,
+                    &mut |_| {
+                        crate::exec::expr::ExprEvaluationControl::checkpoint(control)
+                            .map_err(ConstructionFailure::from)
+                    },
                 )
                 .map_err(|error| match error {
                     novarocks_functions::selected_copy::CopyConstructionError::Creator(error) => {
@@ -1389,6 +1392,7 @@ impl ProjectProcessorOperator {
                     )),
                 })?;
                 columns.push(new_empty_array(target.data_type()));
+                crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
             }
             return Ok(Some(materialize_project_output_owned(
                 columns,
@@ -3978,6 +3982,14 @@ mod owned_project_tests {
         .unwrap()
     }
     struct Control;
+    impl crate::exec::expr::ExprEvaluationControl for Control {
+        fn checkpoint(&self) -> ExecutionResult<()> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> ExecutionResult<()> {
+            Ok(())
+        }
+    }
     impl novarocks_functions::KernelEvaluationControl for Control {
         fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
             Ok(())

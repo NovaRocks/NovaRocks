@@ -18,12 +18,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 
-pub fn eval_regexp_extract(
-    arena: &ExprArena,
+pub fn eval_regexp_extract<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
@@ -38,9 +38,11 @@ pub fn eval_regexp_extract(
         .ok_or_else(|| "regexp_extract expects string".to_string())?;
     let _indices = super::common::downcast_int_arg_array(&idx_arr, "regexp_extract")?;
     let len = s_arr.len();
-    novarocks_functions::builtin::string_extended::evaluate_legacy(
-        novarocks_functions::builtin::string_extended::StringOperation::RegexpExtract,
-        &[str_arr, pat_arr, idx_arr],
-        len,
+    Ok(
+        (novarocks_functions::builtin::string_extended::evaluate_legacy(
+            novarocks_functions::builtin::string_extended::StringOperation::RegexpExtract,
+            &[str_arr, pat_arr, idx_arr],
+            len,
+        ))?,
     )
 }

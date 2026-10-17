@@ -43,6 +43,8 @@ mod context_host;
 mod execution_host;
 mod preparation_memory_control;
 mod project_materialization;
+#[cfg(novarocks_dev_controls)]
+mod task_update_replay_gate;
 mod type_materialization;
 
 #[cfg(test)]

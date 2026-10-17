@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+#[cfg(test)]
 use crate::exec::operators::data_stream_sink::{
     partition_chunk_by_hash, partition_chunk_by_hash_arrays,
 };
@@ -409,12 +410,41 @@ impl LocalExchanger {
         !self.all_consumers_closed() && !self.capacity_full()
     }
 
+    #[cfg(test)]
     pub(crate) fn accept(
         self: &Arc<Self>,
         state: &RuntimeState,
         chunk: Chunk,
         _sink_driver_seq: usize,
     ) -> Result<(), String> {
+        self.accept_with(state, chunk, _sink_driver_seq, |chunk| {
+            self.partition_chunk(chunk)
+        })
+    }
+
+    pub(crate) fn accept_created(
+        self: &Arc<Self>,
+        state: &RuntimeState,
+        chunk: Chunk,
+        driver: usize,
+        factory: Option<&dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        self.accept_with(state, chunk, driver, |chunk| {
+            let factory = factory
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            let control =
+                super::compiled_expression::RuntimeKernelControl::new(state.error_state());
+            self.partition_chunk_created(chunk, factory, &control)
+        })
+    }
+
+    fn accept_with<E: From<String>>(
+        self: &Arc<Self>,
+        state: &RuntimeState,
+        chunk: Chunk,
+        _driver: usize,
+        mut partition: impl FnMut(&Chunk) -> Result<Vec<(usize, Chunk)>, E>,
+    ) -> Result<(), E> {
         if chunk.is_empty() || self.all_consumers_closed() {
             return Ok(());
         }
@@ -427,7 +457,7 @@ impl LocalExchanger {
             self.push_chunk_to_partition(0, chunk);
             return Ok(());
         }
-        let partitioned = self.partition_chunk(&chunk)?;
+        let partitioned = partition(&chunk)?;
         for (idx, mut part_chunk) in partitioned {
             if part_chunk.is_empty() {
                 continue;
@@ -526,6 +556,52 @@ impl LocalExchanger {
         Some(Arc::clone(tracker))
     }
 
+    fn partition_chunk_created(
+        &self,
+        chunk: &Chunk,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        control: &super::compiled_expression::RuntimeKernelControl,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
+        let partitioned = match &self.partition_spec {
+            LocalExchangePartitionSpec::Exprs(exprs) => {
+                let owner = factory.begin_input_construction(chunk)?;
+                let evaluation = crate::exec::expr::ExprEvaluationContext::new(
+                    &self.arena,
+                    owner.as_ref(),
+                    control,
+                );
+                super::data_stream_sink::partition_chunk_by_hash_created(
+                    chunk,
+                    exprs,
+                    &evaluation,
+                    self.partition_count,
+                    false,
+                    factory,
+                    control,
+                )?
+            }
+            LocalExchangePartitionSpec::InputSlotIds(slots) => {
+                let arrays = slots
+                    .iter()
+                    .map(|slot| chunk.column_by_slot_id(*slot))
+                    .collect::<Result<Vec<_>, _>>()?;
+                super::data_stream_sink::partition_chunk_by_hash_arrays_created(
+                    chunk,
+                    &arrays,
+                    self.partition_count,
+                    false,
+                    factory,
+                    control,
+                )?
+            }
+            LocalExchangePartitionSpec::Single => {
+                return Err("local exchange partition spec missing".into());
+            }
+        };
+        Ok(partitioned.into_iter().enumerate().collect())
+    }
+
+    #[cfg(test)]
     fn partition_chunk(&self, chunk: &Chunk) -> Result<Vec<(usize, Chunk)>, String> {
         let partitioned = match &self.partition_spec {
             LocalExchangePartitionSpec::Exprs(exprs) => {

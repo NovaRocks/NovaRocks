@@ -139,6 +139,10 @@ impl WriterPageProjection for TableWriterInputProjection {
     ) -> ExecutionResult<()> {
         self.prepare_created(factory)
     }
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.bind_evaluation_runtime_state(state);
+        Ok(())
+    }
     fn project(&mut self, chunk: &Chunk) -> ExecutionResult<Chunk> {
         self.project_created(chunk)
     }
@@ -1773,7 +1777,16 @@ pub(crate) mod tests {
         RuntimeState::new(None, None, None, None, None, mem_tracker, Some(runtime))
     }
 
+    fn install_construction(operator: &mut dyn Operator, state: &RuntimeState) {
+        let construction = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().expect("actual runtime construction profile"),
+            MemTracker::new_root("writer input construction fixture"), state.error_state(),
+        ).expect("actual construction factory");
+        operator.set_construction_factory(construction);
+    }
+
     fn bind(operator: &mut Box<dyn Operator>, state: &RuntimeState) {
+        install_construction(operator.as_mut(), state);
         operator.prepare().expect("prepare");
         operator
             .bind_runtime_state(state)
@@ -2132,6 +2145,7 @@ pub(crate) mod tests {
                     cancelled: false,
                 }));
                 let state = test_runtime_state();
+                install_construction(&mut operator, &state);
                 operator.prepare().unwrap();
                 operator.bind_runtime_state(&state).unwrap();
                 operator.activate(&state).unwrap();
@@ -2437,10 +2451,31 @@ pub(crate) mod tests {
         Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]))
     }
 
+    fn typed_writer_input_schema() -> crate::exec::chunk::ChunkSchemaRef {
+        let schema = writer_input_schema();
+        let value = novarocks_type_contract::FunctionValueType::new(DataType::Int32, false);
+        let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+            SlotId::new(1),
+            schema.fields()[0].clone(),
+            value.typed_binding().clone(),
+            None,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .expect("explicit typed writer input slot");
+        Arc::new(
+            ChunkSchema::try_new_typed(
+                vec![slot],
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .expect("explicit typed writer input schema"),
+        )
+    }
+
     pub(crate) fn identity_projection() -> TableWriterInputProjection {
         let mut arena = ExprArena::default();
         let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        TableWriterInputProjection::try_new(arena, vec![expr], writer_input_schema())
+        let schema = typed_writer_input_schema();
+        TableWriterInputProjection::try_new_typed(arena, vec![expr], schema.clone(), schema)
             .expect("projection")
     }
 
@@ -2451,9 +2486,7 @@ pub(crate) mod tests {
             vec![Arc::new(Int32Array::from(values)) as ArrayRef],
         )
         .expect("batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("chunk schema");
+        let chunk_schema = typed_writer_input_schema();
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
@@ -2615,6 +2648,7 @@ pub(crate) mod tests {
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
 
+        install_construction(operator.as_mut(), &state);
         operator.prepare().expect("prepare writer");
         operator.bind_runtime_state(&state).expect("bind writer");
         assert_eq!(stats.opened.load(Ordering::Acquire), 0);
@@ -2639,6 +2673,7 @@ pub(crate) mod tests {
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
 
+        install_construction(operator.as_mut(), &state);
         operator.prepare().expect("prepare writer");
         operator.bind_runtime_state(&state).expect("bind writer");
         operator.cancel();
@@ -2940,6 +2975,7 @@ pub(crate) mod tests {
             Arc::clone(&aggregate_rows),
         )));
         let state = test_runtime_state();
+        install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
@@ -3063,6 +3099,7 @@ pub(crate) mod tests {
         let mut operator = factory.create_operator(1, 0);
         operator.replace_partial_aggregate_for_test(Box::new(OneShotPartial::new(partial)));
         let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
+        install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
@@ -3155,6 +3192,7 @@ pub(crate) mod tests {
         let mut operator = factory.create_operator(1, 0);
         operator.replace_partial_aggregate_for_test(Box::new(OneShotPartial::new(partial)));
         let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
+        install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
@@ -3404,6 +3442,7 @@ pub(crate) mod tests {
         let factory = writer_factory(&writer_node(execution));
         let mut operator = factory.create_operator(1, 0);
         let state = test_runtime_state();
+        install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
@@ -3549,6 +3588,7 @@ pub(crate) mod tests {
         ));
         operator.set_profiles(profiles.clone());
         let state = test_runtime_state();
+        install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");

@@ -23,13 +23,13 @@ use std::sync::Arc;
 // SUBSTRING function for Arrow arrays
 // Supports both 2-arg (substr(str, pos)) and 3-arg (substr(str, pos, len)) forms
 // Aligned with StarRocks BE implementation
-pub fn eval_substring(
-    arena: &ExprArena,
+pub fn eval_substring<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     str_expr: ExprId,
     start_expr: ExprId,
     length_expr: Option<ExprId>,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let str_array = arena.eval(str_expr, chunk)?;
     let start_array = arena.eval(start_expr, chunk)?;
 
@@ -99,7 +99,7 @@ pub fn eval_substring(
                 })
                 .collect()
         }
-        _ => return Err("substring: second argument must be a numeric array".to_string()),
+        _ => return Err(("substring: second argument must be a numeric array".to_string()).into()),
     };
 
     // Extract length values (convert to i64)
@@ -149,7 +149,7 @@ pub fn eval_substring(
                 })
                 .collect()
         }
-        _ => return Err("substring: third argument must be a numeric array".to_string()),
+        _ => return Err(("substring: third argument must be a numeric array".to_string()).into()),
     };
 
     // StarRocks SUBSTR narrows BIGINT pos/length to INT (i32); column values

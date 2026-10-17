@@ -224,6 +224,7 @@ impl OperatorFactory for SortProcessorFactory {
             profile_initialized: false,
             profiles: None,
             construction: None,
+            evaluation_control: None,
             prepared: false,
         })
     }
@@ -235,6 +236,7 @@ struct SortProcessorOperator {
     fixture_input_schema: Option<crate::exec::chunk::ChunkSchemaRef>,
     output_schema: Option<crate::exec::chunk::ChunkSchemaRef>,
     construction: Option<Arc<dyn InputConstructionFactory>>,
+    evaluation_control: Option<crate::exec::operators::compiled_expression::RuntimeKernelControl>,
     prepared: bool,
     name: String,
     arena: Arc<ExprArena>,
@@ -268,6 +270,21 @@ impl Operator for SortProcessorOperator {
     fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
         self.construction = Some(factory);
     }
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        let mut control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+            state.error_state(),
+        );
+        control.bind_runtime_memory(state);
+        control.bind_construction_factory(
+            self.construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?
+                .clone(),
+        );
+        self.evaluation_control = Some(control);
+        Ok(())
+    }
+
     fn prepare(&mut self) -> ExecutionResult<()> {
         let factory = self
             .construction
@@ -327,6 +344,7 @@ impl ProcessorOperator for SortProcessorOperator {
         if self.finished {
             return Ok(());
         }
+        self.bind_runtime_state(_state)?;
         self.init_profile_if_needed();
         if self.pending_output.is_some() {
             return Err("sort received input while output buffer is full"
@@ -358,6 +376,7 @@ impl ProcessorOperator for SortProcessorOperator {
         if self.finishing || self.finished {
             return Ok(());
         }
+        self.bind_runtime_state(_state)?;
         self.init_profile_if_needed();
         self.finishing = true;
 
@@ -381,6 +400,11 @@ impl SortProcessorOperator {
                 .as_deref()
                 .ok_or(ConstructionFailure::MissingOwner)?,
             self.output_schema
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?,
+        )
+        .with_evaluation_control(
+            self.evaluation_control
                 .as_ref()
                 .ok_or(ConstructionFailure::MissingOwner)?,
         ))
@@ -796,7 +820,8 @@ impl SortProcessorOperator {
         owner.request(std::alloc::Layout::array::<ArrayRef>(self.order_by.len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         let mut columns = Vec::with_capacity(self.order_by.len());
         for sort_expr in &self.order_by {
-            let values = self.arena.eval(sort_expr.expr, &chunk)?;
+            let evaluation = creation.expression_context(&self.arena, owner.as_ref())?;
+            let values = evaluation.eval(sort_expr.expr, &chunk)?;
             let declared = self.arena.value_type(sort_expr.expr).ok_or_else(|| {
                 ConstructionFailure::InvalidSource(
                     "sort key lacks its complete declared logical type".into(),
@@ -1108,6 +1133,7 @@ mod tests {
             fixture_input_schema: None,
             output_schema: None,
             construction: Some(source.creator.clone()),
+            evaluation_control: None,
             prepared: false,
             name: "test sort".to_string(),
             arena: Arc::new(arena),

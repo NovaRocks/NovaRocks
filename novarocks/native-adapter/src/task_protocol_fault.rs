@@ -615,6 +615,7 @@ pub fn task_update_terminal_ack_dropped(
     identity: TaskIdentity,
     outcome: OperationOutcome,
     terminal_nonempty: bool,
+    activate: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), tonic::Status> {
     if !terminal_nonempty || outcome != OperationOutcome::Accepted {
         return Ok(());
@@ -629,6 +630,7 @@ pub fn task_update_terminal_ack_dropped(
     else {
         return Ok(());
     };
+    activate().map_err(tonic::Status::failed_precondition)?;
     scope
         .record_hit()
         .map_err(tonic::Status::failed_precondition)?;

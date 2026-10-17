@@ -1852,6 +1852,34 @@ impl TaskExecutionRegistry {
 
     // ----------------------------------------------------------- update task
 
+    #[cfg(novarocks_dev_controls)]
+    pub fn reserve_test_update_consumption(
+        &self,
+        request: &UpdateTask,
+        control: novarocks_failpoint::scope::ControlCancellation,
+    ) -> Result<Box<dyn crate::TestTaskUpdateConsumptionReservation>, crate::HostRejection> {
+        // Validate actual membership before a test reservation can create a
+        // queue. The ordinary update remains the sole application authority.
+        let descriptor = {
+            let state = self.state.lock().expect(REGISTRY_LOCK);
+            let live = state
+                .task_index
+                .get(&request.identity())
+                .and_then(|context| live_task(&state, *context, request.identity()))
+                .ok_or_else(|| {
+                    crate::HostRejection::new(
+                        TaskFailureCategory::Protocol,
+                        "replay gate requires an actual live task",
+                    )
+                })?;
+            Arc::clone(&live.descriptor)
+        };
+        validate_task_domain_execution_membership(&descriptor, request.domains())
+            .map_err(|error| crate::HostRejection::new(error.category(), error.detail()))?;
+        self.task_host
+            .reserve_test_update_consumption(request, control)
+    }
+
     pub fn update_task(&self, request: &UpdateTask) -> UpdateTaskOutcome {
         let envelope = request.envelope();
         let operation = envelope.operation_id();
@@ -1931,6 +1959,8 @@ impl TaskExecutionRegistry {
             &descriptor,
             request.domains(),
             &plan,
+            #[cfg(novarocks_dev_controls)]
+            Some(operation),
         ) {
             Ok(queued) => queued,
             Err(rejection) => {

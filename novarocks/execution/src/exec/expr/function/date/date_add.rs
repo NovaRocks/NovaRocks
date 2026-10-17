@@ -24,13 +24,13 @@ use novarocks_functions::builtin::calendar_extended_shared::{
 };
 use std::sync::Arc;
 
-fn eval_with_factor(
-    arena: &ExprArena,
+fn eval_with_factor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     factor: i64,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = arena.eval(args[0], chunk)?;
     let interval = arena.eval(args[1], chunk)?;
     legacy_validate_datetime_source(&date)?;
@@ -41,82 +41,82 @@ fn eval_with_factor(
         .data_type(expr)
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::DaysShift(factor),
         &[date, interval],
         &output_type,
         rows,
-    )
+    ))?)
 }
 
-pub fn eval_date_add(
-    arena: &ExprArena,
+pub fn eval_date_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, 1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, 1))?)
 }
 
-pub fn eval_adddate(
-    arena: &ExprArena,
+pub fn eval_adddate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, 1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, 1))?)
 }
 
-pub fn eval_days_add(
-    arena: &ExprArena,
+pub fn eval_days_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, 1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, 1))?)
 }
 
-pub fn eval_weeks_add(
-    arena: &ExprArena,
+pub fn eval_weeks_add<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, 7)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, 7))?)
 }
 
-pub fn eval_date_sub(
-    arena: &ExprArena,
+pub fn eval_date_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, -1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, -1))?)
 }
 
-pub fn eval_subdate(
-    arena: &ExprArena,
+pub fn eval_subdate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, -1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, -1))?)
 }
 
-pub fn eval_days_sub(
-    arena: &ExprArena,
+pub fn eval_days_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, -1)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, -1))?)
 }
 
-pub fn eval_weeks_sub(
-    arena: &ExprArena,
+pub fn eval_weeks_sub<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_with_factor(arena, expr, args, chunk, -7)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_with_factor(arena, expr, args, chunk, -7))?)
 }

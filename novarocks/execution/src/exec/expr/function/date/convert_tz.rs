@@ -22,12 +22,12 @@ use novarocks_functions::builtin::calendar_extended_shared::{
     CalendarOperation, evaluate_legacy_calendar, legacy_validate_datetime_source,
 };
 
-pub fn eval_convert_tz(
-    arena: &ExprArena,
+pub fn eval_convert_tz<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = arena.eval(args[0], chunk)?;
     let from = arena.eval(args[1], chunk)?;
     let to = arena.eval(args[2], chunk)?;
@@ -43,10 +43,10 @@ pub fn eval_convert_tz(
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
     let rows = date.len();
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::ConvertTz,
         &[date, from, to],
         &output_type,
         rows,
-    )
+    ))?)
 }

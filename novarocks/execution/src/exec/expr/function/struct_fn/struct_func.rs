@@ -40,13 +40,13 @@ fn assert_struct_child_type(
     ))
 }
 
-fn eval_new_struct(
-    arena: &ExprArena,
+fn eval_new_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     fn_name: &str,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let output_type = arena
         .data_type(expr)
         .cloned()
@@ -54,19 +54,19 @@ fn eval_new_struct(
     let struct_fields = match output_type {
         DataType::Struct(fields) => fields,
         other => {
-            return Err(format!(
-                "{} output type must be Struct, got {:?}",
-                fn_name, other
-            ));
+            return Err(
+                (format!("{} output type must be Struct, got {:?}", fn_name, other)).into(),
+            );
         }
     };
     if struct_fields.len() != args.len() {
-        return Err(format!(
+        return Err((format!(
             "{} field count mismatch: expected {}, got {}",
             fn_name,
             struct_fields.len(),
             args.len()
-        ));
+        ))
+        .into());
     }
 
     let num_rows = chunk.len();
@@ -74,13 +74,14 @@ fn eval_new_struct(
     for (idx, expr_id) in args.iter().enumerate() {
         let mut array = arena.eval(*expr_id, chunk)?;
         if array.len() != num_rows {
-            return Err(format!(
+            return Err((format!(
                 "{} field length mismatch at {}: expected {}, got {}",
                 fn_name,
                 idx,
                 num_rows,
                 array.len()
-            ));
+            ))
+            .into());
         }
         let expected_type = struct_fields[idx].data_type();
         if array.data_type() == &DataType::Null && expected_type != &DataType::Null {
@@ -103,36 +104,37 @@ fn eval_new_struct(
     Ok(Arc::new(StructArray::new(struct_fields, arrays, None)) as ArrayRef)
 }
 
-pub fn eval_row(
-    arena: &ExprArena,
+pub fn eval_row<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_new_struct(arena, expr, args, chunk, "row")
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_new_struct(arena, expr, args, chunk, "row"))?)
 }
 
-pub fn eval_struct(
-    arena: &ExprArena,
+pub fn eval_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_new_struct(arena, expr, args, chunk, "struct")
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_new_struct(arena, expr, args, chunk, "struct"))?)
 }
 
-pub fn eval_named_struct(
-    arena: &ExprArena,
+pub fn eval_named_struct<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() < 2 || !args.len().is_multiple_of(2) {
-        return Err(format!(
+        return Err((format!(
             "named_struct expects an even number of arguments >= 2, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
     let values: Vec<ExprId> = args.iter().skip(1).step_by(2).copied().collect();
-    eval_new_struct(arena, expr, &values, chunk, "named_struct")
+    Ok((eval_new_struct(arena, expr, &values, chunk, "named_struct"))?)
 }

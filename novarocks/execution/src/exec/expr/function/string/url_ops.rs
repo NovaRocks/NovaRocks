@@ -115,13 +115,13 @@ fn extract_host_impl(url: &str) -> Option<String> {
     }
 }
 
-fn eval_url_unary<F>(
-    arena: &ExprArena,
+fn eval_url_unary<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     fn_name: &str,
     f: F,
-) -> Result<ArrayRef, String>
+) -> Result<ArrayRef, __Eval::Error>
 where
     F: Fn(&str) -> Result<String, String>,
 {
@@ -133,10 +133,7 @@ where
 
     let rows = arr.len().max(chunk.len());
     if arr.len() != 1 && arr.len() != rows {
-        return Err(format!(
-            "{fn_name} input length mismatch: {} vs {rows}",
-            arr.len()
-        ));
+        return Err((format!("{fn_name} input length mismatch: {} vs {rows}", arr.len())).into());
     }
 
     let mut out = Vec::with_capacity(rows);
@@ -152,30 +149,30 @@ where
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
 
-pub fn eval_url_encode(
-    arena: &ExprArena,
+pub fn eval_url_encode<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_url_unary(arena, args, chunk, "url_encode", |v| Ok(url_encode_impl(v)))
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_url_unary(arena, args, chunk, "url_encode", |v| Ok(url_encode_impl(v))))?)
 }
 
-pub fn eval_url_decode(
-    arena: &ExprArena,
+pub fn eval_url_decode<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_url_unary(arena, args, chunk, "url_decode", url_decode_impl)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_url_unary(arena, args, chunk, "url_decode", url_decode_impl))?)
 }
 
-pub fn eval_url_extract_host(
-    arena: &ExprArena,
+pub fn eval_url_extract_host<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let arr = arr
         .as_any()
@@ -184,10 +181,11 @@ pub fn eval_url_extract_host(
 
     let rows = arr.len().max(chunk.len());
     if arr.len() != 1 && arr.len() != rows {
-        return Err(format!(
+        return Err((format!(
             "url_extract_host input length mismatch: {} vs {rows}",
             arr.len()
-        ));
+        ))
+        .into());
     }
 
     let mut out = Vec::with_capacity(rows);

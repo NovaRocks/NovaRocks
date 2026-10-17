@@ -21,13 +21,13 @@ use arrow::array::{ArrayRef, Float64Array};
 use novarocks_functions::builtin::numeric_binary_core::{NumericBinaryOp, evaluate_binary_rows};
 use std::sync::Arc;
 
-fn eval_binary_f64(
-    arena: &ExprArena,
+fn eval_binary_f64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     operation: NumericBinaryOp,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let left_view = NumericArrayView::new(&left)?;
@@ -61,34 +61,34 @@ fn eval_binary_f64(
     )
     .map_err(|error| error.to_string())?;
     let out = Arc::new(Float64Array::from(values)) as ArrayRef;
-    cast_output(out, arena.data_type(expr))
+    Ok((cast_output(out, arena.data_type(expr)))?)
 }
 
-pub fn eval_atan2(
-    arena: &ExprArena,
+pub fn eval_atan2<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Atan2)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Atan2))?)
 }
 
-pub fn eval_fmod(
-    arena: &ExprArena,
+pub fn eval_fmod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Fmod)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Fmod))?)
 }
 
-pub fn eval_pow(
-    arena: &ExprArena,
+pub fn eval_pow<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Pow)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Pow))?)
 }
 
 #[cfg(test)]

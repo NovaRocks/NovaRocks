@@ -22,12 +22,12 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-pub fn eval_makedate(
-    arena: &ExprArena,
+pub fn eval_makedate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let year_arr = arena.eval(args[0], chunk)?;
     let day_arr = arena.eval(args[1], chunk)?;
     let year_arr = cast(&year_arr, &DataType::Int64).map_err(|e| e.to_string())?;

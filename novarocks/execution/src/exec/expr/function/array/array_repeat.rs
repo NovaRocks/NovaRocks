@@ -21,12 +21,12 @@ use arrow::datatypes::{DataType, Field};
 use novarocks_functions::builtin::array_repeat_core::{cast_repeat_count, repeat_values};
 use std::sync::Arc;
 
-pub fn eval_array_repeat(
-    arena: &ExprArena,
+pub fn eval_array_repeat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let source = arena.eval(args[0], chunk)?;
     let count_array = cast_repeat_count(arena.eval(args[1], chunk)?)?;
     let counts = count_array
@@ -38,5 +38,5 @@ pub fn eval_array_repeat(
         Some(DataType::List(field)) => field.clone(),
         _ => Arc::new(Field::new("item", source.data_type().clone(), true)),
     };
-    repeat_values(source, counts, chunk.len(), output_field)
+    Ok((repeat_values(source, counts, chunk.len(), output_field))?)
 }

@@ -26,8 +26,8 @@
 -- publishes a token-scoped marker, and waits for the harness to replace that
 -- exact process. The frontend's establish therefore never answers, the
 -- attempt fails while its pre-ready retry window is still open, and the
--- replan runs against the topology the replacement joined -- which is why
--- this step still returns a result instead of an error.
+-- successor excludes the failed process and can run on the surviving live
+-- backends. The fresh process need not join before successor preparation.
 --
 -- The runner's own proof is that the replacement carries a different
 -- BackendProcessId and that its fresh log contains neither an establish nor a
@@ -57,6 +57,9 @@ INSERT INTO ${case_db}.be_restart VALUES (3, 3);
 
 -- query 5
 -- @restart_be_after_establish_context_index=1
+-- @native_observation_attempts=1,2
+-- Each attempt has its own finite observation grants; the successor cannot
+-- reuse the first attempt's already-consumed binding grant.
 -- @be_log_count_at_least=NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED,1
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED,3
 SELECT COUNT(*)

@@ -39,82 +39,98 @@ pub fn metadata(name: &str) -> Option<FunctionMeta> {
     STRING_METADATA.iter().find(|m| m.name == name).copied()
 }
 
-pub fn eval_string_function(
+pub fn eval_string_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let canonical = STRING_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "append_trailing_char_if_absent" => {
-            super::append_trailing_char_if_absent::eval_append_trailing_char_if_absent(
+        "append_trailing_char_if_absent" => Ok(
+            (super::append_trailing_char_if_absent::eval_append_trailing_char_if_absent(
                 arena, expr, args, chunk,
-            )
+            ))?,
+        ),
+        "ascii" => Ok((super::ascii::eval_ascii(arena, expr, args, chunk))?),
+        "bar" => Ok((super::bar::eval_bar(arena, expr, args, chunk))?),
+        "char_length" => Ok((super::length_ops::eval_char_length(arena, expr, args, chunk))?),
+        "concat" => Ok((super::concat::eval_concat(arena, expr, args, chunk))?),
+        "concat_ws" => Ok((super::concat_ws::eval_concat_ws(arena, expr, args, chunk))?),
+        "crc32" => Ok((super::crc32::eval_crc32(arena, expr, args, chunk))?),
+        "murmur_hash3_32" => {
+            Ok((super::murmur_hash3_32::eval_murmur_hash3_32(arena, expr, args, chunk))?)
         }
-        "ascii" => super::ascii::eval_ascii(arena, expr, args, chunk),
-        "bar" => super::bar::eval_bar(arena, expr, args, chunk),
-        "char_length" => super::length_ops::eval_char_length(arena, expr, args, chunk),
-        "concat" => super::concat::eval_concat(arena, expr, args, chunk),
-        "concat_ws" => super::concat_ws::eval_concat_ws(arena, expr, args, chunk),
-        "crc32" => super::crc32::eval_crc32(arena, expr, args, chunk),
-        "murmur_hash3_32" => super::murmur_hash3_32::eval_murmur_hash3_32(arena, expr, args, chunk),
-        "ends_with" => super::prefix_suffix_ops::eval_ends_with(arena, expr, args, chunk),
-        "field" => super::field::eval_field(arena, expr, args, chunk),
-        "find_in_set" => super::find_in_set::eval_find_in_set(arena, expr, args, chunk),
-        "format_bytes" => super::format_bytes::eval_format_bytes(arena, expr, args, chunk),
-        "group_concat" => super::group_concat::eval_group_concat(arena, expr, args, chunk),
-        "hex" => super::hex::eval_hex(arena, expr, args, chunk),
-        "initcap" => super::initcap::eval_initcap(arena, expr, args, chunk),
-        "join_row_key" => super::join_row_key::eval_join_row_key(arena, expr, args, chunk),
-        "instr" => super::locate_ops::eval_instr(arena, expr, args, chunk),
-        "left" => super::left_right_ops::eval_left(arena, expr, args, chunk),
-        "length" => super::length_ops::eval_length(arena, expr, args, chunk),
-        "locate" => super::locate_ops::eval_locate(arena, expr, args, chunk),
-        "ngram_search" => super::ngram_search::eval_ngram_search(arena, expr, args, chunk),
-        "ngram_search_case_insensitive" => {
-            super::ngram_search::eval_ngram_search_case_insensitive(arena, expr, args, chunk)
+        "ends_with" => Ok((super::prefix_suffix_ops::eval_ends_with(arena, expr, args, chunk))?),
+        "field" => Ok((super::field::eval_field(arena, expr, args, chunk))?),
+        "find_in_set" => Ok((super::find_in_set::eval_find_in_set(arena, expr, args, chunk))?),
+        "format_bytes" => Ok((super::format_bytes::eval_format_bytes(arena, expr, args, chunk))?),
+        "group_concat" => Ok((super::group_concat::eval_group_concat(arena, expr, args, chunk))?),
+        "hex" => Ok((super::hex::eval_hex(arena, expr, args, chunk))?),
+        "initcap" => Ok((super::initcap::eval_initcap(arena, expr, args, chunk))?),
+        "join_row_key" => Ok((super::join_row_key::eval_join_row_key(arena, expr, args, chunk))?),
+        "instr" => Ok((super::locate_ops::eval_instr(arena, expr, args, chunk))?),
+        "left" => Ok((super::left_right_ops::eval_left(arena, expr, args, chunk))?),
+        "length" => Ok((super::length_ops::eval_length(arena, expr, args, chunk))?),
+        "locate" => Ok((super::locate_ops::eval_locate(arena, expr, args, chunk))?),
+        "ngram_search" => Ok((super::ngram_search::eval_ngram_search(arena, expr, args, chunk))?),
+        "ngram_search_case_insensitive" => Ok(
+            (super::ngram_search::eval_ngram_search_case_insensitive(arena, expr, args, chunk))?,
+        ),
+        "lower" => Ok((super::case_ops::eval_lower(arena, expr, args, chunk))?),
+        "lpad" => Ok((super::pad_ops::eval_lpad(arena, expr, args, chunk))?),
+        "ltrim" => Ok((super::trim_ops::eval_ltrim(arena, expr, args, chunk))?),
+        "money_format" => Ok((super::money_format::eval_money_format(arena, expr, args, chunk))?),
+        "null_or_empty" => {
+            Ok((super::null_or_empty::eval_null_or_empty(arena, expr, args, chunk))?)
         }
-        "lower" => super::case_ops::eval_lower(arena, expr, args, chunk),
-        "lpad" => super::pad_ops::eval_lpad(arena, expr, args, chunk),
-        "ltrim" => super::trim_ops::eval_ltrim(arena, expr, args, chunk),
-        "money_format" => super::money_format::eval_money_format(arena, expr, args, chunk),
-        "null_or_empty" => super::null_or_empty::eval_null_or_empty(arena, expr, args, chunk),
-        "parse_url" => super::parse_url::eval_parse_url(arena, expr, args, chunk),
-        "regexp_count" => super::regexp_count::eval_regexp_count(arena, expr, args, chunk),
-        "regexp_extract" => super::regexp_extract::eval_regexp_extract(arena, expr, args, chunk),
+        "parse_url" => Ok((super::parse_url::eval_parse_url(arena, expr, args, chunk))?),
+        "regexp_count" => Ok((super::regexp_count::eval_regexp_count(arena, expr, args, chunk))?),
+        "regexp_extract" => {
+            Ok((super::regexp_extract::eval_regexp_extract(arena, expr, args, chunk))?)
+        }
         "regexp_extract_all" => {
-            super::regexp_extract_all::eval_regexp_extract_all(arena, expr, args, chunk)
+            Ok((super::regexp_extract_all::eval_regexp_extract_all(arena, expr, args, chunk))?)
         }
-        "regexp_position" => super::regexp_position::eval_regexp_position(arena, expr, args, chunk),
-        "regexp_replace" => super::regexp_replace::eval_regexp_replace(arena, expr, args, chunk),
-        "repeat" => super::repeat::eval_repeat(arena, expr, args, chunk),
-        "replace" => super::replace::eval_replace(arena, expr, args, chunk),
-        "reverse" => super::reverse::eval_reverse(arena, expr, args, chunk),
-        "right" => super::left_right_ops::eval_right(arena, expr, args, chunk),
-        "rpad" => super::pad_ops::eval_rpad(arena, expr, args, chunk),
-        "rtrim" => super::trim_ops::eval_rtrim(arena, expr, args, chunk),
-        "space" => super::space::eval_space(arena, expr, args, chunk),
-        "split" => super::split::eval_split(arena, args[0], args[1], chunk),
-        "split_part" => super::split_part::eval_split_part(arena, expr, args, chunk),
-        "strpos" => super::locate_ops::eval_strpos(arena, expr, args, chunk),
-        "starts_with" => super::prefix_suffix_ops::eval_starts_with(arena, expr, args, chunk),
-        "str_to_map" => super::str_to_map::eval_str_to_map(arena, expr, args, chunk),
-        "substring_index" => super::substring_index::eval_substring_index(arena, expr, args, chunk),
-        "translate" => super::translate::eval_translate(arena, expr, args, chunk),
-        "trim" => super::trim_ops::eval_trim(arena, expr, args, chunk),
-        "unhex" => super::unhex::eval_unhex(arena, expr, args, chunk),
-        "url_decode" => super::url_ops::eval_url_decode(arena, expr, args, chunk),
-        "url_encode" => super::url_ops::eval_url_encode(arena, expr, args, chunk),
-        "url_extract_host" => super::url_ops::eval_url_extract_host(arena, expr, args, chunk),
-        "uuid" => super::uuid::eval_uuid(arena, expr, args, chunk),
-        "raise_error" => super::raise_error::eval_raise_error(arena, expr, args, chunk),
-        other => Err(format!("unsupported string function: {}", other)),
+        "regexp_position" => {
+            Ok((super::regexp_position::eval_regexp_position(arena, expr, args, chunk))?)
+        }
+        "regexp_replace" => {
+            Ok((super::regexp_replace::eval_regexp_replace(arena, expr, args, chunk))?)
+        }
+        "repeat" => Ok((super::repeat::eval_repeat(arena, expr, args, chunk))?),
+        "replace" => Ok((super::replace::eval_replace(arena, expr, args, chunk))?),
+        "reverse" => Ok((super::reverse::eval_reverse(arena, expr, args, chunk))?),
+        "right" => Ok((super::left_right_ops::eval_right(arena, expr, args, chunk))?),
+        "rpad" => Ok((super::pad_ops::eval_rpad(arena, expr, args, chunk))?),
+        "rtrim" => Ok((super::trim_ops::eval_rtrim(arena, expr, args, chunk))?),
+        "space" => Ok((super::space::eval_space(arena, expr, args, chunk))?),
+        "split" => Ok((super::split::eval_split(arena, args[0], args[1], chunk))?),
+        "split_part" => Ok((super::split_part::eval_split_part(arena, expr, args, chunk))?),
+        "strpos" => Ok((super::locate_ops::eval_strpos(arena, expr, args, chunk))?),
+        "starts_with" => {
+            Ok((super::prefix_suffix_ops::eval_starts_with(arena, expr, args, chunk))?)
+        }
+        "str_to_map" => Ok((super::str_to_map::eval_str_to_map(arena, expr, args, chunk))?),
+        "substring_index" => {
+            Ok((super::substring_index::eval_substring_index(arena, expr, args, chunk))?)
+        }
+        "translate" => Ok((super::translate::eval_translate(arena, expr, args, chunk))?),
+        "trim" => Ok((super::trim_ops::eval_trim(arena, expr, args, chunk))?),
+        "unhex" => Ok((super::unhex::eval_unhex(arena, expr, args, chunk))?),
+        "url_decode" => Ok((super::url_ops::eval_url_decode(arena, expr, args, chunk))?),
+        "url_encode" => Ok((super::url_ops::eval_url_encode(arena, expr, args, chunk))?),
+        "url_extract_host" => {
+            Ok((super::url_ops::eval_url_extract_host(arena, expr, args, chunk))?)
+        }
+        "uuid" => Ok((super::uuid::eval_uuid(arena, expr, args, chunk))?),
+        "raise_error" => Ok((super::raise_error::eval_raise_error(arena, expr, args, chunk))?),
+        other => Err((format!("unsupported string function: {}", other)).into()),
     }
 }
 static STRING_FUNCTIONS: &[(&str, &str)] = &[

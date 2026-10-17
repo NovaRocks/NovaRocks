@@ -20,12 +20,12 @@ use arrow::array::{Array, ArrayRef, StringArray};
 use novarocks_functions::builtin::string_trim_core::{StringTrimOp, trimmed_observed};
 use std::{convert::Infallible, sync::Arc};
 
-fn eval_trim_impl(
-    arena: &ExprArena,
+fn eval_trim_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     mode: StringTrimOp,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let str_arr = arena.eval(args[0], chunk)?;
     let s_arr = str_arr
         .as_any()
@@ -49,31 +49,31 @@ fn eval_trim_impl(
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
 
-pub fn eval_ltrim(
-    arena: &ExprArena,
+pub fn eval_ltrim<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_trim_impl(arena, args, chunk, StringTrimOp::Left)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_trim_impl(arena, args, chunk, StringTrimOp::Left))?)
 }
 
-pub fn eval_rtrim(
-    arena: &ExprArena,
+pub fn eval_rtrim<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_trim_impl(arena, args, chunk, StringTrimOp::Right)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_trim_impl(arena, args, chunk, StringTrimOp::Right))?)
 }
 
-pub fn eval_trim(
-    arena: &ExprArena,
+pub fn eval_trim<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_trim_impl(arena, args, chunk, StringTrimOp::Both)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_trim_impl(arena, args, chunk, StringTrimOp::Both))?)
 }
 
 #[cfg(test)]

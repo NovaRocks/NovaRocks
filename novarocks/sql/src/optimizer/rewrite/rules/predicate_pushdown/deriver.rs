@@ -72,21 +72,18 @@ pub(crate) fn derive_inner_join_predicates(
             continue;
         }
         for constraint in &constraints {
-            if same_column(arena, constraint.column, left) {
-                if let Some(group) = substitute_constraint_column(
-                    arena,
-                    constraint,
-                    right,
-                    derived_kind_for_constraint(&constraint.kind),
-                    control,
-                )? {
-                    derived.push(group);
-                }
-            } else if same_column(arena, constraint.column, right)
+            let target = if same_column(arena, constraint.column, left) {
+                transfer_comparison_operand(arena, constraint.column, left, right, control)?
+            } else if same_column(arena, constraint.column, right) {
+                transfer_comparison_operand(arena, constraint.column, right, left, control)?
+            } else {
+                None
+            };
+            if let Some(target) = target
                 && let Some(group) = substitute_constraint_column(
                     arena,
                     constraint,
-                    left,
+                    target,
                     derived_kind_for_constraint(&constraint.kind),
                     control,
                 )?
@@ -130,10 +127,10 @@ fn extract_column_literal_constraint(
         ScalarNode::BinaryOp {
             left, op, right, ..
         } => {
-            if is_column_ref(arena, *left) && is_literal(arena, *right) {
+            if is_constraint_operand(arena, *left) && is_literal(arena, *right) {
                 return build_binary_constraint(*left, *op, *right);
             }
-            if is_literal(arena, *left) && is_column_ref(arena, *right) {
+            if is_literal(arena, *left) && is_constraint_operand(arena, *right) {
                 return build_binary_constraint(*right, reverse_comparison(*op)?, *left);
             }
             None
@@ -142,7 +139,9 @@ fn extract_column_literal_constraint(
             child,
             list,
             negated: false,
-        } if is_column_ref(arena, *child) && list.iter().all(|item| is_literal(arena, *item)) => {
+        } if is_constraint_operand(arena, *child)
+            && list.iter().all(|item| is_literal(arena, *item)) =>
+        {
             Some(ColumnConstraint {
                 column: *child,
                 kind: ConstraintKind::InList(list.clone()),
@@ -153,7 +152,7 @@ fn extract_column_literal_constraint(
             low,
             high,
             negated: false,
-        } if is_column_ref(arena, *child)
+        } if is_constraint_operand(arena, *child)
             && is_literal(arena, *low)
             && is_literal(arena, *high) =>
         {
@@ -176,10 +175,20 @@ fn substitute_constraint_column(
     derived: PredicateDerivedKind,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<PredicateGroup>, crate::compiler::SqlCompileError> {
-    if !is_column_ref(arena, target_column) {
+    if !is_constraint_operand(arena, target_column) {
         return Ok(None);
     }
     if arena.data_type(constraint.column) != arena.data_type(target_column) {
+        return Ok(None);
+    }
+    // New cast/CV paths need the original complete comparison binding. Legacy
+    // direct-column syntax algorithms retain their existing admission below.
+    if (widening_source(arena, constraint.column).is_some()
+        || widening_source(arena, target_column).is_some()
+        || constraint_has_checked_bound(arena, constraint))
+        && (!same_complete_type(arena, constraint.column, target_column, control)?
+            || !bounds_match_operand(arena, constraint, control)?)
+    {
         return Ok(None);
     }
     let expr = match &constraint.kind {
@@ -260,20 +269,16 @@ fn derive_or_branch_side_filters(
         let mut candidates = constraints.clone();
         for (left, right) in pairs {
             for constraint in &constraints {
-                if same_column(arena, constraint.column, left) {
-                    if arena.data_type(constraint.column) != arena.data_type(right) {
-                        continue;
-                    }
-                    candidates.push(ColumnConstraint {
-                        column: right,
-                        kind: constraint.kind.clone(),
-                    });
+                let target = if same_column(arena, constraint.column, left) {
+                    transfer_comparison_operand(arena, constraint.column, left, right, control)?
                 } else if same_column(arena, constraint.column, right) {
-                    if arena.data_type(constraint.column) != arena.data_type(left) {
-                        continue;
-                    }
+                    transfer_comparison_operand(arena, constraint.column, right, left, control)?
+                } else {
+                    None
+                };
+                if let Some(target) = target {
                     candidates.push(ColumnConstraint {
-                        column: left,
+                        column: target,
                         kind: constraint.kind.clone(),
                     });
                 }
@@ -284,44 +289,46 @@ fn derive_or_branch_side_filters(
             return Ok(Vec::new());
         }
 
-        let mut by_column: HashMap<ColumnId, Vec<ColumnConstraint>> = HashMap::new();
+        let mut by_comparison: HashMap<ScalarId, Vec<ColumnConstraint>> = HashMap::new();
         let mut by_side: HashMap<Side, Vec<ColumnConstraint>> = HashMap::new();
         for candidate in candidates {
             if let Some(side) = column_side(arena, candidate.column, left_ids, right_ids) {
-                let Some(column_id) = column_id_of(arena, candidate.column) else {
-                    continue;
-                };
-                by_column
-                    .entry(column_id)
+                // ScalarId includes the complete typed structural expression;
+                // two casts of one base column cannot merge comparison domains.
+                by_comparison
+                    .entry(candidate.column)
                     .or_default()
                     .push(candidate.clone());
                 by_side.entry(side).or_default().push(candidate);
             }
         }
-        if by_column.is_empty() {
+        if by_comparison.is_empty() {
             return Ok(Vec::new());
         }
-        per_branch.push(BranchCandidates { by_column, by_side });
+        per_branch.push(BranchCandidates {
+            by_comparison,
+            by_side,
+        });
     }
 
     let mut derived = Vec::new();
     let mut specialized_sides = HashSet::new();
-    let first_columns: Vec<ColumnId> = per_branch[0].by_column.keys().copied().collect();
-    for column_id in first_columns {
+    let first_comparisons: Vec<ScalarId> = per_branch[0].by_comparison.keys().copied().collect();
+    for comparison in first_comparisons {
         if !per_branch
             .iter()
-            .all(|branch| branch.by_column.contains_key(&column_id))
+            .all(|branch| branch.by_comparison.contains_key(&comparison))
         {
             continue;
         }
 
-        if let Some(group) = derive_or_in_list(arena, column_id, &per_branch, control)? {
+        if let Some(group) = derive_or_in_list(arena, comparison, &per_branch, control)? {
             if let Some(side) = single_column_side(arena, group.expr, left_ids, right_ids) {
                 specialized_sides.insert(side);
             }
             derived.push(group);
         } else if let Some(group) =
-            derive_or_range_envelope(arena, column_id, &per_branch, control)?
+            derive_or_range_envelope(arena, comparison, &per_branch, control)?
         {
             if let Some(side) = single_column_side(arena, group.expr, left_ids, right_ids) {
                 specialized_sides.insert(side);
@@ -344,7 +351,7 @@ fn derive_or_branch_side_filters(
 
 #[derive(Clone, Debug)]
 struct BranchCandidates {
-    by_column: HashMap<ColumnId, Vec<ColumnConstraint>>,
+    by_comparison: HashMap<ScalarId, Vec<ColumnConstraint>>,
     by_side: HashMap<Side, Vec<ColumnConstraint>>,
 }
 
@@ -405,15 +412,19 @@ fn derived_kind_for_constraint(kind: &ConstraintKind) -> PredicateDerivedKind {
 
 fn derive_or_in_list(
     arena: &mut ScalarArena,
-    column_id: ColumnId,
+    comparison: ScalarId,
     per_branch: &[BranchCandidates],
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<PredicateGroup>, crate::compiler::SqlCompileError> {
     let Some(constraint) = (|| {
-        let first = per_branch[0].by_column.get(&column_id)?.first()?.column;
+        let first = per_branch[0]
+            .by_comparison
+            .get(&comparison)?
+            .first()?
+            .column;
         let mut values = Vec::new();
         for branch in per_branch {
-            let constraints = branch.by_column.get(&column_id)?;
+            let constraints = branch.by_comparison.get(&comparison)?;
             let eq = constraints
                 .iter()
                 .find_map(|constraint| match &constraint.kind {
@@ -441,17 +452,33 @@ fn derive_or_in_list(
 
 fn derive_or_range_envelope(
     arena: &mut ScalarArena,
-    column_id: ColumnId,
+    comparison: ScalarId,
     per_branch: &[BranchCandidates],
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<PredicateGroup>, crate::compiler::SqlCompileError> {
+    for branch in per_branch {
+        if let Some(constraints) = branch.by_comparison.get(&comparison) {
+            for constraint in constraints {
+                if (widening_source(arena, constraint.column).is_some()
+                    || constraint_has_checked_bound(arena, constraint))
+                    && !bounds_match_operand(arena, constraint, control)?
+                {
+                    return Ok(None);
+                }
+            }
+        }
+    }
     let Some(constraint) = (|| {
-        let first = per_branch[0].by_column.get(&column_id)?.first()?.column;
+        let first = per_branch[0]
+            .by_comparison
+            .get(&comparison)?
+            .first()?
+            .column;
         let mut low: Option<ScalarId> = None;
         let mut high: Option<ScalarId> = None;
 
         for branch in per_branch {
-            let constraints = branch.by_column.get(&column_id)?;
+            let constraints = branch.by_comparison.get(&comparison)?;
             let (branch_low, branch_high) = branch_range(arena, constraints)?;
             low = Some(match low {
                 Some(current)
@@ -529,6 +556,13 @@ fn ensure_comparable_literal(arena: &ScalarArena, expr: ScalarId) -> Option<()> 
 }
 
 fn compare_literals(arena: &ScalarArena, left: ScalarId, right: ScalarId) -> Option<Ordering> {
+    // Only the checked signed family is new. Keep every legacy literal-only
+    // numeric algorithm below unchanged, including exact decimal strings.
+    if matches!(arena.node(left), ScalarNode::Constant(_))
+        || matches!(arena.node(right), ScalarNode::Constant(_))
+    {
+        return Some(checked_signed_bound(arena, left)?.cmp(&checked_signed_bound(arena, right)?));
+    }
     match (arena.node(left), arena.node(right)) {
         (
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(left))),
@@ -707,10 +741,11 @@ fn column_side(
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
 ) -> Option<Side> {
-    let ScalarNode::ColumnRef(column_id) = arena.node(expr) else {
-        return None;
-    };
-    match (left_ids.contains(column_id), right_ids.contains(column_id)) {
+    let column_id = column_id_of(arena, expr)?;
+    match (
+        left_ids.contains(&column_id),
+        right_ids.contains(&column_id),
+    ) {
         (true, false) => Some(Side::Left),
         (false, true) => Some(Side::Right),
         _ => None,
@@ -748,12 +783,167 @@ fn same_column(arena: &ScalarArena, left: ScalarId, right: ScalarId) -> bool {
 fn column_id_of(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
     match arena.node(expr) {
         ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
-        _ => None,
+        _ => widening_source(arena, expr).and_then(|source| match arena.node(source) {
+            ScalarNode::ColumnRef(column_id) => Some(*column_id),
+            _ => None,
+        }),
     }
 }
 
 fn is_column_ref(arena: &ScalarArena, expr: ScalarId) -> bool {
     matches!(arena.node(expr), ScalarNode::ColumnRef(id) if *id != ColumnId::UNSET)
+}
+
+fn is_constraint_operand(arena: &ScalarArena, expr: ScalarId) -> bool {
+    column_id_of(arena, expr).is_some()
+}
+
+/// Source dependency only: callers must retain the original comparison operand.
+/// Six signed widenings are total, NULL-preserving and strictly order-preserving.
+fn widening_source(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarId> {
+    use novarocks_type_contract::ValueLogicalType;
+    let ScalarNode::Cast { child, target, .. } = arena.node(expr) else {
+        return None;
+    };
+    if !is_column_ref(arena, *child) {
+        return None;
+    }
+    let source = arena.value_type(*child);
+    let result = arena.value_type(expr);
+    if source.logical_type() != ValueLogicalType::Physical
+        || result.logical_type() != ValueLogicalType::Physical
+        || source.nullable() != result.nullable()
+        || result.data_type() != target
+    {
+        return None;
+    }
+    matches!(
+        (source.data_type(), target),
+        (
+            DataType::Int8,
+            DataType::Int16 | DataType::Int32 | DataType::Int64
+        ) | (DataType::Int16, DataType::Int32 | DataType::Int64)
+            | (DataType::Int32, DataType::Int64)
+    )
+    .then_some(*child)
+}
+
+fn same_complete_type(
+    arena: &ScalarArena,
+    left: ScalarId,
+    right: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, crate::compiler::SqlCompileError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )?;
+    let equal = arena
+        .value_type(left)
+        .exactly_equals_checked_observed(arena.value_type(right), || work.step())?;
+    work.finish()?;
+    Ok(equal)
+}
+
+fn transfer_comparison_operand(
+    arena: &mut ScalarArena,
+    operand: ScalarId,
+    source: ScalarId,
+    target: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    let Some(base) = widening_source(arena, operand) else {
+        return Ok((is_column_ref(arena, operand)
+            && arena.data_type(operand) == arena.data_type(target))
+        .then_some(target));
+    };
+    if !is_column_ref(arena, source)
+        || !is_column_ref(arena, target)
+        || column_id_of(arena, base) != column_id_of(arena, source)
+        || !same_complete_type(arena, base, source, control)?
+        || !same_complete_type(arena, base, target, control)?
+    {
+        return Ok(None);
+    }
+    let ScalarNode::Cast {
+        target: cast_target,
+        decimal_overflow_policy,
+        ..
+    } = arena.node(operand)
+    else {
+        unreachable!()
+    };
+    let node = ScalarNode::Cast {
+        child: target,
+        target: cast_target.clone(),
+        decimal_overflow_policy: *decimal_overflow_policy,
+    };
+    let value_type = arena.value_type(operand).clone();
+    Ok(Some(arena.intern_observed(node, value_type, control)?))
+}
+
+fn constraint_has_checked_bound(arena: &ScalarArena, constraint: &ColumnConstraint) -> bool {
+    let checked = |id| matches!(arena.node(id), ScalarNode::Constant(_));
+    match &constraint.kind {
+        ConstraintKind::Eq(id)
+        | ConstraintKind::Lower { value: id, .. }
+        | ConstraintKind::Upper { value: id, .. } => checked(*id),
+        ConstraintKind::InList(ids) => ids.iter().any(|id| checked(*id)),
+        ConstraintKind::Between { low, high } => checked(*low) || checked(*high),
+    }
+}
+
+fn bounds_match_operand(
+    arena: &ScalarArena,
+    constraint: &ColumnConstraint,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, crate::compiler::SqlCompileError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )?;
+    let mut same = |id| {
+        arena
+            .value_type(constraint.column)
+            .same_physical_binding_ignoring_root_nullability_observed(arena.value_type(id), || {
+                work.step()
+            })
+    };
+    let equal = match &constraint.kind {
+        ConstraintKind::Eq(id)
+        | ConstraintKind::Lower { value: id, .. }
+        | ConstraintKind::Upper { value: id, .. } => same(*id)?,
+        ConstraintKind::InList(ids) => {
+            let mut equal = true;
+            for id in ids {
+                if !same(*id)? {
+                    equal = false;
+                    break;
+                }
+            }
+            equal
+        }
+        ConstraintKind::Between { low, high } => same(*low)? && same(*high)?,
+    };
+    work.finish()?;
+    Ok(equal)
+}
+
+fn checked_signed_bound(arena: &ScalarArena, id: ScalarId) -> Option<i64> {
+    let value_type = arena.value_type(id);
+    if value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        || !matches!(
+            value_type.data_type(),
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        )
+    {
+        return None;
+    }
+    match arena.node(id) {
+        ScalarNode::Constant(value) => value.try_i64().ok().flatten(),
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))) => Some(*value),
+        _ => None,
+    }
 }
 
 fn is_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
@@ -797,6 +987,9 @@ fn constraint_to_expr(
     )?
     .map(|group| group.expr))
 }
+
+#[cfg(test)]
+mod comparison_domain_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1376,3 +1569,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod checked_integer_tests;

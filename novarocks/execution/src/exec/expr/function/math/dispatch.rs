@@ -39,64 +39,66 @@ pub fn metadata(name: &str) -> Option<FunctionMeta> {
     MATH_METADATA.iter().find(|m| m.name == name).copied()
 }
 
-pub fn eval_math_function(
+pub fn eval_math_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     name: &str,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let canonical = MATH_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "acos" => super::unary_ops::eval_acos(arena, expr, args, chunk),
-        "asin" => super::unary_ops::eval_asin(arena, expr, args, chunk),
-        "atan" => super::unary_ops::eval_atan(arena, expr, args, chunk),
-        "atan2" => super::binary_ops::eval_atan2(arena, expr, args, chunk),
-        "bin" => super::bin::eval_bin(arena, expr, args, chunk),
-        "cbrt" => super::unary_ops::eval_cbrt(arena, expr, args, chunk),
-        "ceil" => super::unary_ops::eval_ceil(arena, expr, args, chunk),
-        "conv" => super::conv::eval_conv(arena, expr, args, chunk),
-        "cosine_similarity" => super::vector_ops::eval_cosine_similarity(arena, expr, args, chunk),
+        "acos" => Ok((super::unary_ops::eval_acos(arena, expr, args, chunk))?),
+        "asin" => Ok((super::unary_ops::eval_asin(arena, expr, args, chunk))?),
+        "atan" => Ok((super::unary_ops::eval_atan(arena, expr, args, chunk))?),
+        "atan2" => Ok((super::binary_ops::eval_atan2(arena, expr, args, chunk))?),
+        "bin" => Ok((super::bin::eval_bin(arena, expr, args, chunk))?),
+        "cbrt" => Ok((super::unary_ops::eval_cbrt(arena, expr, args, chunk))?),
+        "ceil" => Ok((super::unary_ops::eval_ceil(arena, expr, args, chunk))?),
+        "conv" => Ok((super::conv::eval_conv(arena, expr, args, chunk))?),
+        "cosine_similarity" => {
+            Ok((super::vector_ops::eval_cosine_similarity(arena, expr, args, chunk))?)
+        }
         "cosine_similarity_norm" => {
-            super::vector_ops::eval_cosine_similarity_norm(arena, expr, args, chunk)
+            Ok((super::vector_ops::eval_cosine_similarity_norm(arena, expr, args, chunk))?)
         }
-        "cos" => super::unary_ops::eval_cos(arena, expr, args, chunk),
-        "cot" => super::unary_ops::eval_cot(arena, expr, args, chunk),
-        "degress" => super::unary_ops::eval_degress(arena, expr, args, chunk),
-        "dlog1" => super::unary_ops::eval_dlog1(arena, expr, args, chunk),
-        "dround" => super::truncate_ops::eval_dround(arena, expr, args, chunk),
-        "e" => super::const_ops::eval_e(arena, expr, args, chunk),
+        "cos" => Ok((super::unary_ops::eval_cos(arena, expr, args, chunk))?),
+        "cot" => Ok((super::unary_ops::eval_cot(arena, expr, args, chunk))?),
+        "degress" => Ok((super::unary_ops::eval_degress(arena, expr, args, chunk))?),
+        "dlog1" => Ok((super::unary_ops::eval_dlog1(arena, expr, args, chunk))?),
+        "dround" => Ok((super::truncate_ops::eval_dround(arena, expr, args, chunk))?),
+        "e" => Ok((super::const_ops::eval_e(arena, expr, args, chunk))?),
         "equiwidth_bucket" => {
-            super::equiwidth_bucket::eval_equiwidth_bucket(arena, expr, args, chunk)
+            Ok((super::equiwidth_bucket::eval_equiwidth_bucket(arena, expr, args, chunk))?)
         }
-        "exp" => super::unary_ops::eval_exp(arena, expr, args, chunk),
-        "floor" => super::unary_ops::eval_floor(arena, expr, args, chunk),
-        "fmod" => super::binary_ops::eval_fmod(arena, expr, args, chunk),
-        "greatest" => super::extrema_ops::eval_greatest(arena, expr, args, chunk),
-        "least" => super::extrema_ops::eval_least(arena, expr, args, chunk),
-        "l2_distance" => super::vector_ops::eval_l2_distance(arena, expr, args, chunk),
-        "ln" => super::unary_ops::eval_ln(arena, expr, args, chunk),
-        "log" => super::log::eval_log(arena, expr, args, chunk),
-        "log10" => super::unary_ops::eval_log10(arena, expr, args, chunk),
-        "log2" => super::unary_ops::eval_log2(arena, expr, args, chunk),
-        "mod" => super::mod_ops::eval_mod(arena, expr, args, chunk),
-        "pi" => super::const_ops::eval_pi(arena, expr, args, chunk),
-        "pmod" => super::mod_ops::eval_pmod(arena, expr, args, chunk),
-        "pow" => super::binary_ops::eval_pow(arena, expr, args, chunk),
-        "positive" => super::unary_ops::eval_positive(arena, expr, args, chunk),
-        "radians" => super::unary_ops::eval_radians(arena, expr, args, chunk),
-        "rand" => super::rand_ops::eval_rand(arena, expr, args, chunk),
-        "sign" => super::sign::eval_sign(arena, expr, args, chunk),
-        "sin" => super::unary_ops::eval_sin(arena, expr, args, chunk),
-        "sqrt" => super::unary_ops::eval_sqrt(arena, expr, args, chunk),
-        "square" => super::unary_ops::eval_square(arena, expr, args, chunk),
-        "tan" => super::unary_ops::eval_tan(arena, expr, args, chunk),
-        "truncate" => super::truncate_ops::eval_truncate(arena, expr, args, chunk),
-        other => Err(format!("unsupported math function: {}", other)),
+        "exp" => Ok((super::unary_ops::eval_exp(arena, expr, args, chunk))?),
+        "floor" => Ok((super::unary_ops::eval_floor(arena, expr, args, chunk))?),
+        "fmod" => Ok((super::binary_ops::eval_fmod(arena, expr, args, chunk))?),
+        "greatest" => Ok((super::extrema_ops::eval_greatest(arena, expr, args, chunk))?),
+        "least" => Ok((super::extrema_ops::eval_least(arena, expr, args, chunk))?),
+        "l2_distance" => Ok((super::vector_ops::eval_l2_distance(arena, expr, args, chunk))?),
+        "ln" => Ok((super::unary_ops::eval_ln(arena, expr, args, chunk))?),
+        "log" => Ok((super::log::eval_log(arena, expr, args, chunk))?),
+        "log10" => Ok((super::unary_ops::eval_log10(arena, expr, args, chunk))?),
+        "log2" => Ok((super::unary_ops::eval_log2(arena, expr, args, chunk))?),
+        "mod" => Ok((super::mod_ops::eval_mod(arena, expr, args, chunk))?),
+        "pi" => Ok((super::const_ops::eval_pi(arena, expr, args, chunk))?),
+        "pmod" => Ok((super::mod_ops::eval_pmod(arena, expr, args, chunk))?),
+        "pow" => Ok((super::binary_ops::eval_pow(arena, expr, args, chunk))?),
+        "positive" => Ok((super::unary_ops::eval_positive(arena, expr, args, chunk))?),
+        "radians" => Ok((super::unary_ops::eval_radians(arena, expr, args, chunk))?),
+        "rand" => Ok((super::rand_ops::eval_rand(arena, expr, args, chunk))?),
+        "sign" => Ok((super::sign::eval_sign(arena, expr, args, chunk))?),
+        "sin" => Ok((super::unary_ops::eval_sin(arena, expr, args, chunk))?),
+        "sqrt" => Ok((super::unary_ops::eval_sqrt(arena, expr, args, chunk))?),
+        "square" => Ok((super::unary_ops::eval_square(arena, expr, args, chunk))?),
+        "tan" => Ok((super::unary_ops::eval_tan(arena, expr, args, chunk))?),
+        "truncate" => Ok((super::truncate_ops::eval_truncate(arena, expr, args, chunk))?),
+        other => Err((format!("unsupported math function: {}", other)).into()),
     }
 }
 

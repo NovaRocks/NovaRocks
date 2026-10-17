@@ -18,12 +18,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 
-pub fn eval_from_base64(
-    arena: &ExprArena,
+pub fn eval_from_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
     let input = input
         .as_any()
@@ -46,5 +46,5 @@ pub fn eval_from_base64(
         out.push(super::common::decode_base64(value.as_bytes()));
     }
 
-    super::common::build_bytes_output_latin1(out, arena.data_type(expr))
+    Ok((super::common::build_bytes_output_latin1(out, arena.data_type(expr)))?)
 }

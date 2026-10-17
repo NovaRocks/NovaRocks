@@ -23,12 +23,12 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_distinct_map_keys(
-    arena: &ExprArena,
+pub fn eval_distinct_map_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let map_arr = arena.eval(args[0], chunk)?;
     let map = map_arr.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
         format!(
@@ -46,10 +46,10 @@ pub fn eval_distinct_map_keys(
         "distinct_map_keys",
     )?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err("distinct_map_keys map entries type must be Struct".to_string());
+        return Err(("distinct_map_keys map entries type must be Struct".to_string()).into());
     };
     if fields.len() != 2 {
-        return Err("distinct_map_keys map entries type must have 2 fields".to_string());
+        return Err(("distinct_map_keys map entries type must have 2 fields".to_string()).into());
     }
     if keys.data_type() != fields[0].data_type() {
         keys = cast(&keys, fields[0].data_type()).map_err(|e| {
@@ -112,7 +112,7 @@ pub fn eval_distinct_map_keys(
             current += 1;
         }
         if current > i32::MAX as i64 {
-            return Err("distinct_map_keys offset overflow".to_string());
+            return Err(("distinct_map_keys offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();

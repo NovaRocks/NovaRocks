@@ -329,3 +329,204 @@ fn map_null_keys_are_rejected_and_value_key_type_mismatch_remains_explicit() {
         "map key type mismatch: Utf8 vs Int32"
     );
 }
+
+#[test]
+fn original_map_null_values_keep_null_array_storage_for_hits_misses_and_null_maps() {
+    let source = map(
+        Arc::new(Int32Array::from(vec![1, 1, 1])),
+        Arc::new(NullArray::new(3)),
+        vec![0, 1, 2, 3, 3],
+        Some(vec![true, true, false, true]),
+    );
+    let result = lookup(
+        vec![source, Arc::new(Int32Array::from(vec![1, 2, 1, 1]))],
+        Some(DataType::Null),
+    )
+    .unwrap();
+    assert_eq!(result.data_type(), &DataType::Null);
+    assert_eq!(result.len(), 4);
+    assert_eq!(result.logical_null_count(), 4);
+    assert!(result.to_data().nulls().is_none());
+}
+
+#[test]
+fn original_map_constructor_rejects_null_keys_without_widening_its_output_contract() {
+    use super::function::FunctionKind;
+    for keys in [
+        Arc::new(Int32Array::from(vec![None, Some(1)])) as ArrayRef,
+        Arc::new(NullArray::new(2)) as ArrayRef,
+    ] {
+        let key_type = keys.data_type().clone();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20]));
+        let (mut arena, ids, chunk) = setup(vec![keys, values], 2).unwrap();
+        let target = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", key_type, false),
+                        Field::new("value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let id = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Map("map"),
+                args: ids,
+            },
+            target,
+        );
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| arena.eval(id, &chunk)))
+                .expect("a NULL map key must return an explicit failure instead of panicking");
+        let error =
+            result.expect_err("a NULL map key cannot widen the frozen non-null key contract");
+        assert!(
+            error.to_ascii_lowercase().contains("key")
+                && error.to_ascii_lowercase().contains("null"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn original_map_constructor_checks_only_the_real_if_branch_invocation_domain() {
+    use super::function::FunctionKind;
+    let condition: ArrayRef = Arc::new(BooleanArray::from(vec![false, true]));
+    let keys: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(1)]));
+    let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20]));
+    let (mut arena, ids, chunk) = setup(vec![condition, keys, values], 2).unwrap();
+    let target = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int32, false),
+                    Field::new("value", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let taken = arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::Map("map"),
+            args: vec![ids[1], ids[2]],
+        },
+        target.clone(),
+    );
+    let key = arena.push_typed(
+        ExprNode::Literal(super::LiteralValue::Int32(7)),
+        DataType::Int32,
+    );
+    let value = arena.push_typed(
+        ExprNode::Literal(super::LiteralValue::Int32(8)),
+        DataType::Int32,
+    );
+    let otherwise = arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::Map("map"),
+            args: vec![key, value],
+        },
+        target.clone(),
+    );
+    let choice = arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::If,
+            args: vec![ids[0], taken, otherwise],
+        },
+        target.clone(),
+    );
+    let output = arena
+        .eval(choice, &chunk)
+        .expect("inactive row NULL keys must not enter the actual map invocation");
+    assert_eq!(output.data_type(), &target);
+    let output = output.as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(output.value_offsets(), &[0, 1, 2]);
+    assert_eq!(ints(output.keys()), vec![Some(7), Some(1)]);
+    assert_eq!(ints(output.values()), vec![Some(8), Some(20)]);
+}
+
+#[test]
+fn original_map_constructor_keeps_eager_child_failure_before_own_key_failure() {
+    use super::function::FunctionKind;
+    let (mut arena, _, chunk) = setup(vec![], 1).unwrap();
+    let key = arena.push_typed(
+        ExprNode::Literal(super::LiteralValue::Null),
+        DataType::Int32,
+    );
+    let value = arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Int32);
+    let original = arena.eval(value, &chunk).unwrap_err();
+    let target = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int32, false),
+                    Field::new("value", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let call = arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::Map("map"),
+            args: vec![key, value],
+        },
+        target,
+    );
+    assert_eq!(arena.eval(call, &chunk).unwrap_err(), original);
+}
+
+#[test]
+fn original_map_constructor_zero_rows_and_empty_maps_have_no_null_key_obligation() {
+    use super::function::FunctionKind;
+    for (rows, with_pair, leaf) in [
+        (0, true, DataType::Int32),
+        (0, false, DataType::Int32),
+        (3, false, DataType::Int32),
+        (3, false, DataType::Null),
+    ] {
+        let (mut arena, _, chunk) = setup(vec![], rows).unwrap();
+        let key = arena.push_typed(ExprNode::Literal(super::LiteralValue::Null), leaf.clone());
+        let value = arena.push_typed(ExprNode::Literal(super::LiteralValue::Null), leaf.clone());
+        let target = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", leaf.clone(), false),
+                        Field::new("value", leaf.clone(), true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let args = if with_pair { vec![key, value] } else { vec![] };
+        let call = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Map("map"),
+                args,
+            },
+            target.clone(),
+        );
+        let output = arena.eval(call, &chunk).unwrap();
+        let output = output.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(output.len(), rows);
+        assert_eq!(output.data_type(), &target);
+        assert_eq!(output.keys().len(), 0);
+        assert_eq!(output.keys().logical_null_count(), 0);
+        assert_eq!(output.value_offsets(), vec![0; rows + 1]);
+    }
+}

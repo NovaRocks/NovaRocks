@@ -31,17 +31,75 @@ pub(super) fn supports_result(ty: &DataType) -> bool {
 enum OwnedValue {
     Constant(novarocks_functions::ConstantValue),
     Column(ArrayRef),
+    Source(ArrayRef, Arc<input_source::ActualInvocationDomain>),
     Selected(ArrayRef, Box<[RowDataError]>),
+    Continued(Box<Self>, input_source::ArrayContinuation),
 }
 impl OwnedValue {
+    fn uncontinued(&self) -> &Self {
+        match self {
+            Self::Continued(value, _) => value.uncontinued(),
+            _ => self,
+        }
+    }
+    fn continuation(&self) -> Option<input_source::ArrayContinuation> {
+        match self {
+            Self::Continued(_, owner) => Some(owner.clone()),
+            _ => None,
+        }
+    }
+    fn with_continuation(self, owner: Option<input_source::ArrayContinuation>) -> Self {
+        match owner {
+            Some(owner) => Self::Continued(Box::new(self), owner),
+            None => self,
+        }
+    }
     fn into_value<'a>(
         self,
         selection: Selection<'a>,
         work: &mut Work<'_, '_>,
     ) -> Result<Value<'a>, KernelFailure> {
         Ok(match self {
+            Self::Continued(value, owner) => value
+                .into_value(selection, work)?
+                .retaining_continuation(owner, work)?,
             Self::Constant(value) => Value::Constant(value),
             Self::Column(value) => Value::Column(value),
+            Self::Source(array, domain) => {
+                let actual = domain.selection(work.control)?;
+                if actual.is_all() {
+                    Value::Column(array)
+                } else if actual.same_rows_observed(selection, || work.step())? {
+                    let ty = array.data_type().clone();
+                    Value::Selected(SelectedValues::try_new_observed(
+                        selection,
+                        &ty,
+                        array,
+                        Box::default(),
+                        || work.step(),
+                    )?)
+                } else {
+                    let mut indices = Vec::with_capacity(selection.len());
+                    for row in selection.iter() {
+                        let ordinal = domain.physical_ordinal(row).ok_or_else(|| {
+                            invalid("demanded Slot row is outside its authored source domain")
+                        })?;
+                        indices.push(Some(
+                            u64::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?,
+                        ));
+                        work.step()?;
+                    }
+                    let array = gather(&array, &indices, work)?;
+                    let ty = array.data_type().clone();
+                    Value::Selected(SelectedValues::try_new_observed(
+                        selection,
+                        &ty,
+                        array,
+                        Box::default(),
+                        || work.step(),
+                    )?)
+                }
+            }
             Self::Selected(array, errors) => {
                 let ty = array.data_type().clone();
                 Value::Selected(SelectedValues::try_new_observed(
@@ -53,6 +111,114 @@ impl OwnedValue {
                 )?)
             }
         })
+    }
+    fn retaining_children(
+        self,
+        mut sources: Vec<input_source::ArrayContinuation>,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        if sources.is_empty() {
+            return Ok(self);
+        }
+        let (value, previous) = match self {
+            Self::Continued(value, owner) => (*value, Some(owner)),
+            value => (value, None),
+        };
+        if let Some(previous) = previous {
+            sources.push(previous);
+        }
+        let owner = input_source::ArrayContinuation::combine(sources, allocator, control)?;
+        Ok(match (value, owner) {
+            (Self::Selected(array, errors), Some(owner)) => {
+                let array = owner.retain(array, control)?;
+                Self::Selected(array, errors).with_continuation(Some(owner))
+            }
+            (value, owner) => value.with_continuation(owner),
+        })
+    }
+    fn retaining_custody(
+        self,
+        custody: Option<&input_source::CapturedInputSource>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        let Some(custody) = custody else {
+            return Ok(self);
+        };
+        let (value, _previous) = match self {
+            Self::Continued(value, owner) => (*value, Some(owner)),
+            value => (value, None),
+        };
+        Ok(match value {
+            Self::Selected(array, errors) => {
+                let array = custody.retain(array, control)?;
+                let owner = custody.continuation(&array, control)?;
+                Self::Selected(array, errors).with_continuation(Some(owner))
+            }
+            value => value.with_continuation(_previous),
+        })
+    }
+    fn retaining_result_type(
+        self,
+        ty: &novarocks_functions::FunctionValueType,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        let (value, previous) = match self {
+            Self::Continued(value, owner) => (*value, Some(owner)),
+            value => (value, None),
+        };
+        Ok(match value {
+            Self::Constant(value) => {
+                let owner = input_source::ArrayContinuation::from_constant(&value, allocator);
+                Self::Constant(value).with_continuation(owner.or(previous))
+            }
+            Self::Selected(array, errors) => {
+                let (array, owner) =
+                    Self::retain_arrow_creator(array, ty, allocator, previous, control)?;
+                Self::Selected(array, errors).with_continuation(owner)
+            }
+            Self::Source(array, domain) => {
+                let (array, owner) =
+                    Self::retain_arrow_creator(array, ty, allocator, previous, control)?;
+                Self::Source(array, domain).with_continuation(owner)
+            }
+            Self::Column(array) => {
+                let (array, owner) =
+                    Self::retain_arrow_creator(array, ty, allocator, previous, control)?;
+                Self::Column(array).with_continuation(owner)
+            }
+            value => value.with_continuation(previous),
+        })
+    }
+    fn retain_arrow_creator(
+        array: ArrayRef,
+        ty: &novarocks_functions::FunctionValueType,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+        previous: Option<input_source::ArrayContinuation>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(ArrayRef, Option<input_source::ArrayContinuation>), KernelFailure> {
+        let layout = ty.typed_binding().layout();
+        if layout.storage_lifetime().is_pure() && layout.arrow_backing_storage_lifetime().is_pure()
+        {
+            return Ok((array, previous));
+        }
+        let array = input_source::retain_result_type(array, ty, allocator, control)?;
+        let owner = input_source::ArrayContinuation::capture(
+            &array,
+            allocator.ok_or_else(|| {
+                invalid("compiled result Arrow creator requires its actual allocation host")
+            })?,
+            control,
+        )?;
+        Ok((array, Some(owner)))
+    }
+    fn from_materialized(output: MaterializedValue<'_>) -> Self {
+        let MaterializedValue {
+            value,
+            continuation,
+        } = output;
+        Self::from_selected(value).with_continuation(continuation)
     }
     fn from_selected(output: SelectedValues<'_>) -> Self {
         let (_, array, errors) = output.into_parts();
@@ -68,6 +234,8 @@ struct Frame {
     occurrence: ProgramUseRef,
     activation: novarocks_functions::ScalarInvocationActivation,
     rows: Vec<usize>,
+    output_rows: Vec<usize>,
+    domain: Arc<input_source::ActualInvocationDomain>,
     parent_ordinals: Vec<usize>,
     next: usize,
     children: Vec<Child>,
@@ -86,16 +254,27 @@ impl Frame {
         occurrence: ProgramUseRef,
         shape: ControlShape,
         result_type: &DataType,
-        rows: Vec<usize>,
+        mut rows: Vec<usize>,
+        domain: Arc<input_source::ActualInvocationDomain>,
+        needs_original_domain: bool,
         activation: novarocks_functions::ScalarInvocationActivation,
         parent_ordinals: Vec<usize>,
         work: &mut Work<'_, '_>,
     ) -> Result<Self, KernelFailure> {
+        let output_rows = rows.clone();
+        // IF's original author evaluates its condition on its actual parent
+        // Chunk, then filters mixed branches. Output projection is independent.
+        if shape == ControlShape::If
+            && needs_original_domain
+            && activation == novarocks_functions::ScalarInvocationActivation::Activated
+        {
+            rows = domain.rows().to_vec();
+        }
         // A demand-zero invocation does not construct or interleave a result
         // before its original arity Data. Retain the actual domain storage,
         // but do not invent an output-copy admission for nonexistent values.
         if shape != ControlShape::NoArguments && supports_result(result_type) {
-            novarocks_functions::selected_copy::guarded_interleave_extent(result_type, rows.len())
+            novarocks_functions::selected_copy::guarded_result_extent(result_type, rows.len())
                 .map_err(|_| KernelFailure::ResourceExhausted)?;
             work.step()?;
         }
@@ -143,6 +322,8 @@ impl Frame {
             occurrence,
             activation,
             rows,
+            output_rows,
+            domain,
             parent_ordinals,
             next: 0,
             children: Vec::new(),
@@ -328,7 +509,7 @@ impl Frame {
             let array = if good.len() == output.values().len() {
                 Arc::clone(output.values())
             } else {
-                gather(output.values(), &good, work)?
+                gather_continued(output.values(), &good, output.continuation.as_ref(), work)?
             };
             let mut good_rows = Vec::with_capacity(ordinals.len());
             for &ordinal in &ordinals {
@@ -408,7 +589,7 @@ impl Frame {
         }
         self.children.push(Child {
             ordinals: child.ordinals,
-            value: OwnedValue::from_selected(output),
+            value: OwnedValue::from_materialized(output),
         });
         if ordinal.is_multiple_of(2) {
             return Ok(());
@@ -542,7 +723,7 @@ impl Frame {
             ))?);
             self.children.push(Child {
                 ordinals: child.ordinals,
-                value: OwnedValue::from_selected(output),
+                value: OwnedValue::from_materialized(output),
             });
             return Ok(());
         }
@@ -551,7 +732,7 @@ impl Frame {
         }
         let right = Child {
             ordinals: child.ordinals,
-            value: OwnedValue::from_selected(output),
+            value: OwnedValue::from_materialized(output),
         };
         let mut parents = Vec::with_capacity(right.ordinals.len());
         let mut rows = Vec::with_capacity(right.ordinals.len());
@@ -801,7 +982,7 @@ impl Frame {
             }
             self.children.push(Child {
                 ordinals: child.ordinals,
-                value: OwnedValue::from_selected(output),
+                value: OwnedValue::from_materialized(output),
             });
             return Ok(());
         }
@@ -883,7 +1064,7 @@ impl Frame {
         }
         self.children.push(Child {
             ordinals: child.ordinals,
-            value: OwnedValue::from_selected(output),
+            value: OwnedValue::from_materialized(output),
         });
         Ok(())
     }
@@ -898,6 +1079,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     root: ProgramExpressionRootSite,
     input: CompiledInputLoan<'_>,
     input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
+    actual_domain: Selection<'a>,
     selection: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
     instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
@@ -933,16 +1115,73 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         rows.push(row);
         work.step()?;
     }
+    let domain = Arc::new(input_source::ActualInvocationDomain::root(
+        input,
+        actual_domain,
+        work.control,
+    )?);
+    if selection.batch_rows() != actual_domain.batch_rows() {
+        return Err(invalid("outer root demand has a different logical batch extent").into());
+    }
+    for row in selection.iter() {
+        if domain.physical_ordinal(row).is_none() {
+            return Err(invalid(
+                "outer root demand is outside the explicitly authored actual domain",
+            )
+            .into());
+        }
+        work.step()?;
+    }
     let root_invocation = &flow.uses()[&root_use.use_id];
     let root_type = definitions
         .node(root_invocation.definition)
         .ok_or_else(|| invalid("missing actual root definition"))?
         .data_type();
+    // Reverse propagation is solely from the actual immutable prepared owner
+    // policy over this checked use graph. Ordinary ScalarV1/selected owners do
+    // not acquire a whole-domain child policy by sharing a numeric ABI.
+    let mut needs_original = BTreeSet::new();
+    let mut finished = BTreeSet::new();
+    let mut pending = vec![(root_use.use_id, false)];
+    while let Some((use_id, expanded)) = pending.pop() {
+        if finished.contains(&use_id) {
+            continue;
+        }
+        let invocation = &flow.uses()[&use_id];
+        if expanded {
+            let occurrence = ProgramUseRef {
+                arena: root_use.arena,
+                use_id,
+            };
+            let own = matches!(resolved.calls().get(&ProgramCallSite::Expression(occurrence)).map(|call|call.specialization().prepared()),
+                Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain);
+            let mut required = own;
+            for child in &invocation.arguments {
+                required |= needs_original.contains(child);
+                work.step()?;
+            }
+            if required {
+                needs_original.insert(use_id);
+            }
+            finished.insert(use_id);
+        } else {
+            pending.push((use_id, true));
+            for child in invocation.arguments.iter().rev() {
+                pending.push((*child, false));
+                work.step()?;
+            }
+        }
+        work.step()?;
+    }
+    let mut source_captured = false;
+    let mut source_custody = None;
     let mut frames = vec![Frame::new(
         root_use,
         root_invocation.control,
         root_type,
         rows,
+        domain,
+        needs_original.contains(&root_use.use_id),
         if E::ACTIVATE_EMPTY {
             activation
         } else {
@@ -963,7 +1202,15 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         else {
             return Err(invalid("ordinary root cannot materialize a lambda definition").into());
         };
-        // An empty actual domain never enters children, constructors or kernels.
+        let original_domain = match definition.kind() {
+            StaticExprKind::BoundCall { .. } => {
+                matches!(resolved.calls()[&ProgramCallSite::Expression(frame.occurrence)].specialization().prepared(),
+                    PreparedPureKernel::ScalarInvocation(prepared) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain)
+            }
+            _ => false,
+        };
+        // ValidateOnly with no demanded rows enters no children or leaf.
+        // Activated empty invocations retain their original arity behavior.
         let next = if frame.rows.is_empty()
             && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
         {
@@ -997,11 +1244,35 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         if let Some(ordinals) = next {
             let child_use = invocation.arguments[frame.next];
             frame.next += 1;
-            let mut rows = Vec::with_capacity(ordinals.len());
-            for &ordinal in &ordinals {
-                rows.push(frame.rows[ordinal]);
-                work.step()?;
+            let mut rows = Vec::with_capacity(if original_domain {
+                frame.domain.rows().len()
+            } else {
+                ordinals.len()
+            });
+            if original_domain {
+                for &row in frame.domain.rows() {
+                    rows.push(row);
+                    work.step()?;
+                }
+            } else {
+                for &ordinal in &ordinals {
+                    rows.push(frame.rows[ordinal]);
+                    work.step()?;
+                }
             }
+            // A control author supplies its actual phase mask. Eager required
+            // children retain the parent source domain; no leaf guesses it.
+            let child_domain = if invocation.control == ControlShape::If
+                && frame.next > 1
+                && (!rows.is_empty() || frame.rows.is_empty())
+            {
+                frame.domain.filtered(&rows, work.control)?
+            } else {
+                // Other control/selected owners keep their existing logical
+                // demand and inherit the actual carrier. Only their own typed
+                // policy may demand a full original-domain child invocation.
+                frame.domain.clone()
+            };
             let child = Frame::new(
                 ProgramUseRef {
                     arena: frame.occurrence.arena,
@@ -1013,7 +1284,10 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     .ok_or_else(|| invalid("missing actual child definition"))?
                     .data_type(),
                 rows,
-                if !ordinals.is_empty()
+                child_domain,
+                needs_original.contains(&child_use),
+                if original_domain && !frame.domain.rows().is_empty()
+                    || !ordinals.is_empty()
                     || frame.activation
                         == novarocks_functions::ScalarInvocationActivation::Activated
                         && frame.rows.is_empty()
@@ -1031,6 +1305,15 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         }
         let local_selection =
             Selection::try_sparse_observed(input.num_rows(), &frame.rows, || work.step())?;
+        let output_selection =
+            Selection::try_sparse_observed(input.num_rows(), &frame.output_rows, || work.step())?;
+        // Clone only explicit finite continuations of actually evaluated
+        // children. No host request occurs before the original leaf outcome.
+        let child_sources = frame
+            .children
+            .iter()
+            .filter_map(|child| child.value.continuation())
+            .collect();
         let value = if frame.rows.is_empty()
             && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
         {
@@ -1074,8 +1357,23 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     // Obtain the source at the original checked Slot. Current
                     // kernels still consume only the evaluated array; this
                     // synchronous borrow neither captures nor wraps its owner.
-                    let (array, _source) = column.into_parts();
-                    OwnedValue::Column(Arc::clone(array))
+                    let (_original, _source) = column.into_parts();
+                    let array = frame.domain.column(*ordinal as usize).ok_or_else(|| {
+                        invalid("actual source domain has no checked Slot ordinal")
+                    })?;
+                    if !source_captured {
+                        source_custody = input.capture_source(allocator, work.control)?;
+                        source_captured = true;
+                    }
+                    let array = match &source_custody {
+                        Some(custody) => custody.retain(Arc::clone(array), work.control)?,
+                        None => Arc::clone(array),
+                    };
+                    let owner = source_custody
+                        .as_ref()
+                        .map(|custody| custody.continuation(&array, work.control))
+                        .transpose()?;
+                    OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
                 }
                 StaticExprKind::PreparedLike { negated, .. } => {
                     if frame.children.len() != 2 {
@@ -1216,7 +1514,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     if recipe.is_identity() {
                         // The value passes unchanged, with its row errors;
                         // only the frozen nullability widens.
-                        OwnedValue::from_selected(child.materialize(
+                        OwnedValue::from_materialized(child.materialize(
                             local_selection,
                             &recipe.result_type().data_type(),
                             work,
@@ -1397,21 +1695,36 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                                     )));
                                 }
                             };
-                            let mut children = Vec::with_capacity(frame.children.len());
-                            for child in std::mem::take(&mut frame.children) {
-                                children.push(child.value.into_value(local_selection, work)?);
-                                work.step()?;
+                            if original_domain {
+                                let result = evaluate_original_invocation::<E>(
+                                    frame.occurrence,
+                                    prepared,
+                                    &frame.children,
+                                    &frame.domain,
+                                    local_selection,
+                                    frame.activation,
+                                    instances,
+                                    allocator,
+                                    work,
+                                )?;
+                                OwnedValue::from_selected(result)
+                            } else {
+                                let mut children = Vec::with_capacity(frame.children.len());
+                                for child in std::mem::take(&mut frame.children) {
+                                    children.push(child.value.into_value(local_selection, work)?);
+                                    work.step()?;
+                                }
+                                OwnedValue::from_selected(evaluate_scalar::<E>(
+                                    frame.occurrence,
+                                    prepared,
+                                    &children,
+                                    local_selection,
+                                    frame.activation,
+                                    instances,
+                                    allocator,
+                                    work,
+                                )?)
                             }
-                            OwnedValue::from_selected(evaluate_scalar::<E>(
-                                frame.occurrence,
-                                prepared,
-                                &children,
-                                local_selection,
-                                frame.activation,
-                                instances,
-                                allocator,
-                                work,
-                            )?)
                         }
                         PreparedPureKernel::ControlIntrinsic(_)
                             if matches!(invocation.control, ControlShape::TemporalSource(_)) =>
@@ -1426,14 +1739,29 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                                 work,
                             )?
                         }
-                        PreparedPureKernel::ControlIntrinsic(_) => assemble(
-                            &frame.children,
-                            &frame.choices,
-                            &mut frame.errors,
-                            &result_type.data_type(),
-                            local_selection,
-                            work,
-                        )?,
+                        PreparedPureKernel::ControlIntrinsic(_) => {
+                            if invocation.control == ControlShape::If {
+                                finish_if(
+                                    &frame.children,
+                                    &frame.choices,
+                                    &mut frame.errors,
+                                    &frame.routes,
+                                    frame.rows.is_empty(),
+                                    &result_type.data_type(),
+                                    local_selection,
+                                    work,
+                                )?
+                            } else {
+                                assemble(
+                                    &frame.children,
+                                    &frame.choices,
+                                    &mut frame.errors,
+                                    &result_type.data_type(),
+                                    local_selection,
+                                    work,
+                                )?
+                            }
+                        }
                         _ => {
                             return Err(
                                 invalid("compiled occurrence has a different lifecycle").into()
@@ -1444,6 +1772,40 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 _ => return Err(invalid("unsupported compiled root definition").into()),
             }
         };
+        let value = if frame.output_rows != frame.rows {
+            project_owned(
+                value,
+                &frame.rows,
+                &frame.output_rows,
+                input.num_rows(),
+                work,
+            )?
+        } else {
+            value
+        };
+        // Required children become fatal at their original return boundary,
+        // before any new custody/type-holder allocation can replace the cause.
+        if let Some(parent) = frames.last() {
+            let parent_requires_original = matches!(
+                resolved.calls().get(&ProgramCallSite::Expression(parent.occurrence)).map(|call|call.specialization().prepared()),
+                Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain
+            );
+            if parent_requires_original {
+                if let OwnedValue::Selected(_, errors) = value.uncontinued() {
+                    if let Some(error) = errors.first() {
+                        work.control
+                            .operation_aborted
+                            .store(true, Ordering::Relaxed);
+                        return Err(E::required(root, output_selection, error.clone()));
+                    }
+                }
+            }
+        }
+        // Preserve the original leaf/required-child failure before any new
+        // custody request. Successful scalar aliases inherit their real inputs.
+        let value = value.retaining_children(child_sources, allocator, work.control)?;
+        let value = value.retaining_custody(source_custody.as_ref(), work.control)?;
+        let value = value.retaining_result_type(result_type, allocator, work.control)?;
         if let Some(operand) = frame.operand.take() {
             work.flush()?;
             drop(operand);
@@ -1452,6 +1814,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         if let Some(parent) = frames.last_mut() {
             let parent_invocation = &flow.uses()[&parent.occurrence.use_id];
             let shape = parent_invocation.control;
+
             let child_is_pure = effects
                 .get(&frame.occurrence)
                 .ok_or_else(|| invalid("missing actual child effects"))?
@@ -1471,10 +1834,190 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 work,
             )?;
         } else {
-            return value.into_value(selection, work).map_err(E::from);
+            let value = value.into_value(selection, work)?;
+            if let Some(custody) = &source_custody {
+                let ty = value.argument().array().data_type().clone();
+                let value = value.materialize(selection, &ty, work)?;
+                let continuation = value.continuation.clone();
+                let (_, array, errors) = value.into_parts();
+                let array = custody.retain(array, work.control)?;
+                return SelectedValues::try_new_observed(selection, &ty, array, errors, || {
+                    work.step()
+                })
+                .map(Value::Selected)
+                .and_then(|value| match continuation {
+                    Some(owner) => value.retaining_continuation(owner, work),
+                    None => Ok(value),
+                })
+                .map_err(E::from);
+            }
+            return Ok(value);
         }
     }
     Err(internal("actual compiled root result is absent").into())
+}
+
+/// Only the typed owner policy enters this path. Sources are already evaluated
+/// in the exact actual domain; success projects output, never required errors.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep actual source scope and outer demand explicit"
+)]
+fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure>(
+    occurrence: ProgramUseRef,
+    prepared: scalar_invocation::PreparedCall<'_>,
+    children: &[Child],
+    domain: &Arc<input_source::ActualInvocationDomain>,
+    demand: Selection<'a>,
+    activation: novarocks_functions::ScalarInvocationActivation,
+    instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_>,
+) -> Result<SelectedValues<'a>, E> {
+    use novarocks_functions::{EvaluatedSourceLoan, ScalarInvocationScope, ScalarInvocationSource};
+    let actual = domain.selection(work.control)?;
+    let mut sources = Vec::with_capacity(children.len());
+    for child in children {
+        sources.push(match child.value.uncontinued() {
+            OwnedValue::Constant(value) => ScalarInvocationSource::Constant(value),
+            OwnedValue::Source(array, source) => ScalarInvocationSource::Array(
+                EvaluatedSourceLoan::new(array, source.selection(work.control)?),
+            ),
+            OwnedValue::Continued(_, _) => unreachable!("continuation was unwrapped"),
+            OwnedValue::Column(array) | OwnedValue::Selected(array, _) => {
+                ScalarInvocationSource::Array(EvaluatedSourceLoan::new(array, actual))
+            }
+        });
+        work.step()?;
+    }
+    work.flush()?;
+    if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence) {
+        let instance = match prepared.instantiate(allocator.cloned()) {
+            Ok(instance) => instance,
+            Err(cause) => {
+                work.control
+                    .operation_aborted
+                    .store(true, Ordering::Relaxed);
+                return Err(cause.into());
+            }
+        };
+        work.control.checkpoint(0)?;
+        entry.insert(instance);
+    }
+    let result = E::invoke_scoped(
+        instances
+            .get_mut(&occurrence)
+            .ok_or_else(|| internal("scoped scalar instance was not installed"))?,
+        ScalarInvocationScope::new(actual, demand),
+        &sources,
+        activation,
+        allocator,
+        work,
+    );
+    let output = match result {
+        Ok(output) => output,
+        Err(cause) => {
+            work.control
+                .operation_aborted
+                .store(true, Ordering::Relaxed);
+            return Err(cause);
+        }
+    };
+    // End the local source loans before returning the independent outer demand.
+    let (_, array, errors) = output.into_parts();
+    SelectedValues::try_new_observed(
+        demand,
+        &prepared.contract().result_type().data_type(),
+        array,
+        errors,
+        || work.step(),
+    )
+    .map_err(E::from)
+}
+
+fn project_owned(
+    value: OwnedValue,
+    actual_rows: &[usize],
+    demand_rows: &[usize],
+    batch_rows: usize,
+    work: &mut Work<'_, '_>,
+) -> Result<OwnedValue, KernelFailure> {
+    let actual = Selection::try_sparse_observed(batch_rows, actual_rows, || work.step())?;
+    let value = value.into_value(actual, work)?;
+    let ty = value.argument().array().data_type().clone();
+    let actual_value = value.materialize(actual, &ty, work)?;
+    let mut indices = Vec::with_capacity(demand_rows.len());
+    let mut errors = Vec::new();
+    for (ordinal, row) in demand_rows.iter().enumerate() {
+        let physical = actual_rows.binary_search(row).map_err(|_| {
+            invalid("successful outer demand is outside its actual invocation domain")
+        })?;
+        indices.push(Some(
+            u64::try_from(physical).map_err(|_| KernelFailure::ResourceExhausted)?,
+        ));
+        if let Ok(index) = actual_value
+            .errors()
+            .binary_search_by_key(&physical, RowDataError::selected_ordinal)
+        {
+            errors.push(actual_value.errors()[index].with_selected_ordinal(ordinal));
+        }
+        work.step()?;
+    }
+    let continuation = actual_value.continuation.clone();
+    let array = gather_continued(actual_value.values(), &indices, continuation.as_ref(), work)?;
+    Ok(OwnedValue::Selected(array, errors.into_boxed_slice()).with_continuation(continuation))
+}
+
+/// The original IF author preserves a same-type chosen carrier on its genuine
+/// all-true/all-false fast paths. Mixed routes retain the original assembly.
+fn finish_if(
+    children: &[Child],
+    choices: &[Option<(usize, usize)>],
+    row_errors: &mut BTreeMap<usize, RowDataError>,
+    routes: &[Option<bool>],
+    empty: bool,
+    ty: &DataType,
+    selection: Selection<'_>,
+    work: &mut Work<'_, '_>,
+) -> Result<OwnedValue, KernelFailure> {
+    if row_errors.is_empty() {
+        let mut all_true = true;
+        let mut all_false = true;
+        for route in routes {
+            all_true &= *route == Some(true);
+            all_false &= *route == Some(false);
+            work.step()?;
+        }
+        let selected = if empty {
+            children.len().checked_sub(1)
+        } else if all_true {
+            Some(1)
+        } else if all_false {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(selected) = selected {
+            let child = children
+                .get(selected)
+                .ok_or_else(|| internal("original IF fast path has no selected branch"))?;
+            if let OwnedValue::Selected(array, errors) = child.value.uncontinued() {
+                if array.data_type() == ty {
+                    return Ok(OwnedValue::Selected(array.clone(), errors.clone())
+                        .with_continuation(child.value.continuation()));
+                }
+                if matches!(array.data_type(), DataType::Null) {
+                    work.flush()?;
+                    let array = new_null_array(ty, selection.len());
+                    work.flush()?;
+                    return Ok(OwnedValue::Selected(array, errors.clone()));
+                }
+                // Legal non-Null coercions are explicit frozen child Casts.
+                // Do not invent a late untyped cast or broaden that contract.
+            }
+        }
+    }
+    assemble(children, choices, row_errors, ty, selection, work)
 }
 
 fn assemble(
@@ -1489,7 +2032,7 @@ fn assemble(
     // Frame scheduling and its original lazy row demand remain in this host.
     let mut sources = Vec::with_capacity(children.len());
     for child in children {
-        sources.push(match &child.value {
+        sources.push(match child.value.uncontinued() {
             OwnedValue::Selected(array, _) => Some(array),
             _ => None,
         });
@@ -1555,17 +2098,22 @@ fn between_comparison_operand<'a>(
         ));
         work.step()?;
     }
-    let array = gather(output.values(), &indices, work)?;
+    let continuation = output.continuation.clone();
+    let array = gather_continued(output.values(), &indices, continuation.as_ref(), work)?;
     work.flush()?;
     drop(output);
     work.flush()?;
-    Ok(Value::Selected(SelectedValues::try_new_observed(
+    let value = Value::Selected(SelectedValues::try_new_observed(
         selection,
         &ty,
         array,
         Box::default(),
         || work.step(),
-    )?))
+    )?);
+    match continuation {
+        Some(owner) => value.retaining_continuation(owner, work),
+        None => Ok(value),
+    }
 }
 
 /// The shared Boolean journal/assembly is independent of the numeric algorithm.
@@ -2453,9 +3001,12 @@ fn duplicate_child(child: &Child, work: &mut Work<'_, '_>) -> Result<Child, Kern
         work.step()?;
     }
     work.flush()?;
-    let value = match &child.value {
+    let continuation = child.value.continuation();
+    let value = match child.value.uncontinued() {
+        OwnedValue::Continued(_, _) => unreachable!("continuation was unwrapped"),
         OwnedValue::Constant(value) => OwnedValue::Constant(value.clone()),
         OwnedValue::Column(value) => OwnedValue::Column(Arc::clone(value)),
+        OwnedValue::Source(value, domain) => OwnedValue::Source(Arc::clone(value), domain.clone()),
         OwnedValue::Selected(value, source_errors) => {
             let mut errors = Vec::with_capacity(source_errors.len());
             for error in source_errors.iter() {
@@ -2465,7 +3016,8 @@ fn duplicate_child(child: &Child, work: &mut Work<'_, '_>) -> Result<Child, Kern
             work.flush()?;
             OwnedValue::Selected(Arc::clone(value), errors.into_boxed_slice())
         }
-    };
+    }
+    .with_continuation(continuation);
     work.step()?;
     Ok(Child { ordinals, value })
 }
@@ -2531,3 +3083,7 @@ fn validate_membership_phase(
     work.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "copy_continuation_tests.rs"]
+mod copy_continuation_tests;

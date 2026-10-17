@@ -50,12 +50,11 @@ pub(super) fn definition(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(ByOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    FunctionDefinition::try_new_pure_aggregate_window(name, FunctionVisibility::Public, owner)
+        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin max_by/min_by aggregate pure owner",
             value: error.to_string().into(),
-        },
-    )
+        })
 }
 struct ByOwner {
     resolver: Arc<BuiltinAggregateResolver>,
@@ -95,7 +94,7 @@ impl ByOwner {
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
                 implementation: implementation.clone(),
-                abi: PureKernelAbi::AggregateV1,
+                abi: PureKernelAbi::AggregateWindowV1,
             })
             .collect();
         Ok(Self {
@@ -267,26 +266,6 @@ impl PureAggregateImplementation for ByOwner {
     }
 }
 
-#[cfg(any(test, novarocks_dev_controls))]
-pub(super) fn private_window_definition_for_test(
-    name: &str,
-    declaration: FunctionBindingDeclaration,
-    resolver: Arc<BuiltinAggregateResolver>,
-) -> Result<FunctionDefinition, FunctionCatalogError> {
-    let mut owner = ByOwner::new(name, declaration, resolver)?;
-    for implementation in &mut owner.implementations {
-        implementation.abi = PureKernelAbi::AggregateWindowV1;
-    }
-    FunctionDefinition::try_new_pure_aggregate_window(
-        name,
-        FunctionVisibility::Public,
-        Arc::new(owner),
-    )
-    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-        subject: "test-only original BY window definition",
-        value: error.to_string().into(),
-    })
-}
 impl PureAggregateWindowImplementation for ByOwner {
     fn prepare_aggregate_for_window(
         &self,

@@ -20,13 +20,13 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Float64Array};
 use novarocks_functions::builtin::dround_core::{DroundComputation, evaluate_legacy_dround};
 use std::sync::Arc;
-fn evaluate(
-    arena: &ExprArena,
+fn evaluate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     unary: DroundComputation,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left = arena.eval(args[0], chunk)?;
     let (op, right) = if args.len() == 1 {
         (unary, None)
@@ -36,30 +36,30 @@ fn evaluate(
             Some(arena.eval(args[1], chunk)?),
         )
     };
-    evaluate_legacy_dround(
+    Ok((evaluate_legacy_dround(
         op,
         &left,
         right.as_ref(),
         chunk.len(),
         arena.data_type(expr),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string()))?)
 }
-pub fn eval_truncate(
-    arena: &ExprArena,
+pub fn eval_truncate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    evaluate(arena, expr, args, chunk, DroundComputation::Truncate)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((evaluate(arena, expr, args, chunk, DroundComputation::Truncate))?)
 }
-pub fn eval_dround(
-    arena: &ExprArena,
+pub fn eval_dround<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    evaluate(arena, expr, args, chunk, DroundComputation::Round)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((evaluate(arena, expr, args, chunk, DroundComputation::Round))?)
 }
 
 #[cfg(test)]

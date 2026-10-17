@@ -71,8 +71,15 @@ fn zero_factory(program: &Arc<LocalProgram>) -> CompiledAggregateProcessorFactor
     assert!(factory.requires_local_update_stages());
     factory
 }
-fn original_zero(partial: bool, direct: bool, inputs: &[Chunk]) -> Chunk {
-    let schema = Arc::new(ChunkSchema::empty());
+fn original_zero(partial: bool, direct: bool, inputs: &[Chunk]) -> (Chunk, Arc<MemTracker>) {
+    // Zero calls and zero grouping columns explicitly declare an empty typed output.
+    let schema = Arc::new(
+        ChunkSchema::try_new_typed(
+            vec![],
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .expect("explicit zero-column aggregate declaration"),
+    );
     let factory = AggregateProcessorFactory::new_native(
         7,
         Arc::new(crate::exec::expr::ExprArena::default()),
@@ -94,6 +101,10 @@ fn original_zero(partial: bool, direct: bool, inputs: &[Chunk]) -> Chunk {
     let tracker = MemTracker::new_root("OriginalZeroCalls");
     let mut operator = factory.create(1, 0);
     operator.set_mem_tracker(tracker.clone());
+    operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        state.error_state(),
+    ));
     operator.prepare().expect("prepare original aggregate");
     let processor = operator.as_processor_mut().unwrap();
     for input in inputs {
@@ -105,22 +116,39 @@ fn original_zero(partial: bool, direct: bool, inputs: &[Chunk]) -> Chunk {
     assert!(result.record_batch().columns().is_empty());
     assert!(processor.pull_chunk(&state).unwrap().is_none());
     drop(operator);
-    assert_eq!(tracker.current(), 0);
-    result
+    assert!(
+        tracker.current() > 0,
+        "the live original typed output retains its actual creator"
+    );
+    (result, tracker)
 }
 #[test]
 fn compiled_aggregate_zero_calls_original_and_real_compiled_before() {
     // Original row-count evidence precedes the real package/compiler boundary.
-    let empty = original_zero(false, false, &[]);
+    let (empty, empty_tracker) = original_zero(false, false, &[]);
     assert_eq!(empty.len(), 1);
-    let left = original_zero(true, false, &[]);
-    let right = original_zero(true, false, &[]);
-    let final_result = original_zero(false, true, &[left, right]);
+    let (left, left_tracker) = original_zero(true, false, &[]);
+    let (right, right_tracker) = original_zero(true, false, &[]);
+    let (final_result, final_tracker) = original_zero(false, true, &[left, right]);
+    assert_eq!(left_tracker.current(), 0);
+    assert_eq!(right_tracker.current(), 0);
     assert_eq!(final_result.len(), 1);
     let program = zero_program();
     let source = input(&program);
-    let original = original_zero(false, false, &[source.clone()]);
+    let (original, original_tracker) = original_zero(false, false, &[source.clone()]);
     assert_eq!(original.len(), 1);
+    for (output, tracker) in [
+        (empty, empty_tracker),
+        (final_result, final_tracker),
+        (original, original_tracker),
+    ] {
+        assert!(
+            tracker.current() > 0,
+            "live original output retains its creator"
+        );
+        drop(output);
+        assert_eq!(tracker.current(), 0);
+    }
     // The assertion is permanently the actual original row-count behavior.
     // Before correction this genuine pure factory returns its original Arrow error.
     let tracker = MemTracker::new_root("ZeroCallsOriginalAndCompiled");

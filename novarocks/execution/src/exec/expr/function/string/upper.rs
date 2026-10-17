@@ -19,11 +19,11 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::string_case::{StringCaseOp, evaluate_legacy_case};
 /// V1 retains child evaluation; the shared core owns whole-string calculation.
-pub fn eval_upper(
-    arena: &ExprArena,
+pub fn eval_upper<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     value_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(value_expr, chunk)?;
-    evaluate_legacy_case(StringCaseOp::Upper, &input)
+    Ok((evaluate_legacy_case(StringCaseOp::Upper, &input))?)
 }

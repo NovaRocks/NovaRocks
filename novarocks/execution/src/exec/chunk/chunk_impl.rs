@@ -673,19 +673,39 @@ impl Chunk {
         offset: usize,
         length: usize,
         storage: ValueTypeStorageLifetime,
+        observe: F,
+    ) -> Result<Self, E>
+    where
+        E: From<String>,
+        F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
+    {
+        if !self.chunk_schema.is_typed() {
+            return Err(E::from(
+                "typed chunk slice requires its explicit source contract".into(),
+            ));
+        }
+        self.slice_with_creation_observed(offset, length, storage, observe)
+    }
+
+    /// Create only the new view wrappers under the actual caller's lifetime.
+    /// The source's typed/untyped binding is preserved without reconstruction.
+    pub(crate) fn slice_with_creation_observed<E, F>(
+        &self,
+        offset: usize,
+        length: usize,
+        storage: ValueTypeStorageLifetime,
         mut observe: F,
     ) -> Result<Self, E>
     where
         E: From<String>,
         F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     {
-        if !self.chunk_schema.is_typed()
-            || offset
-                .checked_add(length)
-                .is_none_or(|end| end > self.len())
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > self.len())
         {
             return Err(E::from(
-                "typed chunk slice is outside its explicit source contract".into(),
+                "chunk slice is outside its explicit source contract".into(),
             ));
         }
         observe(ArrayNormalizationStep::CreateChunkColumns {
@@ -1746,3 +1766,6 @@ mod shared_batch_projection_tests {
         assert_eq!(tracker.current(), 0);
     }
 }
+
+#[path = "evaluation_creation.rs"]
+mod evaluation_creation;

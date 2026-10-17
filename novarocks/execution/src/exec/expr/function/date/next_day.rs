@@ -22,12 +22,12 @@ use novarocks_functions::builtin::calendar_extended_shared::{
     CalendarOperation, evaluate_legacy_calendar,
 };
 
-fn eval_next_previous_day_inner(
-    arena: &ExprArena,
+fn eval_next_previous_day_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     next: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let date = arena.eval(args[0], chunk)?;
     let token = arena.eval(args[1], chunk)?;
     token
@@ -35,7 +35,7 @@ fn eval_next_previous_day_inner(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "next_day expects string".to_string())?;
     let rows = date.len();
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         if next {
             CalendarOperation::NextDay
         } else {
@@ -44,23 +44,23 @@ fn eval_next_previous_day_inner(
         &[date, token],
         &DataType::Date32,
         rows,
-    )
+    ))?)
 }
 
-pub fn eval_next_day(
-    arena: &ExprArena,
+pub fn eval_next_day<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_next_previous_day_inner(arena, args, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_next_previous_day_inner(arena, args, chunk, true))?)
 }
 
-pub fn eval_previous_day(
-    arena: &ExprArena,
+pub fn eval_previous_day<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_next_previous_day_inner(arena, args, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_next_previous_day_inner(arena, args, chunk, false))?)
 }

@@ -23,12 +23,12 @@ use chrono::NaiveDate;
 use std::sync::Arc;
 
 #[inline]
-fn eval_current_time_inner(
-    arena: &ExprArena,
+fn eval_current_time_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     chunk: &Chunk,
     utc: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let t = if utc {
         time_from_utc_now()
     } else {
@@ -46,29 +46,29 @@ fn eval_current_time_inner(
     Ok(Arc::new(TimestampMicrosecondArray::from(values)) as ArrayRef)
 }
 
-pub fn eval_current_time(
-    arena: &ExprArena,
+pub fn eval_current_time<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_current_time_inner(arena, expr, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_current_time_inner(arena, expr, chunk, false))?)
 }
 
-pub fn eval_curtime(
-    arena: &ExprArena,
+pub fn eval_curtime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_current_time_inner(arena, expr, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_current_time_inner(arena, expr, chunk, false))?)
 }
 
-pub fn eval_utc_time(
-    arena: &ExprArena,
+pub fn eval_utc_time<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_current_time_inner(arena, expr, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_current_time_inner(arena, expr, chunk, true))?)
 }

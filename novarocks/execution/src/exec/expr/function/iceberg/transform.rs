@@ -31,28 +31,28 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 const MICROS_PER_HOUR: i64 = 3_600_000_000;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
-pub fn eval_iceberg_identity(
-    arena: &ExprArena,
+pub fn eval_iceberg_identity<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    arena.eval(child, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((arena.eval(child, chunk))?)
 }
 
-pub fn eval_iceberg_void(
-    arena: &ExprArena,
+pub fn eval_iceberg_void<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let data_type = arena.data_type(_child).cloned().unwrap_or(DataType::Null);
     Ok(arrow::array::new_null_array(&data_type, chunk.len()))
 }
 
-pub fn eval_iceberg_year(
-    arena: &ExprArena,
+pub fn eval_iceberg_year<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(child, chunk)?;
     let mut builder = arrow::array::Int64Builder::with_capacity(array.len());
     match array.data_type() {
@@ -94,19 +94,17 @@ pub fn eval_iceberg_year(
             }
         }
         other => {
-            return Err(format!(
-                "iceberg_transform_year unsupported type: {other:?}"
-            ));
+            return Err((format!("iceberg_transform_year unsupported type: {other:?}")).into());
         }
     }
     Ok(Arc::new(builder.finish()))
 }
 
-pub fn eval_iceberg_month(
-    arena: &ExprArena,
+pub fn eval_iceberg_month<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(child, chunk)?;
     let mut builder = arrow::array::Int64Builder::with_capacity(array.len());
     match array.data_type() {
@@ -150,19 +148,17 @@ pub fn eval_iceberg_month(
             }
         }
         other => {
-            return Err(format!(
-                "iceberg_transform_month unsupported type: {other:?}"
-            ));
+            return Err((format!("iceberg_transform_month unsupported type: {other:?}")).into());
         }
     }
     Ok(Arc::new(builder.finish()))
 }
 
-pub fn eval_iceberg_day(
-    arena: &ExprArena,
+pub fn eval_iceberg_day<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(child, chunk)?;
     let mut builder = arrow::array::Int64Builder::with_capacity(array.len());
     match array.data_type() {
@@ -198,17 +194,17 @@ pub fn eval_iceberg_day(
             }
         }
         other => {
-            return Err(format!("iceberg_transform_day unsupported type: {other:?}"));
+            return Err((format!("iceberg_transform_day unsupported type: {other:?}")).into());
         }
     }
     Ok(Arc::new(builder.finish()))
 }
 
-pub fn eval_iceberg_hour(
-    arena: &ExprArena,
+pub fn eval_iceberg_hour<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(child, chunk)?;
     let mut builder = arrow::array::Int64Builder::with_capacity(array.len());
     match array.data_type() {
@@ -246,25 +242,21 @@ pub fn eval_iceberg_hour(
             }
         }
         other => {
-            return Err(format!(
-                "iceberg_transform_hour unsupported type: {other:?}"
-            ));
+            return Err((format!("iceberg_transform_hour unsupported type: {other:?}")).into());
         }
     }
     Ok(Arc::new(builder.finish()))
 }
 
-pub fn eval_iceberg_bucket(
-    arena: &ExprArena,
+pub fn eval_iceberg_bucket<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     value: ExprId,
     buckets: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let width = extract_const_i64(arena, buckets, chunk)?;
     if width <= 0 {
-        return Err(format!(
-            "iceberg_transform_bucket width must be > 0, got {width}"
-        ));
+        return Err((format!("iceberg_transform_bucket width must be > 0, got {width}")).into());
     }
     let array = arena.eval(value, chunk)?;
     let mut builder = arrow::array::Int32Builder::with_capacity(array.len());
@@ -383,25 +375,21 @@ pub fn eval_iceberg_bucket(
             }
         }
         other => {
-            return Err(format!(
-                "iceberg_transform_bucket unsupported type: {other:?}"
-            ));
+            return Err((format!("iceberg_transform_bucket unsupported type: {other:?}")).into());
         }
     }
     Ok(Arc::new(builder.finish()))
 }
 
-pub fn eval_iceberg_truncate(
-    arena: &ExprArena,
+pub fn eval_iceberg_truncate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     value: ExprId,
     width: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let width = extract_const_i64(arena, width, chunk)?;
     if width <= 0 {
-        return Err(format!(
-            "iceberg_transform_truncate width must be > 0, got {width}"
-        ));
+        return Err((format!("iceberg_transform_truncate width must be > 0, got {width}")).into());
     }
     let array = arena.eval(value, chunk)?;
     match array.data_type() {
@@ -494,13 +482,15 @@ pub fn eval_iceberg_truncate(
             }
             Ok(Arc::new(builder.finish()))
         }
-        other => Err(format!(
-            "iceberg_transform_truncate unsupported type: {other:?}"
-        )),
+        other => Err((format!("iceberg_transform_truncate unsupported type: {other:?}")).into()),
     }
 }
 
-fn extract_const_i64(arena: &ExprArena, expr: ExprId, chunk: &Chunk) -> Result<i64, String> {
+fn extract_const_i64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr: ExprId,
+    chunk: &Chunk,
+) -> Result<i64, __Eval::Error> {
     let array = arena.eval(expr, chunk)?;
     match array.data_type() {
         DataType::Int32 => {
@@ -509,7 +499,7 @@ fn extract_const_i64(arena: &ExprArena, expr: ExprId, chunk: &Chunk) -> Result<i
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| "expected INT for constant argument".to_string())?;
             if arr.is_null(0) {
-                return Err("constant argument is NULL".to_string());
+                return Err(("constant argument is NULL".to_string()).into());
             }
             Ok(i64::from(arr.value(0)))
         }
@@ -519,13 +509,11 @@ fn extract_const_i64(arena: &ExprArena, expr: ExprId, chunk: &Chunk) -> Result<i
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| "expected BIGINT for constant argument".to_string())?;
             if arr.is_null(0) {
-                return Err("constant argument is NULL".to_string());
+                return Err(("constant argument is NULL".to_string()).into());
             }
             Ok(arr.value(0))
         }
-        other => Err(format!(
-            "constant argument must be INT/BIGINT, got {other:?}"
-        )),
+        other => Err((format!("constant argument must be INT/BIGINT, got {other:?}")).into()),
     }
 }
 

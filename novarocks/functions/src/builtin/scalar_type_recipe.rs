@@ -49,7 +49,9 @@ impl<'a> ScalarTypeRecipe<'a> {
     }
     fn rule(self) -> Result<RealizationRule<'a>, String> {
         Ok(match self.spec {
-            TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) => RealizationRule::Source(
+            TypeSpec::Any(name)
+            | TypeSpec::Decimal128Of(name)
+            | TypeSpec::MapWithUninhabitedKey { map: name, .. } => RealizationRule::Source(
                 self.bindings
                     .lookup_value_borrowed(name)
                     .ok_or_else(|| format!("value type variable {name} is unbound"))?,

@@ -179,12 +179,12 @@ fn rescale_decimal_value(value: i128, from_scale: i8, to_scale: i8) -> Result<i1
     Ok(value / divisor)
 }
 
-pub fn eval_array_sum(
-    arena: &ExprArena,
+pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let list = arr
         .as_any()
@@ -299,11 +299,11 @@ pub fn eval_array_sum(
             })?;
             novarocks_types::largeint::array_from_i128(&sums)?
         }
-        other => return Err(format!("array_sum unsupported element type: {:?}", other)),
+        other => return Err((format!("array_sum unsupported element type: {:?}", other)).into()),
     };
 
     let adjusted_output_type = arena
         .data_type(expr)
         .map(|t| super::common::adjust_legacy_decimalv2_target_type(values.data_type(), t));
-    super::common::cast_output(out, adjusted_output_type.as_ref(), "array_sum")
+    Ok((super::common::cast_output(out, adjusted_output_type.as_ref(), "array_sum"))?)
 }

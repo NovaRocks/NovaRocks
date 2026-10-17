@@ -86,12 +86,12 @@ fn common_overlap_value_type(left: &DataType, right: &DataType) -> Option<DataTy
     }
 }
 
-pub fn eval_arrays_overlap(
-    arena: &ExprArena,
+pub fn eval_arrays_overlap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr1 = arena.eval(args[0], chunk)?;
     let arr2 = arena.eval(args[1], chunk)?;
     if matches!(arr1.data_type(), DataType::Null) || matches!(arr2.data_type(), DataType::Null) {
@@ -143,10 +143,11 @@ pub fn eval_arrays_overlap(
         } else if let Ok(casted) = cast(&values1, &right_type) {
             values1 = casted;
         } else {
-            return Err(format!(
+            return Err((format!(
                 "arrays_overlap type mismatch after coercion attempts: {:?} vs {:?}",
                 left_type, right_type
-            ));
+            ))
+            .into());
         }
     }
     let offsets1 = list1.value_offsets();

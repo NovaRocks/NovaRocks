@@ -22,12 +22,12 @@ use std::sync::Arc;
 use super::common::downcast_int_arg_array;
 use novarocks_functions::string_repeat_pad_core;
 
-pub fn eval_repeat(
-    arena: &ExprArena,
+pub fn eval_repeat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let num_arr = arena.eval(args[1], chunk)?;

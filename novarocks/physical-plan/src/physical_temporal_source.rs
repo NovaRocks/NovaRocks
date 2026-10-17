@@ -262,20 +262,11 @@ pub fn regexp_count_pattern_source_observed(
             "regexp_count requires checked native-v1 source; unchecked Literal is not emitted",
         ));
     }
-    if pattern.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
-        || *pattern.ty.data_type() != DataType::Utf8
-    {
-        return Err(TemporalSourceProjectionError::Invalid(
-            "regexp_count emitted pattern is not exact Physical Utf8",
-        ));
-    }
-    Ok(
-        if native_v1_emitted_constant_reference(&pattern.kind).is_some() {
-            novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent
-        } else {
-            novarocks_type_contract::RegexpCountPatternSource::Dynamic
-        },
+    novarocks_type_contract::RegexpCountPatternSource::from_native_v1_emitted_shape(
+        &pattern.ty,
+        native_v1_emitted_constant_reference(&pattern.kind).is_some(),
     )
+    .map_err(TemporalSourceProjectionError::Invalid)
 }
 
 /// Exact TO_BASE64 immediate source author using the same actual native-v1 identity projection.

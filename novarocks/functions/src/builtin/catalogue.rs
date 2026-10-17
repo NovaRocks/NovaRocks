@@ -1486,7 +1486,6 @@ impl BuiltinScalarResolver {
                 | "builtin.scalar/json_exists/v1"
                 | "builtin.scalar/json_length/v1"
                 | "builtin.scalar/json_keys/v1"
-                | "builtin.scalar/variant_typeof/v1"
         ) {
             let Some(document) = argument_types.first() else {
                 return Err(FunctionBindingError::NoMatchingOverload);
@@ -1500,6 +1499,19 @@ impl BuiltinScalarResolver {
                     _ => false,
                 };
             if !admitted {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+        }
+
+        if self.function_id.as_str() == "builtin.scalar/variant_typeof/v1" {
+            let [document] = argument_types.as_slice() else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            if !matches!(
+                (document.logical_type(), document.data_type()),
+                (ValueLogicalType::Json, DataType::Utf8)
+                    | (ValueLogicalType::Variant, DataType::LargeBinary)
+            ) {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
         }
@@ -3022,9 +3034,19 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             }
         }
         "variant_get" | "try_variant_get" => {
-            if value(0)?.logical_type() != ValueLogicalType::Variant
-                && value(0)?.data_type() != &DataType::Null
-            {
+            // The original runner has two input modes: nominal Variant bytes,
+            // or Utf8 JSON text parsed and validated by json_to_variant. Text
+            // keeps its actual Physical/Json domain; it never signs Variant.
+            let document = value(0)?;
+            let admitted = match document.logical_type() {
+                ValueLogicalType::Variant => document.data_type() == &DataType::LargeBinary,
+                ValueLogicalType::Json => document.data_type() == &DataType::Utf8,
+                ValueLogicalType::Physical => {
+                    matches!(document.data_type(), DataType::Utf8 | DataType::Null)
+                }
+                _ => false,
+            };
+            if !admitted {
                 return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             if value(1)?.logical_type() != ValueLogicalType::Physical
@@ -3314,6 +3336,7 @@ pub(super) fn scalar_definition_parts(
                     "bitmap_to_string" => Some(super::bitmap_to_string_owner::effects()),
                     "parse_json" => Some(super::parse_json_owner::effects()),
                     "json_object" => Some(super::json_object_owner::effects()),
+                    "array_sortby" => Some(super::array_sortby_owner::effects()),
                     "percentile_hash" => Some(super::percentile_hash_owner::effects()),
                     "hll_hash" => Some(super::hll_hash_owner::effects()),
                     name if super::string_measure_owner::operation(name).is_some() => {
@@ -3535,6 +3558,7 @@ pub(super) fn dynamic_definition_parts(
             value: error.to_string().into(),
         })?;
     let pure_effects = match name {
+        "__array_struct_subfield" => Some(super::array_struct_subfield_owner::effects()),
         "map_entries" => Some(super::map_entries_owner::effects()),
         name if super::array_difference_owner::operation(name).is_some() => {
             Some(super::array_difference_owner::effects())
@@ -3594,6 +3618,9 @@ pub fn contribute_builtin_functions(
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {
+            "__array_struct_subfield" => {
+                super::array_struct_subfield_owner::definition(name, declaration, resolver)?
+            }
             "map_entries" => super::map_entries_owner::definition(name, declaration, resolver)?,
             name if super::array_difference_owner::operation(name).is_some() => {
                 super::array_difference_owner::definition(name, declaration, resolver)?
@@ -3667,6 +3694,7 @@ pub fn contribute_builtin_functions(
             "bitmap_to_string" => super::bitmap_to_string_owner::definition(declaration, resolver)?,
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
             "json_object" => super::json_object_owner::definition(declaration, resolver)?,
+            "array_sortby" => super::array_sortby_owner::definition(declaration, resolver)?,
             "percentile_hash" => super::percentile_hash_owner::definition(declaration, resolver)?,
             "hll_hash" => super::hll_hash_owner::definition(declaration, resolver)?,
             name if super::string_measure_owner::operation(name).is_some() => {
@@ -6063,34 +6091,10 @@ pub fn percentile_raw_private_test_catalog() -> EngineFunctionCatalog {
     builder.seal().unwrap()
 }
 
-/// Private runtime test catalogue. Public production BY definitions retain
-/// AggregateV1 until the complete original invocation schedule is validated.
+/// Existing test entry delegates to the same installed public BY owners.
 #[cfg(any(test, novarocks_dev_controls))]
 pub fn by_window_private_test_catalog() -> EngineFunctionCatalog {
-    let original = build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    for declaration in builtin_aggregate_declarations()
-        .into_iter()
-        .filter(|item| matches!(item.name, "max_by" | "min_by"))
-    {
-        let binding = original
-            .definition(declaration.name, FunctionKind::Aggregate)
-            .unwrap()
-            .binding_declaration()
-            .unwrap()
-            .clone();
-        let name = declaration.name;
-        let resolver = Arc::new(BuiltinAggregateResolver { declaration });
-        builder
-            .register(
-                super::aggregate_by_owner::private_window_definition_for_test(
-                    name, binding, resolver,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    }
-    builder.seal().unwrap()
+    build_builtin_engine_function_catalog().unwrap()
 }
 
 /// Private Union capability for original full-domain binding/runtime probes.

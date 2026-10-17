@@ -26,18 +26,18 @@ pub use novarocks_functions::builtin::calendar_extended_shared::{
     calendar_zero_date_sentinel_date32 as zero_date_sentinel_date32,
 };
 
-pub fn eval_from_days(
-    arena: &ExprArena,
+pub fn eval_from_days<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let value = arena.eval(args[0], chunk)?;
     let rows = value.len();
-    evaluate_legacy_calendar(
+    Ok((evaluate_legacy_calendar(
         CalendarOperation::FromDays,
         &[value],
         &DataType::Date32,
         rows,
-    )
+    ))?)
 }

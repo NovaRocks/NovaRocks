@@ -406,6 +406,7 @@ pub struct StaticExprNode {
     data_type: DataType,
     field_schema: Option<ValueTypeRef>,
     complete_type: Option<novarocks_functions::FunctionValueType>,
+    regexp_count_pattern_source: Option<novarocks_type_contract::RegexpCountPatternSource>,
 }
 
 impl StaticExprNode {
@@ -419,6 +420,7 @@ impl StaticExprNode {
             data_type,
             field_schema,
             complete_type: None,
+            regexp_count_pattern_source: None,
         }
     }
 
@@ -433,7 +435,34 @@ impl StaticExprNode {
             data_type: value_type.data_type().clone(),
             field_schema: None,
             complete_type: Some(value_type),
+            regexp_count_pattern_source: None,
         }
+    }
+
+    /// Preserve the same call-local legacy fact; no compiled-call authority is
+    /// supplied here. Complete child admission is checked by the graph owner.
+    pub fn with_regexp_count_pattern_source(
+        mut self,
+        source: novarocks_type_contract::RegexpCountPatternSource,
+    ) -> Result<Self, StaticExpressionError> {
+        if !matches!(&self.kind, StaticExprKind::FunctionCall { kind: StaticFunctionKind::String("regexp_count"), args } if args.len() == 2)
+        {
+            return Err(StaticExpressionError::InvalidRegexpCountSource);
+        }
+        if self
+            .regexp_count_pattern_source
+            .is_some_and(|previous| previous != source)
+        {
+            return Err(StaticExpressionError::InvalidRegexpCountSource);
+        }
+        self.regexp_count_pattern_source = Some(source);
+        Ok(self)
+    }
+
+    pub fn regexp_count_pattern_source(
+        &self,
+    ) -> Option<novarocks_type_contract::RegexpCountPatternSource> {
+        self.regexp_count_pattern_source
     }
 
     pub fn value_type(&self) -> Option<&novarocks_functions::FunctionValueType> {
@@ -475,6 +504,7 @@ pub enum StaticExpressionError {
     InvalidMetadataArity,
     UnsupportedDecimalCastPolicy,
     ConstantTypeMismatch,
+    InvalidRegexpCountSource,
 }
 
 impl fmt::Display for StaticExpressionError {
@@ -610,6 +640,42 @@ impl ImmutableExpressions {
                 }
                 Ok(())
             })?;
+            if let Some(source) = node.regexp_count_pattern_source {
+                let StaticExprKind::FunctionCall {
+                    kind: StaticFunctionKind::String("regexp_count"),
+                    args,
+                } = &node.kind
+                else {
+                    return Err(StaticExpressionError::InvalidRegexpCountSource.into());
+                };
+                let [_, pattern] = args.as_slice() else {
+                    return Err(StaticExpressionError::InvalidRegexpCountSource.into());
+                };
+                let pattern = &nodes[pattern.index()];
+                let exact_physical_utf8 = |ty: &novarocks_functions::FunctionValueType| {
+                    ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                        && ty.data_type() == &DataType::Utf8
+                };
+                // Saved declared facts do not replace the checked pool's domain.
+                if pattern.data_type != DataType::Utf8
+                    || pattern
+                        .value_type()
+                        .is_some_and(|ty| !exact_physical_utf8(ty))
+                    || pattern.field_schema().is_some_and(|schema| {
+                        !matches!(schema.kind(), novarocks_type_contract::ValueKind::String)
+                    })
+                    || matches!(pattern.kind(), StaticExprKind::Constant(value) if !exact_physical_utf8(value.value_type()))
+                    || (source.invalid_pattern_is_error()
+                        && !matches!(
+                            pattern.kind(),
+                            StaticExprKind::Constant(_)
+                                | StaticExprKind::Literal(StaticLiteral::Utf8(_))
+                        ))
+                {
+                    return Err(StaticExpressionError::InvalidRegexpCountSource.into());
+                }
+                observe(ExpressionObservation::Step)?;
+            }
             if let StaticExprKind::Cast(child, policy)
             | StaticExprKind::CastTime(child, policy)
             | StaticExprKind::CastTimeFromDatetime(child, policy) = &node.kind

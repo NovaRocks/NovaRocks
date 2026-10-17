@@ -1368,12 +1368,12 @@ fn normalize_dictionary_comparison_types(
 }
 
 // Arrow vectorized versions
-pub fn eval_eq(
-    arena: &ExprArena,
+pub fn eval_eq<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1381,30 +1381,30 @@ pub fn eval_eq(
         l_norm.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        return eval_nested_eq(&l_norm, &r_norm);
+        return Ok((eval_nested_eq(&l_norm, &r_norm))?);
     }
     let result = eq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
     Ok(Arc::new(result))
 }
 
-pub fn eval_eq_for_null(
-    arena: &ExprArena,
+pub fn eval_eq_for_null<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
-    eval_null_safe_eq(&l_norm, &r_norm)
+    Ok((eval_null_safe_eq(&l_norm, &r_norm))?)
 }
 
-pub fn eval_ne(
-    arena: &ExprArena,
+pub fn eval_ne<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1412,18 +1412,18 @@ pub fn eval_ne(
         l_norm.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        return eval_nested_ne(&l_norm, &r_norm);
+        return Ok((eval_nested_ne(&l_norm, &r_norm))?);
     }
     let result = neq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
     Ok(Arc::new(result))
 }
 
-pub fn eval_lt(
-    arena: &ExprArena,
+pub fn eval_lt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1431,18 +1431,18 @@ pub fn eval_lt(
         l_norm.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        return eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Less);
+        return Ok((eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Less))?);
     }
     let result = lt(&l_norm, &r_norm).map_err(|e| e.to_string())?;
     Ok(Arc::new(result))
 }
 
-pub fn eval_le(
-    arena: &ExprArena,
+pub fn eval_le<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1450,20 +1450,20 @@ pub fn eval_le(
         l_norm.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        return eval_nested_compare(&l_norm, &r_norm, |ord| {
+        return Ok((eval_nested_compare(&l_norm, &r_norm, |ord| {
             ord == Ordering::Less || ord == Ordering::Equal
-        });
+        }))?);
     }
     let result = lt_eq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
     Ok(Arc::new(result))
 }
 
-pub fn eval_gt(
-    arena: &ExprArena,
+pub fn eval_gt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1471,18 +1471,18 @@ pub fn eval_gt(
         l_norm.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        return eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Greater);
+        return Ok((eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Greater))?);
     }
     let result = gt(&l_norm, &r_norm).map_err(|e| e.to_string())?;
     Ok(Arc::new(result))
 }
 
-pub fn eval_ge(
-    arena: &ExprArena,
+pub fn eval_ge<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1490,20 +1490,20 @@ pub fn eval_ge(
         l_norm.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        return eval_nested_compare(&l_norm, &r_norm, |ord| {
+        return Ok((eval_nested_compare(&l_norm, &r_norm, |ord| {
             ord == Ordering::Greater || ord == Ordering::Equal
-        });
+        }))?);
     }
     let result = gt_eq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
     Ok(Arc::new(result))
 }
 
-pub fn eval_and(
-    arena: &ExprArena,
+pub fn eval_and<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let l_bool = l
@@ -1548,12 +1548,12 @@ pub fn eval_and(
     Ok(Arc::new(builder.finish()))
 }
 
-pub fn eval_or(
-    arena: &ExprArena,
+pub fn eval_or<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let l_bool = l
@@ -1596,7 +1596,11 @@ pub fn eval_or(
     Ok(Arc::new(builder.finish()))
 }
 
-pub fn eval_not(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<ArrayRef, String> {
+pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    child: ExprId,
+    chunk: &Chunk,
+) -> Result<ArrayRef, __Eval::Error> {
     let v = arena.eval(child, chunk)?;
 
     if let Some(b) = v.as_any().downcast_ref::<BooleanArray>() {
@@ -1698,10 +1702,9 @@ pub fn eval_not(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<Array
             }
         }
         other => {
-            return Err(format!(
-                "NOT operand must be boolean or numeric, got {:?}",
-                other
-            ));
+            return Err(
+                (format!("NOT operand must be boolean or numeric, got {:?}", other)).into(),
+            );
         }
     }
     Ok(Arc::new(builder.finish()))

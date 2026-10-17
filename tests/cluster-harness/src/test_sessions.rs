@@ -366,9 +366,14 @@ impl ClusterTestSessionPlan {
                     intents.iter().map(move |intent|
             serde_json::json!({"role":role.label(),"session_id":intent.reference.session_id,
                 "process_receipt":intent.reference.process_receipt,"ordinary":intent.ordinary,
-                "binary":intent.binary,"grants":intent.declaration.domain_grants.iter().map(|grant|
-                    serde_json::json!({"domain":grant.domain,"grant_id":grant.grant_id,
-                        "action":grant.parameters.get("action")})).collect::<Vec<_>>()})
+                "binary":intent.binary,"grants":intent.declaration.domain_grants.iter().map(|grant| {
+                    let mut summary = serde_json::json!({"domain":grant.domain,"grant_id":grant.grant_id,
+                        "action":grant.parameters.get("action")});
+                    if let Some(enabled) = grant.parameters.get("hold_split_consumption_until_replay").and_then(Value::as_bool) {
+                        summary["hold_split_consumption_until_replay"] = Value::Bool(enabled);
+                    }
+                    summary
+                }).collect::<Vec<_>>()})
         )
                 })
                 .collect(),
@@ -1458,28 +1463,52 @@ mod tests {
         let native = info("normal-build", vec![]).to_string();
         let binary = executable(directory.path(), &format!("printf '%s' '{}'", native));
         let evidence = directory.path().join("attempt.json");
-        assert!(
-            check_binary(
-                &binary,
-                true,
-                &[],
-                Instant::now() + Duration::from_secs(1),
-                &evidence
+        let diagnostics = |result: &Result<Value>| {
+            format!(
+                "check_binary={result:?}; raw_stdout={:?}; raw_stderr={:?}; exit_receipt={:?}",
+                fs::read_to_string(&evidence),
+                fs::read_to_string(evidence.with_extension("stderr.log")),
+                fs::read_to_string(evidence.with_extension("exit.json")),
             )
-            .is_err()
+        };
+        let rejected = check_binary(
+            &binary,
+            true,
+            &[],
+            Instant::now() + Duration::from_secs(1),
+            &evidence,
         );
-        assert_eq!(fs::read_to_string(&evidence).unwrap(), native);
-        assert!(
-            check_binary(
-                &binary,
-                false,
-                &[],
-                Instant::now() + Duration::from_secs(1),
-                &evidence
-            )
-            .is_err()
+        let first_diagnostics = diagnostics(&rejected);
+        let error = rejected.expect_err(&first_diagnostics);
+        assert_eq!(
+            error.to_string(),
+            "controlled executable lacks Server test-controls",
+            "{first_diagnostics}"
         );
-        assert_eq!(fs::read_to_string(evidence).unwrap(), native);
+        assert_eq!(
+            fs::read_to_string(&evidence).unwrap(),
+            native,
+            "{first_diagnostics}"
+        );
+        let overwrite = check_binary(
+            &binary,
+            false,
+            &[],
+            Instant::now() + Duration::from_secs(1),
+            &evidence,
+        );
+        let overwrite_diagnostics = diagnostics(&overwrite);
+        let error = overwrite.expect_err(&overwrite_diagnostics);
+        assert_eq!(
+            error.to_string(),
+            "preserve raw build-info output",
+            "{overwrite_diagnostics}"
+        );
+        assert_eq!(
+            fs::read_to_string(&evidence).unwrap(),
+            native,
+            "{overwrite_diagnostics}"
+        );
     }
     #[test]
     #[cfg(unix)]

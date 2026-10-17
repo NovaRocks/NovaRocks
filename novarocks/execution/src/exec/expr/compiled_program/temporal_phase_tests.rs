@@ -47,6 +47,22 @@ fn control(fail: usize, cause: KernelFailure) -> Control {
         cause,
     }
 }
+fn source_domain() -> Arc<super::input_source::ActualInvocationDomain> {
+    let batch = RecordBatch::try_new_with_options(
+        Arc::new(arrow::datatypes::Schema::empty()),
+        vec![],
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(7)),
+    )
+    .unwrap();
+    Arc::new(
+        super::input_source::ActualInvocationDomain::root(
+            super::input_source::CompiledInputLoan::RecordBatch(&batch),
+            Selection::all(7),
+            &control(usize::MAX, KernelFailure::Cancelled),
+        )
+        .unwrap(),
+    )
+}
 fn frame(work: &mut Work<'_, '_>) -> Frame {
     Frame::new(
         ProgramUseRef {
@@ -56,6 +72,8 @@ fn frame(work: &mut Work<'_, '_>) -> Frame {
         ControlShape::TemporalSource(S::SecondsCastOther),
         &DataType::Int64,
         vec![1, 3, 5],
+        source_domain(),
+        false,
         novarocks_functions::ScalarInvocationActivation::Activated,
         vec![],
         work,
@@ -286,6 +304,8 @@ fn deepest(control: &Control) -> Result<(), KernelFailure> {
         ControlShape::TemporalSource(S::SecondsCastOther),
         &DataType::Int64,
         vec![1, 3, 5],
+        source_domain(),
+        false,
         novarocks_functions::ScalarInvocationActivation::Activated,
         vec![],
         &mut work,

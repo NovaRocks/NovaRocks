@@ -559,6 +559,9 @@ pub struct FoldArg {
 /// per-node calculator with no traversal knowledge.
 #[derive(Clone, Debug)]
 pub struct FoldRequest {
+    /// Existing emitted-pattern error policy, authored by SQL after its
+    /// children really folded; absence preserves raw reference evaluation.
+    pub regexp_count_pattern_source: Option<novarocks_type_contract::RegexpCountPatternSource>,
     pub kind: FoldNodeKind,
     pub args: Vec<FoldArg>,
     /// Explicit host-admitted policy for the newly evaluated backing.
@@ -3473,6 +3476,7 @@ mod tests {
             }
         }
         let request = FoldRequest {
+            regexp_count_pattern_source: None,
             constant_policy: crate::constant::test_constant_policy(),
             kind: FoldNodeKind::Function {
                 name: "fixture/no-op".into(),
@@ -3704,6 +3708,7 @@ mod tests {
                 .unwrap()
                 .eval_scalar(
                     &FoldRequest {
+                        regexp_count_pattern_source: None,
                         constant_policy: crate::constant::test_constant_policy(),
                         kind: FoldNodeKind::Cast(
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -3760,3 +3765,9 @@ pub use crate::planner::distributed::build::state_source_fixture::ordered_array_
 
 #[cfg(test)]
 mod c16_p1_json_object_error_effect_tests;
+
+#[cfg(test)]
+mod range_envelope_behavior_tests;
+
+#[cfg(test)]
+mod map_subscript_value_type_tests;

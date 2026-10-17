@@ -40,12 +40,12 @@ fn const_i64_arg(arr: IntArgArray<'_>, name: &str) -> Result<i64, String> {
     Ok(first)
 }
 
-pub fn eval_bar(
-    arena: &ExprArena,
+pub fn eval_bar<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let size_eval = arena.eval(args[0], chunk)?;
     let min_eval = arena.eval(args[1], chunk)?;
@@ -62,10 +62,10 @@ pub fn eval_bar(
     let width = const_i64_arg(width_arr, "argument[width]")?;
 
     if min >= max {
-        return Err("bar requirement: min < max".to_string());
+        return Err(("bar requirement: min < max".to_string()).into());
     }
     if width <= 0 {
-        return Err("bar requirement: width > 0".to_string());
+        return Err(("bar requirement: width > 0".to_string()).into());
     }
 
     let mut out = Vec::with_capacity(chunk.len());
@@ -77,10 +77,10 @@ pub fn eval_bar(
 
         let size = size_arr.value(row);
         if size < min {
-            return Err("bar requirement: size >= min".to_string());
+            return Err(("bar requirement: size >= min".to_string()).into());
         }
         if size > max {
-            return Err("bar requirement: size <= max".to_string());
+            return Err(("bar requirement: size <= max".to_string()).into());
         }
 
         let ratio = ((size - min) as f64 / (max - min) as f64).min(1.0);

@@ -20,12 +20,12 @@ use arrow::array::{Array, ArrayRef, StringArray, StructArray, UInt32Array};
 use arrow::compute::cast;
 use arrow::compute::take;
 
-pub fn eval_subfield(
-    arena: &ExprArena,
+pub fn eval_subfield<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
     let field_name_arr = arena.eval(args[1], chunk)?;
     let struct_arr = input
@@ -60,7 +60,7 @@ pub fn eval_subfield(
     if out.data_type() == target_type {
         return Ok(out);
     }
-    cast(&out, target_type).map_err(|e| format!("subfield: failed to cast output: {}", e))
+    Ok((cast(&out, target_type).map_err(|e| format!("subfield: failed to cast output: {}", e)))?)
 }
 
 fn parse_constant_field_name(field_name_arr: &dyn Array) -> Result<String, String> {

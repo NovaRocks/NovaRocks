@@ -147,6 +147,25 @@ enum Value<'a> {
     Constant(novarocks_functions::ConstantValue),
     Column(ArrayRef),
     Selected(SelectedValues<'a>),
+    Continued(Box<Self>, input_source::ArrayContinuation),
+}
+
+// The array itself is wrapped before this value escapes. The explicit sidecar
+// additionally transports its actual creator through later Arrow copy authors.
+struct MaterializedValue<'a> {
+    value: SelectedValues<'a>,
+    continuation: Option<input_source::ArrayContinuation>,
+}
+impl<'a> MaterializedValue<'a> {
+    fn into_parts(self) -> (Selection<'a>, ArrayRef, Box<[RowDataError]>) {
+        self.value.into_parts()
+    }
+}
+impl<'a> std::ops::Deref for MaterializedValue<'a> {
+    type Target = SelectedValues<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
 }
 impl Value<'_> {
     fn argument(&self) -> EvaluatedArgument<'_> {
@@ -154,24 +173,76 @@ impl Value<'_> {
             Self::Constant(value) => EvaluatedArgument::Constant(value),
             Self::Column(array) => EvaluatedArgument::Column(array),
             Self::Selected(value) => EvaluatedArgument::SelectedColumn(value),
+            Self::Continued(value, _) => value.argument(),
         }
     }
     fn errors(&self) -> &[RowDataError] {
         match self {
             Self::Selected(value) => value.errors(),
+            Self::Continued(value, _) => value.errors(),
             _ => &[],
         }
+    }
+    fn continuation(&self) -> Option<input_source::ArrayContinuation> {
+        match self {
+            Self::Continued(_, owner) => Some(owner.clone()),
+            _ => None,
+        }
+    }
+    fn uncontinued(&self) -> &Self {
+        match self {
+            Self::Continued(value, _) => value.uncontinued(),
+            _ => self,
+        }
+    }
+    fn retaining_continuation(
+        self,
+        owner: input_source::ArrayContinuation,
+        work: &mut Work<'_, '_>,
+    ) -> Result<Self, KernelFailure> {
+        let value = match self {
+            Self::Constant(value) => Self::Constant(value),
+            Self::Column(array) => Self::Column(owner.retain(array, work.control)?),
+            Self::Selected(value) => {
+                let (selection, array, errors) = value.into_parts();
+                let array = owner.retain(array, work.control)?;
+                let ty = array.data_type().clone();
+                Self::Selected(SelectedValues::try_new_observed(
+                    selection,
+                    &ty,
+                    array,
+                    errors,
+                    || work.step(),
+                )?)
+            }
+            Self::Continued(value, _) => return value.retaining_continuation(owner, work),
+        };
+        Ok(Self::Continued(Box::new(value), owner))
     }
     fn materialize<'a>(
         self,
         selection: Selection<'a>,
         ty: &DataType,
         work: &mut Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, KernelFailure>
+    ) -> Result<MaterializedValue<'a>, KernelFailure>
     where
         Self: 'a,
     {
-        let (array, errors) = match self {
+        let value = match self {
+            Self::Continued(value, owner) => {
+                let output = value.materialize(selection, ty, work)?;
+                let (_, array, errors) = output.into_parts();
+                let array = owner.retain(array, work.control)?;
+                return Ok(MaterializedValue {
+                    value: SelectedValues::try_new_observed(selection, ty, array, errors, || {
+                        work.step()
+                    })?,
+                    continuation: Some(owner),
+                });
+            }
+            value => value,
+        };
+        let (array, errors) = match value {
             Self::Selected(value) => {
                 let (_, array, errors) = value.into_parts();
                 (array, errors)
@@ -190,7 +261,10 @@ impl Value<'_> {
                 (gather(argument.array(), &indices, work)?, Box::default())
             }
         };
-        SelectedValues::try_new_observed(selection, ty, array, errors, || work.step())
+        Ok(MaterializedValue {
+            value: SelectedValues::try_new_observed(selection, ty, array, errors, || work.step())?,
+            continuation: None,
+        })
     }
 }
 
@@ -623,6 +697,7 @@ impl CompiledExpressionInstance {
             self.evaluate_once::<KernelFailure>(
                 CompiledInputLoan::RecordBatch(input),
                 selection,
+                selection,
                 novarocks_functions::ScalarInvocationActivation::Activated,
                 &mut work,
             )
@@ -641,8 +716,8 @@ impl CompiledExpressionInstance {
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, novarocks_functions::ScalarInvocationFailure> {
-        self.evaluate_controlled::<novarocks_functions::ScalarInvocationFailure>(
+    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
+        self.evaluate_controlled::<crate::runtime::fragment::ExecutionFailure>(
             input, selection, activation, control, None,
         )
     }
@@ -655,8 +730,7 @@ impl CompiledExpressionInstance {
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
         scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> Result<SelectedValues<'a>, crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure>
-    {
+    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
         self.evaluate_input_runtime(
             CompiledInputLoan::RecordBatch(input),
             selection,
@@ -674,9 +748,50 @@ impl CompiledExpressionInstance {
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
         scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> Result<SelectedValues<'a>, crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure>
-    {
-        self.evaluate_input_controlled(input, selection, activation, control, Some(scope))
+    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
+        self.evaluate_input_controlled(
+            input,
+            selection,
+            selection,
+            activation,
+            control,
+            Some(scope),
+        )
+    }
+    /// Explicit actual root calling domain and independent output demand.
+    /// The caller authors the real root domain; no leaf infers it from lengths.
+    pub fn evaluate_scoped_evaluation<'a>(
+        &mut self,
+        input: &RecordBatch,
+        scope: novarocks_functions::ScalarInvocationScope<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
+        self.evaluate_input_controlled(
+            CompiledInputLoan::RecordBatch(input),
+            scope.actual_domain(),
+            scope.demand(),
+            activation,
+            control,
+            None,
+        )
+    }
+    pub fn evaluate_scoped_runtime<'a>(
+        &mut self,
+        input: &RecordBatch,
+        invocation: novarocks_functions::ScalarInvocationScope<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+        runtime: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
+    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
+        self.evaluate_input_controlled(
+            CompiledInputLoan::RecordBatch(input),
+            invocation.actual_domain(),
+            invocation.demand(),
+            activation,
+            control,
+            Some(runtime),
+        )
     }
     #[cfg(test)]
     pub(crate) fn observe_slot_source(&mut self, observer: Arc<input_source::SlotSourceObserver>) {
@@ -693,6 +808,7 @@ impl CompiledExpressionInstance {
         self.evaluate_input_controlled(
             CompiledInputLoan::RecordBatch(input),
             selection,
+            selection,
             activation,
             control,
             scope,
@@ -701,6 +817,7 @@ impl CompiledExpressionInstance {
     fn evaluate_input_controlled<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
         input: CompiledInputLoan<'_>,
+        actual_domain: Selection<'a>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
@@ -734,7 +851,7 @@ impl CompiledExpressionInstance {
         };
         let result = (|| {
             observed.checkpoint(0)?;
-            self.evaluate_once::<E>(input, selection, activation, &mut work)
+            self.evaluate_once::<E>(input, actual_domain, selection, activation, &mut work)
         })();
         // A positively installed whole-invocation root preserves every first
         // failure, including entry validation before any leaf is created.
@@ -751,6 +868,7 @@ impl CompiledExpressionInstance {
     fn evaluate_once<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
         input: CompiledInputLoan<'_>,
+        actual_domain: Selection<'a>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         work: &mut Work<'_, '_>,
@@ -771,7 +889,14 @@ impl CompiledExpressionInstance {
                     invalid("actual input differs from the root's empty one-row port").into(),
                 );
             }
-            return self.evaluate_root::<E>(input, None, selection, activation, work);
+            return self.evaluate_root::<E>(
+                input,
+                None,
+                actual_domain,
+                selection,
+                activation,
+                work,
+            );
         };
         let channels = self.program.checked().channels();
         let layout = channels
@@ -816,6 +941,7 @@ impl CompiledExpressionInstance {
         self.evaluate_root::<E>(
             input,
             Some((input_node, input_role)),
+            actual_domain,
             selection,
             activation,
             work,
@@ -825,6 +951,7 @@ impl CompiledExpressionInstance {
         &mut self,
         input: CompiledInputLoan<'_>,
         input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
+        actual_domain: Selection<'a>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         work: &mut Work<'_, '_>,
@@ -838,6 +965,7 @@ impl CompiledExpressionInstance {
             self.root,
             input,
             input_node,
+            actual_domain,
             selection,
             activation,
             &mut self.instances,
@@ -854,6 +982,13 @@ impl CompiledExpressionInstance {
             return Err(invalid("actual root is not a value").into());
         };
         let result = result.materialize(selection, &ty.data_type(), work)?;
+        let (_, array, errors) = result.into_parts();
+        let array =
+            input_source::retain_result_type(array, ty, self.allocator.as_ref(), work.control)?;
+        let result =
+            SelectedValues::try_new_observed(selection, ty.data_type(), array, errors, || {
+                work.step()
+            })?;
         if !ty.nullable() {
             let mut errors = result.errors().iter().peekable();
             work.flush()?;
@@ -971,8 +1106,13 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
             work.step()?;
         }
         for child in children {
-            let output = if let Value::Selected(child) = child {
-                let array = gather(child.values(), &indices, work)?;
+            let output = if let Value::Selected(child_values) = child.uncontinued() {
+                let array = gather_continued(
+                    child_values.values(),
+                    &indices,
+                    child.continuation().as_ref(),
+                    work,
+                )?;
                 Some(SelectedValues::try_new_observed::<KernelFailure>(
                     call_selection,
                     array.data_type(),
@@ -1068,6 +1208,19 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
         || work.step(),
     )
     .map_err(E::from)
+}
+
+fn gather_continued(
+    array: &ArrayRef,
+    indices: &[Option<u64>],
+    continuation: Option<&input_source::ArrayContinuation>,
+    work: &mut Work<'_, '_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let output = gather(array, indices, work)?;
+    match continuation {
+        Some(owner) => owner.retain(output, work.control),
+        None => Ok(output),
+    }
 }
 
 fn gather(

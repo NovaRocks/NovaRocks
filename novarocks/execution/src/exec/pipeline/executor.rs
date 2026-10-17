@@ -910,6 +910,7 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+    use novarocks_functions::{FunctionResultType, FunctionValueType};
     use novarocks_types::QueryId;
     use novarocks_types::SlotId;
 
@@ -952,6 +953,18 @@ mod tests {
             None,
             None,
             None,
+            Some(test_execution_runtime()),
+        ))
+    }
+
+    fn test_runtime_state_with_construction_owner(label: &'static str) -> Arc<RuntimeState> {
+        Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(label)),
             Some(test_execution_runtime()),
         ))
     }
@@ -1753,6 +1766,14 @@ mod tests {
 
     #[test]
     fn group_by_sum_is_correct_with_dop_2() {
+        let input_types = [
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+        ];
+        let output_types = [
+            input_types[0].clone(),
+            FunctionValueType::new(DataType::Int64, true),
+        ];
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int32, false),
             Field::new("v", DataType::Int32, false),
@@ -1760,19 +1781,26 @@ mod tests {
         let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3, 3, 3])) as arrow::array::ArrayRef;
         let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8, 9])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1), SlotId::new(2)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        };
+        let chunk = crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1), SlotId::new(2)],
+            &input_types,
+        );
 
         let mut arena = ExprArena::default();
-        let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let v = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
+        let k = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), input_types[0].clone());
+        let v = arena.push_value_typed(ExprNode::SlotId(SlotId::new(2)), input_types[1].clone());
+
+        let functions = crate::exec::expr::agg::test_builtin_execution_function_set();
+        let frozen_sum = crate::exec::chunk::typed_fixture::frozen_aggregate(
+            functions.catalog(),
+            "sum",
+            &input_types[1..],
+        );
+        assert_eq!(
+            frozen_sum.selected().result_type,
+            FunctionResultType::Scalar(output_types[1].clone())
+        );
 
         let plan = ExecPlan {
             arena,
@@ -1784,6 +1812,7 @@ mod tests {
                     node_id: 0,
                     group_by: vec![k],
                     functions: vec![AggFunction {
+                        frozen: Some(frozen_sum),
                         name: "sum".to_string(),
                         inputs: vec![v],
                         input_is_intermediate: false,
@@ -1795,19 +1824,20 @@ mod tests {
                         ..Default::default()
                     }],
                     resolved_aggregates: vec![
-                        crate::exec::expr::agg::test_builtin_execution_function_set()
+                        functions
                             .catalog()
                             .resolve_aggregate_trusted("sum", &[DataType::Int32])
                             .expect("resolved builtin aggregate"),
                     ],
                     need_finalize: true,
                     input_is_intermediate: false,
-                    output_chunk_schema: chunk_schema_of(
+                    output_chunk_schema: created_fixture_schema(
                         &Arc::new(Schema::new(vec![
                             Field::new("k", DataType::Int32, false),
                             Field::new("sum", DataType::Int64, true),
                         ])),
                         &[SlotId::new(1), SlotId::new(2)],
+                        &output_types,
                     ),
                     runtime_filter_spec: crate::exec::node::aggregate::AggregateRuntimeFilterSpec {
                         topn_producers: Vec::new(),
@@ -1818,7 +1848,9 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = test_runtime_state_with_construction_owner(
+            "group_by_sum_is_correct_with_dop_2 construction",
+        );
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1870,6 +1902,7 @@ mod tests {
 
     #[test]
     fn nljoin_inner_with_conjunct_is_correct() {
+        let int32 = novarocks_functions::FunctionValueType::new(DataType::Int32, false);
         let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let left_arr = Arc::new(Int32Array::from(vec![1, 3])) as arrow::array::ArrayRef;
         let left_batch =
@@ -1896,51 +1929,58 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = left_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(1)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                left_batch,
+                                &[SlotId::new(1)],
+                                std::slice::from_ref(&int32),
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = right_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(2)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                right_batch,
+                                &[SlotId::new(2)],
+                                std::slice::from_ref(&int32),
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::Inner,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
-                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
-                    join_scope_chunk_schema: chunk_schema_of(
+                    left_chunk_schema: created_fixture_schema(
+                        &left_schema,
+                        &[SlotId::new(1)],
+                        std::slice::from_ref(&int32),
+                    ),
+                    right_chunk_schema: created_fixture_schema(
+                        &right_schema,
+                        &[SlotId::new(2)],
+                        std::slice::from_ref(&int32),
+                    ),
+                    join_scope_chunk_schema: created_fixture_schema(
                         &join_scope_schema,
                         &[SlotId::new(1), SlotId::new(2)],
+                        &[int32.clone(), int32.clone()],
                     ),
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "nljoin_inner_with_conjunct_is_correct input construction",
+            )),
+            Some(test_execution_runtime()),
+        ));
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1988,6 +2028,8 @@ mod tests {
 
     #[test]
     fn nljoin_left_outer_emits_null_extended_rows() {
+        let int32 = novarocks_functions::FunctionValueType::new(DataType::Int32, false);
+        let nullable_int32 = novarocks_functions::FunctionValueType::new(DataType::Int32, true);
         let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let left_arr = Arc::new(Int32Array::from(vec![1, 3, 5])) as arrow::array::ArrayRef;
         let left_batch =
@@ -2014,51 +2056,58 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = left_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(1)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                left_batch,
+                                &[SlotId::new(1)],
+                                std::slice::from_ref(&int32),
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = right_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(2)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                right_batch,
+                                &[SlotId::new(2)],
+                                std::slice::from_ref(&int32),
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::LeftOuter,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
-                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
-                    join_scope_chunk_schema: chunk_schema_of(
+                    left_chunk_schema: created_fixture_schema(
+                        &left_schema,
+                        &[SlotId::new(1)],
+                        std::slice::from_ref(&int32),
+                    ),
+                    right_chunk_schema: created_fixture_schema(
+                        &right_schema,
+                        &[SlotId::new(2)],
+                        std::slice::from_ref(&int32),
+                    ),
+                    join_scope_chunk_schema: created_fixture_schema(
                         &join_scope_schema,
                         &[SlotId::new(1), SlotId::new(2)],
+                        &[int32.clone(), nullable_int32.clone()],
                     ),
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "nljoin_left_outer_emits_null_extended_rows input construction",
+            )),
+            Some(test_execution_runtime()),
+        ));
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -2114,6 +2163,8 @@ mod tests {
 
     #[test]
     fn nljoin_full_outer_with_empty_left_emits_unmatched_build() {
+        let int32 = novarocks_functions::FunctionValueType::new(DataType::Int32, false);
+        let nullable_int32 = novarocks_functions::FunctionValueType::new(DataType::Int32, true);
         let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let left_batch = RecordBatch::new_empty(Arc::clone(&left_schema));
 
@@ -2138,51 +2189,58 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = left_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(1)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                left_batch,
+                                &[SlotId::new(1)],
+                                std::slice::from_ref(&int32),
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = right_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(2)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                right_batch,
+                                &[SlotId::new(2)],
+                                std::slice::from_ref(&int32),
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::FullOuter,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
-                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
-                    join_scope_chunk_schema: chunk_schema_of(
+                    left_chunk_schema: created_fixture_schema(
+                        &left_schema,
+                        &[SlotId::new(1)],
+                        std::slice::from_ref(&int32),
+                    ),
+                    right_chunk_schema: created_fixture_schema(
+                        &right_schema,
+                        &[SlotId::new(2)],
+                        std::slice::from_ref(&int32),
+                    ),
+                    join_scope_chunk_schema: created_fixture_schema(
                         &join_scope_schema,
                         &[SlotId::new(1), SlotId::new(2)],
+                        &[nullable_int32.clone(), int32.clone()],
                     ),
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "nljoin_full_outer_with_empty_left_emits_unmatched_build input construction",
+            )),
+            Some(test_execution_runtime()),
+        ));
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -2235,6 +2293,16 @@ mod tests {
 
     #[test]
     fn hash_left_outer_residual_treats_false_as_no_match() {
+        let input_types = [
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+        ];
+        let scope_types = [
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, true),
+            FunctionValueType::new(DataType::Int32, true),
+        ];
         let left_schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int32, false),
             Field::new("v", DataType::Int32, false),
@@ -2261,11 +2329,18 @@ mod tests {
         ]));
 
         let mut arena = ExprArena::default();
-        let key_left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let key_right = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
-        let left_v = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
-        let right_w = arena.push_typed(ExprNode::SlotId(SlotId::new(4)), DataType::Int32);
-        let residual = arena.push_typed(ExprNode::Lt(left_v, right_w), DataType::Boolean);
+        let key_left =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), input_types[0].clone());
+        let key_right =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(3)), input_types[0].clone());
+        let left_v =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(2)), scope_types[1].clone());
+        let right_w =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(4)), scope_types[3].clone());
+        let residual = arena.push_value_typed(
+            ExprNode::Lt(left_v, right_w),
+            FunctionValueType::new(DataType::Boolean, true),
+        );
 
         let plan = ExecPlan {
             arena,
@@ -2273,48 +2348,38 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = left_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(1), SlotId::new(2)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                left_batch,
+                                &[SlotId::new(1), SlotId::new(2)],
+                                &input_types,
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = right_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(3), SlotId::new(4)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                right_batch,
+                                &[SlotId::new(3), SlotId::new(4)],
+                                &input_types,
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::LeftOuter,
                     distribution_mode: JoinDistributionMode::Partitioned,
-                    left_chunk_schema: chunk_schema_of(
+                    left_chunk_schema: created_fixture_schema(
                         &left_schema,
                         &[SlotId::new(1), SlotId::new(2)],
+                        &input_types,
                     ),
-                    right_chunk_schema: chunk_schema_of(
+                    right_chunk_schema: created_fixture_schema(
                         &right_schema,
                         &[SlotId::new(3), SlotId::new(4)],
+                        &input_types,
                     ),
-                    join_scope_chunk_schema: chunk_schema_of(
+                    join_scope_chunk_schema: created_fixture_schema(
                         &join_scope_schema,
                         &[
                             SlotId::new(1),
@@ -2322,6 +2387,7 @@ mod tests {
                             SlotId::new(3),
                             SlotId::new(4),
                         ],
+                        &scope_types,
                     ),
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -2335,7 +2401,9 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = test_runtime_state_with_construction_owner(
+            "hash_left_outer_residual_treats_false_as_no_match construction",
+        );
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -2415,6 +2483,16 @@ mod tests {
 
     #[test]
     fn hash_right_outer_emits_unmatched_probe_rows() {
+        let input_types = [
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+        ];
+        let scope_types = [
+            FunctionValueType::new(DataType::Int32, true),
+            FunctionValueType::new(DataType::Int32, true),
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+        ];
         let left_schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int32, false),
             Field::new("v", DataType::Int32, false),
@@ -2441,8 +2519,10 @@ mod tests {
         ]));
 
         let mut arena = ExprArena::default();
-        let key_left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let key_right = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
+        let key_left =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), input_types[0].clone());
+        let key_right =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(3)), input_types[0].clone());
 
         let plan = ExecPlan {
             arena,
@@ -2450,48 +2530,38 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = left_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(1), SlotId::new(2)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                left_batch,
+                                &[SlotId::new(1), SlotId::new(2)],
+                                &input_types,
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = right_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(3), SlotId::new(4)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                right_batch,
+                                &[SlotId::new(3), SlotId::new(4)],
+                                &input_types,
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::RightOuter,
                     distribution_mode: JoinDistributionMode::Partitioned,
-                    left_chunk_schema: chunk_schema_of(
+                    left_chunk_schema: created_fixture_schema(
                         &left_schema,
                         &[SlotId::new(1), SlotId::new(2)],
+                        &input_types,
                     ),
-                    right_chunk_schema: chunk_schema_of(
+                    right_chunk_schema: created_fixture_schema(
                         &right_schema,
                         &[SlotId::new(3), SlotId::new(4)],
+                        &input_types,
                     ),
-                    join_scope_chunk_schema: chunk_schema_of(
+                    join_scope_chunk_schema: created_fixture_schema(
                         &join_scope_schema,
                         &[
                             SlotId::new(1),
@@ -2499,6 +2569,7 @@ mod tests {
                             SlotId::new(3),
                             SlotId::new(4),
                         ],
+                        &scope_types,
                     ),
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -2512,7 +2583,9 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = test_runtime_state_with_construction_owner(
+            "hash_right_outer_emits_unmatched_probe_rows construction",
+        );
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -2579,6 +2652,16 @@ mod tests {
 
     #[test]
     fn hash_full_outer_with_empty_left_emits_unmatched_build() {
+        let input_types = [
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+        ];
+        let scope_types = [
+            FunctionValueType::new(DataType::Int32, true),
+            FunctionValueType::new(DataType::Int32, true),
+            FunctionValueType::new(DataType::Int32, true),
+            FunctionValueType::new(DataType::Int32, true),
+        ];
         let left_schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int32, false),
             Field::new("v", DataType::Int32, false),
@@ -2597,13 +2680,15 @@ mod tests {
         let join_scope_schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int32, true),
             Field::new("v", DataType::Int32, true),
-            Field::new("k", DataType::Int32, false),
-            Field::new("w", DataType::Int32, false),
+            Field::new("k", DataType::Int32, true),
+            Field::new("w", DataType::Int32, true),
         ]));
 
         let mut arena = ExprArena::default();
-        let key_left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let key_right = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
+        let key_left =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), input_types[0].clone());
+        let key_right =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(3)), input_types[0].clone());
 
         let plan = ExecPlan {
             arena,
@@ -2611,48 +2696,38 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = left_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(1), SlotId::new(2)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                left_batch,
+                                &[SlotId::new(1), SlotId::new(2)],
+                                &input_types,
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: {
-                                let batch = right_batch;
-                                let chunk_schema =
-                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                                        batch.schema().as_ref(),
-                                        &[SlotId::new(3), SlotId::new(4)],
-                                    )
-                                    .expect("chunk schema")
-                                ;
-                                Chunk::new_with_chunk_schema(batch, chunk_schema)
-                            },
+                            chunk: crate::exec::chunk::typed_fixture::chunk(
+                                right_batch,
+                                &[SlotId::new(3), SlotId::new(4)],
+                                &input_types,
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::FullOuter,
                     distribution_mode: JoinDistributionMode::Broadcast,
-                    left_chunk_schema: chunk_schema_of(
+                    left_chunk_schema: created_fixture_schema(
                         &left_schema,
                         &[SlotId::new(1), SlotId::new(2)],
+                        &input_types,
                     ),
-                    right_chunk_schema: chunk_schema_of(
+                    right_chunk_schema: created_fixture_schema(
                         &right_schema,
                         &[SlotId::new(3), SlotId::new(4)],
+                        &input_types,
                     ),
-                    join_scope_chunk_schema: chunk_schema_of(
+                    join_scope_chunk_schema: created_fixture_schema(
                         &join_scope_schema,
                         &[
                             SlotId::new(1),
@@ -2660,6 +2735,7 @@ mod tests {
                             SlotId::new(3),
                             SlotId::new(4),
                         ],
+                        &scope_types,
                     ),
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -2673,7 +2749,9 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = test_runtime_state_with_construction_owner(
+            "hash_full_outer_with_empty_left_emits_unmatched_build construction",
+        );
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -2736,6 +2814,19 @@ mod tests {
 
     #[test]
     fn analytic_row_number_rank_sum_is_correct() {
+        let input_types = [
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+        ];
+        let output_types = [
+            input_types[0].clone(),
+            input_types[1].clone(),
+            input_types[2].clone(),
+            FunctionValueType::new(DataType::Int64, true),
+            FunctionValueType::new(DataType::Int64, true),
+            FunctionValueType::new(DataType::Int64, true),
+        ];
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int32, false),
             Field::new("o", DataType::Int32, false),
@@ -2745,15 +2836,11 @@ mod tests {
         let o = Arc::new(Int32Array::from(vec![1, 1, 2, 1, 2])) as arrow::array::ArrayRef;
         let v = Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k, o, v]).expect("record batch");
-        let chunk = {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        };
+        let chunk = crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            &input_types,
+        );
         let analytic_output_schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int32, false),
             Field::new("o", DataType::Int32, false),
@@ -2762,7 +2849,7 @@ mod tests {
             Field::new("rank", DataType::Int64, true),
             Field::new("sum", DataType::Int64, true),
         ]));
-        let analytic_output_chunk_schema = chunk_schema_of(
+        let analytic_output_chunk_schema = created_fixture_schema(
             &analytic_output_schema,
             &[
                 SlotId::new(1),
@@ -2772,12 +2859,27 @@ mod tests {
                 SlotId::new(5),
                 SlotId::new(6),
             ],
+            &output_types,
         );
 
         let mut arena = ExprArena::default();
-        let k_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let o_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
-        let v_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
+        let k_expr =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), input_types[0].clone());
+        let o_expr =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(2)), input_types[1].clone());
+        let v_expr =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(3)), input_types[2].clone());
+
+        let functions = crate::exec::expr::agg::test_builtin_execution_function_set();
+        let frozen_sum = crate::exec::chunk::typed_fixture::frozen_aggregate(
+            functions.catalog(),
+            "sum",
+            &input_types[2..],
+        );
+        assert_eq!(
+            frozen_sum.selected().result_type,
+            FunctionResultType::Scalar(output_types[5].clone())
+        );
 
         let plan = ExecPlan {
             arena,
@@ -2807,14 +2909,12 @@ mod tests {
                             args: vec![v_expr],
                             return_type: DataType::Int64,
                             aggregate_binding: Some(WindowAggregateBinding {
-                                // Explicit legacy carrier fixture; this is not frozen-binding admission.
-                                frozen: None,
+                                frozen: Some(frozen_sum),
                                 function_name: "sum".to_string(),
-                                resolved:
-                                    crate::exec::expr::agg::test_builtin_execution_function_set()
-                                        .catalog()
-                                        .resolve_aggregate_trusted("sum", &[DataType::Int32])
-                                        .expect("resolved sum window aggregate"),
+                                resolved: functions
+                                    .catalog()
+                                    .resolve_aggregate_trusted("sum", &[DataType::Int32])
+                                    .expect("resolved sum window aggregate"),
                             }),
                         },
                     ],
@@ -2837,7 +2937,9 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = test_runtime_state_with_construction_owner(
+            "analytic_row_number_rank_sum_is_correct construction",
+        );
         execute_native_plan_with_pipeline(
             plan,
             false,

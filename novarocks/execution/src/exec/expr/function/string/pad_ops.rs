@@ -20,12 +20,12 @@ use arrow::array::{Array, ArrayRef, StringArray};
 use novarocks_functions::string_repeat_pad_core::{OriginalPadProjection, pad_into};
 use std::sync::Arc;
 
-fn eval_pad_impl(
-    arena: &ExprArena,
+fn eval_pad_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     left: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let str_arr = arena.eval(args[0], chunk)?;
     let len_arr = arena.eval(args[1], chunk)?;
     let pad_arr = arena.eval(args[2], chunk)?;
@@ -61,20 +61,20 @@ fn eval_pad_impl(
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
 
-pub fn eval_lpad(
-    arena: &ExprArena,
+pub fn eval_lpad<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_pad_impl(arena, args, chunk, true)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_pad_impl(arena, args, chunk, true))?)
 }
 
-pub fn eval_rpad(
-    arena: &ExprArena,
+pub fn eval_rpad<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_pad_impl(arena, args, chunk, false)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_pad_impl(arena, args, chunk, false))?)
 }

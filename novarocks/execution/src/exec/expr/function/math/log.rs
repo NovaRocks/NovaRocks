@@ -26,12 +26,12 @@ use novarocks_functions::builtin::numeric_elementary::{
 #[cfg(test)]
 use std::sync::Arc;
 
-pub fn eval_log(
-    arena: &ExprArena,
+pub fn eval_log<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let (op, arguments) = if args.len() == 1 {
         (
             NumericElementaryOp::LogNatural,
@@ -46,7 +46,7 @@ pub fn eval_log(
     };
     let out = evaluate_legacy_numeric_elementary(op, &arguments, chunk.len())
         .map_err(|error| error.to_string())?;
-    super::common::cast_output(out, arena.data_type(expr))
+    Ok((super::common::cast_output(out, arena.data_type(expr)))?)
 }
 
 #[cfg(test)]

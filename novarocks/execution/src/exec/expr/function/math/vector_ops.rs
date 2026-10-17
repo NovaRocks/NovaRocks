@@ -76,30 +76,32 @@ fn cast_list_values_to_f64(
     Ok(Arc::new(out.clone()))
 }
 
-fn eval_cosine_impl(
-    arena: &ExprArena,
+fn eval_cosine_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
     normalized: bool,
     fn_name: &'static str,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let left_list = require_list_arg(&left, fn_name)?;
     let right_list = require_list_arg(&right, fn_name)?;
 
     if left_list.null_count() > 0 {
-        return Err(format!(
+        return Err((format!(
             "{} does not support null values. base array has null value.",
             fn_name
-        ));
+        ))
+        .into());
     }
     if right_list.null_count() > 0 {
-        return Err(format!(
+        return Err((format!(
             "{} does not support null values. target array has null value.",
             fn_name
-        ));
+        ))
+        .into());
     }
 
     let out_len = chunk.len();
@@ -124,13 +126,13 @@ fn eval_cosine_impl(
         let left_dim = left_end - left_start;
         let right_dim = right_end - right_start;
         if left_dim != right_dim {
-            return Err(format!(
+            return Err((format!(
                 "{} requires equal length arrays in each row. base array dimension size is {}, target array dimension size is {}.",
                 fn_name, left_dim, right_dim
-            ));
+            )).into());
         }
         if left_dim == 0 {
-            return Err(format!("{} requires non-empty arrays in each row", fn_name));
+            return Err((format!("{} requires non-empty arrays in each row", fn_name)).into());
         }
 
         let mut dot = 0.0_f64;
@@ -156,36 +158,36 @@ fn eval_cosine_impl(
         out.push(Some(value));
     }
 
-    cast_output(
+    Ok((cast_output(
         Arc::new(Float64Array::from(out)) as ArrayRef,
         arena.data_type(expr),
-    )
+    ))?)
 }
 
-pub fn eval_cosine_similarity(
-    arena: &ExprArena,
+pub fn eval_cosine_similarity<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_cosine_impl(arena, expr, args, chunk, false, "cosine_similarity")
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_cosine_impl(arena, expr, args, chunk, false, "cosine_similarity"))?)
 }
 
-pub fn eval_cosine_similarity_norm(
-    arena: &ExprArena,
+pub fn eval_cosine_similarity_norm<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_cosine_impl(arena, expr, args, chunk, true, "cosine_similarity_norm")
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_cosine_impl(arena, expr, args, chunk, true, "cosine_similarity_norm"))?)
 }
 
-pub fn eval_l2_distance(
-    arena: &ExprArena,
+pub fn eval_l2_distance<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let left_list = require_list_arg(&left, "l2_distance")?;
@@ -193,12 +195,14 @@ pub fn eval_l2_distance(
 
     if left_list.null_count() > 0 {
         return Err(
-            "l2_distance does not support null values. base array has null value.".to_string(),
+            ("l2_distance does not support null values. base array has null value.".to_string())
+                .into(),
         );
     }
     if right_list.null_count() > 0 {
         return Err(
-            "l2_distance does not support null values. target array has null value.".to_string(),
+            ("l2_distance does not support null values. target array has null value.".to_string())
+                .into(),
         );
     }
 
@@ -224,13 +228,13 @@ pub fn eval_l2_distance(
         let left_dim = left_end - left_start;
         let right_dim = right_end - right_start;
         if left_dim != right_dim {
-            return Err(format!(
+            return Err((format!(
                 "l2_distance requires equal length arrays in each row. base array dimension size is {}, target array dimension size is {}.",
                 left_dim, right_dim
-            ));
+            )).into());
         }
         if left_dim == 0 {
-            return Err("l2_distance requires non-empty arrays in each row".to_string());
+            return Err(("l2_distance requires non-empty arrays in each row".to_string()).into());
         }
 
         let mut distance = 0.0_f64;
@@ -241,10 +245,10 @@ pub fn eval_l2_distance(
         out.push(Some(distance));
     }
 
-    cast_output(
+    Ok((cast_output(
         Arc::new(Float64Array::from(out)) as ArrayRef,
         arena.data_type(expr),
-    )
+    ))?)
 }
 
 #[cfg(test)]

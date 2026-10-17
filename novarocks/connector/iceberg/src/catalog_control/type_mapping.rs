@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorColumnDefinition, ConnectorDataType, ConnectorDefaultValue, ConnectorStructField,
+    ConnectorColumnDefinition, ConnectorDataType, ConnectorDefaultValue,
 };
 
 use crate::iceberg::spec::{
@@ -114,32 +114,37 @@ pub(crate) fn iceberg_type(
         }
         ConnectorDataType::Map(key, value) => {
             let key_id = allocate_id(next_id)?;
-            let value_id = allocate_id(next_id)?;
             let key_type = iceberg_type(key, next_id)?;
+            let value_id = allocate_id(next_id)?;
             let value_type = iceberg_type(value, next_id)?;
             Ok(Type::Map(MapType::new(
                 Arc::new(NestedField::map_key_element(key_id, key_type)),
                 Arc::new(NestedField::map_value_element(value_id, value_type, false)),
             )))
         }
-        ConnectorDataType::Struct(fields) => Ok(Type::Struct(StructType::new(
-            fields
+        ConnectorDataType::Struct(fields) => {
+            // New-table publication normalizes IDs with the pinned SDK: assign
+            // all sibling IDs before descending into any sibling's children.
+            let ids = fields
                 .iter()
-                .map(|field| struct_field(field, next_id).map(Arc::new))
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
+                .map(|_| allocate_id(next_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            let fields = fields
+                .iter()
+                .zip(ids)
+                .map(|(field, id)| {
+                    let field_type = iceberg_type(&field.data_type, next_id)?;
+                    Ok(Arc::new(NestedField::new(
+                        id,
+                        field.name.as_ref(),
+                        field_type,
+                        !field.nullable,
+                    )))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Type::Struct(StructType::new(fields)))
+        }
     }
-}
-
-fn struct_field(field: &ConnectorStructField, next_id: &mut i32) -> Result<NestedField, String> {
-    let id = allocate_id(next_id)?;
-    let field_type = iceberg_type(&field.data_type, next_id)?;
-    Ok(NestedField::new(
-        id,
-        field.name.as_ref(),
-        field_type,
-        !field.nullable,
-    ))
 }
 
 fn allocate_id(next_id: &mut i32) -> Result<i32, String> {
@@ -234,6 +239,7 @@ pub(crate) fn default_literal(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use novarocks_spi::connector::ConnectorStructField;
 
     #[test]
     fn connector_schema_mapping_preserves_nested_nullability_and_unique_ids() {

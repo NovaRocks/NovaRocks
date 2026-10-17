@@ -21,12 +21,12 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-pub fn eval_to_iso8601(
-    arena: &ExprArena,
+pub fn eval_to_iso8601<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let out = match arr.data_type() {
         DataType::Date32 => extract_date_array(&arr)?

@@ -353,7 +353,17 @@ pub mod aggregate_map_core;
 mod aggregate_map;
 mod aggregate_map_owner;
 
+mod array_invocation_source;
+#[cfg(test)]
+mod array_invocation_test_support;
+pub mod array_sortby_core;
+mod array_sortby_owner;
+mod array_sortby_selected;
+mod array_struct_subfield_actual;
 pub mod array_struct_subfield_core;
+mod array_struct_subfield_owner;
+mod array_struct_subfield_port;
+mod array_struct_subfield_selected;
 
 mod percentile_approx_raw_owner;
 mod percentile_approx_raw_selected;
@@ -378,3 +388,6 @@ mod scalar_type_recipe;
 
 // The single binding carrier preserves FIELD's actual validation prefix.
 pub(crate) use string_field_owner::StringFieldOwner;
+
+#[cfg(test)]
+mod array_struct_subfield_owner_tests;

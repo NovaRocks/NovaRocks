@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use std::sync::Arc;
 
-pub fn eval_ilike(
-    arena: &ExprArena,
+pub fn eval_ilike<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;

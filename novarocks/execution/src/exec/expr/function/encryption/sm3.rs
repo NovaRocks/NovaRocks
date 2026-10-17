@@ -18,12 +18,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::sm3_shared;
-pub fn eval_sm3(
-    arena: &ExprArena,
+pub fn eval_sm3<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "sm3", 0)?;
     Ok(sm3_shared::evaluate_legacy(&input, chunk.len()))

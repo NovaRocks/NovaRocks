@@ -20,12 +20,12 @@ use arrow::array::{Array, ArrayRef, ListArray, UInt32Array};
 use arrow::compute::{cast, take};
 use std::cmp::Ordering;
 
-pub fn eval_array_max(
-    arena: &ExprArena,
+pub fn eval_array_max<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let list = arr
         .as_any()
@@ -92,10 +92,10 @@ pub fn eval_array_max(
             }
         }
         let out = novarocks_types::largeint::array_from_i128(&out_values)?;
-        return super::common::cast_output(out, arena.data_type(expr), "array_max");
+        return Ok((super::common::cast_output(out, arena.data_type(expr), "array_max"))?);
     }
 
     let indices = UInt32Array::from(picked);
     let out = take(values.as_ref(), &indices, None).map_err(|e| e.to_string())?;
-    super::common::cast_output(out, arena.data_type(expr), "array_max")
+    Ok((super::common::cast_output(out, arena.data_type(expr), "array_max"))?)
 }

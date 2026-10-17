@@ -20,7 +20,10 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-fn is_row_constant_expr(arena: &ExprArena, expr: ExprId) -> bool {
+fn is_row_constant_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr: ExprId,
+) -> bool {
     match arena.node(expr) {
         Some(ExprNode::Constant(_) | ExprNode::Literal(_)) => true,
         Some(ExprNode::SlotId(_)) => false,
@@ -71,26 +74,26 @@ fn is_row_constant_expr(arena: &ExprArena, expr: ExprId) -> bool {
     }
 }
 
-pub fn eval_array_position(
-    arena: &ExprArena,
+pub fn eval_array_position<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if chunk.is_empty() {
         let out = Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef;
-        return super::common::cast_output(out, arena.data_type(expr), "array_position");
+        return Ok((super::common::cast_output(out, arena.data_type(expr), "array_position"))?);
     }
     let arr_is_const = is_row_constant_expr(arena, args[0]);
     let target_is_const = is_row_constant_expr(arena, args[1]);
-    let const_chunk = chunk.slice(0, 1);
+    let const_chunk = arena.slice_input(chunk, 0, 1)?;
     let arr_eval_chunk = if arr_is_const { &const_chunk } else { chunk };
     let target_eval_chunk = if target_is_const { &const_chunk } else { chunk };
     let arr = arena.eval(args[0], arr_eval_chunk)?;
     let mut target_arr = arena.eval(args[1], target_eval_chunk)?;
     if arr.data_type() == &DataType::Null {
         let out = Arc::new(Int64Array::from(vec![None; chunk.len()])) as ArrayRef;
-        return super::common::cast_output(out, arena.data_type(expr), "array_position");
+        return Ok((super::common::cast_output(out, arena.data_type(expr), "array_position"))?);
     }
     let list = arr
         .as_any()
@@ -114,7 +117,7 @@ pub fn eval_array_position(
     if arr_is_const {
         if list.is_null(0) {
             let out = Arc::new(Int64Array::from(vec![None; chunk.len()])) as ArrayRef;
-            return super::common::cast_output(out, arena.data_type(expr), "array_position");
+            return Ok((super::common::cast_output(out, arena.data_type(expr), "array_position"))?);
         }
 
         let start = offsets[0] as usize;
@@ -140,7 +143,7 @@ pub fn eval_array_position(
                 p
             };
             let out = Arc::new(Int64Array::from(vec![Some(pos); chunk.len()])) as ArrayRef;
-            return super::common::cast_output(out, arena.data_type(expr), "array_position");
+            return Ok((super::common::cast_output(out, arena.data_type(expr), "array_position"))?);
         }
 
         let mut out = Vec::with_capacity(chunk.len());
@@ -174,7 +177,7 @@ pub fn eval_array_position(
             out.push(Some(pos));
         }
         let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-        return super::common::cast_output(out, arena.data_type(expr), "array_position");
+        return Ok((super::common::cast_output(out, arena.data_type(expr), "array_position"))?);
     }
 
     let mut out = Vec::with_capacity(list.len());
@@ -211,5 +214,5 @@ pub fn eval_array_position(
     }
 
     let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    super::common::cast_output(out, arena.data_type(expr), "array_position")
+    Ok((super::common::cast_output(out, arena.data_type(expr), "array_position"))?)
 }

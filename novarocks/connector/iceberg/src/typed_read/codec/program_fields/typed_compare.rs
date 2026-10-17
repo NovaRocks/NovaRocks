@@ -27,6 +27,7 @@ pub(super) fn value(
     layout: &DataType,
     nominal: Option<ValueLogicalType>,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    nominals: &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Failure> {
     work.step()?;
@@ -101,8 +102,9 @@ pub(super) fn value(
                     &source.field_type,
                     value.value_type(),
                     field.data_type(),
+                    nominals.get(&source.id).map(|domain| domain.logical_type()),
                     None,
-                    None,
+                    nominals,
                     work,
                 )?;
             }
@@ -127,8 +129,11 @@ pub(super) fn value(
                 &list.element_field.field_type,
                 value,
                 field.data_type(),
+                nominals
+                    .get(&list.element_field.id)
+                    .map(|domain| domain.logical_type()),
                 None,
-                None,
+                nominals,
                 work,
             )?;
         }
@@ -163,16 +168,22 @@ pub(super) fn value(
                 &map.key_field.field_type,
                 key,
                 fields[0].data_type(),
+                nominals
+                    .get(&map.key_field.id)
+                    .map(|domain| domain.logical_type()),
                 None,
-                None,
+                nominals,
                 work,
             )?;
             self::value(
                 &map.value_field.field_type,
                 value,
                 fields[1].data_type(),
+                nominals
+                    .get(&map.value_field.id)
+                    .map(|domain| domain.logical_type()),
                 None,
-                None,
+                nominals,
                 work,
             )?;
         }
@@ -180,27 +191,20 @@ pub(super) fn value(
     Ok(())
 }
 
-pub(super) fn nominal(
+pub(super) fn nominal_declarations(
     relation: &IcebergRuntimeRelation,
-    column: &IcebergColumnHandle,
-) -> Option<ValueLogicalType> {
-    if !column.is_base_column() {
-        return None;
-    }
-    let declarations = match relation {
-        IcebergRuntimeRelation::Table(table) => table.nominal_declarations(),
-        IcebergRuntimeRelation::ChangeWindow(window) => window.nominal_declarations(),
+) -> Option<&crate::schema_mapping::nominal_declaration::NominalSourceDeclarations> {
+    match relation {
+        IcebergRuntimeRelation::Table(table) => Some(table.nominal_declarations()),
+        IcebergRuntimeRelation::ChangeWindow(window) => Some(window.nominal_declarations()),
         IcebergRuntimeRelation::TableExecute(execute) => match execute.procedure_handle() {
             Some(IcebergTableExecuteProcedureHandle::Optimize(optimize)) => {
-                optimize.table_handle().nominal_declarations()
+                Some(optimize.table_handle().nominal_declarations())
             }
-            _ => return None,
+            _ => None,
         },
-        _ => return None,
-    };
-    declarations
-        .get(&column.base_field_id())
-        .map(|domain| domain.logical_type())
+        _ => None,
+    }
 }
 
 /// Verify source occurrences directly against their frozen format declaration.

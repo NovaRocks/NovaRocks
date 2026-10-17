@@ -229,11 +229,15 @@ impl ExchangeSourceFactory {
         arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
         let name = node.profile_name();
-        let consumers = RuntimeFilterConsumerSet::from_plan(
-            "ExchangeSource",
-            node.native_runtime_filter_specs(),
-            arena,
-        )?;
+        let consumers = if node.native_runtime_filter_specs().is_empty() {
+            None
+        } else {
+            Some(RuntimeFilterConsumerSet::from_plan(
+                "ExchangeSource",
+                node.native_runtime_filter_specs(),
+                arena,
+            )?)
+        };
         Ok(Self {
             name,
             node: ExchangeSourceIdentity {
@@ -241,7 +245,7 @@ impl ExchangeSourceFactory {
                 timeout: node.timeout,
             },
             binding,
-            runtime_filter_consumers: Some(consumers),
+            runtime_filter_consumers: consumers,
             idle_progress: Arc::new(ExchangeIdleProgress::new()),
         })
     }
@@ -298,6 +302,7 @@ impl OperatorFactory for ExchangeSourceFactory {
             gated_chunk: None,
             event_sink: Arc::new(NoopFragmentEventSink),
             receiver_mem_tracker_ready: false,
+            construction: None,
         })
     }
 
@@ -326,6 +331,7 @@ struct ExchangeSourceOperator {
     gated_chunk: Option<Chunk>,
     event_sink: Arc<dyn FragmentEventSink>,
     receiver_mem_tracker_ready: bool,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
 impl ExchangeSourceOperator {
@@ -337,6 +343,15 @@ impl ExchangeSourceOperator {
 }
 
 impl Operator for ExchangeSourceOperator {
+    fn creates_typed_storage(&self) -> bool {
+        self.native_runtime_filter_consumers.is_some()
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -495,11 +510,19 @@ impl ProcessorOperator for ExchangeSourceOperator {
                                 self.gated_chunk = Some(chunk);
                                 return Ok(None);
                             }
-                            let Some(chunk) =
-                                consumers.apply_chunk_observed(chunk, Some(&self.event_sink))?
-                            else {
-                                continue;
-                            };
+                            let Some(chunk) = consumers.apply_chunk_created(
+                            chunk,
+                            self.construction.as_deref().ok_or(
+                                crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                            )?,
+                            &super::compiled_expression::RuntimeKernelControl::new(
+                                state.error_state(),
+                            ),
+                            Some(&self.event_sink),
+                        )?
+                        else {
+                            continue;
+                        };
                             chunk
                         } else {
                             chunk
@@ -712,6 +735,44 @@ mod tests {
     use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
     use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
+
+    fn created_int32_chunk(values: Vec<i32>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef],
+        )
+        .unwrap();
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
+    }
+    fn created_int32_schema(schema: Arc<Schema>) -> Arc<ChunkSchema> {
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert!(!schema.field(0).is_nullable());
+        let layout = crate::exec::chunk::typed_fixture::layout(
+            schema,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        );
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("declared exchange filter source"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap()
+        .create_compiled_chunk_schema(&layout)
+        .unwrap()
+    }
 
     fn int32_chunk(values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
@@ -1340,8 +1401,7 @@ mod tests {
         let node = ExchangeSourceNode::new(
             key.node_id,
             Duration::from_secs(2),
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .unwrap(),
+            created_int32_schema(schema.clone()),
         )
         .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
         let binding = ExchangeBinding {
@@ -1352,6 +1412,13 @@ mod tests {
         let factory = ExchangeSourceFactory::new_native(node, binding, Arc::new(arena)).unwrap();
         let state = published_runtime_state(vec![2, 4]);
         let mut source = factory.create(1, 0);
+        source.set_construction_factory(
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root("exchange filter evaluation construction"),
+                state.error_state(),
+            ).unwrap(),
+        );
         source.prepare().unwrap();
         source.bind_runtime_state(&state).unwrap();
         source.activate(&state).unwrap();
@@ -1359,7 +1426,7 @@ mod tests {
             receiver_key(key),
             0,
             0,
-            vec![int32_chunk(vec![1, 2, 3, 4])],
+            vec![created_int32_chunk(vec![1, 2, 3, 4])],
             true,
         );
 
@@ -1387,8 +1454,7 @@ mod tests {
         let node = ExchangeSourceNode::new(
             key.node_id,
             Duration::from_secs(2),
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .unwrap(),
+            created_int32_schema(schema.clone()),
         )
         .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
         let binding = ExchangeBinding {
@@ -1399,6 +1465,13 @@ mod tests {
         let factory = ExchangeSourceFactory::new_native(node, binding, Arc::new(arena)).unwrap();
         let state = published_runtime_state(vec![2, 4]);
         let mut source = factory.create(1, 0);
+        source.set_construction_factory(
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root("exchange filter evaluation construction"),
+                state.error_state(),
+            ).unwrap(),
+        );
         source.prepare().unwrap();
         source.bind_runtime_state(&state).unwrap();
         source.activate(&state).unwrap();
@@ -1406,7 +1479,10 @@ mod tests {
             receiver_key(key),
             0,
             0,
-            vec![int32_chunk(vec![1, 3]), int32_chunk(vec![2, 4])],
+            vec![
+                created_int32_chunk(vec![1, 3]),
+                created_int32_chunk(vec![2, 4]),
+            ],
             true,
         );
 
@@ -1456,8 +1532,7 @@ mod tests {
         let node = ExchangeSourceNode::new(
             key.node_id,
             Duration::from_secs(2),
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .unwrap(),
+            created_int32_schema(schema.clone()),
         )
         .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
         let binding = ExchangeBinding {
@@ -1476,6 +1551,13 @@ mod tests {
         });
         let state = runtime_state().with_runtime_filter_session(Some(session));
         let mut source = factory.create(1, 0);
+        source.set_construction_factory(
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root("exchange filter evaluation construction"),
+                state.error_state(),
+            ).unwrap(),
+        );
         source.prepare().unwrap();
         source.bind_runtime_state(&state).unwrap();
         source.activate(&state).unwrap();
@@ -1485,7 +1567,10 @@ mod tests {
             receiver_key(key),
             0,
             0,
-            vec![int32_chunk(vec![1, 2, 3, 4]), int32_chunk(vec![2, 5])],
+            vec![
+                created_int32_chunk(vec![1, 2, 3, 4]),
+                created_int32_chunk(vec![2, 5]),
+            ],
             true,
         );
 

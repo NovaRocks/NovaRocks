@@ -20,14 +20,14 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-pub fn eval_from_binary(
-    arena: &ExprArena,
+pub fn eval_from_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 && args.len() != 2 {
-        return Err("from_binary expects 1 or 2 arguments".to_string());
+        return Err(("from_binary expects 1 or 2 arguments".to_string()).into());
     }
 
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "from_binary", 0)?;
@@ -91,7 +91,7 @@ pub fn eval_from_binary(
             return Ok(Arc::new(StringArray::from(out)) as ArrayRef);
         }
 
-        return super::common::build_bytes_output_latin1(bytes_out, Some(&DataType::Binary));
+        return Ok((super::common::build_bytes_output_latin1(bytes_out, Some(&DataType::Binary)))?);
     }
 
     let mut out = Vec::with_capacity(chunk.len());

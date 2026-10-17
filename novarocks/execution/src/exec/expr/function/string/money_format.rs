@@ -23,12 +23,12 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_legacy};
 
-pub fn eval_money_format(
-    arena: &ExprArena,
+pub fn eval_money_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
     macro_rules! checked {
         ($ty:ty, $message:expr) => {
@@ -60,8 +60,8 @@ pub fn eval_money_format(
         DataType::Decimal128(..) => {
             checked!(Decimal128Array, "money_format expects decimal");
         }
-        other => return Err(format!("money_format expects numeric, got {:?}", other)),
+        other => return Err((format!("money_format expects numeric, got {:?}", other)).into()),
     }
     let rows = input.len();
-    evaluate_legacy(StringOperation::Money, &[input], rows)
+    Ok((evaluate_legacy(StringOperation::Money, &[input], rows))?)
 }

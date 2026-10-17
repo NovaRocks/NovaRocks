@@ -21,12 +21,12 @@ use novarocks_functions::{
     Selection,
     builtin::map_size_core::{MapSizeFailure, count_observed, map_input},
 };
-pub fn eval_map_size(
-    arena: &ExprArena,
+pub fn eval_map_size<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = chunk;
     let map_arr = arena.eval(args[0], chunk)?;
     let map = map_input(map_arr.as_ref())?;
@@ -39,5 +39,5 @@ pub fn eval_map_size(
     .map_err(|failure| match failure {
         MapSizeFailure::Data(message) | MapSizeFailure::Control(message) => message,
     })?;
-    super::common::cast_output(out, arena.data_type(expr), "map_size")
+    Ok((super::common::cast_output(out, arena.data_type(expr), "map_size"))?)
 }

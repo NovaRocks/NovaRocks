@@ -501,7 +501,7 @@ fn pure_differential_map_element_at_required_keys_and_independent_probe_nullabil
 }
 
 #[test]
-fn pure_differential_map_null_result_retains_original_failing_branch_as_named_admission_refusal() {
+fn pure_differential_map_null_result_preserves_valid_null_array_storage() {
     let kt = FunctionValueType::new(DataType::Int32, true);
     let vt = FunctionValueType::new(DataType::Null, true);
     let m = map(
@@ -512,11 +512,10 @@ fn pure_differential_map_null_result_retains_original_failing_branch_as_named_ad
         vec![0, 1],
         None,
     );
-    let failure = super::run_scalar_differential(
-        &ScalarDiffSpec::new("__map_element_at")
+    let summary = assert_scalar_matches_v1(
+        ScalarDiffSpec::new("__map_element_at")
             .typed_column(map_type(&m, &kt, &vt, true), m)
             .column(Arc::new(Int32Array::from(vec![2]))),
-    )
-    .unwrap_err();
-    match failure {super::DifferentialFailure::Specialization(message)=>assert!(message.contains("__map_element_at has no installed Null result profile: original nullable-index overlay panics")),other=>panic!("unexpected complete-profile refusal: {other:?}")}
+    );
+    assert_eq!(summary.attributed_row_errors, 0);
 }

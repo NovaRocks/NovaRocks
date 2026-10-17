@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::md5_shared::{self, Operation};
 
-pub fn eval_md5sum(
-    arena: &ExprArena,
+pub fn eval_md5sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let mut inputs = Vec::with_capacity(args.len());
     // Keep admission before evaluation of the next child, as in the original shell.
@@ -35,5 +35,5 @@ pub fn eval_md5sum(
             idx,
         )?);
     }
-    md5_shared::evaluate_legacy(Operation::Md5sum, &inputs, chunk.len(), None)
+    Ok((md5_shared::evaluate_legacy(Operation::Md5sum, &inputs, chunk.len(), None))?)
 }

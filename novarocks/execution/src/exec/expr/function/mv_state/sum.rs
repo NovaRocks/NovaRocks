@@ -78,34 +78,32 @@ pub fn sum_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-pub fn eval_sum_state_union(
-    arena: &ExprArena,
+pub fn eval_sum_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!(
-            "sum_state_union expects 2 arguments, got {}",
-            args.len()
-        ));
+        return Err((format!("sum_state_union expects 2 arguments, got {}", args.len())).into());
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    eval_sum_state_union_arrays(&lhs, &rhs)
+    Ok((eval_sum_state_union_arrays(&lhs, &rhs))?)
 }
 
-pub fn eval_sum_state_visible(
-    arena: &ExprArena,
+pub fn eval_sum_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if !(1..=2).contains(&args.len()) {
-        return Err(format!(
+        return Err((format!(
             "sum_state_visible expects 1 or 2 arguments, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
     let input = arena.eval(args[0], chunk)?;
     // First-refresh physicalization may attach a typed NULL witness to keep
@@ -119,7 +117,7 @@ pub fn eval_sum_state_visible(
         .cloned()
         .or_else(|| arena.data_type(expr).cloned())
         .unwrap_or(DataType::Int64);
-    eval_sum_state_visible_array(&input, &output_type)
+    Ok((eval_sum_state_visible_array(&input, &output_type))?)
 }
 
 pub fn eval_sum_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {

@@ -56,40 +56,40 @@ pub fn max_state_visible_key_value(
     visible_key_value(state, output_type, true)
 }
 
-pub fn eval_min_state_union(
-    arena: &ExprArena,
+pub fn eval_min_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_min_max_state_union("min_state_union", min_state_union, arena, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_min_max_state_union("min_state_union", min_state_union, arena, args, chunk))?)
 }
 
-pub fn eval_max_state_union(
-    arena: &ExprArena,
+pub fn eval_max_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_min_max_state_union("max_state_union", max_state_union, arena, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_min_max_state_union("max_state_union", max_state_union, arena, args, chunk))?)
 }
 
-pub fn eval_min_state_visible(
-    arena: &ExprArena,
+pub fn eval_min_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_min_max_state_visible("min_state_visible", false, arena, expr, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_min_max_state_visible("min_state_visible", false, arena, expr, args, chunk))?)
 }
 
-pub fn eval_max_state_visible(
-    arena: &ExprArena,
+pub fn eval_max_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_min_max_state_visible("max_state_visible", true, arena, expr, args, chunk)
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_min_max_state_visible("max_state_visible", true, arena, expr, args, chunk))?)
 }
 
 fn min_max_state_union(fn_name: &str, a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
@@ -112,34 +112,31 @@ fn min_max_state_union(fn_name: &str, a: &[u8], b: &[u8]) -> Result<Vec<u8>, Str
 
 type MinMaxStateOp = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
 
-fn eval_min_max_state_union(
+fn eval_min_max_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
     op: MinMaxStateOp,
-    arena: &ExprArena,
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 2 {
-        return Err(format!("{fn_name} expects 2 arguments, got {}", args.len()));
+        return Err((format!("{fn_name} expects 2 arguments, got {}", args.len())).into());
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    eval_min_max_state_union_arrays(fn_name, op, &lhs, &rhs)
+    Ok((eval_min_max_state_union_arrays(fn_name, op, &lhs, &rhs))?)
 }
 
-fn eval_min_max_state_visible(
+fn eval_min_max_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     fn_name: &str,
     pick_max: bool,
-    arena: &ExprArena,
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if !(1..=2).contains(&args.len()) {
-        return Err(format!(
-            "{fn_name} expects 1 or 2 arguments, got {}",
-            args.len()
-        ));
+        return Err((format!("{fn_name} expects 1 or 2 arguments, got {}", args.len())).into());
     }
     let input = arena.eval(args[0], chunk)?;
     // See sum_state_visible: a second typed NULL witness freezes the target
@@ -151,7 +148,7 @@ fn eval_min_max_state_visible(
         .cloned()
         .or_else(|| arena.data_type(expr).cloned())
         .unwrap_or(DataType::Int64);
-    eval_min_max_state_visible_array(fn_name, pick_max, &input, &output_type)
+    Ok((eval_min_max_state_visible_array(fn_name, pick_max, &input, &output_type))?)
 }
 
 fn eval_min_max_state_union_arrays(

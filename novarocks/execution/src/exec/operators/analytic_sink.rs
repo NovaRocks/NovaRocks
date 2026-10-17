@@ -32,6 +32,8 @@ use crate::runtime::fragment::ExecutionResult;
 use crate::exec::chunk::Chunk;
 use crate::exec::operators::analytic_shared::AnalyticSharedState;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use std::sync::Arc;
+
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -60,6 +62,7 @@ impl OperatorFactory for AnalyticSinkFactory {
             name: self.name.clone(),
             state: self.state.clone(),
             finished: false,
+            construction: None,
         })
     }
 
@@ -72,11 +75,23 @@ struct AnalyticSinkOperator {
     name: String,
     state: AnalyticSharedState,
     finished: bool,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
 impl Operator for AnalyticSinkOperator {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -116,7 +131,11 @@ impl ProcessorOperator for AnalyticSinkOperator {
         if self.finished {
             return Ok(());
         }
-        self.state.finish(state)?;
+        let factory = self
+            .construction
+            .as_deref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        self.state.finish_created(state, factory)?;
         self.finished = true;
         Ok(())
     }

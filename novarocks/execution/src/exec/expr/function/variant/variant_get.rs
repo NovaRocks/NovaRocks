@@ -19,6 +19,7 @@
 //! upstream parquet-variant-compute kernel so expression-layer results are
 //! row-identical with the scan-layer shredded fast path (IV3-6 decision B).
 
+use super::common::binary_value_at_any;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -39,19 +40,33 @@ use novarocks_types::value::variant::{
     variant_get_target_type,
 };
 
-/// Read a required string-literal argument directly from the arena.
-/// Spark requires these arguments to be foldable; we require literals.
-fn literal_utf8_arg(
-    arena: &ExprArena,
+/// Read the original required string literal or its checked frozen value.
+/// SQL admission remains literal-only; this never evaluates a foldable tree.
+fn literal_utf8_arg<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     id: ExprId,
     what: &str,
     fn_name: &str,
-) -> Result<String, String> {
+) -> Result<String, __Eval::Error> {
     match arena.node(id) {
         Some(ExprNode::Literal(LiteralValue::Utf8(s))) => Ok(s.clone()),
-        _ => Err(format!(
-            "{fn_name} requires a constant string literal for the {what} argument"
-        )),
+        Some(ExprNode::Constant(value))
+            if value.value_type().logical_type()
+                == novarocks_type_contract::ValueLogicalType::Physical
+                && value.value_type().data_type() == &DataType::Utf8 =>
+        {
+            Ok((value
+                .try_utf8()
+                .map_err(|error| format!("{fn_name} has an invalid frozen {what} string: {error}"))?
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!("{fn_name} requires a constant string literal for the {what} argument")
+                }))?)
+        }
+        _ => Err(
+            (format!("{fn_name} requires a constant string literal for the {what} argument"))
+                .into(),
+        ),
     }
 }
 
@@ -70,26 +85,6 @@ fn kernel_path(path_str: &str) -> Result<parquet::variant::VariantPath<'static>,
         })
         .collect();
     Ok(parquet::variant::VariantPath::from(elems))
-}
-
-fn binary_value_at_any(arr: &ArrayRef, row: usize) -> Result<Option<&[u8]>, String> {
-    use arrow::array::{BinaryArray, BinaryViewArray};
-    if arr.is_null(row) {
-        return Ok(None);
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(Some(a.value(row)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(Some(a.value(row)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BinaryViewArray>() {
-        return Ok(Some(a.value(row)));
-    }
-    Err(format!(
-        "variant_get: expected binary metadata/value arrays, got {:?}",
-        arr.data_type()
-    ))
 }
 
 /// Engine LargeBinary `[size|metadata|value]` rows -> upstream VariantArray.
@@ -151,8 +146,8 @@ fn variant_array_to_large_binary(va: VariantArray) -> Result<ArrayRef, String> {
             continue;
         }
         let (m, v) = match (
-            binary_value_at_any(&metadata, row)?,
-            binary_value_at_any(&value, row)?,
+            binary_value_at_any(&metadata, row, "variant_get")?,
+            binary_value_at_any(&value, row, "variant_get")?,
         ) {
             (Some(m), Some(v)) => (m, v),
             _ => {
@@ -168,18 +163,15 @@ fn variant_array_to_large_binary(va: VariantArray) -> Result<ArrayRef, String> {
     Ok(Arc::new(builder.finish()))
 }
 
-fn eval_variant_get_impl(
-    arena: &ExprArena,
+fn eval_variant_get_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     strict: bool,
     fn_name: &str,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if !(2..=3).contains(&args.len()) {
-        return Err(format!(
-            "{fn_name} expects 2 or 3 arguments, got {}",
-            args.len()
-        ));
+        return Err((format!("{fn_name} expects 2 or 3 arguments, got {}", args.len())).into());
     }
     let path_str = literal_utf8_arg(arena, args[1], "path", fn_name)?;
     let target_type = if args.len() == 3 {
@@ -204,10 +196,11 @@ fn eval_variant_get_impl(
         let json_ref: ArrayRef = Arc::new(json.clone());
         json_to_variant(&json_ref).map_err(|e| format!("{fn_name}: invalid JSON input: {e}"))?
     } else {
-        return Err(format!(
+        return Err((format!(
             "{fn_name} expects VARIANT or JSON/VARCHAR as first argument, got {:?}",
             input.data_type()
-        ));
+        ))
+        .into());
     };
 
     let mut opts =
@@ -227,25 +220,29 @@ fn eval_variant_get_impl(
         None => {
             let va = VariantArray::try_new(result.as_ref())
                 .map_err(|e| format!("{fn_name}: unexpected kernel result: {e}"))?;
-            variant_array_to_large_binary(va)
+            Ok((variant_array_to_large_binary(va))?)
         }
     }
 }
 
-pub fn eval_variant_get(
-    arena: &ExprArena,
+pub fn eval_variant_get<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_variant_get_impl(arena, args, chunk, true, "variant_get")
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_variant_get_impl(arena, args, chunk, true, "variant_get"))?)
 }
 
-pub fn eval_try_variant_get(
-    arena: &ExprArena,
+pub fn eval_try_variant_get<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
-    eval_variant_get_impl(arena, args, chunk, false, "try_variant_get")
+) -> Result<ArrayRef, __Eval::Error> {
+    Ok((eval_variant_get_impl(arena, args, chunk, false, "try_variant_get"))?)
 }
+
+#[cfg(test)]
+#[path = "variant_get_constant_tests.rs"]
+mod constant_tests;

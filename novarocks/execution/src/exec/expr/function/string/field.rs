@@ -19,12 +19,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 use novarocks_functions::field_shared::{FieldState, validate_arity};
-pub fn eval_field(
-    arena: &ExprArena,
+pub fn eval_field<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     validate_arity(args.len())?;
     let first = arena.eval(args[0], chunk)?;
     let mut state = FieldState::new(&first, args.len())?;

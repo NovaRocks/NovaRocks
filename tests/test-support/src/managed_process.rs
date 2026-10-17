@@ -1085,6 +1085,38 @@ impl ManagedProcess {
             .with_context(|| format!("read durable process log {}", self.log_path.display()))
     }
 
+    /// Observes one complete matching line from this live process's original
+    /// durable output. The caller owns waiting, cancellation and its deadline.
+    pub fn live_log_line(&self, matches: &dyn Fn(&str) -> bool) -> Result<Option<String>> {
+        use std::io::{BufRead, BufReader};
+        if !self.is_running()? {
+            bail!("{} exited before the durable log observation", self.label);
+        }
+        let found =
+            self.log_source()
+                .with_bounded_snapshot_reader(u64::MAX, |reader, _length| {
+                    let mut reader = BufReader::new(reader);
+                    let mut line = Vec::new();
+                    while reader.read_until(b'\n', &mut line)? != 0 {
+                        // A snapshot may end inside an append. Partial output
+                        // cannot establish a complete marker or identity yet.
+                        if line.ends_with(b"\n") {
+                            let text = std::str::from_utf8(&line)
+                                .context("complete durable process log line is not UTF-8")?;
+                            if matches(text) {
+                                return Ok(Some(text.to_owned()));
+                            }
+                        }
+                        line.clear();
+                    }
+                    Ok(None)
+                })?;
+        if !self.is_running()? {
+            bail!("{} exited during the durable log observation", self.label);
+        }
+        Ok(found)
+    }
+
     /// Waits for a marker in the process's combined durable output log.
     ///
     /// This is for post-readiness observations. Startup readiness itself must
@@ -3704,6 +3736,56 @@ mod tests {
 
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         assert!(wait_until(Duration::from_secs(1), || !pid_exists(pid)));
+    }
+
+    #[test]
+    fn managed_process_live_log_observation_retains_original_file_identity_and_role_exit() {
+        let temp = TempDir::new("live-original-output");
+        let log = temp.path().join("fixture.log");
+        let mut process = ManagedProcess::spawn(
+            "live original output fixture".to_string(),
+            shell("printf 'READY\\n'; exec sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            log.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            process.live_log_line(&|line| line == "READY\n").unwrap(),
+            Some("READY\n".into())
+        );
+        let mut append = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        append.write_all(b"PARTIAL_\xe4").unwrap();
+        append.flush().unwrap();
+        assert!(
+            process
+                .live_log_line(&|line| line.starts_with("PARTIAL_"))
+                .unwrap()
+                .is_none(),
+            "a snapshot ending inside a UTF-8 append is not a complete line"
+        );
+        append.write_all(b"\xb8\xad\n").unwrap();
+        append.flush().unwrap();
+        assert_eq!(
+            process
+                .live_log_line(&|line| line.starts_with("PARTIAL_"))
+                .unwrap(),
+            Some("PARTIAL_中\n".into())
+        );
+        append.write_all(b"\xff\n").unwrap();
+        append.flush().unwrap();
+        let error = process.live_log_line(&|_| false).unwrap_err();
+        assert!(format!("{error:#}").contains("not UTF-8"), "{error:#}");
+        drop(append);
+        fs::rename(&log, temp.path().join("original.log")).unwrap();
+        fs::write(&log, "READY\n").unwrap();
+        let error = process
+            .live_log_line(&|line| line == "READY\n")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("replaced"), "{error:#}");
+        process.kill_now().unwrap();
+        let error = process.live_log_line(&|_| true).unwrap_err();
+        assert!(format!("{error:#}").contains("exited"), "{error:#}");
     }
 
     #[test]

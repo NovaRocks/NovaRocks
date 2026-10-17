@@ -35,11 +35,20 @@ impl ExprArena {
         if self.runtime_error.is_some() {
             return Err(StaticExpressionError::RuntimeBoundArena);
         }
+        // Recheck call-local receipts before a complete type can supersede the
+        // legacy field schema in the saved node. Both are independent sources.
+        for (index, source) in self.regexp_count_sources.iter().enumerate() {
+            if let Some(source) = source {
+                self.validate_regexp_count_pattern_source(ExprId(index), *source)
+                    .map_err(|_| StaticExpressionError::InvalidRegexpCountSource)?;
+            }
+        }
         let ExprArena {
             nodes,
             types,
             field_schemas,
             complete_types,
+            regexp_count_sources,
             allow_throw_exception,
             query_global_dicts,
             session_time_zone,
@@ -48,24 +57,30 @@ impl ExprArena {
         if nodes.len() != types.len()
             || nodes.len() != field_schemas.len()
             || nodes.len() != complete_types.len()
+            || nodes.len() != regexp_count_sources.len()
         {
             return Err(StaticExpressionError::InvalidMetadataArity);
         }
         let mut frozen = Vec::with_capacity(nodes.len());
-        for (((node, data_type), field_schema), complete_type) in nodes
+        for ((((node, data_type), field_schema), complete_type), regexp_count_source) in nodes
             .into_iter()
             .zip(types)
             .zip(field_schemas)
             .zip(complete_types)
+            .zip(regexp_count_sources)
         {
-            frozen.push(match complete_type {
+            let mut frozen_node = match complete_type {
                 Some(value_type) => StaticExprNode::new_value_typed(freeze_kind(node), value_type),
                 None => StaticExprNode::new(
                     freeze_kind(node),
                     data_type,
                     field_schema.map(freeze_field_schema),
                 ),
-            });
+            };
+            if let Some(source) = regexp_count_source {
+                frozen_node = frozen_node.with_regexp_count_pattern_source(source)?;
+            }
+            frozen.push(frozen_node);
         }
         ImmutableExpressions::try_new(
             frozen,
@@ -94,13 +109,17 @@ impl ExprArena {
         arena.set_query_global_dicts(expressions.query_global_dicts().clone());
         arena.set_session_time_zone(expressions.session_time_zone().map(str::to_owned));
         for node in expressions.nodes() {
-            if let Some(value_type) = node.value_type() {
-                arena.push_value_typed(thaw_kind(node.kind())?, value_type.clone());
-                continue;
-            }
-            let id = arena.push_typed(thaw_kind(node.kind())?, node.data_type().clone());
-            if let Some(schema) = node.field_schema() {
-                arena.set_field_schema(id, thaw_field_schema(schema));
+            let id = if let Some(value_type) = node.value_type() {
+                arena.push_value_typed(thaw_kind(node.kind())?, value_type.clone())
+            } else {
+                let id = arena.push_typed(thaw_kind(node.kind())?, node.data_type().clone());
+                if let Some(schema) = node.field_schema() {
+                    arena.set_field_schema(id, thaw_field_schema(schema));
+                }
+                id
+            };
+            if let Some(source) = node.regexp_count_pattern_source() {
+                arena.set_regexp_count_pattern_source(id, source)?;
             }
         }
         Ok(arena)

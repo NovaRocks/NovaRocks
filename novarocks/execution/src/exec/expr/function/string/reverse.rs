@@ -23,21 +23,20 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-fn eval_reverse_list(
-    arena: &ExprArena,
+fn eval_reverse_list<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     list: &ListArray,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
         _ => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "reverse ARRAY output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("reverse ARRAY output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -77,7 +76,7 @@ fn eval_reverse_list(
             current += 1;
         }
         if current > i32::MAX as i64 {
-            return Err("reverse ARRAY offset overflow".to_string());
+            return Err(("reverse ARRAY offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
@@ -93,15 +92,15 @@ fn eval_reverse_list(
     Ok(Arc::new(out) as ArrayRef)
 }
 
-pub fn eval_reverse(
-    arena: &ExprArena,
+pub fn eval_reverse<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let input = arena.eval(args[0], chunk)?;
     if let Some(list) = input.as_any().downcast_ref::<ListArray>() {
-        return eval_reverse_list(arena, expr, list, chunk);
+        return Ok((eval_reverse_list(arena, expr, list, chunk))?);
     }
 
     let s_arr = input

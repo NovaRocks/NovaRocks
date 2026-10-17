@@ -21,12 +21,12 @@ use arrow::array::{ArrayRef, Int64Array};
 use novarocks_functions::calendar_julian::day_number_from_date;
 use std::sync::Arc;
 
-pub fn eval_to_days(
-    arena: &ExprArena,
+pub fn eval_to_days<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let dates = extract_date_array(&arr)?;
     let mut out = Vec::with_capacity(dates.len());

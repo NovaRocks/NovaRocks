@@ -18,18 +18,18 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 
-pub fn eval_nullif(
-    arena: &ExprArena,
+pub fn eval_nullif<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let left_arr = arena.eval(left, chunk)?;
     let right_arr = arena.eval(right, chunk)?;
-    novarocks_functions::builtin::nullif::evaluate_legacy(
+    Ok((novarocks_functions::builtin::nullif::evaluate_legacy(
         left_arr,
         right_arr,
         arena.data_type(expr),
-    )
+    ))?)
 }

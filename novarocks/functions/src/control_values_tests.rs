@@ -151,7 +151,20 @@ fn control_values_indexed_rejects_dedicated_carriers_without_fallback() {
     for ty in [
         DataType::Null,
         DataType::FixedSizeBinary(16),
-        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Utf8, false)),
+                        Arc::new(Field::new("value", DataType::Int64, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        ),
     ] {
         assert!(!supports_indexed_result(&ty));
         let error = assemble_values(

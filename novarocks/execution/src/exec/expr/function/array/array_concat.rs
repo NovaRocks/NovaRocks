@@ -64,14 +64,14 @@ fn relax_map_entry_nullability(target_type: &DataType, source_type: &DataType) -
     )
 }
 
-pub fn eval_array_concat(
-    arena: &ExprArena,
+pub fn eval_array_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.is_empty() {
-        return Err("array_concat expects at least one argument".to_string());
+        return Err(("array_concat expects at least one argument".to_string()).into());
     }
 
     let mut list_arrays = Vec::with_capacity(args.len());
@@ -88,10 +88,9 @@ pub fn eval_array_concat(
         _ => match list_arrays[0].data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(format!(
-                    "array_concat output type must be List, got {:?}",
-                    other
-                ));
+                return Err(
+                    (format!("array_concat output type must be List, got {:?}", other)).into(),
+                );
             }
         },
     };
@@ -163,7 +162,7 @@ pub fn eval_array_concat(
 
         current += row_len;
         if current > i32::MAX as i64 {
-            return Err("array_concat offset overflow".to_string());
+            return Err(("array_concat offset overflow".to_string()).into());
         }
         offsets.push(current as i32);
         null_builder.append_non_null();

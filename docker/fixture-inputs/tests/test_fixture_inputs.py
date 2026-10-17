@@ -91,6 +91,48 @@ class FixtureInputsTest(unittest.TestCase):
                     ],
                 )
 
+    def test_store_lock_does_not_reclassify_body_oserror(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary)
+            (store / ".provision.lock").touch()
+            failure = FileNotFoundError("protected artifact disappeared")
+            with mock.patch.object(fixture_inputs.fcntl, "flock") as flock:
+                with self.assertRaises(FileNotFoundError) as raised:
+                    with fixture_inputs.fixture_store_lock(store, exclusive=False):
+                        raise failure
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(
+                    flock.call_args_list[-1],
+                    mock.call(mock.ANY, fixture_inputs.fcntl.LOCK_UN),
+                )
+
+    def test_missing_lock_still_reports_its_own_prerequisite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                fixture_inputs.FixtureInputError, "cannot acquire fixture store lock"
+            ):
+                with fixture_inputs.fixture_store_lock(Path(temporary), exclusive=False):
+                    self.fail("missing lock must not admit the protected body")
+
+    def test_command_launch_failure_inside_lock_names_the_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary)
+            (store / ".provision.lock").touch()
+            with mock.patch.object(
+                fixture_inputs.subprocess,
+                "run",
+                side_effect=FileNotFoundError(2, "No such file or directory", "docker"),
+            ):
+                with self.assertRaisesRegex(
+                    fixture_inputs.FixtureInputError,
+                    "cannot start fixture command docker",
+                ) as raised:
+                    with fixture_inputs.fixture_store_lock(store, exclusive=False):
+                        fixture_inputs.inspect_image("locked-image")
+            self.assertNotIn(
+                "cannot acquire fixture store lock", str(raised.exception)
+            )
+
     def test_missing_bom_blocks_without_docker_or_network(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.object(verify_module, "inspect_image") as inspect:

@@ -182,6 +182,7 @@ DROP TABLE ${case_db}.t_insert_exact_having;
 DROP TABLE ${case_db}.t_insert_exact_union_distinct;
 
 -- query 23
+-- Construct nominal Variant with the selected accessor before its identity CAST.
 SELECT variant_typeof(parse_json('{"text":"values-direct"}')) AS variant_kind,
-       get_json_string(CAST(parse_json('{"text":"values-cast"}') AS VARIANT),'$.text') AS cast_text,
+       get_json_string(CAST(variant_get(parse_json('{"text":"values-cast"}'), '$') AS VARIANT),'$.text') AS cast_text,
        get_json_string(parse_json(CAST('{"text":"varchar-cast"}' AS VARCHAR)),'$.text') AS varchar_text;

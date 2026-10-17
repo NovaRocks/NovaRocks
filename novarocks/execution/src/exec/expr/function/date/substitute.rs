@@ -18,12 +18,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
 
-pub fn eval_substitute(
-    arena: &ExprArena,
+pub fn eval_substitute<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let arr = arena.eval(args[0], chunk)?;
     let output_type = arena
         .data_type(expr)
@@ -32,7 +32,7 @@ pub fn eval_substitute(
     if arr.data_type() == &output_type {
         Ok(arr)
     } else {
-        arrow::compute::cast(&arr, &output_type)
-            .map_err(|e| format!("substitute cast error: {}", e))
+        Ok((arrow::compute::cast(&arr, &output_type)
+            .map_err(|e| format!("substitute cast error: {}", e)))?)
     }
 }

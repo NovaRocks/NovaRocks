@@ -23,12 +23,12 @@ use super::super::{
 use super::*;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::runtime::{
+    fragment::ExecutionFailureCause,
     mem_tracker::MemTracker,
     query_memory::QueryMemoryBinding,
     runtime_state::RuntimeState,
     scalar_memory::{
-        RuntimeScalarEvaluationFailure, RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal,
-        RuntimeScalarMemoryScope,
+        RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
 };
 use arrow::{
@@ -186,8 +186,9 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
             assert!(journal.preparation.as_ref().unwrap().settlement.is_some());
             assert!(journal.body.settlement.is_some());
             if data {
-                let Err(RuntimeScalarEvaluationFailure::Data(data)) = result else {
-                    panic!("original complex key Data")
+                let error = result.unwrap_err();
+                let ExecutionFailureCause::ScalarInvocationData(data) = error.cause() else {
+                    panic!("original complex key Data: {error:?}")
                 };
                 assert_eq!(
                     data.message(),
@@ -204,9 +205,7 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
                         &control,
                         &mut RuntimeScalarMemoryScope::new(&control, &mut journal)
                     ),
-                    Err(RuntimeScalarEvaluationFailure::Kernel(
-                        KernelFailure::InstanceFailed
-                    ))
+                    Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
                 ));
             } else {
                 let output = result.unwrap();
@@ -285,17 +284,13 @@ fn runtime_invocation_memory_actual_sql_frame_cached_host_rebind_and_missing_lat
         if rebind {
             assert!(matches!(
                 result,
-                Err(RuntimeScalarEvaluationFailure::Source(
-                    novarocks_functions::ScalarResourceError::Invariant(_)
-                ))
+                Err(error) if matches!(error.cause(), ExecutionFailureCause::RuntimeScalarSource(novarocks_functions::ScalarResourceError::Invariant(_)))
             ));
             assert!(journal.preparation.is_some());
         } else {
             assert!(matches!(
                 result,
-                Err(RuntimeScalarEvaluationFailure::Host(
-                    RuntimeScalarMemoryRefusal::MissingQueryMemory
-                ))
+                Err(error) if matches!(error.cause(), ExecutionFailureCause::RuntimeScalarMemory(RuntimeScalarMemoryRefusal::MissingQueryMemory))
             ));
         }
         assert!(journal.body.settlement.is_none());
@@ -307,9 +302,7 @@ fn runtime_invocation_memory_actual_sql_frame_cached_host_rebind_and_missing_lat
                 &control,
                 &mut RuntimeScalarMemoryScope::new(&control, &mut journal)
             ),
-            Err(RuntimeScalarEvaluationFailure::Kernel(
-                KernelFailure::InstanceFailed
-            ))
+            Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
         ));
     }
 }

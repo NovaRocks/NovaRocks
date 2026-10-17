@@ -2113,6 +2113,9 @@ impl IcebergWriteSessionControl {
                 request.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
+        if let ConnectorWriteSessionFlavor::DistributedRewrite { frozen, .. } = &request.flavor {
+            frozen.validate_owner(&self.key)?;
+        }
         // A staged target is the one target that cannot be looked up: the
         // catalog will not know it until the publication that owns it commits.
         // So its frozen facts arrive with the request, and this branch reads
@@ -2249,21 +2252,29 @@ impl IcebergWriteSessionControl {
         if staged.is_none() {
             crate::commit::validation::ensure_iceberg_write_supported_from_metadata(&metadata)
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
-            // INSERT uses this ordinary data session instead of the legacy
-            // prepare_write call. Reuse its intent/ref policy after the existing
-            // generic support gate; other session flavors and input families
-            // retain their independent admission contracts.
+            // Ordinary INSERT and ADD EQUALITY DELETE use this session instead
+            // of the separate preparation call. Reuse their existing policies;
+            // other input families and session flavors retain their own gates.
             if matches!(request.flavor, ConnectorWriteSessionFlavor::Ordinary)
                 && request.purpose == ConnectorWriteAdmissionPurpose::OrdinaryDml
-                && matches!(request.input, ConnectorWriteInputRequest::Data { .. })
             {
-                let target_fqn = format!("{}.{}", self.key.instance_id.as_str(), request.table);
-                if let Some(denied) = crate::commit::write_preparation::insert_intent_support_denial(
-                    &metadata,
-                    request.intent,
-                    request.target_ref.as_str(),
-                    &target_fqn,
-                ) {
+                let denied = match &request.input {
+                    ConnectorWriteInputRequest::Data { .. } => {
+                        let target_fqn =
+                            format!("{}.{}", self.key.instance_id.as_str(), request.table);
+                        crate::commit::write_preparation::insert_intent_support_denial(
+                            &metadata,
+                            request.intent,
+                            request.target_ref.as_str(),
+                            &target_fqn,
+                        )
+                    }
+                    ConnectorWriteInputRequest::EqualityDelete { .. } => {
+                        crate::commit::write_preparation::equality_delete_support_denial(&metadata)
+                    }
+                    _ => None,
+                };
+                if let Some(denied) = denied {
                     return Err(denied);
                 }
             }
@@ -2470,10 +2481,9 @@ impl IcebergWriteSessionControl {
             // A delete branch's frozen old-delete references are the one piece
             // of material that costs an external read, so it is taken only when
             // the request's own shape says a delete branch exists.
-            merge_targets: if session_freezes_old_deletes(&request.flavor, &signed) {
-                let snapshot_id = base_snapshot_id.ok_or_else(|| {
-                    invalid("Iceberg row-level write requires a frozen target snapshot")
-                })?;
+            merge_targets: if session_freezes_old_deletes(&request.flavor, &signed)
+                && let Some(snapshot_id) = base_snapshot_id
+            {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg row-level write requires a loaded target table")
                 })?;

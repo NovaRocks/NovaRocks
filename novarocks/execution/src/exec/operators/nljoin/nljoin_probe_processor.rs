@@ -33,7 +33,6 @@ use std::sync::Arc;
 
 use arrow::array::Array;
 use arrow::array::BooleanArray;
-use arrow::compute::filter_record_batch;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
@@ -138,11 +137,15 @@ impl OperatorFactory for NlJoinProbeProcessorFactory {
             input_finished: false,
             post_probe_finalized: false,
             finished: false,
+            construction: None,
+            evaluation_control: None,
         })
     }
 }
 
 struct NlJoinProbeProcessorOperator {
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    evaluation_control: Option<super::super::compiled_expression::RuntimeKernelControl>,
     name: String,
     arena: Arc<ExprArena>,
     join_type: NestedLoopJoinType,
@@ -190,6 +193,20 @@ enum ConjunctState {
 }
 
 impl Operator for NlJoinProbeProcessorOperator {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.evaluation_control =
+            Some(super::super::compiled_expression::RuntimeKernelControl::new(state.error_state()));
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -393,19 +410,100 @@ impl NlJoinProbeProcessorOperator {
         Chunk::new_with_chunk_schema(RecordBatch::new_empty(schema), chunk_schema)
     }
 
-    fn ensure_build_loaded(&mut self) -> Result<(), String> {
+    fn control(&self) -> ExecutionResult<&super::super::compiled_expression::RuntimeKernelControl> {
+        Ok(self
+            .evaluation_control
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?)
+    }
+
+    fn eval_created(&self, expr: ExprId, input: &Chunk) -> ExecutionResult<arrow::array::ArrayRef> {
+        let control = self.control()?;
+        crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+        let owner = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+            .begin_input_construction(input)?;
+        let output =
+            crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), control)
+                .eval(expr, input)?;
+        crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+        Ok(output)
+    }
+
+    fn filter_created(&self, input: &Chunk, mask: &BooleanArray) -> ExecutionResult<Chunk> {
+        let control = self.control()?;
+        crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+        let owner = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+            .begin_input_construction(input)?;
+        let output = input.filter_for_evaluation(mask, owner.as_ref())?;
+        crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+        Ok(output)
+    }
+
+    fn create_join_scope_chunk(
+        &self,
+        batch: RecordBatch,
+        extra_probe: Option<&Chunk>,
+    ) -> ExecutionResult<Chunk> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        let control = self.control()?;
+        crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+        let owner = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?
+            .begin_typed_construction(&self.join_scope_chunk_schema)?;
+        let mut storage = owner.storage_lifetime();
+        for source in self
+            .probe_chunk
+            .iter()
+            .chain(extra_probe)
+            .chain(self.build_batches.iter())
+        {
+            storage = source
+                .source_storage_lifetime_observed::<ConstructionFailure>(storage, |layout| {
+                    owner.request(layout)
+                })?;
+        }
+        let chunk = if self.join_scope_chunk_schema.is_typed() {
+            Chunk::try_new_typed_record_batch_owned_observed::<ConstructionFailure, _, _>(
+                batch,
+                Arc::clone(&self.join_scope_chunk_schema),
+                storage,
+                owner.storage_lifetime(),
+                |layout| owner.request(layout),
+                |step| owner.observe(0, &[], step),
+            )?
+        } else {
+            let chunk =
+                Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?;
+            chunk.retaining_array_type_storage_observed::<ConstructionFailure>(
+                &storage,
+                |layout| owner.request(layout),
+            )?
+        };
+        crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+        Ok(chunk)
+    }
+
+    fn ensure_build_loaded(&mut self) -> ExecutionResult<()> {
         if self.build_loaded {
             return Ok(());
         }
         let Some(artifact) = self.state.get_build() else {
-            return Err("nljoin build not ready".to_string());
+            return Err("nljoin build not ready".into());
         };
         self.build_batches = Arc::clone(&artifact.build_batches);
         self.build_loaded = true;
         Ok(())
     }
 
-    fn finalize_post_probe(&mut self) -> Result<(), String> {
+    fn finalize_post_probe(&mut self) -> ExecutionResult<()> {
         if self.post_probe_finalized {
             return Ok(());
         }
@@ -443,7 +541,7 @@ impl NlJoinProbeProcessorOperator {
         Ok(())
     }
 
-    fn read_inner_cross(&mut self, chunk_size: usize) -> Result<Option<Chunk>, String> {
+    fn read_inner_cross(&mut self, chunk_size: usize) -> ExecutionResult<Option<Chunk>> {
         loop {
             if self.build_batches.is_empty() {
                 if self.probe_chunk.is_some() {
@@ -493,14 +591,11 @@ impl NlJoinProbeProcessorOperator {
                 continue;
             };
 
-            let batch = self.apply_join_conjunct(batch)?;
-            if batch.num_rows() == 0 {
+            let chunk = self.apply_join_conjunct(batch, Some(&probe_chunk))?;
+            if chunk.is_empty() {
                 continue;
             }
-            return Ok(Some(Chunk::try_new_with_chunk_schema(
-                batch,
-                Arc::clone(&self.join_scope_chunk_schema),
-            )?));
+            return Ok(Some(chunk));
         }
     }
 
@@ -510,7 +605,7 @@ impl NlJoinProbeProcessorOperator {
         right: &Chunk,
         output_schema: &SchemaRef,
         chunk_size: usize,
-    ) -> Result<Option<arrow::record_batch::RecordBatch>, String> {
+    ) -> ExecutionResult<Option<arrow::record_batch::RecordBatch>> {
         let left_len = probe_chunk.len();
         let right_len = right.len();
         if left_len == 0 || right_len == 0 {
@@ -550,16 +645,16 @@ impl NlJoinProbeProcessorOperator {
             }
         }
 
-        gather_join_batch(
+        Ok(gather_join_batch(
             probe_chunk,
             right,
             &left_indices,
             &right_indices,
             output_schema,
-        )
+        )?)
     }
 
-    fn read_left_semi_anti(&mut self) -> Result<Option<Chunk>, String> {
+    fn read_left_semi_anti(&mut self) -> ExecutionResult<Option<Chunk>> {
         let Some(probe_chunk) = self.probe_chunk.take() else {
             return Ok(None);
         };
@@ -581,19 +676,11 @@ impl NlJoinProbeProcessorOperator {
 
         let keep = self.eval_probe_keep_flags(&probe_chunk, &join_scope_schema)?;
         let mask = BooleanArray::from(keep);
-        let filtered = filter_record_batch(&probe_chunk.record_batch(), &mask)
-            .map_err(|e| format!("nljoin semi/anti filter failed: {e}"))?;
-        if filtered.num_rows() == 0 {
-            return Ok(None);
-        }
-        // A semi/anti NL join returns the probe rows themselves.  Preserve
-        // the input's frozen chunk contract rather than substituting the
-        // logical child schema: scan-side bindings may carry provider-owned
-        // field labels while retaining the same slot identities.
-        Ok(Some(Chunk::try_new_like(filtered, &probe_chunk)?))
+        let filtered = self.filter_created(&probe_chunk, &mask)?;
+        Ok((!filtered.is_empty()).then_some(filtered))
     }
 
-    fn read_outer(&mut self, chunk_size: usize) -> Result<Option<Chunk>, String> {
+    fn read_outer(&mut self, chunk_size: usize) -> ExecutionResult<Option<Chunk>> {
         let preserve_probe = matches!(
             self.join_type,
             NestedLoopJoinType::LeftOuter
@@ -613,10 +700,7 @@ impl NlJoinProbeProcessorOperator {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    return Ok(Some(Chunk::try_new_with_chunk_schema(
-                        batch,
-                        Arc::clone(&self.join_scope_chunk_schema),
-                    )?));
+                    return Ok(Some(self.create_join_scope_chunk(batch, None)?));
                 }
                 OuterPhase::EmitUnmatchedProbe => {
                     let Some(batch) = self.emit_unmatched_probe_chunk(chunk_size)? else {
@@ -629,10 +713,7 @@ impl NlJoinProbeProcessorOperator {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    return Ok(Some(Chunk::try_new_with_chunk_schema(
-                        batch,
-                        Arc::clone(&self.join_scope_chunk_schema),
-                    )?));
+                    return Ok(Some(self.create_join_scope_chunk(batch, None)?));
                 }
                 OuterPhase::ProbeBuild => {}
             }
@@ -710,17 +791,15 @@ impl NlJoinProbeProcessorOperator {
                 &build_indices,
                 preserve_build,
                 build_batch_idx,
+                &probe_chunk,
             )?;
             let Some(filtered) = filtered else {
                 continue;
             };
-            if filtered.num_rows() == 0 {
+            if filtered.is_empty() {
                 continue;
             }
-            return Ok(Some(Chunk::try_new_with_chunk_schema(
-                filtered,
-                Arc::clone(&self.join_scope_chunk_schema),
-            )?));
+            return Ok(Some(filtered));
         }
     }
 
@@ -740,7 +819,7 @@ impl NlJoinProbeProcessorOperator {
     fn emit_unmatched_probe_chunk(
         &mut self,
         chunk_size: usize,
-    ) -> Result<Option<arrow::record_batch::RecordBatch>, String> {
+    ) -> ExecutionResult<Option<arrow::record_batch::RecordBatch>> {
         let Some(probe_chunk) = self.probe_chunk.as_ref() else {
             return Ok(None);
         };
@@ -763,26 +842,26 @@ impl NlJoinProbeProcessorOperator {
         }
 
         if self.probe_is_left {
-            gather_left_with_null_right(
+            Ok(gather_left_with_null_right(
                 probe_chunk,
                 &indices,
                 &self.right_schema,
                 &self.join_scope_schema,
-            )
+            )?)
         } else {
-            gather_null_left_with_right(
+            Ok(gather_null_left_with_right(
                 probe_chunk,
                 &indices,
                 &self.left_schema,
                 &self.join_scope_schema,
-            )
+            )?)
         }
     }
 
     fn emit_unmatched_build_chunk(
         &mut self,
         chunk_size: usize,
-    ) -> Result<Option<arrow::record_batch::RecordBatch>, String> {
+    ) -> ExecutionResult<Option<arrow::record_batch::RecordBatch>> {
         let Some(flags) = self.build_matched.as_ref() else {
             return Ok(None);
         };
@@ -812,12 +891,12 @@ impl NlJoinProbeProcessorOperator {
             }
 
             if !indices.is_empty() {
-                return gather_null_left_with_right(
+                return Ok(gather_null_left_with_right(
                     build_batch,
                     &indices,
                     &self.left_schema,
                     &self.join_scope_schema,
-                );
+                )?);
             }
 
             self.emit_unmatched_build_batch += 1;
@@ -832,7 +911,7 @@ impl NlJoinProbeProcessorOperator {
         probe_chunk: &Chunk,
         build_batch: &Chunk,
         chunk_size: usize,
-    ) -> Result<OuterPermutedBatch, String> {
+    ) -> ExecutionResult<OuterPermutedBatch> {
         let probe_len = probe_chunk.len();
         let build_len = build_batch.len();
         if probe_len == 0 || build_len == 0 {
@@ -904,24 +983,22 @@ impl NlJoinProbeProcessorOperator {
         build_indices: &[u32],
         preserve_build: bool,
         build_batch_idx: usize,
-    ) -> Result<Option<arrow::record_batch::RecordBatch>, String> {
+        probe_chunk: &Chunk,
+    ) -> ExecutionResult<Option<Chunk>> {
         if batch.num_rows() == 0 {
             return Ok(None);
         }
 
+        let chunk = self.create_join_scope_chunk(batch, Some(probe_chunk))?;
         let matched_mask = if let Some(pred) = self.join_conjunct {
-            let chunk = Chunk::try_new_with_chunk_schema(
-                batch.clone(),
-                Arc::clone(&self.join_scope_chunk_schema),
-            )?;
-            let mask_arr = self.arena.eval(pred, &chunk).map_err(|e| e.to_string())?;
+            let mask_arr = self.eval_created(pred, &chunk)?;
             mask_arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| "nljoin join conjunct must return boolean array".to_string())?
                 .clone()
         } else {
-            BooleanArray::from(vec![true; batch.num_rows()])
+            BooleanArray::from(vec![true; chunk.len()])
         };
 
         for i in 0..matched_mask.len() {
@@ -952,24 +1029,21 @@ impl NlJoinProbeProcessorOperator {
         }
 
         if self.join_conjunct.is_none() {
-            return Ok(Some(batch));
+            return Ok(Some(chunk));
         }
-
-        filter_record_batch(&batch, &matched_mask)
-            .map(Some)
-            .map_err(|e| format!("nljoin join conjunct filter failed: {e}"))
+        Ok(Some(self.filter_created(&chunk, &matched_mask)?))
     }
 
     fn eval_probe_keep_flags(
         &self,
         probe_chunk: &Chunk,
         join_scope_schema: &SchemaRef,
-    ) -> Result<Vec<bool>, String> {
+    ) -> ExecutionResult<Vec<bool>> {
         let is_semi = self.join_type == NestedLoopJoinType::LeftSemi;
         let is_anti = self.join_type == NestedLoopJoinType::LeftAnti;
         let is_null_aware_anti = self.join_type == NestedLoopJoinType::NullAwareLeftAnti;
         if !is_semi && !is_anti && !is_null_aware_anti {
-            return Err("nljoin semi/anti keep flags called with invalid join type".to_string());
+            return Err("nljoin semi/anti keep flags called with invalid join type".into());
         }
 
         let null_aware_split = if is_null_aware_anti {
@@ -1053,10 +1127,10 @@ impl NlJoinProbeProcessorOperator {
         &self,
         chunk: &Chunk,
         conjuncts: &[ExprId],
-    ) -> Result<Vec<BooleanArray>, String> {
+    ) -> ExecutionResult<Vec<BooleanArray>> {
         let mut out = Vec::with_capacity(conjuncts.len());
         for expr in conjuncts {
-            let mask_arr = self.arena.eval(*expr, chunk).map_err(|e| e.to_string())?;
+            let mask_arr = self.eval_created(*expr, chunk)?;
             let mask = mask_arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
@@ -1070,7 +1144,7 @@ impl NlJoinProbeProcessorOperator {
     fn eval_conjunct_row_state(
         masks: &[BooleanArray],
         row: usize,
-    ) -> Result<ConjunctState, String> {
+    ) -> ExecutionResult<ConjunctState> {
         if masks.is_empty() {
             return Ok(ConjunctState::True);
         }
@@ -1081,7 +1155,8 @@ impl NlJoinProbeProcessorOperator {
                     "nljoin conjunct row out of bounds: row={} mask_len={}",
                     row,
                     mask.len()
-                ));
+                )
+                .into());
             }
             if !mask.is_valid(row) {
                 has_null = true;
@@ -1105,7 +1180,7 @@ impl NlJoinProbeProcessorOperator {
         key_conjuncts: &[ExprId],
         residual_conjuncts: &[ExprId],
         join_scope_schema: &SchemaRef,
-    ) -> Result<(bool, bool), String> {
+    ) -> ExecutionResult<(bool, bool)> {
         let mut has_true = false;
         let mut has_null = false;
         for right in self.build_batches.iter() {
@@ -1126,8 +1201,7 @@ impl NlJoinProbeProcessorOperator {
                 continue;
             };
 
-            let joined_chunk =
-                Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?;
+            let joined_chunk = self.create_join_scope_chunk(batch, Some(probe_chunk))?;
             let key_masks = self.eval_conjunct_masks(&joined_chunk, key_conjuncts)?;
             let residual_masks = self.eval_conjunct_masks(&joined_chunk, residual_conjuncts)?;
 
@@ -1157,7 +1231,7 @@ impl NlJoinProbeProcessorOperator {
         probe_row: usize,
         pred: ExprId,
         join_scope_schema: &SchemaRef,
-    ) -> Result<(bool, bool), String> {
+    ) -> ExecutionResult<(bool, bool)> {
         let mut has_true = false;
         let mut has_null = false;
         for right in self.build_batches.iter() {
@@ -1178,16 +1252,8 @@ impl NlJoinProbeProcessorOperator {
                 continue;
             };
 
-            let mask_arr = self
-                .arena
-                .eval(
-                    pred,
-                    &Chunk::try_new_with_chunk_schema(
-                        batch,
-                        Arc::clone(&self.join_scope_chunk_schema),
-                    )?,
-                )
-                .map_err(|e| e.to_string())?;
+            let joined_chunk = self.create_join_scope_chunk(batch, Some(probe_chunk))?;
+            let mask_arr = self.eval_created(pred, &joined_chunk)?;
             let mask = mask_arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
@@ -1211,20 +1277,18 @@ impl NlJoinProbeProcessorOperator {
 
     fn apply_join_conjunct(
         &self,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> Result<arrow::record_batch::RecordBatch, String> {
+        batch: RecordBatch,
+        probe_chunk: Option<&Chunk>,
+    ) -> ExecutionResult<Chunk> {
+        let chunk = self.create_join_scope_chunk(batch, probe_chunk)?;
         let Some(pred) = self.join_conjunct else {
-            return Ok(batch);
+            return Ok(chunk);
         };
-
-        let chunk =
-            Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?;
-        let mask_arr = self.arena.eval(pred, &chunk).map_err(|e| e.to_string())?;
+        let mask_arr = self.eval_created(pred, &chunk)?;
         let mask = mask_arr
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| "nljoin join conjunct must return boolean array".to_string())?;
-        filter_record_batch(chunk.record_batch(), mask)
-            .map_err(|e| format!("nljoin join conjunct filter failed: {e}"))
+        self.filter_created(&chunk, mask)
     }
 }

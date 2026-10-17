@@ -20,14 +20,14 @@ use arrow::array::{Array, ArrayRef, ListBuilder, StringArray, StringBuilder};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-pub fn eval_json_keys(
-    arena: &ExprArena,
+pub fn eval_json_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!("json_keys expects 1 argument, got {}", args.len()));
+        return Err((format!("json_keys expects 1 argument, got {}", args.len())).into());
     }
 
     let input = arena.eval(args[0], chunk)?;

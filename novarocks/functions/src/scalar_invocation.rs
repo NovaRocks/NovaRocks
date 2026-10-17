@@ -36,6 +36,11 @@ pub enum ScalarInvocationActivation {
 
 pub trait PreparedInvocationScalarKernel: Send + Sync + fmt::Debug {
     fn contract(&self) -> &Arc<ScalarCallContract>;
+    /// A factual exact-owner scheduling policy. The whole-Data ABI alone
+    /// does not request full-domain children for existing owners.
+    fn input_domain_policy(&self) -> InvocationInputDomainPolicy {
+        InvocationInputDomainPolicy::SelectedDemand
+    }
     /// Explicitly uncovered unless this exact prepared owner supplies an
     /// audited complete request source. No name or ABI selects a profile.
     fn invocation_resource_profile(&self) -> Option<WholeInvocationResourceProfile> {
@@ -55,6 +60,15 @@ pub trait InvocationScalarKernelInstance: Send {
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, ScalarInvocationFailure>;
+    /// Explicit scoped entry for owners declaring OriginalActualDomain.
+    /// Older selected-demand instances remain unchanged and refuse this entry.
+    fn evaluate_scoped<'a>(
+        &mut self,
+        _input: ScopedScalarCallInput<'_, 'a>,
+        _control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, ScalarInvocationFailure> {
+        Err(invalid("scalar owner does not implement explicit invocation scope").into())
+    }
     fn retained_bytes(&self) -> usize;
 }
 impl ScalarInvocationError for ScalarInvocationFailure {
@@ -250,6 +264,7 @@ pub struct InvocationScalarEvaluationInstance {
     retained_upper_bound: usize,
     failed: bool,
     inline_charge: OpaqueRetainedCharge,
+    host: Arc<dyn AggregateStateAllocator>,
 }
 impl InvocationScalarEvaluationInstance {
     pub fn instantiate_with_allocator(
@@ -270,7 +285,7 @@ impl InvocationScalarEvaluationInstance {
         } else {
             Some(inline_charge.reserve_operation(inline_bytes)?)
         };
-        let instance = prepared.create_instance_with_allocator(actual)?;
+        let instance = prepared.create_instance_with_allocator(actual.clone())?;
         if let Some(reservation) = &mut reservation {
             inline_charge.reconcile_under_reservation(inline_bytes, reservation)?;
         }
@@ -286,6 +301,7 @@ impl InvocationScalarEvaluationInstance {
             retained_upper_bound,
             failed: false,
             inline_charge,
+            host: actual,
         })
     }
     pub fn contract(&self) -> &ScalarCallContract {
@@ -294,6 +310,9 @@ impl InvocationScalarEvaluationInstance {
     /// Original first-cause latch, readable without a diagnostic or callback.
     pub const fn is_failed(&self) -> bool {
         self.failed
+    }
+    pub fn input_domain_policy(&self) -> InvocationInputDomainPolicy {
+        self._prepared.input_domain_policy()
     }
     pub fn invocation_resource_profile(&self) -> Option<WholeInvocationResourceProfile> {
         self._prepared.invocation_resource_profile()
@@ -326,20 +345,94 @@ impl InvocationScalarEvaluationInstance {
         if self.failed {
             return Err(KernelFailure::InstanceFailed.into());
         }
-        let result =
-            if activation == ScalarInvocationActivation::ValidateOnly && !selection.is_empty() {
-                Err(invalid("nonempty scalar demand cannot be validation-only").into())
-            } else {
-                evaluate_scalar_once(
-                    self.instance.as_mut(),
-                    &self.contract,
-                    self.retained_upper_bound,
-                    selection,
-                    arguments,
-                    activation == ScalarInvocationActivation::Activated,
-                    control,
+        let result = if self.input_domain_policy() != InvocationInputDomainPolicy::SelectedDemand {
+            Err(invalid("original-domain scalar requires an explicit invocation scope").into())
+        } else if activation == ScalarInvocationActivation::ValidateOnly && !selection.is_empty() {
+            Err(invalid("nonempty scalar demand cannot be validation-only").into())
+        } else {
+            evaluate_scalar_once(
+                self.instance.as_mut(),
+                &self.contract,
+                self.retained_upper_bound,
+                selection,
+                arguments,
+                activation == ScalarInvocationActivation::Activated,
+                control,
+            )
+        };
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    pub fn evaluate_scoped<'a>(
+        &mut self,
+        scope: ScalarInvocationScope<'a>,
+        sources: &'a [ScalarInvocationSource<'a>],
+        activation: ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, ScalarInvocationFailure> {
+        if self.failed {
+            return Err(KernelFailure::InstanceFailed.into());
+        }
+        let result = (|| {
+            if self.input_domain_policy() != InvocationInputDomainPolicy::OriginalActualDomain {
+                return Err(invalid(
+                    "selected-demand scalar does not accept an original-domain scope",
                 )
-            };
+                .into());
+            }
+            if activation == ScalarInvocationActivation::ValidateOnly && !scope.demand().is_empty()
+            {
+                return Err(invalid("nonempty scalar demand cannot be validation-only").into());
+            }
+            scope.validate(control)?;
+            control.checkpoint(0)?;
+            let expected = self.contract.value_argument_types();
+            if expected.len() != sources.len() {
+                return Err(
+                    invalid("scoped scalar sources differ from the exact call shape").into(),
+                );
+            }
+            for (source, ty) in sources.iter().zip(expected) {
+                source.validate(scope, ty, control)?;
+            }
+            if activation == ScalarInvocationActivation::ValidateOnly && scope.demand().is_empty() {
+                return SelectedValues::try_new(
+                    scope.demand(),
+                    self.contract.result_type().data_type(),
+                    crate::invocation_scope::retain_scoped_result_type(
+                        arrow_array::new_empty_array(self.contract.result_type().data_type()),
+                        self.contract.result_type(),
+                        &self.host,
+                        control,
+                    )?,
+                    Box::default(),
+                )
+                .map_err(|_| internal("empty scoped scalar result violates its contract").into());
+            }
+            let output = self.instance.evaluate_scoped(
+                ScopedScalarCallInput {
+                    contract: &self.contract,
+                    scope,
+                    sources,
+                },
+                control,
+            )?;
+            if self.instance.retained_bytes() > self.retained_upper_bound {
+                return Err(
+                    internal("scalar instance exceeded its lifetime retained bound").into(),
+                );
+            }
+            crate::scalar_kernel::validate_scalar_output_observed(
+                &output,
+                scope.demand(),
+                &self.contract,
+                control,
+            )?;
+            control.checkpoint(0)?;
+            Ok(output)
+        })();
         if result.is_err() {
             self.failed = true;
         }

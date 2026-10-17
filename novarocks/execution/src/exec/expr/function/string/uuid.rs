@@ -21,12 +21,12 @@ use rand::Rng;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
-pub(super) fn eval_uuid(
-    _arena: &ExprArena,
+pub(super) fn eval_uuid<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    _arena: &__Eval,
     _expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let mut rng = rand::thread_rng();
     let mut values = Vec::with_capacity(chunk.len());
     for _ in 0..chunk.len() {

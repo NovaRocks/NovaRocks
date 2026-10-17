@@ -17,13 +17,13 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::ArrayRef;
-pub fn eval_hll_hash(
-    arena: &ExprArena,
+pub fn eval_hll_hash<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let input = arena.eval(args[0], chunk)?;
-    novarocks_functions::hll_hash_core::array(&input)
+    Ok((novarocks_functions::hll_hash_core::array(&input))?)
 }

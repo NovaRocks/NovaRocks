@@ -21,7 +21,11 @@ use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 // IS NULL predicate for Arrow arrays
-pub fn eval_is_null(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<ArrayRef, String> {
+pub fn eval_is_null<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    child: ExprId,
+    chunk: &Chunk,
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(child, chunk)?;
     let len = array.len();
 
@@ -57,11 +61,11 @@ pub fn eval_is_null(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<A
 }
 
 // IS NOT NULL predicate for Arrow arrays
-pub fn eval_is_not_null(
-    arena: &ExprArena,
+pub fn eval_is_not_null<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let array = arena.eval(child, chunk)?;
     let len = array.len();
 

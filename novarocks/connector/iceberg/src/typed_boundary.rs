@@ -1501,6 +1501,12 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         procedure: novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure,
     ) -> Result<Option<Self::Table>, ConnectorError> {
         let novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(group) = procedure;
+        group
+            .content()
+            .validate_owner(&novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            })?;
         // Reuse the existing frozen-artifact construction, but retain the
         // resulting concrete handle instead of encoding it into a carrier.
         if system_relation_of(name.table_name()).is_some() {

@@ -105,12 +105,12 @@ fn translate_utf8(src: &str, utf8_map: &HashMap<char, Option<char>>) -> Option<S
     Some(out)
 }
 
-pub fn eval_translate(
-    arena: &ExprArena,
+pub fn eval_translate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let src_arr = arena.eval(args[0], chunk)?;
     let from_arr = arena.eval(args[1], chunk)?;
