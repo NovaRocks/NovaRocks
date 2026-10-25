@@ -915,6 +915,22 @@ mod owner_tests {
         assert_eq!(port.cancelled.load(Ordering::SeqCst), 0);
     }
     #[test]
+    fn joining_existing_handles_never_registers_another_settlement() {
+        let id = UniqueId::new(84036, 1);
+        let owner = deferred_fragment_owner(id);
+        let (dormant, _, _) = deferred_fragment_with_receiver(id, &owner, None);
+        let running = dormant.start();
+        wait_for_fragment_probe(|| owner.pending_settlements() == 1);
+        owner.advance_all();
+        assert!(running.stopped_fact().is_some());
+        assert_eq!(owner.pending_settlements(), 0);
+        let original = running.join();
+        let repeated = running.clone().join();
+        assert!(matches!(original.outcome(), FragmentOutcome::Succeeded));
+        assert!(matches!(repeated.outcome(), FragmentOutcome::Succeeded));
+        assert_eq!(owner.pending_settlements(), 0);
+    }
+    #[test]
     fn cancellation_accepted_after_settlement_still_retires_as_cancelled() {
         use novarocks_execution_contract::{
             CancelReason, TaskConclusionPort, TaskConclusionProposal,
@@ -2578,8 +2594,10 @@ impl RunningFragmentHandle {
         self.inner.lifecycle.interrupt(reason.detail());
     }
     pub fn join(&self) -> FragmentTerminalFact {
-        let result = self.inner.pipeline.join();
-        self.inner.lifecycle.settle_after_stop(result);
+        // The original once-only finisher owns settlement and resource
+        // retirement. A waiter observes its result rather than registering a
+        // second finisher (including when several handles join concurrently).
+        let _ = self.inner.pipeline.join();
         let mut state = self
             .inner
             .lifecycle

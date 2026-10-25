@@ -3371,6 +3371,7 @@ const fn lane_name(lane: DispatchLane) -> &'static str {
 /// receipt share one vocabulary.
 const fn outcome_name(outcome: OperationOutcome) -> &'static str {
     match outcome {
+        OperationOutcome::OwnerFailed => "owner_failed",
         OperationOutcome::Accepted => "accepted",
         OperationOutcome::Idempotent => "idempotent",
         OperationOutcome::OperationTimedOut => "operation_timed_out",
@@ -8454,6 +8455,62 @@ mod tests {
             OperationDispatchResult::NonWorkerRejected
         );
         assert_eq!(*acks[0].payload(), AckPayload::None);
+    }
+
+    #[test]
+    fn owner_failure_never_consumes_a_success_or_closure_acknowledgement() {
+        for kind in [
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            OperationKind::CreateTask,
+            OperationKind::UpdateTask,
+            OperationKind::UpdateQueryContext,
+            OperationKind::QuiesceQueryContext,
+            OperationKind::AbortQueryContext,
+            OperationKind::ReleaseQueryContext,
+        ] {
+            assert!(!consumes_ack_body_for_outcome(
+                kind,
+                OperationOutcome::OwnerFailed
+            ));
+        }
+        assert_eq!(outcome_name(OperationOutcome::OwnerFailed), "owner_failed");
+    }
+
+    #[test]
+    fn owner_failed_subscription_rejection_is_fatal_but_network_loss_can_resubscribe() {
+        assert!(subscription_rejection_is_fatal(
+            &tonic::Status::failed_precondition("the context protocol owner failed",)
+        ));
+        assert!(!subscription_rejection_is_fatal(
+            &tonic::Status::unavailable("connection closed",)
+        ));
+    }
+
+    #[tokio::test]
+    async fn owner_failed_abort_keeps_its_exact_verdict_without_a_closure_body() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        fixture
+            .loopback
+            .peer
+            .expect_apply(ApplyAnswer::WithAck(vec![(
+                OperationOutcome::OwnerFailed,
+                None,
+            )]));
+        submit_batch(
+            &fixture.sink,
+            released_batch(backend, vec![abort_intent(context(backend))]),
+        );
+        let acks = settled(&fixture.acks, 1).await;
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::OwnerFailed)
+        );
+        assert_eq!(*acks[0].payload(), AckPayload::None);
+        assert_eq!(
+            novarocks_query_application::coordination::frontend_action(acks[0].dispatch_result()),
+            novarocks_query_application::coordination::FrontendAction::FailAttempt,
+        );
     }
 
     #[tokio::test]

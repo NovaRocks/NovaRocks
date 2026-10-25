@@ -3831,6 +3831,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-control-runtime"
+version = "0.1.0"
+dependencies = [
+ "loom",
+ "novarocks-control-runtime-core",
+]
+
+[[package]]
+name = "novarocks-control-runtime-core"
+version = "0.1.0"
+
+[[package]]
 name = "novarocks-coordination-contract"
 version = "0.1.0"
 dependencies = [
@@ -4886,6 +4898,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "novarocks-control-runtime",
+ "novarocks-control-runtime-core",
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-failpoint",
@@ -4896,10 +4910,20 @@ dependencies = [
  "novarocks-spi",
  "novarocks-type-contract",
  "novarocks-types",
+ "novarocks-worker-protocol",
  "sha2 0.10.9",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-worker-protocol"
+version = "0.1.0"
+dependencies = [
+ "novarocks-control-runtime-core",
+ "novarocks-execution-contract",
+ "novarocks-types",
 ]
 
 [[package]]

@@ -294,6 +294,10 @@ impl OperationEnvelope {
 /// delivery are query-side port results and do not enter this enum.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum OperationOutcome {
+    /// The operation owner failed locally. This is fatal to the attempt and
+    /// proves neither Task termination nor physical resource convergence.
+    /// Previously published receipts remain valid.
+    OwnerFailed,
     /// The operation was applied.
     Accepted,
     /// An exact replay of an already applied operation.

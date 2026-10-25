@@ -97,7 +97,7 @@ enum Step {
     StandDown,
     BodyPanic,
 }
-const STEPS: usize = 9;
+pub(crate) const STEPS: usize = Step::BodyPanic as usize + 1;
 // Each role belongs to one lexically bounded, once-only body boundary. A
 // retained-bytes unwind and its independent input destructor may both fail.
 #[derive(Clone, Copy)]
@@ -108,7 +108,7 @@ pub(crate) enum PreparationUnwindRole {
     Input,
     Tail,
 }
-const BODY_ROLES: usize = 4;
+pub(crate) const BODY_ROLES: usize = PreparationUnwindRole::Tail as usize + 1;
 type Payload = Box<dyn Any + Send>;
 type PanicCustody = [Option<ManuallyDrop<Payload>>; STEPS];
 

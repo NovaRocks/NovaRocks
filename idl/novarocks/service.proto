@@ -1161,6 +1161,9 @@ enum TaskOperationOutcome {
   TASK_OPERATION_OUTCOME_ADMISSION_TICKET_STILL_ACTIVE = 18;
   TASK_OPERATION_OUTCOME_NOT_READY = 19;
   TASK_OPERATION_OUTCOME_PREPARATION_BUSY = 20;
+  // The local protocol owner failed. This fails the attempt without proving
+  // Task termination or physical resource convergence; prior receipts stand.
+  TASK_OPERATION_OUTCOME_OWNER_FAILED = 21;
 }
 
 // Per plan node, the highest sequence this task has accepted and whether that

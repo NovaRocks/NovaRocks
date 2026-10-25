@@ -40,6 +40,7 @@ mod admission_epoch;
 mod catalog_manager;
 mod catalog_manager_config;
 mod clock;
+pub mod control_runtime_policy;
 pub mod connector_batch_transform;
 pub mod connector_variant_transform;
 pub mod connector_write_runtime;
@@ -66,6 +67,7 @@ pub mod result_batch;
 pub mod result_buffer;
 pub mod root_result_channel;
 mod runtime_filter_error;
+mod settlement;
 pub mod sink_commit;
 mod status;
 mod task_completion;
@@ -75,6 +77,7 @@ mod task_diagnostics;
 mod task_domain_execution;
 mod task_execution_ports;
 mod task_preparation;
+mod task_proposal_ingress;
 mod task_protocol_event;
 pub use task_preparation::{
     TaskPreparationChild, TaskPreparationChildExit, TaskPreparationChildRegistrationFailure,

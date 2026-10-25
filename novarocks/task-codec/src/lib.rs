@@ -1085,6 +1085,7 @@ mod tests {
         assert_eq!(encode_query_context_state(QueryContextState::Absent), None);
         assert!(encode_query_context_state(QueryContextState::Active).is_some());
         for outcome in [
+            OperationOutcome::OwnerFailed,
             OperationOutcome::Accepted,
             OperationOutcome::Idempotent,
             OperationOutcome::OperationTimedOut,
@@ -1111,6 +1112,23 @@ mod tests {
                 ),
                 Ok(outcome),
                 "{outcome:?} must have one exact Worker receipt encoding"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_failed_has_a_distinct_wire_value_and_unknown_outcomes_are_refused() {
+        assert_eq!(encode_operation_outcome(OperationOutcome::OwnerFailed), 21);
+        assert_eq!(
+            decode_operation_outcome(21, FieldPath::root("operation_outcome")),
+            Ok(OperationOutcome::OwnerFailed)
+        );
+        for invalid in [0, 5, 16, i32::MAX] {
+            assert_eq!(
+                decode_operation_outcome(invalid, FieldPath::root("operation_outcome"))
+                    .unwrap_err()
+                    .kind(),
+                &ProtocolErrorKind::InvalidEnum
             );
         }
     }

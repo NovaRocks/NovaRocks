@@ -1199,6 +1199,7 @@ pub fn decode_control_operation_batch(
 
 fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, ProtocolError> {
     match novarocks::TaskOperationOutcome::try_from(value) {
+        Ok(novarocks::TaskOperationOutcome::OwnerFailed) => Ok(OperationOutcome::OwnerFailed),
         Ok(novarocks::TaskOperationOutcome::Accepted) => Ok(OperationOutcome::Accepted),
         Ok(novarocks::TaskOperationOutcome::Idempotent) => Ok(OperationOutcome::Idempotent),
         Ok(novarocks::TaskOperationOutcome::OperationTimedOut) => {
@@ -1254,6 +1255,7 @@ fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, Proto
 /// one exact wire representation.
 fn encode_outcome(value: OperationOutcome) -> i32 {
     let encoded = match value {
+        OperationOutcome::OwnerFailed => novarocks::TaskOperationOutcome::OwnerFailed,
         OperationOutcome::Accepted => novarocks::TaskOperationOutcome::Accepted,
         OperationOutcome::Idempotent => novarocks::TaskOperationOutcome::Idempotent,
         OperationOutcome::OperationTimedOut => novarocks::TaskOperationOutcome::OperationTimedOut,

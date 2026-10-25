@@ -1228,6 +1228,10 @@ fn admission_may_hold_worker_capacity(state: AdmissionIssueState) -> bool {
             | AdmissionIssueState::Granted { .. }
             | AdmissionIssueState::ExpiredGrant(_)
             | AdmissionIssueState::PreWorkerRejectedAfterUnknown
+            // A failed owner answered the request, but did not prove that its
+            // grant/captures exited. Abort or exact process replacement must
+            // still settle the original responsibility.
+            | AdmissionIssueState::Rejected(OperationOutcome::OwnerFailed)
             | AdmissionIssueState::RetryableNoGrant(OperationOutcome::AdmissionTicketStillActive)
     )
 }
@@ -1877,6 +1881,38 @@ mod tests {
         assert_eq!(
             ledger.stand_down_facts().unwrap(),
             vec![(context, EstablishStandDownFact::NoGrant)]
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_failed_admission_closes_replay_but_keeps_abort_responsibility() {
+        let execution = execution(35);
+        let activation = activation(execution);
+        let context = context(execution);
+        let now = times().0;
+        let mut ledger = issue_ledger(context, 2);
+        let request = admission_request(context, 35);
+        let issue = ledger
+            .begin_admission_issue(activation, request, now)
+            .unwrap();
+        let settlement =
+            AdmissionIssueSettlement::rejected(issue.operation_id(), OperationOutcome::OwnerFailed)
+                .unwrap();
+        assert_eq!(
+            ledger.settle_admission_issue(activation, issue, settlement, now),
+            Err(EstablishIssueError::AdmissionRejected)
+        );
+        assert_eq!(
+            ledger.begin_admission_issue(activation, request, now),
+            Err(EstablishIssueError::AdmissionReplayClosed)
+        );
+        assert_eq!(
+            ledger.begin_admission_issue(activation, admission_request(context, 36), now),
+            Err(EstablishIssueError::ConflictingAdmissionIssue)
+        );
+        assert_eq!(
+            ledger.stand_down_facts().unwrap(),
+            vec![(context, EstablishStandDownFact::AbortRequired)]
         );
     }
 

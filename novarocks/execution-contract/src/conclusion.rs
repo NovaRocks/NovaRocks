@@ -198,6 +198,81 @@ impl<C> AcceptedTaskConclusion<C> {
 pub type SettledContinuation<C> =
     Box<dyn FnOnce(Option<Arc<AcceptedTaskConclusion<C>>>) + Send + 'static>;
 
+/// Opaque, single-use authority issued with an admitted lifecycle role.
+/// The issuer keeps its bounded storage and work responsibility until actual
+/// callback/capture exit and every required completion consumer retires.
+///
+/// This is public so the application owner can implement it across crates.
+/// An Execution consumer receives a permit; cloning a Task port grants no
+/// authority to construct another admitted role.
+pub trait SettlementCapability<C>: Send
+where
+    C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
+{
+    /// Transfers the continuation into the role's existing prepaid custody.
+    /// The implementation must not wait for the protocol owner to advance.
+    fn register(self: Box<Self>, continuation: SettledContinuation<C>);
+    /// Withdraws an unused registration authority. This is not evidence that
+    /// the bound role, its captures or its other reports have actually exited.
+    fn revoke_unused(self: Box<Self>);
+}
+
+/// Moving this value is the only way to register one settlement continuation.
+/// It intentionally implements neither Clone nor a factory on a Task handle.
+#[must_use = "An admitted role must consume or revoke its settlement authority"]
+pub struct SettlementPermit<C>
+where
+    C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
+{
+    identity: Option<TaskIdentity>,
+    capability: Option<Box<dyn SettlementCapability<C>>>,
+}
+impl<C> SettlementPermit<C>
+where
+    C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
+{
+    /// Called only by the role admission owner after reserving its complete
+    /// storage/work vector. This factory creates no capacity on its own.
+    pub fn from_admitted_role(
+        identity: TaskIdentity,
+        capability: Box<dyn SettlementCapability<C>>,
+    ) -> Self {
+        Self {
+            identity: Some(identity),
+            capability: Some(capability),
+        }
+    }
+    /// Taskless execution can have an admitted local finisher without
+    /// manufacturing a distributed Task identity or depending on Worker.
+    pub fn from_admitted_local_role(capability: Box<dyn SettlementCapability<C>>) -> Self {
+        Self {
+            identity: None,
+            capability: Some(capability),
+        }
+    }
+    pub const fn identity(&self) -> Option<TaskIdentity> {
+        self.identity
+    }
+    /// A successful handoff consumes the unique authority before invoking the
+    /// issuer. An unwind cannot turn it back into an unused reservation.
+    pub fn register(mut self, continuation: SettledContinuation<C>) {
+        self.capability
+            .take()
+            .expect("one settlement authority")
+            .register(continuation);
+    }
+}
+impl<C> Drop for SettlementPermit<C>
+where
+    C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        if let Some(capability) = self.capability.take() {
+            capability.revoke_unused();
+        }
+    }
+}
+
 /// Bound to one exact Task from Accepted through preparation and execution.
 ///
 /// `submit` hands off an owned proposal without returning a verdict or waiting
@@ -394,6 +469,68 @@ mod source_ownership_tests {
             ),
             SafeDetail::truncating("originating local failure"),
         )))
+    }
+    struct CapabilityProbe {
+        registered: Arc<AtomicUsize>,
+        revoked: Arc<AtomicUsize>,
+    }
+    impl SettlementCapability<Origin> for CapabilityProbe {
+        fn register(self: Box<Self>, continuation: SettledContinuation<Origin>) {
+            self.registered.fetch_add(1, Ordering::AcqRel);
+            continuation(None);
+        }
+        fn revoke_unused(self: Box<Self>) {
+            self.revoked.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    #[test]
+    fn settlement_permit_handoff_consumes_authority_without_unused_revocation() {
+        let registered = Arc::new(AtomicUsize::new(0));
+        let revoked = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let permit = SettlementPermit::from_admitted_role(
+            receipt(TaskConclusion::Succeeded).identity(),
+            Box::new(CapabilityProbe {
+                registered: registered.clone(),
+                revoked: revoked.clone(),
+            }),
+        );
+        let called = calls.clone();
+        permit.register(Box::new(move |snapshot| {
+            assert!(snapshot.is_none());
+            called.fetch_add(1, Ordering::AcqRel);
+        }));
+        assert_eq!(registered.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(revoked.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn unused_settlement_permit_revokes_registration_authority_once() {
+        let registered = Arc::new(AtomicUsize::new(0));
+        let revoked = Arc::new(AtomicUsize::new(0));
+        let permit = SettlementPermit::from_admitted_role(
+            receipt(TaskConclusion::Succeeded).identity(),
+            Box::new(CapabilityProbe {
+                registered: registered.clone(),
+                revoked: revoked.clone(),
+            }),
+        );
+        drop(permit);
+        assert_eq!(registered.load(Ordering::Acquire), 0);
+        assert_eq!(revoked.load(Ordering::Acquire), 1);
+    }
+    #[test]
+    fn local_settlement_authority_never_manufactures_a_task_identity() {
+        let registered = Arc::new(AtomicUsize::new(0));
+        let revoked = Arc::new(AtomicUsize::new(0));
+        let permit = SettlementPermit::from_admitted_local_role(Box::new(CapabilityProbe {
+            registered: registered.clone(),
+            revoked: revoked.clone(),
+        }));
+        assert!(permit.identity().is_none());
+        permit.register(Box::new(|snapshot| assert!(snapshot.is_none())));
+        assert_eq!(registered.load(Ordering::Acquire), 1);
+        assert_eq!(revoked.load(Ordering::Acquire), 0);
     }
     #[test]
     fn receipt_aliases_retain_one_nonclone_origin_until_the_last_reader_drops() {

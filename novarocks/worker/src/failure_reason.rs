@@ -118,6 +118,7 @@ pub(crate) enum WorkerFailureReason {
     RootMetadataNotification = 163,
     RootMetadataNotificationInvariant = 164,
     RootReadUnknown = 165,
+    SettlementCall = 166,
 }
 impl WorkerFailureReason {
     pub(crate) const fn reason(self) -> FailureReason {

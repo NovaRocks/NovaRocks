@@ -18,11 +18,10 @@
 //! Worker-owned admission authority for task exchange destinations.
 
 use std::collections::{HashMap, HashSet};
-use std::mem::size_of;
 use std::sync::{Arc, Mutex, RwLock};
 
 use novarocks_execution_contract::{
-    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeInbound, ExchangeSource,
+    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeSource,
     ExchangeStreamClose, ExchangeStreamIdentity, FragmentNodeId, QueryContextRef, TaskDescriptor,
     TaskIdentity,
 };
@@ -250,13 +249,7 @@ pub struct TaskInboundCapabilities {
     max_bytes: usize,
 }
 
-/// The bounded, payload-free remainder of a receiver that normally stopped.
-#[derive(Debug)]
-struct NormalClosedInboundRecord {
-    destination: TaskIdentity,
-    inbound: Vec<ExchangeInbound>,
-    closes: Box<[ExchangeStreamClose]>,
-}
+use novarocks_worker_protocol::inbound_cost::NormalClosedInboundRecord;
 
 /// An exact normal-close answer to a frozen sender of one input occurrence.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -350,19 +343,7 @@ impl TaskInboundCapabilities {
     }
 
     fn record_bytes(descriptor: &TaskDescriptor) -> Option<usize> {
-        if descriptor.topology().inbound().is_empty() {
-            return Some(0);
-        }
-        descriptor.topology().inbound().iter().try_fold(
-            size_of::<NormalClosedInboundRecord>() + 128,
-            |bytes, node| {
-                bytes
-                    .checked_add(size_of::<ExchangeInbound>() + 64)?
-                    .checked_add(node.sources().len().checked_mul(
-                        size_of::<ExchangeSource>() + size_of::<ExchangeStreamClose>() + 16,
-                    )?)
-            },
-        )
+        novarocks_worker_protocol::inbound_cost::record_bytes(descriptor)
     }
 
     pub fn reserve_normal_close(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {

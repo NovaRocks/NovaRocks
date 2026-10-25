@@ -127,6 +127,34 @@ impl PreparedTaskConclusion {
     pub(crate) fn late_diagnostic_mut(&mut self) -> &mut Option<Arc<TaskSecondaryDiagnostic>> {
         &mut self.late_diagnostic
     }
+
+    /// Moves only already projected neutral values into the pure protocol.
+    /// The caller retains the rich source in prepaid host custody. Rendering
+    /// and the old diagnostic record's destruction occur before its cut lock.
+    pub(crate) fn into_protocol(
+        self,
+    ) -> (
+        novarocks_worker_protocol::proposal_summary::Proposal,
+        Option<ExecutionFailure>,
+    ) {
+        let diagnostic = self.late_diagnostic.as_ref().map(|record| {
+            novarocks_worker_protocol::proposal_summary::Diagnostic {
+                phase: record.phase(),
+                fact: record.fact(),
+                detail: novarocks_execution_contract::SafeDetail::truncating(record.detail()),
+                cleanup: false,
+            }
+        });
+        (
+            novarocks_worker_protocol::proposal_summary::Proposal {
+                conclusion: self.conclusion,
+                evidence: self.reported_evidence,
+                source: None,
+                diagnostic,
+            },
+            self.origin,
+        )
+    }
 }
 
 /// This member has no mutex or notifications. TaskStatusOwner's transaction

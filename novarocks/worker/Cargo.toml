@@ -13,6 +13,9 @@ doctest = false
 [features]
 
 [dependencies]
+novarocks-worker-protocol.workspace = true
+novarocks-control-runtime.workspace = true
+novarocks-control-runtime-core.workspace = true
 novarocks-failpoint = { workspace = true }
 arrow.workspace = true
 async-trait.workspace = true
