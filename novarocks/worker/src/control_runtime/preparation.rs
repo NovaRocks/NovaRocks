@@ -20,7 +20,10 @@
 //! have separate release conditions. No host call or opaque Drop runs locked.
 
 use super::actors::{WorkerAction, WorkerActor};
-use crate::{control_admission::Dimension, task_port::TaskPendingNotice};
+use crate::{
+    control_admission::Dimension,
+    task_port::{TaskPendingNotice, TaskStopSignal},
+};
 use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::{ActorRuntime, DriverError, EffectTicket},
@@ -66,6 +69,7 @@ struct State {
 }
 struct Custody {
     task: TaskIdentity,
+    stop: TaskStopSignal,
     parent: PreparationParent,
     input: Mutex<Option<ManuallyDrop<TaskCreationInput>>>,
     state: Mutex<State>,
@@ -109,12 +113,14 @@ pub(crate) struct PreparationJob {
 }
 pub(crate) enum PreparationOutcome<T> {
     Returned(T),
+    TaskStopped,
     StartRefused(RuntimeError),
     Unresolved,
 }
 #[derive(Debug)]
 pub(crate) enum PreparationAdoptionError {
     WrongEffect,
+    WrongTask,
     Driver(DriverError),
     Runtime(RuntimeError),
 }
@@ -123,6 +129,9 @@ impl std::fmt::Display for PreparationAdoptionError {
         match self {
             Self::WrongEffect => {
                 f.write_str("preparation adoption requires the exact EnqueuePreparation effect")
+            }
+            Self::WrongTask => {
+                f.write_str("preparation stop signal differs from the admitted Task")
             }
             Self::Driver(error) => write!(f, "preparation responsibility transfer failed: {error}"),
             Self::Runtime(error) => write!(f, "preparation report admission failed: {error}"),
@@ -133,6 +142,11 @@ impl std::error::Error for PreparationAdoptionError {}
 
 pub(crate) const PREPARATION_CORE_CONSUMER: ConsumerId = ConsumerId::new(1).unwrap();
 pub(crate) const PREPARATION_OBSERVER_CONSUMER: ConsumerId = ConsumerId::new(2).unwrap();
+pub(crate) struct PreparationBinding {
+    pub stop: TaskStopSignal,
+    pub pending: Arc<dyn TaskPendingNotice>,
+    pub health: Arc<ExecutionHealth>,
+}
 fn revoke_unbound_report(report: &ReportSlot) {
     report.revoke_unused().expect("unused preparation report");
     report
@@ -152,8 +166,7 @@ impl PreparationCustody {
         runtime: &ActorRuntime<WorkerActor>,
         ticket: &EffectTicket<WorkerAction>,
         input: TaskCreationInput,
-        pending: Arc<dyn TaskPendingNotice>,
-        health: Arc<ExecutionHealth>,
+        binding: PreparationBinding,
     ) -> Result<(Self, PreparationJob), (PreparationAdoptionError, TaskCreationInput)> {
         let (task, reservation) = match &ticket.effect {
             WorkerAction::Context(
@@ -165,6 +178,9 @@ impl PreparationCustody {
             ) => (*task, *reservation),
             _ => return Err((PreparationAdoptionError::WrongEffect, input)),
         };
+        if binding.stop.identity() != task {
+            return Err((PreparationAdoptionError::WrongTask, input));
+        }
         let guard = match runtime.take_step_reservation(ticket, reservation) {
             Ok(guard) => guard,
             Err(error) => return Err((PreparationAdoptionError::Driver(error), input)),
@@ -209,13 +225,11 @@ impl PreparationCustody {
             }
         };
         Ok(Self::from_admitted(
-            task,
+            binding,
             work,
             capacity,
             [body, exit],
             input,
-            pending,
-            health,
         ))
     }
     /// All work, storage and both reports were admitted before attaching this
@@ -223,13 +237,11 @@ impl PreparationCustody {
     /// The Task owner receives it back, with preparation charges removed, only
     /// after real whole exit and report retirement. Inbound charges stay in it.
     pub(crate) fn from_admitted(
-        task: TaskIdentity,
+        binding: PreparationBinding,
         work: WorkLease,
         capacity: CapacityBundle,
         reports: [ReportSlot; 2],
         input: TaskCreationInput,
-        pending: Arc<dyn TaskPendingNotice>,
-        health: Arc<ExecutionHealth>,
     ) -> (Self, PreparationJob) {
         let resources = capacity
             .resources()
@@ -249,7 +261,8 @@ impl PreparationCustody {
         };
         let [body_report, exit_report] = reports;
         let custody = Arc::new(Custody {
-            task,
+            task: binding.stop.identity(),
+            stop: binding.stop,
             parent,
             input: Mutex::new(Some(ManuallyDrop::new(input))),
             state: Mutex::new(State {
@@ -267,8 +280,8 @@ impl PreparationCustody {
             body_report,
             exit_report,
             preparing,
-            pending,
-            health,
+            pending: binding.pending,
+            health: binding.health,
             retained: Mutex::new(None),
         });
         *custody.retained.lock().expect("preparation retention lock") = Some(custody.clone());
@@ -415,37 +428,49 @@ impl PreparationCustody {
     }
 }
 impl PreparationJob {
-    fn key(&self) -> Key {
+    pub(super) fn key(&self) -> Key {
         self.custody.key()
     }
     /// Invoked by an actual host worker, never an actor poller. Start checks
-    /// the current scope stop/failure gate; an old Accepted fact cannot grant
+    /// the exact Task stop intent and current scope stop/failure gate; an old Accepted fact cannot grant
     /// execution. A refused job still really disposes its original input.
     pub(crate) fn run<T>(
         mut self,
         host: impl FnOnce(TaskCreationInput, PreparationParent) -> T,
     ) -> PreparationOutcome<T> {
-        let start = self
-            .custody
-            .0
-            .state
-            .lock()
-            .expect("preparation custody lock")
-            .work
-            .as_mut()
-            .expect("preparation work")
-            .start();
-        let result = catch_unwind(AssertUnwindSafe(|| match start {
-            Ok(()) => PreparationOutcome::Returned(host(
-                self.custody
-                    .take_input()
-                    .expect("one actual preparation input"),
-                self.custody.0.parent.clone(),
-            )),
-            Err(error) => {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if self.custody.0.stop.is_set() {
                 drop(host);
                 drop(self.custody.take_input());
-                PreparationOutcome::StartRefused(error)
+                return PreparationOutcome::TaskStopped;
+            }
+            let start = self
+                .custody
+                .0
+                .state
+                .lock()
+                .expect("preparation custody lock")
+                .work
+                .as_mut()
+                .expect("preparation work")
+                .start();
+            match start {
+                Ok(()) if !self.custody.0.stop.is_set() => PreparationOutcome::Returned(host(
+                    self.custody
+                        .take_input()
+                        .expect("one actual preparation input"),
+                    self.custody.0.parent.clone(),
+                )),
+                Ok(()) => {
+                    drop(host);
+                    drop(self.custody.take_input());
+                    PreparationOutcome::TaskStopped
+                }
+                Err(error) => {
+                    drop(host);
+                    drop(self.custody.take_input());
+                    PreparationOutcome::StartRefused(error)
+                }
             }
         }));
         let outcome = match result {
@@ -493,23 +518,37 @@ impl Drop for PreparationJob {
     }
 }
 
-struct QueueState {
+pub(crate) trait QueuedPreparation: Send + 'static {
+    /// Read-only metadata, called before taking the queue lock.
+    fn queue_key(&self) -> (ScopeId, WorkId);
+}
+impl QueuedPreparation for PreparationJob {
+    fn queue_key(&self) -> (ScopeId, WorkId) {
+        self.key()
+    }
+}
+
+struct QueueState<J: QueuedPreparation> {
     fair: FairWorkQueue,
-    jobs: BTreeMap<Key, ManuallyDrop<PreparationJob>>,
+    jobs: BTreeMap<Key, ManuallyDrop<J>>,
     running: usize,
 }
-struct Queue {
-    state: Mutex<QueueState>,
+struct Queue<J: QueuedPreparation = PreparationJob> {
+    state: Mutex<QueueState<J>>,
     workers: usize,
 }
-#[derive(Clone)]
-pub(crate) struct PreparationQueue(Arc<Queue>);
-pub(crate) struct RunningPreparation {
-    queue: PreparationQueue,
-    key: Key,
-    job: Option<PreparationJob>,
+pub(crate) struct PreparationQueue<J: QueuedPreparation = PreparationJob>(Arc<Queue<J>>);
+impl<J: QueuedPreparation> Clone for PreparationQueue<J> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
-impl PreparationQueue {
+pub(crate) struct RunningPreparation<J: QueuedPreparation = PreparationJob> {
+    queue: PreparationQueue<J>,
+    key: Key,
+    job: Option<J>,
+}
+impl<J: QueuedPreparation> PreparationQueue<J> {
     pub(crate) fn new(contexts: usize, jobs: usize, per_context: usize, workers: usize) -> Self {
         assert!(contexts > 0 && jobs > 0 && per_context > 0 && workers > 0);
         Self(Arc::new(Queue {
@@ -521,11 +560,8 @@ impl PreparationQueue {
             workers,
         }))
     }
-    pub(crate) fn enqueue(
-        &self,
-        job: PreparationJob,
-    ) -> Result<(), (FairQueueError, PreparationJob)> {
-        let key = job.key();
+    pub(crate) fn enqueue(&self, job: J) -> Result<(), (FairQueueError, J)> {
+        let key = job.queue_key();
         let mut state = self.0.state.lock().expect("preparation queue lock");
         if let Err(error) = state.fair.enqueue(key.0, key.1) {
             drop(state);
@@ -534,7 +570,7 @@ impl PreparationQueue {
         assert!(state.jobs.insert(key, ManuallyDrop::new(job)).is_none());
         Ok(())
     }
-    pub(crate) fn pop(&self) -> Option<RunningPreparation> {
+    pub(crate) fn pop(&self) -> Option<RunningPreparation<J>> {
         let mut state = self.0.state.lock().expect("preparation queue lock");
         if state.running == self.0.workers {
             return None;
@@ -553,11 +589,7 @@ impl PreparationQueue {
         })
     }
     /// The caller disposes the returned original on a host cleanup executor.
-    pub(crate) fn cancel(
-        &self,
-        scope: ScopeId,
-        work: WorkId,
-    ) -> Result<PreparationJob, FairQueueError> {
+    pub(crate) fn cancel(&self, scope: ScopeId, work: WorkId) -> Result<J, FairQueueError> {
         let mut state = self.0.state.lock().expect("preparation queue lock");
         state.fair.remove_queued(scope, work)?;
         let job = state
@@ -568,19 +600,24 @@ impl PreparationQueue {
         Ok(ManuallyDrop::into_inner(job))
     }
 }
-impl RunningPreparation {
-    pub(crate) fn run<T>(
-        mut self,
-        host: impl FnOnce(TaskCreationInput, PreparationParent) -> T,
-    ) -> PreparationOutcome<T> {
-        let result = self.job.take().expect("one actual running body").run(host);
-        // Drop returns only the physical body slot. Original work, whole exit
-        // reports, child obligations and P/bytes remain in PreparationCustody.
+impl<J: QueuedPreparation> RunningPreparation<J> {
+    pub(super) fn run_body<T>(mut self, body: impl FnOnce(J) -> T) -> T {
+        let result = body(self.job.take().expect("one actual running body"));
+        // This returns only the physical worker slot, including on unwind.
+        // All original work/capture/report custody stays with its real job.
         drop(self);
         result
     }
 }
-impl Drop for RunningPreparation {
+impl RunningPreparation<PreparationJob> {
+    pub(crate) fn run<T>(
+        self,
+        host: impl FnOnce(TaskCreationInput, PreparationParent) -> T,
+    ) -> PreparationOutcome<T> {
+        self.run_body(|job| job.run(host))
+    }
+}
+impl<J: QueuedPreparation> Drop for RunningPreparation<J> {
     fn drop(&mut self) {
         // Dropping an uninvoked body leaves its original work unresolved.
         let job = self.job.take();
@@ -596,7 +633,7 @@ impl Drop for RunningPreparation {
     }
 }
 
-impl Drop for Queue {
+impl<J: QueuedPreparation> Drop for Queue<J> {
     fn drop(&mut self) {
         let jobs =
             std::mem::take(&mut self.state.get_mut().expect("exclusive queue teardown").jobs);

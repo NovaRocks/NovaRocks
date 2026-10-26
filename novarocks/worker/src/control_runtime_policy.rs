@@ -40,6 +40,7 @@ pub enum PolicyError {
     ZeroBatchItems,
     ZeroRootReadHolders,
     Overflow,
+    InvalidStorageGeometry,
     InvalidActorBudget,
 }
 impl std::fmt::Display for PolicyError {
@@ -49,6 +50,9 @@ impl std::fmt::Display for PolicyError {
             Self::ZeroBatchItems => "control runtime batch items must be positive",
             Self::ZeroRootReadHolders => "control runtime root read holders must be positive",
             Self::Overflow => "control runtime storage geometry overflowed",
+            Self::InvalidStorageGeometry => {
+                "loading storage exceeds the complete Task storage inventory"
+            }
             Self::InvalidActorBudget => {
                 "control runtime actor budget cannot cover every input class"
             }
@@ -92,6 +96,42 @@ pub struct StorageNeed {
 }
 
 impl StorageNeed {
+    pub fn checked_sub(self, other: Self) -> Result<Self, PolicyError> {
+        Ok(Self {
+            inputs: self
+                .inputs
+                .checked_sub(other.inputs)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
+            batches: self
+                .batches
+                .checked_sub(other.batches)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
+            effects: self
+                .effects
+                .checked_sub(other.effects)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
+            cuts: self
+                .cuts
+                .checked_sub(other.cuts)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
+            replies: self
+                .replies
+                .checked_sub(other.replies)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
+            completions: self
+                .completions
+                .checked_sub(other.completions)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
+            captures: self
+                .captures
+                .checked_sub(other.captures)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
+            work: self
+                .work
+                .checked_sub(other.work)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
+        })
+    }
     pub fn checked_add(self, other: Self) -> Result<Self, PolicyError> {
         Ok(Self {
             inputs: self
@@ -206,6 +246,7 @@ pub enum TaskLifecycleRole {
 }
 impl TaskLifecycleRole {
     pub(crate) const COUNT: usize = Self::FailureProjection as usize + 1;
+    const LOADING: [Self; 2] = [Self::InputLoaded, Self::LoaderExited];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +254,10 @@ pub struct ControlRuntimePolicy {
     pub ingress: IngressRoleLimits,
     pub request_roles: usize,
     pub task_base: StorageNeed,
+    /// Creating owns these original positions before any input getter runs.
+    /// Accepted reserves only the remainder, never the same storage twice.
+    pub loading: StorageNeed,
+    pub accepted: StorageNeed,
     /// Maximum per-Task cut geometry, including a possible concentration of
     /// the shared request pool. These positions are not all reserved per Task.
     pub max_task_cuts: usize,
@@ -230,11 +275,18 @@ impl ControlRuntimePolicy {
             .and_then(|n| n.checked_add(crate::task_preparation::STEPS))
             .ok_or(PolicyError::Overflow)?;
         let mut task_base = StorageNeed::role(false).checked_mul(fixed_roles)?;
+        // Protocol lifecycle roles are bounded input authors. The original
+        // Task lifetime is a separate parent, not another notification author.
+        task_base.work = task_base.work.checked_add(1).ok_or(PolicyError::Overflow)?;
+        let mut loading = StorageNeed::role(false).checked_mul(TaskLifecycleRole::LOADING.len())?;
+        loading.work = crate::control_runtime::loading::LOADING_WORK_POSITIONS;
+        loading.completions = crate::control_runtime::loading::LOADING_REPORT_POSITIONS;
         // The open and consuming summary each have two candidate positions.
         task_base.captures = task_base
             .captures
             .checked_add(4)
             .ok_or(PolicyError::Overflow)?;
+        let accepted = task_base.checked_sub(loading)?;
         let max_task_cuts = fixed_roles
             .checked_add(request_roles)
             .and_then(|n| n.checked_add(ingress.root_read_holders))
@@ -243,6 +295,8 @@ impl ControlRuntimePolicy {
             ingress,
             request_roles,
             task_base,
+            loading,
+            accepted,
             max_task_cuts,
             request_pool: StorageNeed::role(true).checked_mul(request_roles)?,
             root_read_pool_per_root: StorageNeed::role(false)
@@ -327,6 +381,11 @@ mod tests {
     #[test]
     fn process_request_pool_is_shared_rather_than_multiplied_by_each_task() {
         let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
+        assert_eq!(
+            policy.loading.checked_add(policy.accepted).unwrap(),
+            policy.task_base
+        );
+        assert!(policy.loading.work > 0 && policy.loading.completions > 0);
         let one = policy.process_task_storage(1, 0).unwrap();
         let two = policy.process_task_storage(2, 0).unwrap();
         assert_eq!(two.replies, one.replies);

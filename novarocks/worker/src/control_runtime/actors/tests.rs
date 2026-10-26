@@ -156,12 +156,22 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
         WorkerAction::Context(ContextEffect::EnqueuePreparation { reservation, .. }) => reservation,
         _ => unreachable!(),
     };
+    let port = crate::task_port::TaskRuntimePort::from_admitted(
+        task,
+        &f.scope,
+        Arc::new(crate::task_proposal_ingress::TaskProposalIngress::new(4).unwrap()),
+        Arc::new(Pending),
+        Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+    );
     let (custody, job) = PreparationCustody::adopt(
         &f.runtime,
         &ticket,
         input,
-        Arc::new(Pending),
-        Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+        crate::control_runtime::preparation::PreparationBinding {
+            stop: port.stop_signal(),
+            pending: Arc::new(Pending),
+            health: port.health(),
+        },
     )
     .unwrap_or_else(|(error, _)| panic!("original Accepted guard adoption: {error}"));
     assert!(matches!(
@@ -224,13 +234,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_byte_limits(100)
+    }
+    fn with_byte_limits(bytes: u64) -> Self {
         let ledger = RuntimeLedger::new(
             ResourceVector::new([
                 (Dimension::ActiveTasks.id(), 2),
                 (Dimension::PreparingTasks.id(), 1),
-                (Dimension::PreparingBytes.id(), 100),
+                (Dimension::PreparingBytes.id(), bytes),
                 (Dimension::InboundRecords.id(), 4),
-                (Dimension::InboundBytes.id(), 100),
+                (Dimension::InboundBytes.id(), bytes),
                 (Dimension::Tickets.id(), 1),
                 (Dimension::Contexts.id(), 1),
             ])
@@ -260,7 +273,7 @@ impl Fixture {
                 max_creation_waiters: 4,
                 max_pending_requests: 16,
                 max_preparing: 1,
-                max_task_bytes: 100,
+                max_task_bytes: bytes,
                 step_budget: ContextCore::MAX_STEP_WORK,
                 lease_bounds: LeaseBounds::DEFAULT,
                 metric_publish_interval: Duration::from_millis(100),
@@ -1180,4 +1193,377 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
     f.runtime.effect_completed(conclusion).unwrap();
     f.runtime.retire_input(actor(), input).unwrap();
     f.finish();
+}
+
+fn exercise_original_fragment_roles(task_stopped: bool) {
+    use crate::control_runtime::{
+        effect_dispatch::EffectDispatch,
+        preparation::PreparationOutcome,
+        task::{TaskHostBinding, TaskHostError, TaskHostRecord, TaskHostResources},
+    };
+    use crate::{
+        control_runtime_policy::TaskLifecycleRole, settlement::RegistrationNotice,
+        task_port::TaskPendingNotice,
+    };
+    use novarocks_control_runtime_core::identity::ConsumerId;
+    use novarocks_execution_contract::{CreationContent, FrozenBytes, TaskCreationInput};
+    use std::{
+        any::Any,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    struct Pending;
+    impl TaskPendingNotice for Pending {
+        fn pending(&self) {}
+    }
+    struct Registered(Arc<AtomicUsize>);
+    impl RegistrationNotice for Registered {
+        fn registered(self: Box<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn unused(self: Box<Self>) {
+            self.0.fetch_add(2, Ordering::SeqCst);
+        }
+    }
+    #[derive(Debug)]
+    struct Assignment;
+    impl CreationContent for Assignment {
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn retained_bytes(&self) -> usize {
+            0
+        }
+        fn into_stored(self: Box<Self>) -> Box<dyn Any + Send> {
+            self
+        }
+    }
+    let mut f = Fixture::with_byte_limits(4096);
+    let task = task(f.identity, 1);
+    let create = f.send(
+        ContextInput::Create {
+            request: operation(1),
+            task,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+        InputClass::Ordinary,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    let load = f
+        .runtime
+        .ready_effects(actor(), create, 15)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let ticket = f.runtime.take_effect(actor(), create, load).unwrap();
+    let mut host = TaskHostRecord::adopt_loading(
+        &f.runtime,
+        &ticket,
+        TaskHostBinding {
+            context: f.identity,
+            max_cuts: 4,
+            pending: Arc::new(Pending),
+            health: Arc::new(
+                novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+            ),
+        },
+    )
+    .unwrap();
+    f.runtime.effect_completed(ticket).unwrap();
+    f.drain(create);
+    let registration = Arc::new(AtomicUsize::new(0));
+    let (error, notice) =
+        match host.issue_completion_roles(Box::new(Registered(registration.clone()))) {
+            Err(refused) => refused,
+            Ok(_) => panic!("completion before Accepted must fail"),
+        };
+    assert!(matches!(error, TaskHostError::CompletionBeforeAccepted));
+    assert_eq!(registration.load(Ordering::SeqCst), 0);
+    let input = TaskCreationInput::new(
+        FrozenBytes::freeze(bytes::Bytes::new()),
+        Box::new(Assignment),
+    );
+    let inbound = novarocks_execution_contract::ExchangeInbound::try_new(
+        novarocks_execution_contract::FragmentNodeId::new(7),
+        vec![novarocks_execution_contract::ExchangeSource::new(
+            self::task(f.identity, 2),
+            novarocks_types::UniqueId::new(2, 2),
+            0,
+        )],
+        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+    )
+    .unwrap();
+    let descriptor = novarocks_execution_contract::TaskDescriptor::try_new(
+        task,
+        novarocks_types::UniqueId::new(1, 1),
+        std::num::NonZeroUsize::new(1).unwrap(),
+        vec![],
+        novarocks_execution_contract::ExchangeTopology::try_new(vec![], vec![inbound]).unwrap(),
+    )
+    .unwrap();
+    let inbound_bytes =
+        novarocks_worker_protocol::inbound_cost::record_bytes(&descriptor).unwrap() as u64;
+    let request = Arc::new(
+        novarocks_execution_contract::CreateTask::try_new(
+            operation(1),
+            f.identity,
+            descriptor,
+            vec![],
+        )
+        .unwrap(),
+    );
+    let request_weak = Arc::downgrade(&request);
+    let loader = host
+        .begin_loader(crate::control_runtime::loading::TaskCreatePayload {
+            id: PayloadId(1),
+            request,
+            input,
+            ingress_retained_bytes: 2,
+        })
+        .unwrap_or_else(|(error, _)| panic!("actual loader admission: {error}"));
+    let cost = match loader.run() {
+        crate::control_runtime::loading::LoaderOutcome::Measured(Ok(cost)) => cost,
+        _ => panic!("actual elected loader must measure its own input"),
+    };
+    assert!(
+        !host.loader().unwrap().ready_for_exit().unwrap(),
+        "input source is still retained, so loader whole exit remains false"
+    );
+    let loaded = f.send(
+        ContextInput::Loaded {
+            task,
+            result: Ok(cost),
+        },
+        None,
+        InputClass::Lifecycle,
+        2,
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
+    let mut dispatch = EffectDispatch::new(actor(), 15);
+    dispatch.index_committed(&f.runtime, 32).unwrap();
+    let publication = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
+    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &publication.effect
+    else {
+        panic!("actual Accepted snapshot")
+    };
+    let port = host.port();
+    let next = port
+        .publication()
+        .read()
+        .with_status(snapshot.clone())
+        .unwrap();
+    drop(
+        f.runtime
+            .commit_snapshot(&publication, port.publication(), Arc::new(next))
+            .unwrap_or_else(|(error, _)| panic!("actual Task snapshot commit: {error}")),
+    );
+    dispatch
+        .publication_committed(&f.runtime, &publication)
+        .unwrap();
+    let preparation = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
+    let job = host
+        .adopt_preparation(&f.runtime, &preparation)
+        .unwrap_or_else(|error| panic!("actual Task prep: {error}"));
+    let admitted = host
+        .issue_completion_roles(notice)
+        .unwrap_or_else(|(error, _)| panic!("original completion issuer: {error}"));
+    assert!(matches!(
+        host.issue_completion_roles(Box::new(Registered(registration.clone()))),
+        Err((TaskHostError::CompletionAlreadyIssued, _))
+    ));
+    f.runtime.effect_completed(preparation).unwrap();
+    f.runtime.effect_completed(publication).unwrap();
+    f.drain(loaded);
+    f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
+    assert!(host.loader().unwrap().ready_for_exit().unwrap());
+    f.run(
+        ContextInput::Physical {
+            task,
+            fact: PhysicalFact::LoaderExited,
+        },
+        None,
+    );
+    let loader = host.loader().unwrap();
+    loader
+        .report()
+        .consume(ConsumerId::new(1).unwrap())
+        .unwrap();
+    loader
+        .report()
+        .consume(ConsumerId::new(2).unwrap())
+        .unwrap();
+    assert!(loader.try_retire().unwrap());
+    if task_stopped {
+        let canceled = f.send(
+            ContextInput::Cancel {
+                request: operation(3),
+                task,
+                reason: novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+            },
+            Some(operation(3)),
+            InputClass::Control,
+            2,
+        );
+        f.runtime.poll_one(Tick(3)).unwrap();
+        let mut cancel_dispatch = EffectDispatch::new(actor(), 15);
+        cancel_dispatch.index_committed(&f.runtime, 32).unwrap();
+        for _ in 0..2 {
+            let publication = cancel_dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
+            let current = port.publication().read();
+            let next = match &publication.effect {
+                WorkerAction::Context(ContextEffect::PublishConclusion {
+                    generation,
+                    conclusion,
+                    source,
+                    ..
+                }) => {
+                    let accepted = port
+                        .prepare_conclusion(
+                            std::num::NonZeroU64::new(*generation).unwrap(),
+                            conclusion.clone(),
+                            *source,
+                        )
+                        .unwrap();
+                    current.with_conclusion(accepted).unwrap()
+                }
+                WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) => {
+                    current.with_status(snapshot.clone()).unwrap()
+                }
+                _ => panic!("actual ordered cancellation publication"),
+            };
+            drop(current);
+            drop(
+                f.runtime
+                    .commit_snapshot(&publication, port.publication(), Arc::new(next))
+                    .unwrap_or_else(|(error, _)| panic!("actual cancellation commit: {error}")),
+            );
+            cancel_dispatch
+                .publication_committed(&f.runtime, &publication)
+                .unwrap();
+            f.runtime.effect_completed(publication).unwrap();
+        }
+        for _ in 0..15 {
+            let effect = cancel_dispatch
+                .take_ready(&f.runtime, 15)
+                .unwrap()
+                .expect("actual producer stop remains ready");
+            let stop = matches!(
+                effect.effect,
+                WorkerAction::Context(ContextEffect::StopTask { .. })
+            );
+            if stop {
+                port.notify_stopped();
+            }
+            f.runtime.effect_completed(effect).unwrap();
+            if stop {
+                break;
+            }
+        }
+        f.drain(canceled);
+        assert!(port.is_stopped());
+        assert!(
+            !f.scope.snapshot().unwrap().stopped,
+            "Task stop keeps the context scope live for other Tasks"
+        );
+    }
+    let called = AtomicUsize::new(0);
+    let queue = crate::control_runtime::preparation::PreparationQueue::new(1, 1, 1, 1);
+    queue
+        .enqueue(job)
+        .unwrap_or_else(|_| panic!("actual Task request/input queue custody"));
+    let outcome = queue.pop().unwrap().run(|_request, input, _| {
+        called.fetch_add(1, Ordering::SeqCst);
+        drop(input)
+    });
+    if task_stopped {
+        assert!(matches!(outcome, PreparationOutcome::TaskStopped));
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+    } else {
+        assert!(matches!(outcome, PreparationOutcome::Returned(())));
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+    }
+    assert!(
+        request_weak.upgrade().is_none(),
+        "preparation exit must release the original opaque Create carrier while Task finishers remain alive"
+    );
+    let prep = host.preparation().unwrap();
+    assert!(
+        prep.publish_whole_exit().unwrap(),
+        "original finishers are Task children, not preparation children"
+    );
+    for report in [prep.body_report(), prep.exit_report()] {
+        report.consume(ConsumerId::new(1).unwrap()).unwrap();
+        report.consume(ConsumerId::new(2).unwrap()).unwrap();
+    }
+    assert!(host.collect_preparation_remainder().unwrap());
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 0);
+    assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), 0);
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    assert_eq!(f.ledger.used(Dimension::InboundBytes.id()), inbound_bytes);
+    let completion = host.completion().unwrap().clone();
+    assert!(
+        !completion.try_retire(),
+        "the original capabilities are still live"
+    );
+    // Simulate true unused original holder exit. Scope stop alone supplies no
+    // such observation; a port clone has no factory for another capability.
+    f.scope.request_stop().unwrap();
+    assert!(!completion.try_retire());
+    drop(admitted);
+    completion.observe_unused_settlement();
+    assert_eq!(registration.load(Ordering::SeqCst), 2);
+    for role in [
+        TaskLifecycleRole::Finisher,
+        TaskLifecycleRole::Settlement,
+        TaskLifecycleRole::WallTime,
+        TaskLifecycleRole::TerminalPublisher,
+    ] {
+        completion
+            .report(role)
+            .consume(ConsumerId::new(1).unwrap())
+            .unwrap();
+        completion
+            .report(role)
+            .consume(ConsumerId::new(2).unwrap())
+            .unwrap();
+    }
+    completion.try_retire();
+    f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
+    assert!(completion.try_retire());
+    drop(completion);
+    drop(port);
+    let TaskHostResources {
+        mut lifetime,
+        mut active,
+        port,
+        loader,
+        preparation,
+        mut preparation_remainder,
+        completion,
+    } = host.into_resources();
+    drop(completion);
+    drop(preparation);
+    drop(loader);
+    drop(port);
+    lifetime.body_exited().unwrap();
+    lifetime.captures_exited().unwrap();
+    f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
+    active.release(&active.resources().unwrap()).unwrap();
+    let retained = preparation_remainder.as_mut().unwrap();
+    retained.release(&retained.resources().unwrap()).unwrap();
+    f.finish();
+}
+
+#[test]
+fn original_fragment_roles_belong_to_task_lifetime_and_do_not_hold_preparation_positions() {
+    exercise_original_fragment_roles(false);
+}
+#[test]
+fn task_stop_prevents_queued_preparation_start_without_stopping_the_context_scope() {
+    exercise_original_fragment_roles(true);
 }

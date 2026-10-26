@@ -1202,7 +1202,7 @@ impl TaskExecutionRegistry {
             .preparation_scope()
             .input_retained_bytes()
             .saturating_add(retained_bytes)
-            .saturating_add(create_request_structural_bytes(request));
+            .saturating_add(crate::task_creation_cost::structural_bytes(request));
         let status = Arc::new(TaskStatusOwner::from_preparation_scope(
             identity,
             Arc::clone(&source),
@@ -4885,43 +4885,6 @@ fn map_create_status(
     receipt: CreateTaskOutcome,
 ) -> OperationReceipt<novarocks_execution_contract::TaskStatus> {
     receipt.map_ack(|acknowledgement| acknowledgement.current_status().clone())
-}
-
-fn create_request_structural_bytes(request: &CreateTask) -> usize {
-    let mut bytes = std::mem::size_of::<CreateTask>()
-        .saturating_add(std::mem::size_of_val(
-            request.descriptor().split_plan_nodes(),
-        ))
-        .saturating_add(std::mem::size_of_val(request.initial_domains()));
-    let topology = request.descriptor().topology();
-    bytes = bytes
-        .saturating_add(std::mem::size_of_val(topology.outbound()))
-        .saturating_add(std::mem::size_of_val(topology.inbound()));
-    for edge in topology.outbound() {
-        bytes = bytes.saturating_add(std::mem::size_of_val(edge.destinations()));
-    }
-    for inbound in topology.inbound() {
-        bytes = bytes.saturating_add(std::mem::size_of_val(inbound.sources()));
-    }
-    for domain in request.initial_domains() {
-        let extra = match domain {
-            novarocks_execution_contract::TaskDomainUpdate::SplitAssignment(intent) => {
-                intent.payload().encoded_len()
-            }
-            novarocks_execution_contract::TaskDomainUpdate::TaskDynamicFilter {
-                payload, ..
-            } => payload.encoded_len(),
-            novarocks_execution_contract::TaskDomainUpdate::OpenExchangeEdges { edges, .. } => {
-                std::mem::size_of_val(edges.as_slice())
-            }
-            novarocks_execution_contract::TaskDomainUpdate::CloseExchangeDestination { .. } => {
-                std::mem::size_of::<novarocks_execution_contract::TaskIdentity>()
-                    + std::mem::size_of::<novarocks_execution_contract::ExchangeEdgeId>()
-            }
-        };
-        bytes = bytes.saturating_add(extra);
-    }
-    bytes
 }
 
 fn effective_wait(

@@ -142,6 +142,23 @@ impl ExitRole {
             .expect("original role custody lock")
             .captures_exited
     }
+    /// Physical readiness, independently of report storage retirement. A host
+    /// uses this to publish the exit fact whose real consumption subsequently
+    /// allows `try_retire`; waiting for that consumption here would deadlock.
+    pub fn actual_exit_ready(&self) -> Result<bool, ExitRoleError> {
+        let state = self.0.state.lock().expect("original role custody lock");
+        if state.phase == ExitRolePhase::Retired {
+            return Ok(true);
+        }
+        if state.phase != ExitRolePhase::Exited {
+            return Ok(false);
+        }
+        Ok(state
+            .work
+            .as_ref()
+            .expect("original role work")
+            .actual_exit_ready()?)
+    }
     /// Actual body/capture exit is necessary but not sufficient: children and
     /// every independent report consumer must also retire before capacity can
     /// be reused. No consumer is acknowledged implicitly by this role.

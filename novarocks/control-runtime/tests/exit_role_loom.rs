@@ -167,3 +167,87 @@ fn scope_failure_abandons_only_the_owner_leg_and_never_the_original_exit() {
         assert!(ledger.is_empty());
     });
 }
+
+#[test]
+fn parent_physical_exit_waits_for_its_actual_child_but_not_for_report_consumption() {
+    model(|| {
+        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap(), 2, 1);
+        let scope = ledger.open_scope_next(None, generation(), 2, 2).unwrap();
+        let (parent_work, parent_capacity) = scope
+            .reserve_next(
+                generation(),
+                resources(),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Business)
+            .unwrap();
+        let (child_work, child_capacity) = scope
+            .reserve_child_next(
+                generation(),
+                parent_capacity.id(),
+                resources(),
+                WorkKind::Cleanup,
+            )
+            .unwrap()
+            .bind(WorkKind::Cleanup)
+            .unwrap();
+        let consumer = ConsumerId::new(1).unwrap();
+        let parent_report = ReportSlot::reserve_next(
+            &scope,
+            generation(),
+            parent_work.id(),
+            1,
+            [(consumer, ConsumerKind::Observer)],
+        )
+        .unwrap();
+        let child_report = ReportSlot::reserve_next(
+            &scope,
+            generation(),
+            child_work.id(),
+            1,
+            [(consumer, ConsumerKind::Observer)],
+        )
+        .unwrap();
+        let (parent, mut parent_authority) =
+            ExitRole::from_admitted(parent_work, parent_capacity, parent_report.clone());
+        let (child, mut child_authority) =
+            ExitRole::from_admitted(child_work, child_capacity, child_report.clone());
+        parent_authority.start().unwrap();
+        child_authority.start().unwrap();
+        parent_authority.exited().unwrap();
+        assert!(!parent.actual_exit_ready().unwrap());
+        scope.close_external().unwrap();
+        let reaping = ledger.clone();
+        let owner = scope.id();
+        let exiting = thread::spawn(move || {
+            child_authority.exited().unwrap();
+            reaping.reap_scope_ready(owner, 2).unwrap();
+        });
+        let checking = parent.clone();
+        let actual_child = child.clone();
+        let observing = thread::spawn(move || {
+            if checking.actual_exit_ready().unwrap() {
+                assert!(actual_child.actual_exit_ready().unwrap());
+            }
+            assert!(!checking.try_retire().unwrap());
+        });
+        exiting.join().unwrap();
+        observing.join().unwrap();
+        assert!(parent.actual_exit_ready().unwrap());
+        assert!(!parent.try_retire().unwrap());
+        assert_eq!(
+            ledger.used(dimension()),
+            2,
+            "physical exit does not consume either report"
+        );
+        assert!(!scope.snapshot().unwrap().retirement_ready);
+        parent_report.consume(consumer).unwrap();
+        child_report.consume(consumer).unwrap();
+        assert!(parent.try_retire().unwrap());
+        assert!(child.try_retire().unwrap());
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    });
+}

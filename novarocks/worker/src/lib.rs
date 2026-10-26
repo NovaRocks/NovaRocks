@@ -76,6 +76,7 @@ mod task_causal_input;
 mod task_completion;
 mod task_completion_roles;
 mod task_conclusion;
+mod task_creation_cost;
 mod task_creation_gate;
 mod task_diagnostics;
 mod task_domain_execution;

@@ -48,6 +48,22 @@ pub(crate) trait TaskPendingNotice: Send + Sync {
     fn pending(&self);
 }
 
+/// Read-only metadata for the exact Task's published producer-stop intent.
+/// Clones cannot clear it, notify observers, or claim any physical exit.
+#[derive(Clone)]
+pub(crate) struct TaskStopSignal {
+    identity: TaskIdentity,
+    stopped: Arc<AtomicBool>,
+}
+impl TaskStopSignal {
+    pub(crate) fn identity(&self) -> TaskIdentity {
+        self.identity
+    }
+    pub(crate) fn is_set(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
 /// An immutable projection, authored only by ordered core publication effects.
 /// Rich sources are immutable shared references, never inputs to adjudication.
 #[derive(Clone)]
@@ -126,7 +142,7 @@ pub(crate) struct TaskRuntimePort {
     stop: Arc<Observable>,
     // Presence hint installed only by the post-publication host effect. It
     // selects no conclusion and keeps rich Arc destruction out of wait locks.
-    stop_published: AtomicBool,
+    stop_published: Arc<AtomicBool>,
     wait: Mutex<()>,
     changed: Condvar,
 }
@@ -147,7 +163,7 @@ impl TaskRuntimePort {
             health,
             published: PublishedSnapshot::new(scope, Arc::new(TaskProjection::bootstrap(identity))),
             stop: Arc::new(Observable::new()),
-            stop_published: AtomicBool::new(false),
+            stop_published: Arc::new(AtomicBool::new(false)),
             wait: Mutex::new(()),
             changed: Condvar::new(),
         }
@@ -227,6 +243,12 @@ impl TaskRuntimePort {
     }
     pub(crate) fn is_stopped(&self) -> bool {
         self.stop_published.load(Ordering::Acquire)
+    }
+    pub(crate) fn stop_signal(&self) -> TaskStopSignal {
+        TaskStopSignal {
+            identity: self.identity,
+            stopped: self.stop_published.clone(),
+        }
     }
     pub(crate) fn stop_observable(&self) -> Arc<Observable> {
         self.stop.clone()
