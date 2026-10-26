@@ -81,6 +81,10 @@ pub enum HistoryFact {
         actor: ActorId,
         input: InputId,
     },
+    InputAbandoned {
+        actor: ActorId,
+        input: InputId,
+    },
     BatchCommitted {
         scope: ScopeId,
         input: InputId,

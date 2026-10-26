@@ -19,8 +19,8 @@
 //! Task creation/preparation capacity never traverses this mailbox.
 use crate::{
     admission::{AdmissionCore, AdmissionTicketConfig, AdmissionTicketRedemption},
-    context::{CoreError, RequestResult, RequestSettlement},
-    creation::{AdmissionNeed, AdmissionPort, PayloadId, RequestContext},
+    context::{CoreError, DomainRefusal, RequestResult, RequestSettlement},
+    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId, RequestContext},
     lease::MonotonicInstant,
     retention::RetentionIndex,
 };
@@ -35,6 +35,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ControlConfig {
+    /// Total directory records, including retained and physically removing
+    /// contexts. Composition pays for these independently of active tickets.
     pub max_contexts: usize,
     pub max_waiters: usize,
     pub max_pending_requests: usize,
@@ -104,6 +106,10 @@ pub enum ControlInput {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlEffect {
+    DomainFailureReply {
+        request: TaskOperationId,
+        refusal: DomainRefusal,
+    },
     ContinueRequestReplies {
         operation: TaskOperationId,
     },
@@ -169,7 +175,6 @@ pub struct ControlCore {
     establish_reply_owners: BTreeMap<TaskOperationId, QueryContextRef>,
     request_deadlines: BTreeSet<(MonotonicInstant, InputId)>,
     ready: BTreeMap<TaskOperationId, (OperationOutcome, MonotonicInstant)>,
-    last_request_token: u64,
     fencing: Option<(FrontendProcessId, Option<QueryContextRef>)>,
 }
 impl ControlCore {
@@ -208,7 +213,6 @@ impl ControlCore {
             establish_reply_owners: BTreeMap::new(),
             request_deadlines: BTreeSet::new(),
             ready: BTreeMap::new(),
-            last_request_token: 0,
             fencing: None,
         })
     }
@@ -251,10 +255,9 @@ impl ControlCore {
             ControlInput::Establish { request, .. } => *request,
             _ => return Err(CoreError::WrongIdentity),
         };
-        if operation != request.operation || request.token.get() <= self.last_request_token {
+        if operation != request.operation || self.requests.contains_key(&request.token) {
             return Err(CoreError::WrongIdentity);
         }
-        self.last_request_token = request.token.get();
         self.now = now;
         if now.has_reached(request.deadline) {
             let owned = self.request_operations.contains_key(&operation)
@@ -282,6 +285,10 @@ impl ControlCore {
                                     request: id,
                                     outcome,
                                 } if *id == operation => Some(*outcome),
+                                ControlEffect::DomainFailureReply {
+                                    request: id,
+                                    refusal,
+                                } if *id == operation => Some(refusal.outcome.outcome()),
                                 ControlEffect::AdmissionReply {
                                     request: id,
                                     result,
@@ -372,32 +379,51 @@ impl ControlCore {
                     .fenced
                     .contains(&request.context().frontend_process_id())
                 {
-                    Err(OperationOutcome::Gone)
+                    Err(AdmissionRefusal::Verdict(OperationOutcome::Gone))
                 } else {
                     self.admission
                         .acquire(request, ticket, now, capacity)
-                        .map(|g| g.receipt())
-                        .map_err(|e| {
+                        .map(|grant| grant.receipt())
+                        .map_err(|error| {
                             use crate::admission::AdmissionTicketAcquisitionRejection as R;
-                            match e {
-                                R::ContextAlreadyGranted => {
-                                    OperationOutcome::AdmissionTicketStillActive
+                            match error {
+                                R::ReservationRefused(refusal) => refusal,
+                                R::ContextAlreadyGranted => AdmissionRefusal::Verdict(
+                                    OperationOutcome::AdmissionTicketStillActive,
+                                ),
+                                R::OperationReplayConflict => {
+                                    AdmissionRefusal::Verdict(OperationOutcome::DomainConflict)
                                 }
-                                R::OperationReplayConflict => OperationOutcome::DomainConflict,
                                 R::ReservationCapacityExhausted | R::ReplayCapacityExhausted => {
-                                    OperationOutcome::ResourceExhausted
+                                    AdmissionRefusal::Verdict(OperationOutcome::ResourceExhausted)
                                 }
-                                R::ValidityExceedsWorkerLimit => {
-                                    OperationOutcome::InvalidStateOrRequest
+                                R::ValidityExceedsWorkerLimit => AdmissionRefusal::Verdict(
+                                    OperationOutcome::InvalidStateOrRequest,
+                                ),
+                                R::Inactive(_) | R::SealedEpoch => {
+                                    AdmissionRefusal::Verdict(OperationOutcome::Gone)
                                 }
-                                _ => OperationOutcome::Gone,
                             }
                         })
                 };
-                step.effects.push(ControlEffect::AdmissionReply {
-                    request: operation,
-                    result,
-                });
+                match result {
+                    Ok(receipt) => step.effects.push(ControlEffect::AdmissionReply {
+                        request: operation,
+                        result: Ok(receipt),
+                    }),
+                    Err(AdmissionRefusal::Verdict(outcome)) => {
+                        step.effects.push(ControlEffect::AdmissionReply {
+                            request: operation,
+                            result: Err(outcome),
+                        })
+                    }
+                    Err(AdmissionRefusal::Domain(outcome, failure)) => {
+                        step.effects.push(ControlEffect::DomainFailureReply {
+                            request: operation,
+                            refusal: DomainRefusal { outcome, failure },
+                        })
+                    }
+                }
             }
             ControlInput::Establish {
                 request,
@@ -476,8 +502,14 @@ impl ControlCore {
                                 context,
                                 generation,
                             }) {
-                                Err(outcome) => {
+                                Err(AdmissionRefusal::Verdict(outcome)) => {
                                     step.effects.push(ControlEffect::Reply { request, outcome })
+                                }
+                                Err(AdmissionRefusal::Domain(outcome, failure)) => {
+                                    step.effects.push(ControlEffect::DomainFailureReply {
+                                        request,
+                                        refusal: DomainRefusal { outcome, failure },
+                                    })
                                 }
                                 Ok(reservation) => {
                                     self.directory.insert(
@@ -546,24 +578,32 @@ impl ControlCore {
                     .directory
                     .get_mut(&context)
                     .ok_or(CoreError::WrongIdentity)?;
-                record.state = QueryContextState::TerminalRetained;
-                step.effects.push(ControlEffect::Route {
-                    context,
-                    state: record.state,
-                    generation: record.generation,
-                });
-                if self.retained.len() == self.config.retained_contexts {
-                    let oldest = self
-                        .retained
-                        .oldest()
-                        .expect("full retained set has an oldest");
-                    self.retained.remove(oldest).expect("oldest exists");
-                    step.effects
-                        .push(ControlEffect::RemoveHost { context: oldest });
+                if record.state != QueryContextState::TerminalRetained {
+                    // This input follows the context's complete physical and
+                    // host-release receipt. Active admission ends here; its
+                    // separately funded metadata can remain for replay.
+                    record.state = QueryContextState::TerminalRetained;
+                    if let Some(ticket) = self.admission.close_context(context, now) {
+                        step.effects.push(ControlEffect::RetireReservation(ticket));
+                    }
+                    step.effects.push(ControlEffect::Route {
+                        context,
+                        state: record.state,
+                        generation: record.generation,
+                    });
+                    if self.retained.len() == self.config.retained_contexts {
+                        let oldest = self
+                            .retained
+                            .oldest()
+                            .expect("full retained set has an oldest");
+                        self.retained.remove(oldest).expect("oldest exists");
+                        step.effects
+                            .push(ControlEffect::RemoveHost { context: oldest });
+                    }
+                    self.retained
+                        .insert(context, now.saturating_add(self.config.retention), 0)
+                        .map_err(|_| CoreError::IllegalFact)?;
                 }
-                self.retained
-                    .insert(context, now.saturating_add(self.config.retention), 0)
-                    .map_err(|_| CoreError::IllegalFact)?;
             }
             ControlInput::HostRemoved { context } => {
                 let record = self
@@ -596,12 +636,9 @@ impl ControlCore {
                 }
                 step.effects
                     .push(ControlEffect::RetireReservation(record.reservation));
-                if let Some(ticket) = self.admission.close_context(context, now) {
-                    step.effects.push(ControlEffect::RetireReservation(ticket));
-                }
             }
             ControlInput::RevokeTicket { context } => {
-                if let Some(r) = self.admission.close_context(context, now) {
+                if let Some(r) = self.admission.revoke_unredeemed(context, now) {
                     step.effects.push(ControlEffect::RetireReservation(r));
                 }
             }
@@ -645,6 +682,9 @@ impl ControlCore {
             .iter()
             .filter_map(|effect| match effect {
                 ControlEffect::Reply { request, outcome } => Some((*request, *outcome)),
+                ControlEffect::DomainFailureReply { request, refusal } => {
+                    Some((*request, refusal.outcome.outcome()))
+                }
                 ControlEffect::AdmissionReply { request, result } => Some((
                     *request,
                     result

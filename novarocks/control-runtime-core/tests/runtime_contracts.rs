@@ -684,3 +684,30 @@ fn reservation_owner_index_follows_split_transfer_rollback_and_final_release() {
     assert_eq!(ledger.reservation_count_for(a.id()), 0);
     assert_eq!(ledger.reservation_count(), 0);
 }
+
+#[test]
+fn independent_scope_work_ordinals_never_collide_or_cancel_each_other() {
+    let a = ScopeId::new(1).unwrap();
+    let b = ScopeId::new(2).unwrap();
+    let mut queue = FairWorkQueue::new(2, 4, 2);
+    for scope in [a, b] {
+        queue.enqueue(scope, work(1)).unwrap();
+        queue.enqueue(scope, work(2)).unwrap();
+    }
+    assert_eq!(queue.len(), 4);
+    assert_eq!(queue.pop(), Some((a, work(1))));
+    assert_eq!(queue.pop(), Some((b, work(1))));
+    queue.remove_queued(a, work(2)).unwrap();
+    assert_eq!(queue.len(), 3);
+    queue.finish(a, work(1)).unwrap();
+    assert_eq!(queue.running(b), Some(work(1)));
+    assert_eq!(
+        queue.pop(),
+        None,
+        "the other context still owns its body slot"
+    );
+    queue.finish(b, work(1)).unwrap();
+    assert_eq!(queue.pop(), Some((b, work(2))));
+    queue.finish(b, work(2)).unwrap();
+    assert!(queue.is_empty());
+}

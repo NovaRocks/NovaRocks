@@ -19,7 +19,7 @@
 
 use novarocks_control_runtime_core::{
     effect::{EffectBatchState, EffectDescriptor, EffectError},
-    identity::{Generation, InputId, ScopeId, Tick},
+    identity::{Generation, InputId, ReservationId, ScopeId, Tick, WorkId},
     mailbox::InputEnvelope,
     scheduler::TurnBudget,
 };
@@ -49,15 +49,19 @@ pub trait Actor: Send + 'static {
 }
 
 pub struct StepContext<'a, E> {
+    scope: &'a crate::transaction::ScopeHandle,
     turn: &'a mut TurnBudget,
     work_remaining: usize,
     batch: EffectBatchState,
     payloads: std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,
+    reservations: std::collections::BTreeMap<ReservationId, crate::lease::StepGuard>,
+    max_reservations: usize,
+    failure_work: Option<WorkId>,
 }
 impl<'a, E> StepContext<'a, E> {
     pub(crate) fn new(
         budget: &'a mut TurnBudget,
-        scope: ScopeId,
+        scope: &'a crate::transaction::ScopeHandle,
         generation: Generation,
         input: InputId,
         max_effects: usize,
@@ -65,11 +69,52 @@ impl<'a, E> StepContext<'a, E> {
         work_budget: usize,
     ) -> Self {
         Self {
+            scope,
             turn: budget,
             work_remaining: work_budget,
             payloads: std::collections::BTreeMap::new(),
-            batch: EffectBatchState::new(scope, generation, input, max_effects, max_dependencies),
+            reservations: std::collections::BTreeMap::new(),
+            max_reservations: max_effects,
+            failure_work: None,
+            batch: EffectBatchState::new(
+                scope.id(),
+                generation,
+                input,
+                max_effects,
+                max_dependencies,
+            ),
         }
+    }
+    pub(crate) fn set_failure_work(&mut self, work: Option<WorkId>) {
+        self.failure_work = work;
+    }
+    /// Immutable registration metadata, independent of the suspect core. The
+    /// registration owner retains this admitted cleanup lease until removal.
+    pub fn failure_work(&self) -> Option<WorkId> {
+        self.failure_work
+    }
+    /// Transfer a still-unbound synchronous reservation into the same atomic
+    /// handoff as its neutral effect. No queue/capture may bind it beforehand.
+    /// An unwinding step rolls these pure guards back; a committed batch keeps
+    /// the originals until its actual host or failure custodian takes them.
+    pub fn reservation(
+        &mut self,
+        guard: crate::lease::StepGuard,
+    ) -> Result<(), (ReservationHandoffError, crate::lease::StepGuard)> {
+        let error = if !guard.belongs_to(self.scope) {
+            Some(ReservationHandoffError::WrongScope)
+        } else if self.reservations.contains_key(&guard.reservation_id()) {
+            Some(ReservationHandoffError::Duplicate)
+        } else if self.reservations.len() >= self.max_reservations {
+            Some(ReservationHandoffError::Capacity)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err((error, guard));
+        }
+        self.reservations.insert(guard.reservation_id(), guard);
+        Ok(())
     }
     /// Traversal and effect production consume the same finite turn budget.
     pub fn charge(&mut self, units: usize) -> bool {
@@ -111,6 +156,7 @@ impl<'a, E> StepContext<'a, E> {
         StepEnvelope {
             state: self.batch,
             payloads: self.payloads,
+            reservations: self.reservations,
         }
     }
 }
@@ -118,6 +164,13 @@ pub(crate) struct StepEnvelope<E> {
     pub(crate) state: EffectBatchState,
     pub(crate) payloads:
         std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,
+    pub(crate) reservations: std::collections::BTreeMap<ReservationId, crate::lease::StepGuard>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservationHandoffError {
+    WrongScope,
+    Duplicate,
+    Capacity,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectEmissionError {

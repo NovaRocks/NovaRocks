@@ -18,7 +18,7 @@
 //! Pure ticket policy. IDs and the issuer come from the driver; capacity
 //! transactions return scope-visible reservations, never asynchronous permits.
 use crate::{
-    creation::{AdmissionNeed, AdmissionPort},
+    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal},
     lease::MonotonicInstant,
 };
 use novarocks_control_runtime_core::identity::ReservationId;
@@ -79,6 +79,12 @@ impl AdmissionTicketConfig {
 
     pub const fn max_valid_for(self) -> Duration {
         self.max_valid_for
+    }
+    pub const fn replay_retention(self) -> Duration {
+        self.replay_retention
+    }
+    pub const fn max_records(self) -> usize {
+        self.max_records
     }
 }
 
@@ -146,10 +152,15 @@ impl AdmissionTicketGrant {
 }
 
 /// Why this worker refused to issue a ticket.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The exact bounded domain refusal stays inline in its prepaid ticket record; capacity denial does not allocate another box."
+)]
 pub enum AdmissionTicketAcquisitionRejection {
     ValidityExceedsWorkerLimit,
     ReservationCapacityExhausted,
+    ReservationRefused(AdmissionRefusal),
     ReplayCapacityExhausted,
     ContextAlreadyGranted,
     OperationReplayConflict,
@@ -163,6 +174,7 @@ impl fmt::Display for AdmissionTicketAcquisitionRejection {
             Self::ValidityExceedsWorkerLimit => {
                 "admission ticket validity exceeds the worker limit"
             }
+            Self::ReservationRefused(_) => "worker admission reservation was refused",
             Self::ReservationCapacityExhausted => {
                 "worker query-context admission capacity is exhausted"
             }
@@ -235,7 +247,7 @@ struct TicketRecord {
     reservation: ReservationId,
     expires_at: MonotonicInstant,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Decision {
     identity: AcquisitionIdentity,
     result: Result<QueryContextAdmissionTicketReceipt, AdmissionTicketAcquisitionRejection>,
@@ -290,7 +302,7 @@ impl AdmissionCore {
             if d.identity != identity {
                 return Err(AdmissionTicketAcquisitionRejection::OperationReplayConflict);
             }
-            return match d.result {
+            return match d.result.clone() {
                 Err(e) => Err(e),
                 Ok(receipt) => match self.tickets.get(&receipt.ticket_id()).map(|r| r.state) {
                     Some(AdmissionTicketState::Issued)
@@ -326,21 +338,21 @@ impl AdmissionCore {
             None
         };
         if let Some(e) = reject {
-            self.record(operation, identity, Err(e), Some(now));
+            self.record(operation, identity, Err(e.clone()), Some(now));
             return Err(e);
         }
         let reservation = match capacity.try_reserve(AdmissionNeed::Ticket {
             context: request.context(),
         }) {
             Ok(r) => r,
-            Err(OperationOutcome::ResourceExhausted) => {
+            Err(AdmissionRefusal::Verdict(OperationOutcome::ResourceExhausted)) => {
                 let e = AdmissionTicketAcquisitionRejection::ReservationCapacityExhausted;
-                self.record(operation, identity, Err(e), Some(now));
+                self.record(operation, identity, Err(e.clone()), Some(now));
                 return Err(e);
             }
-            Err(_) => {
-                let e = AdmissionTicketAcquisitionRejection::SealedEpoch;
-                self.record(operation, identity, Err(e), Some(now));
+            Err(refusal) => {
+                let e = AdmissionTicketAcquisitionRejection::ReservationRefused(refusal);
+                self.record(operation, identity, Err(e.clone()), Some(now));
                 return Err(e);
             }
         };
@@ -418,6 +430,19 @@ impl AdmissionCore {
             AdmissionTicketState::Closed => Err(AdmissionTicketRedemptionRejection::Closed),
             AdmissionTicketState::Expired => Err(AdmissionTicketRedemptionRejection::Expired),
         }
+    }
+    /// Closing new admission revokes an unused ticket only. A redeemed
+    /// reservation remains owned by its actual context until physical release.
+    pub fn revoke_unredeemed(
+        &mut self,
+        context: QueryContextRef,
+        now: MonotonicInstant,
+    ) -> Option<ReservationId> {
+        let ticket = *self.contexts.get(&context)?;
+        if self.tickets.get(&ticket)?.state != AdmissionTicketState::Issued {
+            return None;
+        }
+        self.terminal(ticket, AdmissionTicketState::Closed, now)
     }
     pub fn close_context(
         &mut self,

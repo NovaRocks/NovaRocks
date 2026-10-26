@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use novarocks_execution_contract::CompletionWork;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 
 pub(crate) type Payload = ManuallyDrop<Box<dyn Any + Send>>;
@@ -114,6 +115,7 @@ impl FailureProjection for BindingConflict {
 }
 
 struct State<F> {
+    work: Option<CompletionWork>,
     callback: Option<ManuallyDrop<Callback<F>>>,
     bound: bool,
     call_started: bool,
@@ -137,8 +139,17 @@ pub(crate) struct OnceRole<F> {
 
 impl<F: Send + 'static> OnceRole<F> {
     pub(crate) fn new(role: Role) -> Arc<Self> {
+        Self::with_work(role, None)
+    }
+
+    pub(crate) fn from_admitted(role: Role, work: CompletionWork) -> Arc<Self> {
+        Self::with_work(role, Some(work))
+    }
+
+    fn with_work(role: Role, work: Option<CompletionWork>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
+                work,
                 callback: None,
                 bound: false,
                 call_started: false,
@@ -156,6 +167,20 @@ impl<F: Send + 'static> OnceRole<F> {
         })
     }
 
+    /// Before a dormant execution is handed to any runner, its preparation
+    /// owner transfers the one already admitted role into this original cell.
+    /// A rejected transfer preserves the caller's unique work authority.
+    pub(crate) fn admit_work(&self, slot: &mut Option<CompletionWork>) -> ExecutionResult<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.bound || state.work.is_some() || slot.is_none() {
+            return Err(ExecutionFailure::from_domain(BindingConflict(
+                self.role, false,
+            )));
+        }
+        state.work = slot.take();
+        Ok(())
+    }
+
     /// A failed binding leaves the original callback in the caller's slot.
     /// No rejected foreign capture is destroyed by this API.
     pub(crate) fn bind(self: &Arc<Self>, slot: &mut Option<Callback<F>>) -> ExecutionResult<()> {
@@ -169,6 +194,9 @@ impl<F: Send + 'static> OnceRole<F> {
             return Err(ExecutionFailure::from_domain(BindingConflict(
                 self.role, true,
             )));
+        }
+        if let Some(work) = state.work.as_mut() {
+            work.bind();
         }
         state.callback = slot.take().map(ManuallyDrop::new);
         state.bound = true;
@@ -191,6 +219,9 @@ impl<F: Send + 'static> OnceRole<F> {
             return Err(ExecutionFailure::from_domain(BindingConflict(
                 self.role, true,
             )));
+        }
+        if let Some(work) = state.work.as_mut() {
+            work.bind();
         }
         state.callback = slot.take().map(|mut callback| {
             ManuallyDrop::new(Box::new(move |fact: &F| {
@@ -218,17 +249,22 @@ impl<F: Send + 'static> OnceRole<F> {
     }
 
     pub(crate) fn invoke(self: &Arc<Self>, fact: &F, control: &RuntimeErrorState) {
-        let mut callback = {
+        let (mut callback, mut work) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.call_started || !state.bound {
                 return;
             }
             state.call_started = true;
-            state.callback.take()
+            (state.callback.take(), state.work.take())
         };
         let Some(mut callback_value) = callback.take() else {
             return;
         };
+        // The work owner is a metadata port, but it may take its own ledger
+        // lock. Never call even that port while holding callback custody.
+        if let Some(work) = work.as_mut() {
+            work.started();
+        }
         let result = catch_unwind(AssertUnwindSafe(|| callback_value(fact)));
         // Restore the original capture before diagnostics can invoke any host.
         let call_completed = matches!(result, Ok(true));
@@ -236,6 +272,7 @@ impl<F: Send + 'static> OnceRole<F> {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.callback = Some(callback_value);
+            state.work = work;
             // Establish deferred retention before completion can observe the
             // returned call and dispose its capture.
             if !call_completed {
@@ -292,15 +329,23 @@ impl<F: Send + 'static> OnceRole<F> {
                 self.retain();
                 self.report(control, Phase::CaptureDrop);
             } else {
-                let no_payload = {
-                    let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.call_payload.is_none()
+                let (no_payload, work) = {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let no_payload = state.call_payload.is_none()
                         && state
                             .report_payloads
                             .iter()
-                            .all(|phase| phase.iter().all(Option::is_none))
+                            .all(|phase| phase.iter().all(Option::is_none));
+                    let work = no_payload.then(|| state.work.take()).flatten();
+                    (no_payload, work)
                 };
                 if no_payload {
+                    // `disposed` only claims disposal. Positive exit belongs
+                    // here, after the actual capture destructor returned and
+                    // after any deferred original resource work finished.
+                    if let Some(work) = work {
+                        work.completed();
+                    }
                     let pin = self
                         .quarantine
                         .lock()
@@ -351,6 +396,124 @@ impl<F: Send + 'static> OnceRole<F> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct WorkEvents(Arc<Mutex<Vec<&'static str>>>);
+    impl novarocks_execution_contract::CompletionWorkCapability for WorkEvents {
+        fn started(&mut self) {
+            self.0.lock().unwrap().push("started");
+        }
+        fn completed(self: Box<Self>) {
+            self.0.lock().unwrap().push("completed");
+        }
+        fn unused_exited(self: Box<Self>) {
+            self.0.lock().unwrap().push("unused");
+        }
+        fn unresolved(self: Box<Self>) {
+            self.0.lock().unwrap().push("unresolved");
+        }
+    }
+    fn admitted(role: Role, events: &Arc<Mutex<Vec<&'static str>>>) -> Arc<OnceRole<()>> {
+        OnceRole::from_admitted(
+            role,
+            CompletionWork::from_admitted_role(None, Box::new(WorkEvents(events.clone()))),
+        )
+    }
+
+    #[test]
+    fn an_unused_role_exits_only_when_its_original_holder_is_dropped() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let role = admitted(Role::TerminalPublisher, &events);
+        assert!(events.lock().unwrap().is_empty());
+        drop(role);
+        assert_eq!(*events.lock().unwrap(), ["unused"]);
+    }
+
+    #[test]
+    fn admitted_work_spans_the_original_deferred_finisher() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let capture = Capture(drops.clone());
+        let role = admitted(Role::PipelineFinisher, &events);
+        let mut callback: Option<Callback<()>> = Some(Box::new(move |_| {
+            std::hint::black_box(&capture);
+            false
+        }));
+        let control = RuntimeErrorState::default();
+        role.bind(&mut callback).unwrap();
+        role.invoke(&(), &control);
+        assert_eq!(*events.lock().unwrap(), ["started"]);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        role.complete_deferred(&control);
+        role.complete_deferred(&control);
+        assert_eq!(*events.lock().unwrap(), ["started", "completed"]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn claiming_disposal_does_not_report_capture_exit_before_its_destructor_returns() {
+        struct BlockingCapture {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for BlockingCapture {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let role = admitted(Role::WallTime, &events);
+        let (entered, on_entered) = std::sync::mpsc::channel();
+        let (release, on_release) = std::sync::mpsc::channel();
+        let capture = BlockingCapture {
+            entered,
+            release: on_release,
+        };
+        let mut callback: Option<Callback<()>> = Some(Box::new(move |_| {
+            std::hint::black_box(&capture);
+            true
+        }));
+        role.bind(&mut callback).unwrap();
+        let original = role.clone();
+        let thread = std::thread::spawn(move || {
+            original.invoke(&(), &RuntimeErrorState::default());
+        });
+        on_entered.recv().unwrap();
+        assert!(role.state.lock().unwrap().disposed);
+        assert_eq!(*events.lock().unwrap(), ["started"]);
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(*events.lock().unwrap(), ["started", "completed"]);
+    }
+
+    #[test]
+    fn callback_or_capture_panic_keeps_the_original_work_unresolved() {
+        struct PanicCapture;
+        impl Drop for PanicCapture {
+            fn drop(&mut self) {
+                panic!("capture exit is unknown");
+            }
+        }
+        for capture_panics in [false, true] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let role = admitted(Role::TerminalPublisher, &events);
+            let mut callback: Option<Callback<()>> = if capture_panics {
+                let capture = PanicCapture;
+                Some(Box::new(move |_| {
+                    std::hint::black_box(&capture);
+                    true
+                }))
+            } else {
+                Some(Box::new(|_| panic!("call exit is unknown")))
+            };
+            role.bind(&mut callback).unwrap();
+            let control = RuntimeErrorState::default();
+            role.invoke(&(), &control);
+            assert_eq!(*events.lock().unwrap(), ["started"]);
+            assert!(role.state.lock().unwrap().work.is_some());
+            assert!(control.local_exit_fault().is_some());
+        }
+    }
 
     struct Capture(Arc<AtomicUsize>);
     impl Drop for Capture {

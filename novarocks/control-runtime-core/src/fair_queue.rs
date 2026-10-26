@@ -40,7 +40,6 @@ struct ContextQueue {
 }
 #[derive(Clone, Copy, Debug)]
 struct WorkNode {
-    scope: ScopeId,
     previous: Option<WorkId>,
     next: Option<WorkId>,
     running: bool,
@@ -52,7 +51,9 @@ pub struct FairWorkQueue {
     per_context: usize,
     contexts: BTreeMap<ScopeId, ContextQueue>,
     ready: BTreeSet<(u64, ScopeId)>,
-    work: BTreeMap<WorkId, WorkNode>,
+    // Work identities are minted independently by each scope. Global queue
+    // membership must retain the complete owner identity, also for removal.
+    work: BTreeMap<(ScopeId, WorkId), WorkNode>,
     next_order: u64,
 }
 impl FairWorkQueue {
@@ -74,7 +75,7 @@ impl FairWorkQueue {
         self.work.is_empty()
     }
     pub fn enqueue(&mut self, scope: ScopeId, work: WorkId) -> Result<(), FairQueueError> {
-        if self.work.contains_key(&work) {
+        if self.work.contains_key(&(scope, work)) {
             return Err(FairQueueError::DuplicateWork);
         }
         if self.work.len() >= self.max_work {
@@ -104,16 +105,18 @@ impl FairWorkQueue {
         let context = self.contexts.entry(scope).or_default();
         let previous = context.tail;
         self.work.insert(
-            work,
+            (scope, work),
             WorkNode {
-                scope,
                 previous,
                 next: None,
                 running: false,
             },
         );
         if let Some(tail) = previous {
-            self.work.get_mut(&tail).expect("queued tail exists").next = Some(work);
+            self.work
+                .get_mut(&(scope, tail))
+                .expect("queued tail exists")
+                .next = Some(work);
         } else {
             context.head = Some(work);
         }
@@ -136,14 +139,17 @@ impl FairWorkQueue {
         assert!(context.running.is_none(), "one running item per context");
         context.ready_order = None;
         let work = context.head.expect("eligible context has queued work");
-        let node = self.work.get_mut(&work).expect("head work exists");
+        let node = self.work.get_mut(&(scope, work)).expect("head work exists");
         node.running = true;
         let next = node.next;
         node.next = None;
         context.head = next;
         context.queued -= 1;
         if let Some(next) = next {
-            self.work.get_mut(&next).expect("next work exists").previous = None;
+            self.work
+                .get_mut(&(scope, next))
+                .expect("next work exists")
+                .previous = None;
         } else {
             context.tail = None;
         }
@@ -168,7 +174,7 @@ impl FairWorkQueue {
         };
         let context = self.contexts.get_mut(&scope).expect("validated context");
         context.running = None;
-        self.work.remove(&work);
+        self.work.remove(&(scope, work));
         if context.queued > 0 {
             context.ready_order = Some(self.next_order);
             self.ready.insert((self.next_order, scope));
@@ -182,25 +188,33 @@ impl FairWorkQueue {
     pub fn remove_queued(&mut self, scope: ScopeId, work: WorkId) -> Result<(), FairQueueError> {
         let node = self
             .work
-            .get(&work)
+            .get(&(scope, work))
             .copied()
             .ok_or(FairQueueError::UnknownWork)?;
-        if node.scope != scope || node.running {
+        if node.running {
             return Err(FairQueueError::UnknownWork);
         }
         let context = self.contexts.get_mut(&scope).expect("work retains context");
         match node.previous {
             Some(previous) => {
-                self.work.get_mut(&previous).expect("previous exists").next = node.next
+                self.work
+                    .get_mut(&(scope, previous))
+                    .expect("previous exists")
+                    .next = node.next
             }
             None => context.head = node.next,
         }
         match node.next {
-            Some(next) => self.work.get_mut(&next).expect("next exists").previous = node.previous,
+            Some(next) => {
+                self.work
+                    .get_mut(&(scope, next))
+                    .expect("next exists")
+                    .previous = node.previous
+            }
             None => context.tail = node.previous,
         }
         context.queued -= 1;
-        self.work.remove(&work);
+        self.work.remove(&(scope, work));
         if context.queued == 0 {
             if let Some(order) = context.ready_order.take() {
                 self.ready.remove(&(order, scope));

@@ -134,6 +134,10 @@ impl EffectBatchState {
     pub fn is_empty(&self) -> bool {
         self.effects.is_empty()
     }
+    /// The actual batch watermark; IDs need not be dense or start at one.
+    pub fn last_action_id(&self) -> Option<ActionId> {
+        ActionId::new(self.last_action)
+    }
     pub fn push(&mut self, descriptor: EffectDescriptor) -> Result<(), EffectError> {
         if self.phase != BatchPhase::Building {
             return Err(EffectError::AlreadyCommitted);
@@ -181,6 +185,20 @@ impl EffectBatchState {
     }
     pub fn record(&self, id: ActionId) -> Option<&EffectRecord> {
         self.effects.get(&id)
+    }
+    /// Bounded metadata from the actual batch, including dependencies whose
+    /// condition is not yet satisfied. No host reconstructs a parallel DAG.
+    pub fn records(
+        &self,
+        after: Option<ActionId>,
+        budget: usize,
+    ) -> Vec<(EffectDescriptor, EffectState)> {
+        let lower = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        self.effects
+            .range((lower, std::ops::Bound::Unbounded))
+            .take(budget)
+            .map(|(_, record)| (record.descriptor.clone(), record.state))
+            .collect()
     }
     pub fn dependency_published(
         &mut self,

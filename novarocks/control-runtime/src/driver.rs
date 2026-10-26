@@ -24,11 +24,12 @@ use crate::{
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    effect::{EffectDescriptor, EffectError, EffectState},
+    effect::{EffectDescriptor, EffectError, EffectKind, EffectState},
     history::HistoryFact,
-    identity::{ActionId, ActorId, Generation, InputId, SlotId, Tick},
+    identity::{ActionId, ActorId, Generation, InputId, ReservationId, SlotId, Tick, WorkId},
     mailbox::{InputClass, InputEnvelope, MailboxError, MailboxState},
     scheduler::{ReadyQueue, SchedulerError, TurnBudget},
+    scope::{WorkKind, WorkPhase},
     timer::{TimerError, TimerIndex},
 };
 use std::{
@@ -60,6 +61,12 @@ pub enum DriverError {
     ReplyAlreadyCommitted,
     UnknownRole,
     RoleBusy,
+    FailurePublicationRequired,
+    FailurePublicationAlreadyClaimed,
+    FailureWorkInactive,
+    ReservationsRemain,
+    UnknownReservation,
+    ReservationOwnerMismatch,
 }
 impl From<SchedulerError> for DriverError {
     fn from(v: SchedulerError) -> Self {
@@ -136,6 +143,12 @@ pub struct InputRoleCustody {
     pub class: InputClass,
     pub in_flight: Option<InputId>,
 }
+struct FailurePublicationRecord {
+    generation: Generation,
+    input: InputId,
+    action: ActionId,
+    work: WorkId,
+}
 struct Inbox<A: Actor> {
     payloads: BTreeMap<InputId, A::Input>,
     mailbox: MailboxState,
@@ -149,6 +162,8 @@ struct Inbox<A: Actor> {
     timer_input: Option<InputId>,
     failure: Option<ManuallyDrop<Box<dyn Any + Send>>>,
     last_progress: Tick,
+    failure_publication: Option<FailurePublicationRecord>,
+    failure_action_watermark: u64,
 }
 impl<A: Actor> Drop for Inbox<A> {
     fn drop(&mut self) {
@@ -171,6 +186,7 @@ struct ActorCell<A: Actor> {
     scope: ScopeHandle,
     attachment: SlotId,
     config: ActorConfig,
+    failure_work: Option<WorkId>,
     core: Mutex<Option<A>>,
     inbox: Mutex<Inbox<A>>,
 }
@@ -469,6 +485,156 @@ pub struct EffectTicket<E> {
     pub generation: Generation,
     pub descriptor: EffectDescriptor,
 }
+/// Exclusive publication authority within one actual failure supervision job.
+/// It signs no work and never reads the failed core. Each commit touches one
+/// actual target; application failure policy and bounded inventory loops remain
+/// in the host. Drop neither exits the cleanup work nor rolls back any value.
+#[must_use = "A failure session belongs to its original running cleanup work"]
+pub struct FailurePublicationSession<A: Actor> {
+    runtime: ActorRuntime<A>,
+    actor: ActorId,
+    input: InputId,
+    generation: Generation,
+    action: ActionId,
+    work: WorkId,
+}
+impl<A: Actor> std::fmt::Debug for FailurePublicationSession<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailurePublicationSession")
+            .field("actor", &self.actor)
+            .field("generation", &self.generation)
+            .field("work", &self.work)
+            .finish()
+    }
+}
+impl<A: Actor> FailurePublicationSession<A> {
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+    fn validate(
+        &self,
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        target: &ScopeHandle,
+    ) -> Result<ActionId, DriverError> {
+        if node.scope.id() != target.id()
+            || !Arc::ptr_eq(&node.scope.runtime.shared, &target.runtime.shared)
+        {
+            return Err(DriverError::PublicationTargetMismatch);
+        }
+        ActorRuntime::<A>::validate_failure_work(
+            node,
+            inbox,
+            ledger,
+            self.input,
+            self.generation,
+            self.action,
+            self.work,
+        )?;
+        let claim = inbox
+            .failure_publication
+            .as_ref()
+            .ok_or(DriverError::FailurePublicationRequired)?;
+        if claim.generation != self.generation
+            || claim.input != self.input
+            || claim.action != self.action
+            || claim.work != self.work
+        {
+            return Err(EffectError::StaleGeneration.into());
+        }
+        inbox
+            .failure_action_watermark
+            .checked_add(1)
+            .and_then(ActionId::new)
+            .ok_or(DriverError::IdentityExhausted)
+    }
+    pub fn commit_snapshot<T>(
+        &mut self,
+        target: &crate::publication::PublishedSnapshot<T>,
+        next: Arc<T>,
+    ) -> Result<Arc<T>, (DriverError, Arc<T>)> {
+        let next = ManuallyDrop::new(next);
+        let node = match self.runtime.node(self.actor) {
+            Ok(node) => node,
+            Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
+        };
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let ledger = node
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let action = match self.validate(&node, &inbox, &ledger, &target.owner) {
+            Ok(action) => action,
+            Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
+        };
+        let mut value = target.value.lock().expect("published snapshot lock");
+        inbox.failure_action_watermark = action.get();
+        self.runtime.shared.record(HistoryFact::Published {
+            scope: node.scope.id(),
+            generation: self.generation,
+            action,
+        });
+        // All fallible metadata work precedes the no-callback/no-destructor
+        // actual swap. Failure and readers are still excluded by these gates.
+        let old = ManuallyDrop::new(std::mem::replace(
+            &mut *value,
+            ManuallyDrop::into_inner(next),
+        ));
+        drop(value);
+        drop(ledger);
+        drop(inbox);
+        self.runtime.shared.changed.notify();
+        Ok(ManuallyDrop::into_inner(old))
+    }
+    pub fn commit_reply<T>(
+        &mut self,
+        target: &crate::publication::PublishedReply<T>,
+        next: Arc<T>,
+    ) -> Result<(), (DriverError, Arc<T>)> {
+        let next = ManuallyDrop::new(next);
+        let node = match self.runtime.node(self.actor) {
+            Ok(node) => node,
+            Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
+        };
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let ledger = node
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let action = match self.validate(&node, &inbox, &ledger, &target.owner) {
+            Ok(action) => action,
+            Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
+        };
+        let mut reply = target.cell.lock().expect("published reply lock");
+        if reply.phase != crate::publication::ReplyPhase::Empty || reply.value.is_some() {
+            return Err((
+                DriverError::ReplyAlreadyCommitted,
+                ManuallyDrop::into_inner(next),
+            ));
+        }
+        inbox.failure_action_watermark = action.get();
+        self.runtime.shared.record(HistoryFact::Published {
+            scope: node.scope.id(),
+            generation: self.generation,
+            action,
+        });
+        reply.phase = crate::publication::ReplyPhase::Committed;
+        let previous = ManuallyDrop::new(reply.value.replace(ManuallyDrop::into_inner(next)));
+        drop(reply);
+        drop(ledger);
+        drop(inbox);
+        self.runtime.shared.changed.notify();
+        drop(ManuallyDrop::into_inner(previous));
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActorSnapshot {
     pub generation: Generation,
@@ -520,7 +686,7 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
     ) -> Result<(), (DriverError, A)> {
-        self.register_inner(id, scope, Some(attachment), actor, config)
+        self.register_inner(id, scope, (Some(attachment), None), actor, config)
             .map(|_| ())
     }
     /// Production composition chooses and binds actor storage in one ledger
@@ -532,13 +698,54 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
     ) -> Result<SlotId, (DriverError, A)> {
-        self.register_inner(id, scope, None, actor, config)
+        self.register_inner(id, scope, (None, None), actor, config)
+    }
+    /// Bind the original failure-cleanup role outside the actor's mutable
+    /// state. Its pure failure hook receives only the role identity, even if
+    /// handle panics halfway through mutating every protocol field.
+    pub fn register_supervised_next(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        failure_work: &crate::lease::WorkLease,
+    ) -> Result<SlotId, (DriverError, A)> {
+        if scope.id() != failure_work.scope().id()
+            || !Arc::ptr_eq(&scope.runtime.shared, &failure_work.scope().runtime.shared)
+        {
+            return Err((DriverError::PublicationTargetMismatch, actor));
+        }
+        let valid = {
+            let ledger = scope
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime ledger lock");
+            ledger
+                .scopes
+                .get(&scope.id())
+                .and_then(|state| state.work(failure_work.id()))
+                .is_some_and(|work| {
+                    work.kind == WorkKind::Cleanup
+                        && !work.unbound_guard
+                        && matches!(
+                            work.phase,
+                            WorkPhase::Admitted | WorkPhase::Queued | WorkPhase::Started
+                        )
+                })
+        };
+        if !valid {
+            return Err((DriverError::FailureWorkInactive, actor));
+        }
+        self.register_inner(id, scope, (None, Some(failure_work.id())), actor, config)
     }
     fn register_inner(
         &self,
         id: ActorId,
         scope: ScopeHandle,
-        attachment: Option<SlotId>,
+        binding: (Option<SlotId>, Option<WorkId>),
         actor: A,
         config: ActorConfig,
     ) -> Result<SlotId, (DriverError, A)> {
@@ -551,6 +758,7 @@ impl<A: Actor> ActorRuntime<A> {
             Err(e) => return Err((e.into(), actor)),
         };
         let deadline = actor.next_deadline();
+        let (attachment, failure_work) = binding;
         let attachment = match attachment {
             Some(slot) => match scope.attach_actor(slot) {
                 Ok(()) => slot,
@@ -593,6 +801,7 @@ impl<A: Actor> ActorRuntime<A> {
                 scope,
                 attachment,
                 config,
+                failure_work,
                 core: Mutex::new(Some(actor)),
                 inbox: Mutex::new(Inbox {
                     payloads: BTreeMap::new(),
@@ -607,6 +816,8 @@ impl<A: Actor> ActorRuntime<A> {
                     timer_input: None,
                     failure: None,
                     last_progress: Tick(0),
+                    failure_publication: None,
+                    failure_action_watermark: 0,
                 }),
             }),
         );
@@ -690,19 +901,19 @@ impl<A: Actor> ActorRuntime<A> {
     }
     /// Both drivers call the same timer conversion. A delayed clock read cannot move process time backwards.
     pub fn advance_time(&self, observed: Tick, budget: usize) -> Result<usize, DriverError> {
-        let actors = {
+        let (actors, now) = {
             let mut state = self.shared.state.lock().expect("runtime scheduler lock");
             let now = observed.max(state.now);
             state.now = now;
             if let Some(history) = &self.shared.history {
                 history.observe_time(now);
             }
-            state.timers.advance(now, budget)?
+            (state.timers.advance(now, budget)?, now)
         };
         let mut filled = 0;
         for actor in actors {
             let node = self.node(actor)?;
-            let timer_value = A::timer_input(observed);
+            let timer_value = A::timer_input(now);
             let mut inbox = node.inbox.lock().expect("actor inbox lock");
             if inbox.failed {
                 self.shared
@@ -753,9 +964,23 @@ impl<A: Actor> ActorRuntime<A> {
         }
         Ok(filled)
     }
-    /// Executes at most one actor's finite turn. No host callback or rich source is invoked here.
+    /// Executes one finite actor turn using an explicit simulation time. Every
+    /// input still clamps this value against the shared scheduler's latest time.
     pub fn poll_one(&self, observed: Tick) -> Result<bool, DriverError> {
-        let (node, now) = {
+        self.poll_one_inner(observed, None)
+    }
+    /// Production input steps observe time independently. Clock sampling occurs
+    /// after removing the input and outside inbox, ledger, scheduler and core
+    /// locks; only the clamped Tick value enters the pure actor.
+    pub fn poll_one_with_clock(&self, clock: &dyn Clock) -> Result<bool, DriverError> {
+        self.poll_one_inner(clock.now(), Some(clock))
+    }
+    fn poll_one_inner(
+        &self,
+        observed: Tick,
+        clock: Option<&dyn Clock>,
+    ) -> Result<bool, DriverError> {
+        let node = {
             let mut state = self.shared.state.lock().expect("runtime scheduler lock");
             state.now = observed.max(state.now);
             if let Some(history) = &self.shared.history {
@@ -765,14 +990,11 @@ impl<A: Actor> ActorRuntime<A> {
                 return Ok(false);
             };
             self.shared.record(HistoryFact::Claimed { actor });
-            (
-                state
-                    .actors
-                    .get(&actor)
-                    .cloned()
-                    .expect("registered ready actor"),
-                state.now,
-            )
+            state
+                .actors
+                .get(&actor)
+                .cloned()
+                .expect("registered ready actor")
         };
         let mut budget = TurnBudget::new(node.config.turn_budget)?;
         loop {
@@ -808,16 +1030,26 @@ impl<A: Actor> ActorRuntime<A> {
             let Some((input, value)) = next else {
                 break;
             };
+            let observed = clock.map_or(observed, Clock::now);
+            let now = {
+                let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+                state.now = observed.max(state.now);
+                if let Some(history) = &self.shared.history {
+                    history.observe_time(state.now);
+                }
+                state.now
+            };
             let generation = node.inbox.lock().expect("actor inbox lock").generation;
             let mut step = StepContext::new(
                 &mut budget,
-                node.scope.id(),
+                &node.scope,
                 generation,
                 input.input,
                 node.config.max_effects_per_step,
                 node.config.max_dependencies_per_effect,
                 node.config.max_step_work,
             );
+            step.set_failure_work(node.failure_work);
             let result = {
                 let mut core = node.core.lock().expect("actor core lock");
                 let core = core.as_mut().expect("registered pure actor");
@@ -864,22 +1096,30 @@ impl<A: Actor> ActorRuntime<A> {
                     );
                     let mut failure_step = StepContext::new(
                         &mut failure_budget,
-                        node.scope.id(),
+                        &node.scope,
                         generation,
                         input.input,
                         node.config.max_effects_per_step,
                         node.config.max_dependencies_per_effect,
                         node.config.max_step_work,
                     );
+                    failure_step.set_failure_work(node.failure_work);
                     // A failure projection panic is a shared runtime invariant failure.
                     A::owner_failed(node.scope.id(), generation, input, &mut failure_step);
                     let mut inbox = node.inbox.lock().expect("actor inbox lock");
-                    inbox.batches.insert(input.input, failure_step.finish());
+                    let batch = failure_step.finish();
+                    inbox.failure_action_watermark =
+                        batch.state.last_action_id().map_or(0, ActionId::get);
+                    inbox.batches.insert(input.input, batch);
                     inbox
                         .inputs
                         .get_mut(&input.input)
                         .expect("failed input custody")
-                        .phase = InputPhase::Committed;
+                        .phase = InputPhase::AbandonedByOwnerFailure;
+                    self.shared.record(HistoryFact::InputAbandoned {
+                        actor: node.id,
+                        input: input.input,
+                    });
                     inbox.last_progress = now;
                     self.shared.record(HistoryFact::BatchCommitted {
                         scope: node.scope.id(),
@@ -927,6 +1167,24 @@ impl<A: Actor> ActorRuntime<A> {
             .state
             .poll_ready(budget, generation)?)
     }
+    /// Actual bounded dependency metadata, also available to failed-owner
+    /// cleanup. Payload custody stays exclusively in the original batch.
+    pub fn effect_inventory(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        after: Option<ActionId>,
+        budget: usize,
+    ) -> Result<Vec<(EffectDescriptor, EffectState)>, DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        Ok(inbox
+            .batches
+            .get(&input)
+            .ok_or(DriverError::UnknownInput)?
+            .state
+            .records(after, budget))
+    }
     /// Start is synchronized with the same failure fence as batch commitment.
     pub fn take_effect(
         &self,
@@ -968,6 +1226,174 @@ impl<A: Actor> ActorRuntime<A> {
                 .clone(),
         })
     }
+    /// Move the original still-unbound reservation into its actual host job.
+    /// Starting the exact committed effect and taking its guard share the
+    /// generation gate; no host side counter or reconstructed permit is used.
+    pub fn take_step_reservation(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+        reservation: ReservationId,
+    ) -> Result<crate::lease::StepGuard, DriverError> {
+        let node = self.node(ticket.actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let ledger = node
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        self.validate_publication(&node, &inbox, &ledger, ticket, &node.scope)?;
+        let batch = inbox
+            .batches
+            .get_mut(&ticket.input)
+            .ok_or(DriverError::UnknownInput)?;
+        let guard = batch
+            .reservations
+            .get(&reservation)
+            .ok_or(DriverError::UnknownReservation)?;
+        if guard.work_id() != ticket.descriptor.work {
+            return Err(DriverError::ReservationOwnerMismatch);
+        }
+        Ok(batch
+            .reservations
+            .remove(&reservation)
+            .expect("validated original reservation"))
+    }
+    /// Bounded inventory of the actual guards retained by one committed step.
+    /// This remains readable after owner failure without reading its core.
+    pub fn step_reservations(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        after: Option<ReservationId>,
+        budget: usize,
+    ) -> Result<Vec<(ReservationId, WorkId)>, DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let batch = inbox.batches.get(&input).ok_or(DriverError::UnknownInput)?;
+        let lower = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        Ok(batch
+            .reservations
+            .range((lower, std::ops::Bound::Unbounded))
+            .take(budget)
+            .map(|(id, guard)| (*id, guard.work_id()))
+            .collect())
+    }
+    /// An unstarted reservation has no payload or captures. The failure owner
+    /// takes the original guard and rolls it back outside the inbox lock.
+    pub fn take_failed_reservation(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        reservation: ReservationId,
+    ) -> Result<crate::lease::StepGuard, DriverError> {
+        let node = self.node(actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        if !inbox.failed {
+            return Err(DriverError::ActorNotRetired);
+        }
+        inbox
+            .batches
+            .get_mut(&input)
+            .ok_or(DriverError::UnknownInput)?
+            .reservations
+            .remove(&reservation)
+            .ok_or(DriverError::UnknownReservation)
+    }
+    fn validate_failure_work(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        input: InputId,
+        generation: Generation,
+        action: ActionId,
+        work: WorkId,
+    ) -> Result<(), DriverError> {
+        let scope = ledger
+            .scopes
+            .get(&node.scope.id())
+            .ok_or(RuntimeError::UnknownScope)?;
+        if !inbox.failed
+            || !scope.failed()
+            || inbox.generation != generation
+            || scope.generation() != generation
+        {
+            return Err(EffectError::StaleGeneration.into());
+        }
+        let batch = inbox.batches.get(&input).ok_or(DriverError::UnknownInput)?;
+        if batch.state.generation() != generation {
+            return Err(EffectError::StaleGeneration.into());
+        }
+        let effect = batch
+            .state
+            .record(action)
+            .ok_or(EffectError::UnknownAction)?;
+        if effect.state() != EffectState::Started
+            || effect.descriptor().kind != EffectKind::Cleanup
+            || effect.descriptor().work != work
+        {
+            return Err(EffectError::InvalidTransition.into());
+        }
+        let work = scope.work(work).ok_or(DriverError::FailureWorkInactive)?;
+        if work.kind != WorkKind::Cleanup || work.phase != WorkPhase::Started || work.body_exited {
+            return Err(DriverError::FailureWorkInactive);
+        }
+        Ok(())
+    }
+    /// Claims one failure-generation publication authority from the actual
+    /// started cleanup effect and its prepaid, still-running supervision work.
+    /// The original ticket remains Started until the host completes that work.
+    pub fn claim_failure_publication(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+    ) -> Result<FailurePublicationSession<A>, DriverError> {
+        let node = self.node(ticket.actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let ledger = node
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        Self::validate_failure_work(
+            &node,
+            &inbox,
+            &ledger,
+            ticket.input,
+            ticket.generation,
+            ticket.descriptor.id,
+            ticket.descriptor.work,
+        )?;
+        let effect = inbox
+            .batches
+            .get(&ticket.input)
+            .expect("validated failure batch")
+            .state
+            .record(ticket.descriptor.id)
+            .expect("validated failure effect");
+        if effect.descriptor() != &ticket.descriptor {
+            return Err(EffectError::InvalidTransition.into());
+        }
+        if inbox.failure_publication.is_some() {
+            return Err(DriverError::FailurePublicationAlreadyClaimed);
+        }
+        inbox.failure_publication = Some(FailurePublicationRecord {
+            generation: ticket.generation,
+            input: ticket.input,
+            action: ticket.descriptor.id,
+            work: ticket.descriptor.work,
+        });
+        Ok(FailurePublicationSession {
+            runtime: self.clone(),
+            actor: ticket.actor,
+            input: ticket.input,
+            generation: ticket.generation,
+            action: ticket.descriptor.id,
+            work: ticket.descriptor.work,
+        })
+    }
     fn validate_publication(
         &self,
         node: &ActorCell<A>,
@@ -989,6 +1415,9 @@ impl<A: Actor> ActorRuntime<A> {
             .batches
             .get(&ticket.input)
             .ok_or(DriverError::UnknownInput)?;
+        if inbox.failed && ticket.generation == inbox.generation {
+            return Err(DriverError::FailurePublicationRequired);
+        }
         if scope.generation() != ticket.generation || batch.state.generation() != ticket.generation
         {
             return Err(EffectError::StaleGeneration.into());
@@ -1233,7 +1662,11 @@ impl<A: Actor> ActorRuntime<A> {
         if record.phase == InputPhase::Committed {
             return Err(DriverError::EffectsRemain);
         }
-        record.phase = InputPhase::AbandonedByOwnerFailure;
+        if record.phase != InputPhase::AbandonedByOwnerFailure {
+            record.phase = InputPhase::AbandonedByOwnerFailure;
+            self.shared
+                .record(HistoryFact::InputAbandoned { actor, input });
+        }
         Ok(())
     }
     pub fn take_failed_input(
@@ -1253,6 +1686,10 @@ impl<A: Actor> ActorRuntime<A> {
                 .get_mut(&input.input)
                 .expect("failed filled input")
                 .phase = InputPhase::AbandonedByOwnerFailure;
+            self.shared.record(HistoryFact::InputAbandoned {
+                actor,
+                input: input.input,
+            });
             let value = inbox
                 .payloads
                 .remove(&input.input)
@@ -1285,6 +1722,13 @@ impl<A: Actor> ActorRuntime<A> {
             .is_some_and(|batch| !batch.state.all_terminal())
         {
             return Err(DriverError::EffectsRemain);
+        }
+        if inbox
+            .batches
+            .get(&input)
+            .is_some_and(|batch| !batch.reservations.is_empty())
+        {
+            return Err(DriverError::ReservationsRemain);
         }
         let class = record.class;
         let role = record.role;
@@ -1556,7 +2000,7 @@ impl<A: Actor> PollerPool<A> {
                                 .advance_time(now, 64)
                                 .unwrap_or_else(|_| std::process::abort());
                             if worker_runtime
-                                .poll_one(now)
+                                .poll_one_with_clock(worker_clock.as_ref())
                                 .unwrap_or_else(|_| std::process::abort())
                             {
                                 continue;

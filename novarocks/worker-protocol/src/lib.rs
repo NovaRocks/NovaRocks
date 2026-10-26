@@ -18,21 +18,20 @@
 //! Shared control-plane worker protocol contracts.
 
 #![forbid(unsafe_code)]
-
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
-pub mod control;
-pub mod context;
-pub mod task;
-pub mod creation;
 pub mod admission;
-pub mod lifecycle;
-pub mod domain;
-pub mod observation;
 pub mod conclusion;
-pub mod proposal_summary;
+pub mod context;
+pub mod control;
+pub mod creation;
+pub mod domain;
 pub mod inbound_cost;
+pub mod lifecycle;
+pub mod observation;
+pub mod proposal_summary;
 pub mod retention;
+pub mod task;
 
-pub mod lease;
 pub mod convergence;
+pub mod lease;

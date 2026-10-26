@@ -19,15 +19,17 @@
 
 #![forbid(unsafe_code)]
 
-pub mod driver;
 pub mod actor;
-pub mod resource;
-pub mod lease;
-pub mod transaction;
 pub mod completion;
-pub mod sync;
+pub mod continuation;
+pub mod driver;
+pub mod exit_role;
+pub mod lease;
 pub mod notify;
+pub mod resource;
 pub mod shutdown;
+pub mod sync;
+pub mod transaction;
 
 pub mod history;
 pub mod publication;

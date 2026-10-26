@@ -3887,6 +3887,8 @@ dependencies = [
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
+ "novarocks-control-runtime",
+ "novarocks-control-runtime-core",
  "novarocks-coordination-contract",
  "novarocks-execution-contract",
  "novarocks-failure-contract",

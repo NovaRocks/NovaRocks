@@ -96,3 +96,6 @@ impl<T> PublishedReply<T> {
         self.cell.lock().expect("published reply lock").phase != ReplyPhase::Empty
     }
 }
+
+/// Failure-owner publication uses the original running cleanup work authority.
+pub use crate::driver::FailurePublicationSession;

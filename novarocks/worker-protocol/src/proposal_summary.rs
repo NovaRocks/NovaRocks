@@ -239,9 +239,9 @@ struct CutCell {
     consumers: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConsumingSegment {
-    Open,
-    Cut(CutId, bool),
+struct ConsumingCut {
+    id: CutId,
+    abandoning: bool,
 }
 pub struct CausalSegments {
     limit: usize,
@@ -249,7 +249,11 @@ pub struct CausalSegments {
     open: ProposalSummary,
     cells: std::collections::BTreeMap<CutId, CutCell>,
     filled: std::collections::VecDeque<CutId>,
-    consuming: Option<ConsumingSegment>,
+    consuming_cut: Option<ConsumingCut>,
+    // This slot owns the open summary until its real publication/disposal
+    // captures exit. Core consumption alone permits later cuts, not slot reuse.
+    consuming_open: Option<novarocks_control_runtime_core::completion::Consumption>,
+    failed: bool,
 }
 impl CausalSegments {
     pub fn new(max_cuts: usize) -> Self {
@@ -259,16 +263,26 @@ impl CausalSegments {
             open: ProposalSummary::default(),
             cells: Default::default(),
             filled: Default::default(),
-            consuming: None,
+            consuming_cut: None,
+            consuming_open: None,
+            failed: false,
         }
     }
     pub fn push(&mut self, proposal: Proposal) -> Option<SourceId> {
+        if self.failed {
+            return proposal.source;
+        }
         self.open.push(proposal)
     }
     pub fn cleanup(&mut self, diagnostic: Diagnostic) {
-        self.open.cleanup(diagnostic);
+        if !self.failed {
+            self.open.cleanup(diagnostic);
+        }
     }
     pub fn reserve_cut(&mut self, id: CutId, consumers: u64) -> Result<(), CutError> {
+        if self.failed {
+            return Err(CutError::NotReady);
+        }
         if id.0 <= self.last_cut {
             return Err(CutError::IdentityOrder);
         }
@@ -313,46 +327,90 @@ impl CausalSegments {
         self.cells.remove(&id);
         Ok(())
     }
-    /// An open segment can progress without another lifecycle role registering
-    /// a cut. Earlier filled cuts and the sole consuming segment keep order.
+    /// An open segment can progress without a lifecycle role registering a
+    /// cut. Its sole custody slot remains occupied after core acknowledgement,
+    /// until the original publication/disposal captures really exit.
     pub fn begin_open(&mut self) -> Result<ProposalSummary, CutError> {
-        if self.consuming.is_some() {
+        if self.failed {
+            return Err(CutError::NotReady);
+        }
+        if self.consuming_open.is_some() || self.consuming_cut.is_some() {
             return Err(CutError::Consuming);
         }
         if !self.filled.is_empty() || self.open.is_empty() {
             return Err(CutError::NotReady);
         }
-        self.consuming = Some(ConsumingSegment::Open);
+        self.consuming_open =
+            Some(novarocks_control_runtime_core::completion::Consumption::Pending);
         Ok(std::mem::take(&mut self.open))
     }
-    pub fn finish_open(&mut self) -> Result<(), CutError> {
-        if self.consuming != Some(ConsumingSegment::Open) {
+    /// Records only the successful Core leg. It neither releases original
+    /// source custody nor acknowledges publication/disposal capture exit.
+    pub fn observe_open_consumed(&mut self) -> Result<(), CutError> {
+        use novarocks_control_runtime_core::completion::Consumption;
+        if self.failed || self.consuming_open != Some(Consumption::Pending) {
             return Err(CutError::NotReady);
         }
-        self.consuming = None;
+        self.consuming_open = Some(Consumption::Consumed);
         Ok(())
     }
-    /// Move source custody to failure teardown. This never adjudicates the
-    /// abandoned summary or acknowledges effects, captures or other consumers.
+    /// The original open publication/disposal owner reports actual completion.
+    /// Legacy callers may acknowledge Core success and actual completion at
+    /// once. Failure teardown never turns a Pending Core leg into Consumed.
+    /// An overlapping cut has its own cell and is completely unaffected.
+    pub fn finish_open(&mut self) -> Result<(), CutError> {
+        use novarocks_control_runtime_core::completion::Consumption;
+        let consumption = self.consuming_open.ok_or(CutError::NotReady)?;
+        if consumption == Consumption::Pending && !self.failed {
+            self.observe_open_consumed()?;
+        }
+        self.consuming_open = None;
+        Ok(())
+    }
+    /// Move a queued cut to failed-owner custody. FIFO still applies, but no
+    /// failed Core acknowledgement is required from an earlier open summary.
+    /// The failed target is fenced against new Source/cut admission.
     pub fn begin_abandon(&mut self, id: CutId) -> Result<ProposalSummary, CutError> {
-        let summary = self.begin_consume(id)?;
-        self.consuming = Some(ConsumingSegment::Cut(id, true));
+        let summary = self.take_cut(id, true)?;
+        self.failed = true;
         Ok(summary)
     }
-    /// The core may fail after taking a segment. Its original custodian still
-    /// owns every source until teardown; only this consumption leg changes.
+    /// The Core may fail after taking a cut. Only that cut's consumption leg
+    /// changes; an overlapping open summary retains its original custody slot.
     pub fn abandon_consuming(&mut self, id: CutId) -> Result<(), CutError> {
-        if self.consuming != Some(ConsumingSegment::Cut(id, false)) {
+        if self.consuming_cut
+            != Some(ConsumingCut {
+                id,
+                abandoning: false,
+            })
+        {
             return Err(CutError::NotReady);
         }
-        self.consuming = Some(ConsumingSegment::Cut(id, true));
+        self.failed = true;
+        self.consuming_cut = Some(ConsumingCut {
+            id,
+            abandoning: true,
+        });
         self.finish_abandon(id)
     }
+    /// Original failure teardown takes over the open custody outside this
+    /// metadata owner. No positive Core acknowledgement is manufactured and
+    /// no fresh Source/open summary may reuse the failed target afterwards.
     pub fn abandon_open(&mut self) -> Result<(), CutError> {
-        self.finish_open()
+        if self.consuming_open.is_none() {
+            return Err(CutError::NotReady);
+        }
+        self.failed = true;
+        self.consuming_open = None;
+        Ok(())
     }
     pub fn finish_abandon(&mut self, id: CutId) -> Result<(), CutError> {
-        if self.consuming != Some(ConsumingSegment::Cut(id, true)) {
+        if self.consuming_cut
+            != Some(ConsumingCut {
+                id,
+                abandoning: true,
+            })
+        {
             return Err(CutError::NotReady);
         }
         self.cells
@@ -360,7 +418,7 @@ impl CausalSegments {
             .ok_or(CutError::Unknown)?
             .core_consumption =
             novarocks_control_runtime_core::completion::Consumption::AbandonedByOwnerFailure;
-        self.consuming = None;
+        self.consuming_cut = None;
         Ok(())
     }
     pub fn core_consumption(
@@ -373,8 +431,20 @@ impl CausalSegments {
         self.filled.front().copied()
     }
     pub fn begin_consume(&mut self, id: CutId) -> Result<ProposalSummary, CutError> {
-        if self.consuming.is_some() {
+        self.take_cut(id, false)
+    }
+    fn take_cut(&mut self, id: CutId, abandoning: bool) -> Result<ProposalSummary, CutError> {
+        use novarocks_control_runtime_core::completion::Consumption;
+        if self.consuming_cut.is_some() {
             return Err(CutError::Consuming);
+        }
+        if !abandoning {
+            if self.failed {
+                return Err(CutError::NotReady);
+            }
+            if self.consuming_open == Some(Consumption::Pending) {
+                return Err(CutError::Consuming);
+            }
         }
         if self.next_cut() != Some(id) {
             return Err(CutError::NotReady);
@@ -382,20 +452,27 @@ impl CausalSegments {
         let cell = self.cells.get_mut(&id).ok_or(CutError::Unknown)?;
         let segment = cell.segment.take().ok_or(CutError::NotReady)?;
         self.filled.pop_front();
-        self.consuming = Some(ConsumingSegment::Cut(id, false));
+        self.consuming_cut = Some(ConsumingCut { id, abandoning });
         Ok(segment)
     }
-    /// The source custody owner calls this only when the consuming summary is
-    /// fully handed off; at most one external consuming summary exists.
+    /// Records this cut's successful Core consumption. Its prepaid cell still
+    /// retains independent effect, capture and consumer retirement obligations.
+    /// The open summary's actual source custody is not released by this call.
     pub fn finish_consume(&mut self, id: CutId) -> Result<(), CutError> {
-        if self.consuming != Some(ConsumingSegment::Cut(id, false)) {
+        if self.failed
+            || self.consuming_cut
+                != Some(ConsumingCut {
+                    id,
+                    abandoning: false,
+                })
+        {
             return Err(CutError::NotReady);
         }
         self.cells
             .get_mut(&id)
             .ok_or(CutError::Unknown)?
             .core_consumption = novarocks_control_runtime_core::completion::Consumption::Consumed;
-        self.consuming = None;
+        self.consuming_cut = None;
         Ok(())
     }
     pub fn observe_captures_exit(&mut self, id: CutId) -> Result<(), CutError> {
@@ -439,7 +516,11 @@ impl CausalSegments {
         self.cells.len()
     }
     pub fn resident_segments(&self) -> usize {
-        1 + usize::from(self.consuming.is_some()) + self.filled.len()
+        // The open buffer and its one original custody slot contribute two.
+        // Every filled or consuming cut belongs to a distinct resident cell.
+        1 + usize::from(self.consuming_open.is_some())
+            + usize::from(self.consuming_cut.is_some())
+            + self.filled.len()
     }
 }
 
@@ -735,5 +816,170 @@ mod tests {
                 .iter()
                 .all(|d| d == &diagnostic(1, false))
         );
+    }
+    fn assert_segment_bound(cuts: &CausalSegments) {
+        assert!(cuts.resident_segments() <= cuts.resident_cuts() + 2);
+    }
+    #[test]
+    fn open_core_ack_unblocks_a_prepaid_cut_without_reusing_original_source_custody() {
+        use novarocks_control_runtime_core::completion::Consumption;
+        let input = [
+            proposal(3, 1),
+            proposal(3, 2),
+            proposal(2, 3),
+            proposal(3, 4),
+        ];
+        let mut cuts = CausalSegments::new(1);
+        cuts.reserve_cut(CutId(1), 1).unwrap();
+        assert_eq!(cuts.push(input[0].clone()), None);
+        cuts.cleanup(diagnostic(100, true));
+        assert_eq!(cuts.push(input[1].clone()), Some(SourceId(2)));
+        let open = cuts.begin_open().unwrap();
+        assert_segment_bound(&cuts);
+        cuts.push(input[2].clone());
+        cuts.cleanup(diagnostic(102, true));
+        cuts.push(input[3].clone());
+        cuts.seal_cut(CutId(1)).unwrap();
+        assert_eq!(cuts.resident_segments(), 3);
+        assert_segment_bound(&cuts);
+        assert!(matches!(
+            cuts.begin_consume(CutId(1)),
+            Err(CutError::Consuming)
+        ));
+        assert_eq!(cuts.core_consumption(CutId(1)), Some(Consumption::Pending));
+        let open_result = open.apply(ConclusionState::default(), Diagnostics::default());
+        cuts.observe_open_consumed().unwrap();
+        assert_eq!(cuts.observe_open_consumed(), Err(CutError::NotReady));
+        let closing = cuts.begin_consume(CutId(1)).unwrap();
+        assert_eq!(
+            cuts.resident_segments(),
+            3,
+            "open custody and current cut occupy different slots"
+        );
+        assert_segment_bound(&cuts);
+        let result = closing.apply(open_result.state, open_result.diagnostics);
+        assert_eq!(
+            (result.state, result.diagnostics),
+            reference(ConclusionState::default(), Diagnostics::default(), &input)
+        );
+        assert_eq!(result.released, vec![SourceId(4)]);
+        cuts.finish_consume(CutId(1)).unwrap();
+        assert_eq!(cuts.core_consumption(CutId(1)), Some(Consumption::Consumed));
+        assert!(matches!(cuts.begin_open(), Err(CutError::Consuming)));
+        assert_eq!(cuts.reserve_cut(CutId(2), 1), Err(CutError::Full));
+        assert_eq!(cuts.retire(CutId(1)), Err(CutError::ExitUnobserved));
+        cuts.observe_captures_exit(CutId(1)).unwrap();
+        cuts.observe_effects_exit(CutId(1)).unwrap();
+        assert_eq!(cuts.retire(CutId(1)), Err(CutError::ExitUnobserved));
+        cuts.consume(CutId(1), 0).unwrap();
+        cuts.retire(CutId(1)).unwrap();
+        assert_eq!(
+            cuts.resident_segments(),
+            2,
+            "the slow original source still occupies the open custody slot"
+        );
+        assert_segment_bound(&cuts);
+        cuts.reserve_cut(CutId(2), 1).unwrap();
+        cuts.push(proposal(3, 5));
+        assert!(matches!(cuts.begin_open(), Err(CutError::Consuming)));
+        cuts.finish_open().unwrap();
+        cuts.begin_open().unwrap();
+        cuts.finish_open().unwrap();
+        assert_segment_bound(&cuts);
+    }
+    #[test]
+    fn finishing_open_custody_never_clears_an_overlapping_cut_or_its_fifo_successor() {
+        use novarocks_control_runtime_core::completion::Consumption;
+        let mut cuts = CausalSegments::new(2);
+        cuts.push(proposal(3, 1));
+        cuts.begin_open().unwrap();
+        cuts.reserve_cut(CutId(1), 1).unwrap();
+        cuts.seal_cut(CutId(1)).unwrap();
+        cuts.observe_open_consumed().unwrap();
+        cuts.begin_consume(CutId(1)).unwrap();
+        cuts.push(proposal(3, 2));
+        cuts.reserve_cut(CutId(2), 1).unwrap();
+        cuts.seal_cut(CutId(2)).unwrap();
+        assert_eq!(cuts.resident_segments(), 4);
+        assert_segment_bound(&cuts);
+        cuts.finish_open().unwrap();
+        assert_eq!(cuts.core_consumption(CutId(1)), Some(Consumption::Pending));
+        assert_eq!(cuts.next_cut(), Some(CutId(2)));
+        assert!(matches!(
+            cuts.begin_consume(CutId(2)),
+            Err(CutError::Consuming)
+        ));
+        cuts.finish_consume(CutId(1)).unwrap();
+        cuts.begin_consume(CutId(2)).unwrap();
+        cuts.finish_consume(CutId(2)).unwrap();
+        assert_eq!(cuts.core_consumption(CutId(1)), Some(Consumption::Consumed));
+        assert_eq!(cuts.core_consumption(CutId(2)), Some(Consumption::Consumed));
+        assert_segment_bound(&cuts);
+    }
+    #[test]
+    fn failed_cut_teardown_preserves_open_custody_and_never_acknowledges_a_failed_core() {
+        use novarocks_control_runtime_core::completion::Consumption;
+        let mut cuts = CausalSegments::new(2);
+        cuts.push(proposal(3, 1));
+        cuts.begin_open().unwrap();
+        for id in [CutId(1), CutId(2)] {
+            cuts.reserve_cut(id, 1).unwrap();
+            cuts.seal_cut(id).unwrap();
+        }
+        assert!(matches!(
+            cuts.begin_abandon(CutId(2)),
+            Err(CutError::NotReady)
+        ));
+        cuts.begin_abandon(CutId(1)).unwrap();
+        assert_eq!(cuts.consuming_open, Some(Consumption::Pending));
+        assert_eq!(cuts.observe_open_consumed(), Err(CutError::NotReady));
+        assert_eq!(cuts.finish_consume(CutId(1)), Err(CutError::NotReady));
+        cuts.finish_abandon(CutId(1)).unwrap();
+        assert_eq!(cuts.consuming_open, Some(Consumption::Pending));
+        assert_eq!(
+            cuts.core_consumption(CutId(1)),
+            Some(Consumption::AbandonedByOwnerFailure)
+        );
+        assert!(matches!(
+            cuts.begin_consume(CutId(2)),
+            Err(CutError::NotReady)
+        ));
+        cuts.begin_abandon(CutId(2)).unwrap();
+        cuts.finish_abandon(CutId(2)).unwrap();
+        assert_eq!(
+            cuts.core_consumption(CutId(2)),
+            Some(Consumption::AbandonedByOwnerFailure)
+        );
+        assert_eq!(cuts.retire(CutId(1)), Err(CutError::ExitUnobserved));
+        // Actual open teardown remains independent and cannot rewrite the
+        // failed cut legs as positive consumption for the Core that failed.
+        cuts.finish_open().unwrap();
+        assert!(matches!(cuts.begin_open(), Err(CutError::NotReady)));
+        assert_eq!(cuts.reserve_cut(CutId(3), 1), Err(CutError::NotReady));
+        assert_eq!(cuts.push(proposal(3, 99)), Some(SourceId(99)));
+        assert_segment_bound(&cuts);
+    }
+    #[test]
+    fn abandoning_open_metadata_fences_reuse_without_finishing_the_current_cut() {
+        use novarocks_control_runtime_core::completion::Consumption;
+        let mut cuts = CausalSegments::new(1);
+        cuts.push(proposal(3, 1));
+        cuts.begin_open().unwrap();
+        cuts.observe_open_consumed().unwrap();
+        cuts.reserve_cut(CutId(1), 1).unwrap();
+        cuts.seal_cut(CutId(1)).unwrap();
+        cuts.begin_consume(CutId(1)).unwrap();
+        cuts.abandon_open().unwrap();
+        assert_eq!(cuts.core_consumption(CutId(1)), Some(Consumption::Pending));
+        assert_eq!(cuts.finish_consume(CutId(1)), Err(CutError::NotReady));
+        cuts.abandon_consuming(CutId(1)).unwrap();
+        assert_eq!(
+            cuts.core_consumption(CutId(1)),
+            Some(Consumption::AbandonedByOwnerFailure)
+        );
+        assert_eq!(cuts.observe_open_consumed(), Err(CutError::NotReady));
+        assert!(matches!(cuts.begin_open(), Err(CutError::NotReady)));
+        assert_eq!(cuts.push(proposal(3, 7)), Some(SourceId(7)));
+        assert_segment_bound(&cuts);
     }
 }

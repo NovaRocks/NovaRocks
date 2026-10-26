@@ -22,7 +22,7 @@ use crate::domain::{ContextDomainInput, QueryContextDomains, TaskDomainInput, Ta
 use crate::observation::CoveredSubscriptionRequest;
 use crate::{
     conclusion::{adjudicate, terminal_state, terminating_state},
-    creation::{AdmissionNeed, AdmissionPort, CreationCost, PayloadId},
+    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId},
     lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant},
     proposal_summary::{CutId, Proposal, ProposalSummary, SourceId},
     task::{CreationPhase, TaskRecord},
@@ -263,7 +263,7 @@ pub enum ContextInput {
     },
     Loaded {
         task: TaskIdentity,
-        result: Result<CreationCost, OperationOutcome>,
+        result: Result<CreationCost, AdmissionRefusal>,
     },
     ContinueReplies {
         task: TaskIdentity,
@@ -435,7 +435,10 @@ pub enum ContextEffect {
         conclusion: TaskConclusion,
         source: Option<SourceId>,
     },
-    DisposeSource(SourceId),
+    DisposeSource {
+        task: TaskIdentity,
+        source: SourceId,
+    },
     StopTask {
         task: TaskIdentity,
         generation: Generation,
@@ -551,7 +554,6 @@ pub struct ContextCore {
     creation_reply_owners: BTreeMap<TaskOperationId, TaskIdentity>,
     request_deadlines: BTreeSet<(MonotonicInstant, InputId)>,
     pending_replies: BTreeMap<TaskOperationId, PendingReply>,
-    last_request_token: u64,
 }
 impl ContextCore {
     /// One slice visits at most one task/domain member/request/catch-up member.
@@ -613,7 +615,6 @@ impl ContextCore {
             creation_reply_owners: BTreeMap::new(),
             request_deadlines: BTreeSet::new(),
             pending_replies: BTreeMap::new(),
-            last_request_token: 0,
         })
     }
     pub fn identity(&self) -> QueryContextRef {
@@ -667,23 +668,31 @@ impl ContextCore {
         if now < self.now {
             return Err(CoreError::TimeRegressed);
         }
-        if request.token.get() <= self.last_request_token {
+        if self.requests.contains_key(&request.token) {
             return Err(CoreError::WrongIdentity);
         }
         if Self::request_operation(&input) != Some(request.operation) {
             return Err(CoreError::WrongIdentity);
         }
-        self.last_request_token = request.token.get();
         self.now = now;
         if now.has_reached(request.deadline) {
-            return Ok(ContextStep {
+            let mut step = ContextStep {
                 effects: Vec::new(),
-                records_visited: 0,
+                records_visited: 1,
                 requests: vec![RequestSettlement {
                     request,
                     result: self.late_request_result(&input, request.operation),
                 }],
-            });
+            };
+            if let ContextInput::Create { task, .. } = &input
+                && let Some(refusal) = self
+                    .tasks
+                    .get(task)
+                    .and_then(|record| record.creation_refusal.clone())
+            {
+                Self::refusal_reply(request.operation, refusal, &mut step);
+            }
+            return Ok(step);
         }
         if self.requests.len() >= self.config.max_pending_requests {
             return Ok(ContextStep {
@@ -856,7 +865,8 @@ impl ContextCore {
                     preparing
                 };
                 if let Some(source) = record.proposals.push(chosen) {
-                    step.effects.push(ContextEffect::DisposeSource(source));
+                    step.effects
+                        .push(ContextEffect::DisposeSource { task, source });
                 }
                 self.flush(task, &mut step)?;
             }
@@ -1208,7 +1218,8 @@ impl ContextCore {
                     return Err(CoreError::IllegalFact);
                 }
                 if let Some(source) = t.proposals.push(proposal) {
-                    step.effects.push(ContextEffect::DisposeSource(source));
+                    step.effects
+                        .push(ContextEffect::DisposeSource { task, source });
                 }
             }
             ContextInput::Adjudicate { task } => {
@@ -1514,6 +1525,8 @@ impl ContextCore {
                 } else {
                     t.waiting_replies.insert(request);
                 }
+            } else if let Some(refusal) = &t.creation_refusal {
+                Self::refusal_reply(request, refusal.clone(), step);
             } else {
                 step.effects.push(ContextEffect::Reply {
                     request,
@@ -1550,7 +1563,7 @@ impl ContextCore {
             task,
             generation: self.generation,
         }) {
-            Err(outcome) => step.effects.push(ContextEffect::Reply { request, outcome }),
+            Err(refusal) => Self::refusal_reply(request, refusal, step),
             Ok(reservation) => {
                 self.tasks.insert(
                     task,
@@ -1570,7 +1583,7 @@ impl ContextCore {
     fn loaded(
         &mut self,
         task: TaskIdentity,
-        result: Result<CreationCost, OperationOutcome>,
+        result: Result<CreationCost, AdmissionRefusal>,
         capacity: &mut impl AdmissionPort,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
@@ -1583,15 +1596,18 @@ impl ContextCore {
             c.preparation_bytes()
                 .filter(|b| *b <= self.config.max_task_bytes)
                 .map(|bytes| (c, bytes))
-                .ok_or(OperationOutcome::ResourceExhausted)
+                .ok_or(AdmissionRefusal::Verdict(
+                    OperationOutcome::ResourceExhausted,
+                ))
         });
         let preparing = self.preparing;
         let reserved = if self.state != QueryContextState::Active {
-            Err(self.closed_outcome())
-        } else if preparing >= self.config.max_preparing {
-            Err(OperationOutcome::PreparationBusy)
+            Err(AdmissionRefusal::Verdict(self.closed_outcome()))
         } else {
             cost.and_then(|(c, bytes)| {
+                if preparing >= self.config.max_preparing {
+                    return Err(AdmissionRefusal::Verdict(OperationOutcome::PreparationBusy));
+                }
                 capacity.try_reserve(AdmissionNeed::Preparation {
                     context: self.identity,
                     task,
@@ -1611,7 +1627,9 @@ impl ContextCore {
                 self.preparing += 1;
                 OperationOutcome::Accepted
             }
-            Err(outcome) => {
+            Err(refusal) => {
+                let outcome = refusal.outcome();
+                t.creation_refusal = Some(refusal);
                 t.phase = CreationPhase::Rejected;
                 // No preparation/runtime holder was ever admitted. Only the
                 // original loader/captures still owe a real exit fact.
@@ -1655,6 +1673,19 @@ impl ContextCore {
         self.retire_if_ready(task, step)?;
         Ok(())
     }
+    fn refusal_reply(request: TaskOperationId, refusal: AdmissionRefusal, step: &mut ContextStep) {
+        match refusal {
+            AdmissionRefusal::Verdict(outcome) => {
+                step.effects.push(ContextEffect::Reply { request, outcome })
+            }
+            AdmissionRefusal::Domain(outcome, failure) => {
+                step.effects.push(ContextEffect::DomainFailureReply {
+                    request,
+                    refusal: DomainRefusal { outcome, failure },
+                })
+            }
+        }
+    }
     fn reply_creation(
         &mut self,
         task: TaskIdentity,
@@ -1663,7 +1694,10 @@ impl ContextCore {
         let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
         let outcome = t.pending_reply_outcome.ok_or(CoreError::IllegalFact)?;
         if let Some(request) = t.waiting_replies.pop_first() {
-            step.effects.push(ContextEffect::Reply { request, outcome });
+            match &t.creation_refusal {
+                Some(refusal) => Self::refusal_reply(request, refusal.clone(), step),
+                None => step.effects.push(ContextEffect::Reply { request, outcome }),
+            }
         }
         if !t.waiting_replies.is_empty() {
             step.effects.push(ContextEffect::ContinueReplies { task });
@@ -1732,7 +1766,8 @@ impl ContextCore {
                 });
             }
             for source in publication.released {
-                step.effects.push(ContextEffect::DisposeSource(source));
+                step.effects
+                    .push(ContextEffect::DisposeSource { task, source });
             }
             if let Some(state) = terminating_state(&publication.conclusion)
                 && publication.changed
@@ -1848,7 +1883,8 @@ impl ContextCore {
                     diagnostic: None,
                 };
                 if let Some(source) = t.proposals.push(proposal) {
-                    step.effects.push(ContextEffect::DisposeSource(source));
+                    step.effects
+                        .push(ContextEffect::DisposeSource { task, source });
                 }
                 self.flush(task, step)?;
             }

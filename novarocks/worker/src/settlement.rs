@@ -15,18 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Custody for one prepaid settlement role. The protocol publishes permission
-//! to call it; a host executor owns invocation and every foreign destructor.
+//! Task identity, registration notification and failure projection over the
+//! shared runtime's single continuation-custody implementation.
 
-use std::{
-    any::Any,
-    mem::ManuallyDrop,
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex},
-};
-
+pub(crate) use novarocks_control_runtime::continuation::ContinuationPhase as SettlementPhase;
 use novarocks_control_runtime::{
     completion::ReportSlot,
+    continuation::{ContinuationSlot, InvocationResult, RegistrationToken},
     lease::{CapacityBundle, WorkLease},
 };
 use novarocks_execution::{
@@ -38,84 +33,44 @@ use novarocks_execution_contract::{
     TaskFailurePhase, TaskIdentity,
     failure::{FailureClass, FailureFact},
 };
-
+use std::{mem::ManuallyDrop, sync::Arc};
 type Snapshot = Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>>;
-type Payload = ManuallyDrop<Box<dyn Any + Send>>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SettlementPhase {
-    AwaitingRegistration,
-    Registered,
-    Ready,
-    Running,
-    Unused,
-    Exited,
-    Unresolved,
-    Retired,
-}
-
-struct State {
-    phase: SettlementPhase,
-    callback: Option<ManuallyDrop<SettledContinuation<ExecutionFailure>>>,
-    snapshot: Snapshot,
-    work: Option<WorkLease>,
-    capacity: Option<CapacityBundle>,
-    panic: Option<Payload>,
-}
-
-struct Custody {
-    identity: TaskIdentity,
-    completion: ReportSlot,
-    health: Arc<ExecutionHealth>,
-    state: Mutex<State>,
-    // Actual unresolved work stays owned even if its external handle exits.
-    // Successful retirement explicitly breaks this original custody cycle.
-    retained: Mutex<Option<Arc<Self>>>,
-}
-
-/// The host's handle for an already admitted role. Clones refer to the same
-/// role and cannot issue another registration authority.
-#[derive(Clone)]
-pub(crate) struct SettlementRole(Arc<Custody>);
-
-/// The role's already reserved mailbox position. Implementations only fill
-/// a neutral event; they cannot wait for its actor or invoke the continuation.
+/// A role's already reserved neutral mailbox position. It cannot wait for its
+/// actor or invoke the continuation; it only transfers the admitted role ID.
 pub(crate) trait RegistrationNotice: Send {
     fn registered(self: Box<Self>);
     fn unused(self: Box<Self>);
 }
-
 struct Registration {
-    custody: Arc<Custody>,
+    token: RegistrationToken<Snapshot>,
     notice: Box<dyn RegistrationNotice>,
 }
 impl SettlementCapability<ExecutionFailure> for Registration {
     fn register(self: Box<Self>, continuation: SettledContinuation<ExecutionFailure>) {
-        // Taking an EC permit already consumed the only registration right.
-        // Neither locking nor this handoff calls or drops foreign captures.
-        let continuation = ManuallyDrop::new(continuation);
-        let mut state = self.custody.state.lock().expect("settlement custody lock");
-        assert_eq!(state.phase, SettlementPhase::AwaitingRegistration);
-        state.callback = Some(continuation);
-        state.phase = SettlementPhase::Registered;
-        drop(state);
+        if let Err((error, callback)) = self.token.register(continuation) {
+            let _callback = ManuallyDrop::new(callback);
+            tracing::error!(
+                ?error,
+                "admitted Task settlement lost its unique registration"
+            );
+            std::process::abort();
+        }
         self.notice.registered();
     }
-
     fn revoke_unused(self: Box<Self>) {
-        let mut state = self.custody.state.lock().expect("settlement custody lock");
-        assert_eq!(state.phase, SettlementPhase::AwaitingRegistration);
-        state.phase = SettlementPhase::Unused;
-        // This only revokes authority. The role's original host still owes
-        // its actual exit, and its report still owes core consumption.
-        drop(state);
+        drop(self.token);
         self.notice.unused();
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct SettlementRole {
+    identity: TaskIdentity,
+    slot: ContinuationSlot<Snapshot>,
+    health: Arc<ExecutionHealth>,
+}
 impl SettlementRole {
-    /// Consumes a role's existing work, capacity and reliable exit storage.
-    /// This constructor does not reserve capacity or mint work after admission.
     pub(crate) fn from_admitted(
         identity: TaskIdentity,
         work: WorkLease,
@@ -124,91 +79,44 @@ impl SettlementRole {
         health: Arc<ExecutionHealth>,
         notice: Box<dyn RegistrationNotice>,
     ) -> (Self, SettlementPermit<ExecutionFailure>) {
-        let custody = Arc::new(Custody {
-            identity,
-            completion,
-            health,
-            state: Mutex::new(State {
-                phase: SettlementPhase::AwaitingRegistration,
-                callback: None,
-                snapshot: None,
-                work: Some(work),
-                capacity: Some(capacity),
-                panic: None,
-            }),
-            retained: Mutex::new(None),
-        });
-        *custody.retained.lock().expect("settlement retention lock") = Some(custody.clone());
+        let (slot, token) = ContinuationSlot::from_admitted(work, capacity, completion);
         let permit = SettlementPermit::from_admitted_role(
             identity,
-            Box::new(Registration {
-                custody: custody.clone(),
-                notice,
-            }),
+            Box::new(Registration { token, notice }),
         );
-        (Self(custody), permit)
+        (
+            Self {
+                identity,
+                slot,
+                health,
+            },
+            permit,
+        )
     }
-
     pub(crate) fn phase(&self) -> SettlementPhase {
-        self.0.state.lock().expect("settlement custody lock").phase
+        self.slot.phase()
     }
-
-    /// Called by the barrier's ordered publication effect, after every earlier
-    /// proposal has been adjudicated and its required publications committed.
-    /// This grants execution; it never invokes the continuation on a poller.
+    /// Only the ordered, actually published barrier effect grants this input.
     pub(crate) fn publish_barrier(&self, snapshot: Snapshot) {
         if let Some(snapshot) = snapshot.as_ref() {
-            assert_eq!(snapshot.neutral().identity(), self.0.identity);
+            assert_eq!(snapshot.neutral().identity(), self.identity);
         }
-        let mut state = self.0.state.lock().expect("settlement custody lock");
-        assert_eq!(state.phase, SettlementPhase::Registered);
-        state.snapshot = snapshot;
-        state.phase = SettlementPhase::Ready;
+        if let Err((error, snapshot)) = self.slot.publish_barrier(snapshot) {
+            drop(snapshot);
+            panic!("Task settlement barrier failed: {error}");
+        }
     }
-
-    /// Runs on the role's host executor. Failure retains the original payload
-    /// and work; a panic is never positive evidence of capture disposal.
     pub(crate) fn invoke(&self) {
-        let (callback, snapshot, mut work) = {
-            let mut state = self.0.state.lock().expect("settlement custody lock");
-            assert_eq!(state.phase, SettlementPhase::Ready);
-            let mut work = state.work.take().expect("original settlement work");
-            work.start().expect("admitted settlement starts after stop");
-            state.phase = SettlementPhase::Running;
-            (
-                state.callback.take().expect("registered continuation"),
-                state.snapshot.take(),
-                work,
-            )
-        };
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            ManuallyDrop::into_inner(callback)(snapshot);
-        }));
-        match result {
-            Ok(()) => {
-                // FnOnce's call and capture destruction have really returned.
-                work.body_exited().expect("settlement body exits once");
-                work.captures_exited_with_report(&self.0.completion)
-                    .expect("settlement capture exit and report are atomic");
-                self.0.completion.body_exited().expect("exit report body");
-                self.0
-                    .completion
-                    .captures_exited()
-                    .expect("exit report captures");
-                let mut state = self.0.state.lock().expect("settlement custody lock");
-                state.work = Some(work);
-                state.phase = SettlementPhase::Exited;
-            }
-            Err(payload) => {
-                let payload = ManuallyDrop::new(payload);
-                let mut state = self.0.state.lock().expect("settlement custody lock");
-                state.panic = Some(payload);
-                state.work = Some(work);
-                state.phase = SettlementPhase::Unresolved;
-                drop(state);
-                self.0.health.report_unresolved(
+        match self
+            .slot
+            .invoke()
+            .expect("admitted Task settlement invocation")
+        {
+            InvocationResult::Exited => {}
+            InvocationResult::Unresolved => {
+                self.health.report_unresolved(
                     ExecutionExitOrigin::Task {
-                        identity: self.0.identity,
+                        identity: self.identity,
                         phase: TaskFailurePhase::Execution,
                     },
                     FailureFact::new(
@@ -219,57 +127,15 @@ impl SettlementRole {
             }
         }
     }
-
-    /// The original unused role has exited without constructing a callback.
-    /// Dropping its permit alone cannot call this method or supply this fact.
     pub(crate) fn unused_role_exited(&self) {
-        let mut state = self.0.state.lock().expect("settlement custody lock");
-        assert_eq!(state.phase, SettlementPhase::Unused);
-        let work = state.work.as_mut().expect("original settlement work");
-        work.body_exited().expect("unused role body exits once");
-        work.captures_exited_with_report(&self.0.completion)
-            .expect("unused role capture exit and report are atomic");
-        self.0.completion.body_exited().expect("exit report body");
-        self.0
-            .completion
-            .captures_exited()
-            .expect("exit report captures");
-        state.phase = SettlementPhase::Exited;
+        self.slot
+            .unused_role_exited()
+            .expect("original unused Task settlement exits");
     }
-
-    /// Core/other consumers acknowledge the actual reliable report separately.
-    /// Storage and its capacity remain owned until every such leg is retired.
     pub(crate) fn try_retire(&self) -> bool {
-        let mut state = self.0.state.lock().expect("settlement custody lock");
-        if state.phase != SettlementPhase::Exited {
-            return false;
-        }
-        if !self
-            .0
-            .completion
+        self.slot
             .try_retire()
-            .expect("settlement completion slot")
-        {
-            return false;
-        }
-        let mut capacity = state.capacity.take().expect("original settlement capacity");
-        let resources = capacity.resources().expect("live settlement capacity");
-        capacity
-            .release(&resources)
-            .expect("retired settlement capacity");
-        let work = state.work.take();
-        state.phase = SettlementPhase::Retired;
-        drop(state);
-        drop(work);
-        drop(capacity);
-        let retained = self
-            .0
-            .retained
-            .lock()
-            .expect("settlement retention lock")
-            .take();
-        drop(retained);
-        true
+            .expect("Task settlement completion custody")
     }
 }
 

@@ -21,9 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use novarocks_execution_contract::{
-    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeSource,
-    ExchangeStreamClose, ExchangeStreamIdentity, FragmentNodeId, QueryContextRef, TaskDescriptor,
-    TaskIdentity,
+    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeSource, ExchangeStreamClose,
+    ExchangeStreamIdentity, FragmentNodeId, QueryContextRef, TaskDescriptor, TaskIdentity,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
 

@@ -69,6 +69,21 @@ pub struct PreparedPipelineExecution {
 }
 
 impl PreparedPipelineExecution {
+    pub(crate) fn admit_local_completion_driver(
+        &self,
+        driver: crate::runtime::local_completion::LocalCompletionDriver,
+    ) {
+        self.completion.admit_local_completion_driver(driver);
+    }
+
+    pub(crate) fn admit_completion_work(
+        &self,
+        finisher: novarocks_execution_contract::CompletionWork,
+        wall_time: novarocks_execution_contract::CompletionWork,
+    ) {
+        self.completion.admit_completion_work(finisher, wall_time);
+    }
+
     pub(crate) fn failure_control(&self) -> Arc<crate::runtime::runtime_state::RuntimeErrorState> {
         self.runtime_state.error_state()
     }

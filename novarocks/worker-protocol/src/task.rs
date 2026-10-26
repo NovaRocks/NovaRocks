@@ -18,7 +18,7 @@
 //! Pure Task facts. Logical conclusion never stands in for physical exit.
 use crate::convergence::TaskConvergence;
 use crate::{
-    creation::PayloadId,
+    creation::{AdmissionRefusal, PayloadId},
     proposal_summary::{ConclusionState, Diagnostics, ProposalSummary},
 };
 use novarocks_control_runtime_core::identity::{Generation, ReservationId};
@@ -45,6 +45,7 @@ pub struct TaskRecord {
     pub preparation_reservation: Option<ReservationId>,
     pub waiting_replies: std::collections::BTreeSet<TaskOperationId>,
     pub pending_reply_outcome: Option<OperationOutcome>,
+    pub creation_refusal: Option<AdmissionRefusal>,
     pub state: TaskState,
     pub version: u64,
     pub installed: bool,
@@ -93,6 +94,7 @@ impl TaskRecord {
             preparation_reservation: None,
             waiting_replies: [request].into_iter().collect(),
             pending_reply_outcome: None,
+            creation_refusal: None,
             state: TaskState::Planned,
             version: 1,
             installed: false,

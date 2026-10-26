@@ -1,0 +1,536 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! These tests drive the actual common runtime and synchronous capacity port.
+//! The host records neutral effects; they do not claim Native/Execution wiring.
+use super::*;
+use crate::control_admission::Dimension;
+use novarocks_control_runtime::{
+    actor::ActorConfig,
+    driver::{ActorRuntime, DriverError},
+    lease::{CapacityBundle, WorkLease},
+    transaction::RuntimeLedger,
+};
+use novarocks_control_runtime_core::{
+    capacity::ResourceVector,
+    effect::EffectState,
+    identity::{ActorId, InputId, ReservationId},
+    mailbox::InputClass,
+    scope::{WorkAdmission, WorkKind},
+};
+use novarocks_execution_contract::{
+    LeaseValidFor, OperationOutcome, QueryContextRef, TaskOperationId,
+};
+use novarocks_types::{
+    AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+};
+use novarocks_worker_protocol::{
+    context::{ContextConfig, PhysicalFact, RequestResult},
+    creation::{CreationCost, PayloadId},
+    lease::{InstalledLease, LeaseBounds},
+};
+fn generation() -> Generation {
+    Generation::new(1).unwrap()
+}
+fn actor() -> ActorId {
+    ActorId::new(1).unwrap()
+}
+fn context() -> QueryContextRef {
+    QueryContextRef::new(
+        QueryExecutionId::new(QueryId::new(7301, 7302), AttemptId::new(1).unwrap()).unwrap(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    )
+}
+fn task(c: QueryContextRef, n: u32) -> TaskIdentity {
+    TaskIdentity::new(
+        c.query_execution_id(),
+        StageId::new(1).unwrap(),
+        TaskId::new(n).unwrap(),
+        c.backend_process_id(),
+    )
+}
+fn operation(n: u8) -> TaskOperationId {
+    let mut bytes = [n; 16];
+    bytes[6] = 0x70;
+    bytes[8] = 0x80;
+    TaskOperationId::try_from_bytes(bytes).unwrap()
+}
+fn empty() -> ResourceVector {
+    ResourceVector::default()
+}
+struct Fixture {
+    ledger: RuntimeLedger,
+    scope: ScopeHandle,
+    runtime: ActorRuntime<ContextActor>,
+    identity: QueryContextRef,
+    roles: Vec<(WorkLease, CapacityBundle)>,
+    jobs: BTreeMap<ReservationId, (WorkLease, CapacityBundle)>,
+}
+impl Fixture {
+    fn new() -> Self {
+        let ledger = RuntimeLedger::new(
+            ResourceVector::new([
+                (Dimension::ActiveTasks.id(), 2),
+                (Dimension::PreparingTasks.id(), 1),
+                (Dimension::PreparingBytes.id(), 100),
+                (Dimension::InboundRecords.id(), 4),
+                (Dimension::InboundBytes.id(), 100),
+            ])
+            .unwrap(),
+            32,
+            1,
+        );
+        let scope = ledger.open_scope_next(None, generation(), 32, 32).unwrap();
+        let mut roles = Vec::new();
+        for kind in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step] {
+            let (mut work, capacity) = scope
+                .reserve_next(generation(), empty(), kind, WorkAdmission::External)
+                .unwrap()
+                .bind(kind)
+                .unwrap();
+            if kind != WorkKind::Cleanup {
+                work.start().unwrap();
+            }
+            roles.push((work, capacity));
+        }
+        let identity = context();
+        let core = ContextCore::new(
+            identity,
+            generation(),
+            ContextConfig {
+                max_tasks: 4,
+                max_creation_waiters: 4,
+                max_pending_requests: 16,
+                max_preparing: 1,
+                max_task_bytes: 100,
+                step_budget: ContextCore::MAX_STEP_WORK,
+                lease_bounds: LeaseBounds::DEFAULT,
+                metric_publish_interval: Duration::from_millis(100),
+            },
+            MonotonicInstant::ORIGIN,
+            InstalledLease::install_initial(
+                LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+                LeaseBounds::DEFAULT,
+                MonotonicInstant::ORIGIN,
+            ),
+        )
+        .unwrap();
+        let runtime = ActorRuntime::new(1);
+        let bound = ContextActor::new(
+            core,
+            scope.clone(),
+            AdmissionStorage {
+                loading: empty(),
+                accepted: empty(),
+                context: empty(),
+                ticket: empty(),
+            },
+            roles[1].0.id(),
+        );
+        runtime
+            .register_supervised_next(
+                actor(),
+                scope.clone(),
+                bound,
+                ActorConfig {
+                    mailbox: [16, 16, 16, 1],
+                    max_batches: 49,
+                    max_effects_per_step: ContextCore::MAX_STEP_WORK,
+                    max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
+                    turn_budget: 64,
+                    max_step_work: ContextCore::MAX_STEP_WORK,
+                },
+                &roles[0].0,
+            )
+            .unwrap_or_else(|(e, _)| panic!("context registration: {e:?}"));
+        let mut fixture = Self {
+            ledger,
+            scope,
+            runtime,
+            identity,
+            roles,
+            jobs: BTreeMap::new(),
+        };
+        let input = fixture.send(ContextInput::Established, None, InputClass::Lifecycle, 2);
+        fixture.runtime.poll_one(Tick(1)).unwrap();
+        fixture.drain(input);
+        fixture
+    }
+    fn send(
+        &self,
+        command: ContextInput,
+        request: Option<TaskOperationId>,
+        class: InputClass,
+        source: u64,
+    ) -> InputId {
+        self.runtime
+            .reserve_input(actor(), ActorId::new(source).unwrap(), class)
+            .unwrap()
+            .fill(ContextMessage::Command {
+                work: self.roles[2].0.id(),
+                request: request.map(|operation| RequestMetadata {
+                    operation,
+                    deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
+                }),
+                command,
+            })
+            .unwrap()
+    }
+    fn run(
+        &mut self,
+        command: ContextInput,
+        request: Option<TaskOperationId>,
+    ) -> Vec<ContextAction> {
+        let input = self.send(command, request, InputClass::Ordinary, 2);
+        self.runtime.poll_one(Tick(1)).unwrap();
+        self.drain(input)
+    }
+    fn drain(&mut self, input: InputId) -> Vec<ContextAction> {
+        let mut outputs = Vec::new();
+        loop {
+            let inventory = self
+                .runtime
+                .effect_inventory(actor(), input, None, ContextCore::MAX_STEP_WORK)
+                .unwrap();
+            let states: BTreeMap<_, _> = inventory.iter().map(|(d, s)| (d.id, *s)).collect();
+            for (descriptor, state) in inventory {
+                if state == EffectState::Pending {
+                    for predecessor in descriptor.dependencies {
+                        if states[&predecessor] == EffectState::Completed {
+                            self.runtime
+                                .acknowledge_dependency(actor(), input, descriptor.id, predecessor)
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+            let ready = self
+                .runtime
+                .ready_effects(actor(), input, ContextCore::MAX_STEP_WORK)
+                .unwrap();
+            if ready.is_empty() {
+                break;
+            }
+            for action in ready {
+                let ticket = self.runtime.take_effect(actor(), input, action).unwrap();
+                if let ContextAction::Protocol(
+                    ContextEffect::LoadInput { reservation, .. }
+                    | ContextEffect::EnqueuePreparation { reservation, .. },
+                ) = &ticket.effect
+                {
+                    let guard = self
+                        .runtime
+                        .take_step_reservation(&ticket, *reservation)
+                        .unwrap();
+                    assert_eq!(guard.work_id(), ticket.descriptor.work);
+                    let (mut work, capacity) = guard.bind(WorkKind::Business).unwrap();
+                    work.start().unwrap();
+                    assert!(self.jobs.insert(*reservation, (work, capacity)).is_none());
+                }
+                outputs.push(ticket.effect.clone());
+                self.runtime.effect_completed(ticket).unwrap();
+            }
+        }
+        self.runtime.retire_input(actor(), input).unwrap();
+        outputs
+    }
+    fn finish(mut self) {
+        for (_, (mut work, mut capacity)) in std::mem::take(&mut self.jobs) {
+            work.body_exited().unwrap();
+            work.captures_exited().unwrap();
+            self.ledger.reap_scope_ready(self.scope.id(), 32).unwrap();
+            capacity.release(&capacity.resources().unwrap()).unwrap();
+        }
+        for (mut work, mut capacity) in self.roles.drain(..) {
+            work.body_exited().unwrap();
+            work.captures_exited().unwrap();
+            self.ledger.reap_scope_ready(self.scope.id(), 32).unwrap();
+            capacity.release(&capacity.resources().unwrap()).unwrap();
+        }
+        while let Some(id) = self.runtime.claim_effect_actor() {
+            self.runtime.release_effect_actor(id, false).unwrap();
+        }
+        drop(self.runtime.take_failure_payload(actor()).unwrap());
+        self.scope.close_external().unwrap();
+        self.runtime
+            .remove_actor(actor())
+            .unwrap_or_else(|e| panic!("context removal: {e:?}"));
+        self.ledger.remove_scope(self.scope.id()).unwrap();
+        assert!(self.ledger.is_empty());
+    }
+}
+#[test]
+fn actual_fair_delivery_uses_each_envelope_token_even_when_issuance_order_differs() {
+    let mut f = Fixture::new();
+    let first_task = task(f.identity, 1);
+    let second_task = task(f.identity, 2);
+    let first = f.send(
+        ContextInput::Create {
+            request: operation(1),
+            task: first_task,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+        InputClass::Ordinary,
+        2,
+    );
+    let second = f.send(
+        ContextInput::Create {
+            request: operation(2),
+            task: second_task,
+            payload: PayloadId(2),
+        },
+        Some(operation(2)),
+        InputClass::Control,
+        3,
+    );
+    assert!(second > first);
+    f.runtime.poll_one(Tick(1)).unwrap();
+    assert!(!f.runtime.snapshot(actor()).unwrap().failed);
+    let a = f.drain(first);
+    let b = f.drain(second);
+    assert!(
+        matches!(a.as_slice(), [ContextAction::Protocol(ContextEffect::LoadInput { task, .. })] if *task == first_task)
+    );
+    assert!(
+        matches!(b.as_slice(), [ContextAction::Protocol(ContextEffect::LoadInput { task, .. })] if *task == second_task)
+    );
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 2);
+    let mut replied = Vec::new();
+    for token in [first, second] {
+        let identity = if token == first {
+            first_task
+        } else {
+            second_task
+        };
+        let outputs = f.run(
+            ContextInput::Loaded {
+                task: identity,
+                result: Ok(CreationCost {
+                    input_retained_bytes: 1,
+                    ingress_retained_bytes: 1,
+                    structural_bytes: 1,
+                    inbound_records: 0,
+                    inbound_bytes: 0,
+                }),
+            },
+            None,
+        );
+        replied.extend(outputs.into_iter().filter_map(|effect| {
+            if let ContextAction::Reply(reply) = effect {
+                Some(reply)
+            } else {
+                None
+            }
+        }));
+    }
+    assert_eq!(replied.len(), 2);
+    assert_eq!(replied[0].request.token, first);
+    assert_eq!(
+        replied[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    assert_eq!(replied[1].request.token, second);
+    assert_eq!(
+        replied[1].result,
+        RequestResult::Outcome(OperationOutcome::PreparationBusy)
+    );
+    f.finish();
+}
+#[test]
+fn accepted_preparation_keeps_its_original_bundle_after_the_body_fact() {
+    let mut f = Fixture::new();
+    let identity = task(f.identity, 1);
+    f.run(
+        ContextInput::Create {
+            request: operation(1),
+            task: identity,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+    );
+    let outputs = f.run(
+        ContextInput::Loaded {
+            task: identity,
+            result: Ok(CreationCost {
+                input_retained_bytes: 5,
+                ingress_retained_bytes: 7,
+                structural_bytes: 11,
+                inbound_records: 1,
+                inbound_bytes: 13,
+            }),
+        },
+        None,
+    );
+    assert!(outputs.iter().any(|action| matches!(action, ContextAction::Reply(reply) if reply.result == RequestResult::Outcome(OperationOutcome::Accepted))));
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
+    assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), 23);
+    assert_eq!(f.ledger.used(Dimension::InboundBytes.id()), 13);
+    f.run(
+        ContextInput::Physical {
+            task: identity,
+            fact: PhysicalFact::LoaderExited,
+        },
+        None,
+    );
+    f.run(
+        ContextInput::Physical {
+            task: identity,
+            fact: PhysicalFact::PreparationBodyExited,
+        },
+        None,
+    );
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
+    assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), 23);
+    assert_eq!(f.ledger.used(Dimension::InboundRecords.id()), 1);
+    f.finish();
+}
+#[test]
+fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_owner() {
+    let mut f = Fixture::new();
+    let identity = task(f.identity, 1);
+    let earlier = f.send(
+        ContextInput::Create {
+            request: operation(1),
+            task: identity,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+        InputClass::Ordinary,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    let (reservation, _) = f
+        .runtime
+        .step_reservations(actor(), earlier, None, 1)
+        .unwrap()[0];
+    let failed = f.send(
+        ContextInput::Installed {
+            task: task(f.identity, 999),
+        },
+        None,
+        InputClass::Lifecycle,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    assert!(f.runtime.snapshot(actor()).unwrap().failed);
+    let failure = f
+        .runtime
+        .take_effect(actor(), failed, ActionId::new(1).unwrap())
+        .unwrap();
+    assert_eq!(failure.descriptor.work, f.roles[0].0.id());
+    assert!(
+        matches!(failure.effect, ContextAction::OwnerFailed { scope, generation } if scope == f.scope.id() && generation.get() == 2)
+    );
+    f.roles[0].0.start().unwrap();
+    f.runtime.effect_completed(failure).unwrap();
+    f.runtime.retire_input(actor(), failed).unwrap();
+    let descriptor = f
+        .runtime
+        .effect_inventory(actor(), earlier, None, 1)
+        .unwrap()[0]
+        .0
+        .clone();
+    assert_eq!(
+        f.runtime.take_effect(actor(), earlier, descriptor.id).err(),
+        Some(DriverError::Effect(
+            novarocks_control_runtime_core::effect::EffectError::NotReady
+        ))
+    );
+    f.runtime
+        .abandon_unstarted_effect(actor(), earlier, descriptor.id)
+        .unwrap();
+    assert_eq!(
+        f.runtime.retire_input(actor(), earlier),
+        Err(DriverError::ReservationsRemain)
+    );
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    drop(
+        f.runtime
+            .take_failed_reservation(actor(), earlier, reservation)
+            .unwrap(),
+    );
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 0);
+    f.runtime.retire_input(actor(), earlier).unwrap();
+    f.finish();
+}
+
+#[test]
+fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generation() {
+    let mut f = Fixture::new();
+    let identity = task(f.identity, 1);
+    f.run(
+        ContextInput::Create {
+            request: operation(1),
+            task: identity,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+    );
+    f.run(
+        ContextInput::Loaded {
+            task: identity,
+            result: Ok(CreationCost {
+                input_retained_bytes: 1,
+                ingress_retained_bytes: 1,
+                structural_bytes: 1,
+                inbound_records: 0,
+                inbound_bytes: 0,
+            }),
+        },
+        None,
+    );
+    let aborted = f.run(
+        ContextInput::Abort {
+            request: operation(2),
+            cause: novarocks_execution_contract::AbortCause::QueryFailed,
+        },
+        Some(operation(2)),
+    );
+    let close = aborted
+        .iter()
+        .find_map(|action| match action {
+            ContextAction::Protocol(ContextEffect::ContinueClose { generation }) => {
+                Some(*generation)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(close.get(), 2);
+    let outputs = f.run(ContextInput::ContinueClose, None);
+    assert!(outputs.iter().any(|action| matches!(action,
+        ContextAction::Protocol(ContextEffect::ApplyTaskClose { task, generation }) if *task == identity && *generation == close)));
+    let outputs = f.run(
+        ContextInput::ApplyTaskClose {
+            task: identity,
+            generation: close,
+        },
+        None,
+    );
+    assert!(outputs.iter().any(|action| matches!(action,
+        ContextAction::Protocol(ContextEffect::StopTask { task, generation }) if *task == identity && *generation == close)));
+    assert_eq!(
+        f.runtime.snapshot(actor()).unwrap().generation,
+        generation()
+    );
+    assert!(!f.runtime.snapshot(actor()).unwrap().failed);
+    // The host still owns all accepted physical work after logical shutdown.
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
+    f.finish();
+}

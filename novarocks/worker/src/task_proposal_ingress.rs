@@ -44,6 +44,13 @@ pub(crate) struct SummaryInput {
     pub summary: ProposalSummary,
 }
 
+pub(crate) struct ProposalHandoff {
+    /// A transferred occurrence may retain only a diagnostic and return its
+    /// rich source as a definite loser. It still needs a coalesced wake.
+    pub transferred: bool,
+    pub discarded: Option<ExecutionFailure>,
+}
+
 impl TaskProposalIngress {
     pub(crate) fn new(max_cuts: usize) -> Option<Self> {
         let max_sources = max_cuts.checked_add(2)?.checked_mul(2)?;
@@ -58,12 +65,13 @@ impl TaskProposalIngress {
         })
     }
 
-    /// `None` means custody transferred. A returned loser must be dropped by
-    /// the submitter after returning from this API, with no cut/ledger lock.
+    /// A returned loser must be dropped by the submitter after returning from
+    /// this API, with no cut/ledger lock. A failed target transfers no input,
+    /// even for a control/success proposal which has no source to return.
     pub(crate) fn submit(
         &self,
         proposal: TaskConclusionProposal<ExecutionFailure>,
-    ) -> Option<ExecutionFailure> {
+    ) -> ProposalHandoff {
         let (mut proposal, source) =
             crate::task_conclusion::PreparedTaskConclusion::new(proposal).into_protocol();
         // Unwind cannot destroy an opaque graph while this short lock is held.
@@ -71,7 +79,10 @@ impl TaskProposalIngress {
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if state.failed {
             drop(state);
-            return source.map(ManuallyDrop::into_inner);
+            return ProposalHandoff {
+                transferred: false,
+                discarded: source.map(ManuallyDrop::into_inner),
+            };
         }
         let id = if source.is_some() {
             state.last_source = state
@@ -104,14 +115,19 @@ impl TaskProposalIngress {
             );
         }
         drop(state);
-        source.map(ManuallyDrop::into_inner)
+        ProposalHandoff {
+            transferred: true,
+            discarded: source.map(ManuallyDrop::into_inner),
+        }
     }
 
-    pub(crate) fn cleanup(&self, diagnostic: Diagnostic) {
+    pub(crate) fn cleanup(&self, diagnostic: Diagnostic) -> bool {
         let mut state = self.state.lock().expect("task proposal handoff lock");
-        if !state.failed {
-            state.segments.cleanup(diagnostic);
+        if state.failed {
+            return false;
         }
+        state.segments.cleanup(diagnostic);
+        true
     }
 
     /// Called before the role acquires captures, not at registration time.
@@ -145,6 +161,17 @@ impl TaskProposalIngress {
             let summary = state.segments.begin_open()?;
             Ok(SummaryInput { cut: None, summary })
         }
+    }
+
+    /// The open summary's core leg completed. Its actual publication/source
+    /// disposal still owns the open consuming slot; a paid later cut may now
+    /// advance without waiting for that unrelated foreign destructor.
+    pub(crate) fn open_summary_consumed(&self) -> Result<(), CutError> {
+        self.state
+            .lock()
+            .expect("task proposal handoff lock")
+            .segments
+            .observe_open_consumed()
     }
 
     /// A cut has its own prepaid storage after core consumption. The open
@@ -313,9 +340,15 @@ mod tests {
         assert!(
             ingress
                 .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
+                .discarded
                 .is_none()
         );
-        assert!(ingress.submit(failure(&ingress, &drops)).is_none());
+        assert!(
+            ingress
+                .submit(failure(&ingress, &drops))
+                .discarded
+                .is_none()
+        );
         for _ in 0..20 {
             drop(ingress.submit(failure(&ingress, &drops)));
         }
@@ -345,12 +378,22 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         ingress.reserve_cut(CutId(1), 1).unwrap();
         ingress.reserve_cut(CutId(2), 1).unwrap();
-        assert!(ingress.submit(failure(&ingress, &drops)).is_none());
+        assert!(
+            ingress
+                .submit(failure(&ingress, &drops))
+                .discarded
+                .is_none()
+        );
         ingress.seal_cut(CutId(2)).unwrap();
         let first = ingress.take_next_summary().unwrap();
         assert_eq!(first.cut, Some(CutId(2)));
         // The role reserved first has not registered; its prefix is still open.
-        assert!(ingress.submit(TaskConclusionProposal::Succeeded).is_none());
+        assert!(
+            ingress
+                .submit(TaskConclusionProposal::Succeeded)
+                .discarded
+                .is_none()
+        );
         ingress.seal_cut(CutId(1)).unwrap();
         assert!(matches!(
             ingress.take_next_summary(),
@@ -386,7 +429,12 @@ mod tests {
     fn failed_owner_teardown_takes_actual_sources_without_adjudicating_them() {
         let ingress = Arc::new(TaskProposalIngress::new(1).unwrap());
         let drops = Arc::new(AtomicUsize::new(0));
-        assert!(ingress.submit(failure(&ingress, &drops)).is_none());
+        assert!(
+            ingress
+                .submit(failure(&ingress, &drops))
+                .discarded
+                .is_none()
+        );
         ingress.fail();
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(ingress.submit(failure(&ingress, &drops)));
@@ -436,5 +484,47 @@ mod tests {
         assert!(result.diagnostics.entries.iter().all(|d| d.cleanup));
         assert_eq!(ingress.retained_sources(), 0);
         ingress.summary_consumed(None).unwrap();
+    }
+
+    #[test]
+    fn an_open_publication_hold_does_not_block_a_later_paid_cut_after_core_ack() {
+        let ingress = Arc::new(TaskProposalIngress::new(1).unwrap());
+        let drops = Arc::new(AtomicUsize::new(0));
+        ingress.reserve_cut(CutId(1), 1).unwrap();
+        drop(ingress.submit(failure(&ingress, &drops)));
+        let open = ingress.take_next_summary().unwrap();
+        assert!(open.cut.is_none());
+        let result = open
+            .summary
+            .apply(ConclusionState::default(), Diagnostics::default());
+        ingress.seal_cut(CutId(1)).unwrap();
+        assert!(matches!(
+            ingress.take_next_summary(),
+            Err(CutError::Consuming)
+        ));
+        ingress.open_summary_consumed().unwrap();
+        let later = ingress.take_next_summary().unwrap();
+        assert_eq!(later.cut, Some(CutId(1)));
+        ingress.summary_consumed(later.cut).unwrap();
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the old publication still owns its actual source"
+        );
+        drop(ingress.submit(TaskConclusionProposal::Succeeded));
+        assert!(
+            matches!(ingress.take_next_summary(), Err(CutError::Consuming)),
+            "the old open slot cannot be reused yet"
+        );
+        assert_eq!(ingress.retire_cut(CutId(1)), Err(CutError::ExitUnobserved));
+        drop(ingress.take_source(result.state.source.unwrap()));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        ingress.summary_consumed(None).unwrap();
+        let open = ingress.take_next_summary().unwrap();
+        assert!(open.cut.is_none());
+        ingress.summary_consumed(None).unwrap();
+        ingress.observe_cut_exit(CutId(1), true, true).unwrap();
+        ingress.consume_cut(CutId(1), 0).unwrap();
+        ingress.retire_cut(CutId(1)).unwrap();
     }
 }

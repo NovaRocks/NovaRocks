@@ -22,7 +22,7 @@ use novarocks_control_runtime_core::{
     capacity::{ReservationRequest, ResourceVector},
     history::HistoryFact,
     identity::{ReservationId, WorkId},
-    scope::{WorkAdmission, WorkKind},
+    scope::{ScopeError, WorkAdmission, WorkKind},
 };
 
 #[must_use = "A reservation must be bound to its actual holder or rolled back before it acquires a payload"]
@@ -68,6 +68,10 @@ impl StepGuard {
     }
     pub const fn reservation_id(&self) -> ReservationId {
         self.reservation
+    }
+    pub(crate) fn belongs_to(&self, scope: &ScopeHandle) -> bool {
+        self.scope.id() == scope.id()
+            && crate::sync::Arc::ptr_eq(&self.scope.runtime.shared, &scope.runtime.shared)
     }
 }
 impl Drop for StepGuard {
@@ -122,6 +126,33 @@ impl WorkLease {
     pub fn scope(&self) -> &ScopeHandle {
         &self.scope
     }
+    /// Actual exit includes the complete admitted child tree. A retained
+    /// lease may outlive its pure record: this non-forgeable handle is created
+    /// only after admission, and its local exit flags can become true only
+    /// after that record accepted both actual observations. Bound work cannot
+    /// roll back and IDs never repeat, so absence after those observations is
+    /// known successful retirement (also after full scope removal).
+    pub fn actual_exit_ready(&self) -> Result<bool, RuntimeError> {
+        let state = self
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let observed_exit = self.body_exited && self.captures_exited;
+        let Some(scope) = state.scopes.get(&self.scope.id) else {
+            return if observed_exit {
+                Ok(true)
+            } else {
+                Err(RuntimeError::UnknownScope)
+            };
+        };
+        match scope.work_exited(self.id) {
+            Err(ScopeError::UnknownWork) if observed_exit => Ok(true),
+            result => result.map_err(Into::into),
+        }
+    }
     pub fn start(&mut self) -> Result<(), RuntimeError> {
         let mut state = self
             .scope
@@ -140,6 +171,18 @@ impl WorkLease {
             work: self.id,
         });
         Ok(())
+    }
+    /// Records unknown exit while the actual custodian keeps this lease.
+    /// Diagnostic responsibility is not a substitute for physical exit.
+    pub(crate) fn mark_unresolved(&self) {
+        self.scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock")
+            .note_unresolved(self.scope.id, self.id);
+        self.scope.runtime.shared.changed.notify();
     }
     pub fn derive(&self, mut request: ReservationRequest) -> Result<StepGuard, RuntimeError> {
         request.admission = WorkAdmission::Derived(self.id);

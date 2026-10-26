@@ -177,6 +177,49 @@ fn reserve_guard_is_scope_visible_and_only_unbound_guard_rolls_back() {
     assert!(scope.snapshot().unwrap().retirement_ready);
     ledger.remove_scope(sid(1)).unwrap();
 }
+
+#[test]
+fn capacity_refusal_keeps_the_same_transaction_snapshot_and_no_partial_charge() {
+    use novarocks_control_runtime::transaction::{CapacityDenial, RuntimeError};
+    let first = DimensionId::new(1).unwrap();
+    let second = DimensionId::new(2).unwrap();
+    let ledger = RuntimeLedger::new(
+        ResourceVector::new([(first, 8), (second, 4)]).unwrap(),
+        4,
+        1,
+    );
+    let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+    let held = scope
+        .reserve_next(
+            generation(),
+            ResourceVector::new([(first, 6)]).unwrap(),
+            WorkKind::Business,
+            WorkAdmission::External,
+        )
+        .unwrap();
+    let denied = scope.reserve_next(
+        generation(),
+        ResourceVector::new([(first, 2), (second, 5)]).unwrap(),
+        WorkKind::Business,
+        WorkAdmission::External,
+    );
+    assert_eq!(
+        denied.err(),
+        Some(RuntimeError::CapacityDenied(CapacityDenial {
+            dimension: second,
+            requested: 5,
+            committed: 0,
+            limit: 4,
+        }))
+    );
+    assert_eq!(ledger.used(first), 6);
+    assert_eq!(ledger.used(second), 0);
+    assert_eq!(scope.snapshot().unwrap().work, 1);
+    drop(held);
+    scope.close_external().unwrap();
+    assert!(scope.snapshot().unwrap().retirement_ready);
+    ledger.remove_scope(scope.id()).unwrap();
+}
 #[test]
 fn dropping_a_bound_lease_or_capacity_never_invents_exit() {
     let ledger = ledger();
@@ -1038,7 +1081,7 @@ fn committed_reply_remains_once_ever_after_failure_and_take() {
             .commit_reply(&cleanup, &reply, Arc::new(999))
             .unwrap_err()
             .0,
-        DriverError::ReplyAlreadyCommitted
+        DriverError::FailurePublicationRequired
     );
     runtime.effect_completed(cleanup).unwrap();
     runtime.retire_input(aid(1), failed).unwrap();
@@ -1245,4 +1288,193 @@ fn failed_role_still_waits_for_its_started_failure_effect_and_input_retirement()
     drop(role);
     drop(runtime.take_failure_payload(aid(1)).unwrap().unwrap());
     remove_actor(&runtime, aid(1)).unwrap();
+}
+
+#[test]
+fn production_turn_observes_current_time_for_each_input_before_lease_decisions() {
+    use novarocks_control_runtime::driver::Clock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct AdvancingClock(AtomicU64);
+    impl Clock for AdvancingClock {
+        fn now(&self) -> Tick {
+            Tick(self.0.fetch_add(10, Ordering::Relaxed))
+        }
+    }
+    #[derive(Debug)]
+    struct LeaseRecorder(Vec<(Tick, u64, bool)>);
+    impl Actor for LeaseRecorder {
+        type Input = u64;
+        type Effect = u64;
+        fn timer_input(now: Tick) -> u64 {
+            now.0
+        }
+        fn handle(
+            &mut self,
+            now: Tick,
+            _input: InputEnvelope,
+            value: u64,
+            _step: &mut StepContext<'_, u64>,
+        ) {
+            self.0.push((now, value, now < Tick(15)));
+        }
+        fn next_deadline(&self) -> Option<Tick> {
+            None
+        }
+        fn owner_failed(
+            _scope: ScopeId,
+            _generation: Generation,
+            _input: InputEnvelope,
+            _step: &mut StepContext<'_, u64>,
+        ) {
+        }
+    }
+    let ledger = ledger();
+    let scope = ledger.open_scope_next(None, generation(), 8, 8).unwrap();
+    let runtime = ActorRuntime::new(1);
+    runtime
+        .register_next(aid(1), scope.clone(), LeaseRecorder(vec![]), config())
+        .unwrap();
+    let first = runtime
+        .reserve_input(aid(1), aid(2), InputClass::Ordinary)
+        .unwrap()
+        .fill(1)
+        .unwrap();
+    let second = runtime
+        .reserve_input(aid(1), aid(2), InputClass::Ordinary)
+        .unwrap()
+        .fill(2)
+        .unwrap();
+    assert!(
+        runtime
+            .poll_one_with_clock(&AdvancingClock(AtomicU64::new(0)))
+            .unwrap()
+    );
+    assert_eq!(
+        runtime.snapshot(aid(1)).unwrap().batches,
+        2,
+        "both inputs share one bounded actor turn"
+    );
+    runtime.retire_input(aid(1), first).unwrap();
+    runtime.retire_input(aid(1), second).unwrap();
+    scope.close_external().unwrap();
+    let actor = remove_actor(&runtime, aid(1)).unwrap();
+    assert_eq!(actor.0, vec![(Tick(10), 1, true), (Tick(20), 2, false)]);
+    ledger.remove_scope(scope.id()).unwrap();
+}
+
+#[test]
+fn late_clock_observation_cannot_put_old_time_into_a_due_timer_payload() {
+    let ledger = ledger();
+    let scope = ledger.open_scope_next(None, generation(), 8, 8).unwrap();
+    let runtime = ActorRuntime::new(1);
+    let mut actor = recorder(false);
+    actor.deadline = Some(Tick(10));
+    runtime
+        .register_next(aid(1), scope.clone(), actor, config())
+        .unwrap();
+    assert_eq!(runtime.advance_time(Tick(20), 0).unwrap(), 0);
+    assert_eq!(runtime.advance_time(Tick(5), 1).unwrap(), 1);
+    runtime.poll_one(Tick(5)).unwrap();
+    runtime
+        .retire_input(aid(1), InputId::new(1).unwrap())
+        .unwrap();
+    scope.close_external().unwrap();
+    assert_eq!(remove_actor(&runtime, aid(1)).unwrap().seen, vec![(1, 20)]);
+    ledger.remove_scope(scope.id()).unwrap();
+}
+
+#[test]
+fn targeted_scope_reaping_excludes_other_owners_and_budgets_the_ready_parent() {
+    use novarocks_control_runtime::{history::HistoryCapture, transaction::RuntimeError};
+    use novarocks_control_runtime_core::history::HistoryFact;
+    let history = HistoryCapture::new(64);
+    let ledger = RuntimeLedger::with_history(vector(8), 16, 8, history.clone());
+    let earlier = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let target = ledger.open_scope(sid(2), None, generation(), 8, 8).unwrap();
+    let mut unrelated = earlier
+        .admit_work(
+            generation(),
+            wid(1),
+            WorkKind::Business,
+            WorkAdmission::External,
+        )
+        .unwrap();
+    let mut parent = target
+        .admit_work(
+            generation(),
+            wid(1),
+            WorkKind::Business,
+            WorkAdmission::External,
+        )
+        .unwrap();
+    let mut child = target
+        .admit_work(
+            generation(),
+            wid(2),
+            WorkKind::Business,
+            WorkAdmission::Derived(parent.id()),
+        )
+        .unwrap();
+    for work in [&mut unrelated, &mut parent, &mut child] {
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+    }
+    earlier.close_external().unwrap();
+    target.close_external().unwrap();
+    let version = ledger.change_version();
+    assert_eq!(
+        ledger.reap_scope_ready(sid(99), 1),
+        Err(RuntimeError::UnknownScope)
+    );
+    assert_eq!(ledger.reap_scope_ready(target.id(), 0).unwrap(), 0);
+    assert_eq!(
+        ledger.change_version(),
+        version,
+        "no progress sends no extra notification"
+    );
+    assert_eq!(ledger.reap_scope_ready(target.id(), 1).unwrap(), 1);
+    assert!(ledger.change_version() > version);
+    assert_eq!(
+        target.snapshot().unwrap().work,
+        1,
+        "child retirement queues the ready parent for a later budget unit"
+    );
+    assert_eq!(
+        earlier.snapshot().unwrap().work,
+        1,
+        "earlier global keys cannot consume this owner's budget"
+    );
+    assert_eq!(ledger.reap_scope_ready(target.id(), 1).unwrap(), 1);
+    assert!(target.snapshot().unwrap().retirement_ready);
+    assert_eq!(ledger.reap_scope_ready(target.id(), 8).unwrap(), 0);
+    assert!(!earlier.snapshot().unwrap().retirement_ready);
+    assert_eq!(
+        ledger.reap_ready(1).unwrap(),
+        1,
+        "the original global API still reaps the unrelated owner"
+    );
+    let facts: Vec<_> = history
+        .drain(64)
+        .entries
+        .into_iter()
+        .filter_map(|entry| match entry.fact {
+            HistoryFact::WorkRetired { scope, work } => Some((scope, work)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        facts,
+        vec![
+            (target.id(), child.id()),
+            (target.id(), parent.id()),
+            (earlier.id(), unrelated.id())
+        ]
+    );
+    ledger.remove_scope(target.id()).unwrap();
+    assert_eq!(
+        ledger.reap_scope_ready(target.id(), 0),
+        Err(RuntimeError::UnknownScope)
+    );
+    ledger.remove_scope(earlier.id()).unwrap();
+    assert!(ledger.is_empty());
 }

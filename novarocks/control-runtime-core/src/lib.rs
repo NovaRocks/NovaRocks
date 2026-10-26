@@ -18,16 +18,15 @@
 //! Shared control-plane control runtime core contracts.
 
 #![forbid(unsafe_code)]
-
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
-pub mod identity;
-pub mod scope;
 pub mod capacity;
+pub mod completion;
+pub mod effect;
+pub mod fair_queue;
+pub mod history;
+pub mod identity;
 pub mod mailbox;
 pub mod scheduler;
-pub mod fair_queue;
+pub mod scope;
 pub mod timer;
-pub mod effect;
-pub mod completion;
-pub mod history;

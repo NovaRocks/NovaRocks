@@ -160,14 +160,14 @@ impl StorageNeed {
         })
     }
 
-    /// One role has one input and an atomic batch of at most MAX_STEP_WORK
-    /// effects. Its cut retains up to two rich proposal candidates; the role
+    /// A causal role has distinct prefix/event inputs, each with an atomic
+    /// bounded batch. Its cut retains two rich proposal candidates; the role
     /// itself can retain one callback/input capture and one reliable exit.
     pub fn role(reply: bool) -> Self {
         Self {
-            inputs: 1,
-            batches: 1,
-            effects: ContextCore::MAX_STEP_WORK,
+            inputs: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
+            batches: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
+            effects: ContextCore::MAX_STEP_WORK * crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
             cuts: 1,
             replies: usize::from(reply),
             completions: 1,
@@ -198,6 +198,9 @@ pub enum TaskLifecycleRole {
     OperatorStatistics,
     DynamicFilters,
     Finisher,
+    Settlement,
+    WallTime,
+    TerminalPublisher,
     ContextClose,
     FailureProjection,
 }
@@ -268,8 +271,9 @@ impl ControlRuntimePolicy {
         let lifecycle = self
             .task_base
             .inputs
-            .checked_add(self.ingress.root_read_holders)
+            .checked_add(self.root_read_pool_per_root.inputs)
             .and_then(|n| n.checked_mul(max_live_tasks))
+            .and_then(|n| n.checked_add(self.request_roles))
             .ok_or(PolicyError::Overflow)?;
         let ordinary = self.request_roles;
         let control = self.request_roles;
@@ -312,7 +316,10 @@ mod tests {
         assert_eq!(policy.request_pool.replies, policy.request_roles);
         assert_eq!(policy.request_pool.cuts, policy.request_roles);
         let actor = policy.context_actor(9).unwrap();
-        assert_eq!(actor.mailbox[0], (policy.task_base.inputs + 2) * 9);
+        assert_eq!(
+            actor.mailbox[0],
+            (policy.task_base.inputs + 4) * 9 + policy.request_roles
+        );
         assert_eq!(actor.mailbox[1], policy.request_roles);
         assert_eq!(actor.mailbox[2], policy.request_roles);
     }

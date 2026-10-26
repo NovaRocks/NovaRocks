@@ -302,11 +302,27 @@ pub fn prepare_compiled_fragment_with_metadata_host(
 
 fn prepare_compiled_fragment_in(
     mut submission: CompiledFragmentSubmission,
-    context: FragmentPrepareContext,
+    mut context: FragmentPrepareContext,
     schema_preparation: Option<
         &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
     >,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {
+    if context
+        .completion_roles
+        .as_ref()
+        .is_some_and(|roles| roles.identity() != context.result_identity)
+    {
+        return Err(FragmentLaunchError::from_failure(
+            FragmentLaunchStage::ValidateSubmission,
+            FragmentLaunchErrorKind::Binding,
+            FragmentBindingError::new(
+                FragmentBindingTarget::Instance,
+                FragmentBindingErrorKind::InvalidAssignment,
+                "admitted completion roles do not match the fragment's exact Task identity",
+            )
+            .into(),
+        ));
+    }
     // The write capabilities move into the one pipeline graph that owns them.
     let writers = std::mem::take(&mut submission.writers);
     let program = submission.program();
@@ -525,15 +541,36 @@ fn prepare_compiled_fragment_in(
         })
     })();
     match prepare_result {
-        Ok(prepared) => Ok(DormantFragmentHandle {
-            prepared,
-            resources,
-            query_id,
-            fragment_instance_id: finst_id,
-            profiler: context.profiler.clone(),
-            mem_tracker: context.mem_tracker.clone(),
-            start_failure: context.start_failure(),
-        }),
+        Ok(prepared) => {
+            if context.completion_roles.is_none() && context.result_identity.is_none() {
+                let (roles, driver) =
+                    crate::runtime::local_completion::LocalCompletionDriver::admit(
+                        prepared.failure_control().exit_health_reporter(),
+                    );
+                context.completion_roles = Some(roles);
+                prepared.admit_local_completion_driver(driver);
+            }
+            let (settlement, publisher_work) = if let Some(roles) = context.completion_roles.take()
+            {
+                let (finisher, wall_time, publisher) = roles.into_parts();
+                let (permit, work) = finisher.into_parts();
+                prepared.admit_completion_work(work, wall_time);
+                (Some(permit), Some(publisher))
+            } else {
+                (None, None)
+            };
+            Ok(DormantFragmentHandle {
+                prepared,
+                resources,
+                query_id,
+                fragment_instance_id: finst_id,
+                profiler: context.profiler.clone(),
+                mem_tracker: context.mem_tracker.clone(),
+                start_failure: context.start_failure(),
+                settlement,
+                publisher_work,
+            })
+        }
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),
     }
 }

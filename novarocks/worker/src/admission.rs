@@ -39,64 +39,9 @@ use crate::MonotonicInstant;
 
 const AUTHORITY_LOCK: &str = "admission ticket authority lock";
 
-/// Maximum number of query-context capacity reservations one worker owns.
-pub const MAX_ADMISSION_RESERVATIONS: usize = 1024;
-
-/// Maximum lifetime an unredeemed grant may request.
-pub const MAX_ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
-
-/// Worker-local bounds for admission grants and their replay records.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct AdmissionTicketConfig {
-    max_reservations: usize,
-    max_valid_for: Duration,
-    replay_retention: Duration,
-    max_records: usize,
-}
-
-impl AdmissionTicketConfig {
-    pub const DEFAULT: Self = Self {
-        max_reservations: MAX_ADMISSION_RESERVATIONS,
-        max_valid_for: MAX_ADMISSION_TICKET_VALID_FOR,
-        replay_retention: Duration::from_secs(120),
-        max_records: MAX_ADMISSION_RESERVATIONS * 8,
-    };
-
-    pub fn new(
-        max_reservations: usize,
-        max_valid_for: Duration,
-        replay_retention: Duration,
-        max_records: usize,
-    ) -> Option<Self> {
-        if max_reservations == 0
-            || max_valid_for.is_zero()
-            || replay_retention.is_zero()
-            || max_records < max_reservations
-        {
-            return None;
-        }
-        Some(Self {
-            max_reservations,
-            max_valid_for,
-            replay_retention,
-            max_records,
-        })
-    }
-
-    pub const fn max_reservations(self) -> usize {
-        self.max_reservations
-    }
-
-    pub const fn max_valid_for(self) -> Duration {
-        self.max_valid_for
-    }
-}
-
-impl Default for AdmissionTicketConfig {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
+pub use novarocks_worker_protocol::admission::{
+    AdmissionTicketConfig, MAX_ADMISSION_RESERVATIONS, MAX_ADMISSION_TICKET_VALID_FOR,
+};
 
 /// The single owner's state for one ticket nonce.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -438,9 +383,9 @@ impl AdmissionTicketAuthority {
             return Err(AdmissionTicketAcquisitionRejection::SealedEpoch);
         }
 
-        let rejection = if request.valid_for().get() > self.config.max_valid_for {
+        let rejection = if request.valid_for().get() > self.config.max_valid_for() {
             Some(AdmissionTicketAcquisitionRejection::ValidityExceedsWorkerLimit)
-        } else if state.reserved >= self.config.max_reservations {
+        } else if state.reserved >= self.config.max_reservations() {
             Some(AdmissionTicketAcquisitionRejection::ReservationCapacityExhausted)
         } else if state.tickets.values().any(|record| {
             record.receipt.context() == request.context()
@@ -525,7 +470,7 @@ impl AdmissionTicketAuthority {
     }
 
     fn ensure_acquisition_capacity_locked(&self, state: &mut AdmissionTicketStateOwner) -> bool {
-        if state.acquisitions.len() < self.config.max_records {
+        if state.acquisitions.len() < self.config.max_records() {
             return true;
         }
 
@@ -779,7 +724,7 @@ impl AdmissionTicketAuthority {
                 state.terminal_order.pop_front();
                 continue;
             };
-            if !now.has_reached(terminal_at.saturating_add(self.config.replay_retention)) {
+            if !now.has_reached(terminal_at.saturating_add(self.config.replay_retention())) {
                 break;
             }
             state.terminal_order.pop_front();
@@ -794,7 +739,7 @@ impl AdmissionTicketAuthority {
                 state.terminal_acquisition_order.pop_front();
                 continue;
             };
-            if !now.has_reached(terminal_at.saturating_add(self.config.replay_retention)) {
+            if !now.has_reached(terminal_at.saturating_add(self.config.replay_retention())) {
                 break;
             }
             state.terminal_acquisition_order.pop_front();

@@ -32,8 +32,17 @@ use novarocks_control_runtime_core::{
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacityDenial {
+    pub dimension: DimensionId,
+    pub requested: u64,
+    pub committed: u64,
+    pub limit: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
     Capacity(CapacityError),
+    CapacityDenied(CapacityDenial),
     Scope(ScopeError),
     Completion(CompletionError),
     UnknownScope,
@@ -412,16 +421,7 @@ impl RuntimeLedger {
             let Some((scope, work)) = state.pending_retirement.pop_first() else {
                 break;
             };
-            let parent = state
-                .scopes
-                .get_mut(&scope)
-                .ok_or(RuntimeError::UnknownScope)?
-                .retire_work(work)?;
-            state.clear_unresolved(scope, work);
-            self.shared.record(HistoryFact::WorkRetired { scope, work });
-            if let Some(parent) = parent {
-                state.pending_retirement.insert((scope, parent));
-            }
+            self.retire_work_locked(&mut state, scope, work)?;
             retired += 1;
         }
         drop(state);
@@ -429,6 +429,54 @@ impl RuntimeLedger {
             self.shared.changed.notify();
         }
         Ok(retired)
+    }
+    /// Reaps only this exact owner's ready work. Each operation is an indexed
+    /// scope range lookup plus one retirement; other owners cannot consume the
+    /// budget or delay a newly ready parent. Zero budget never mutates state.
+    pub fn reap_scope_ready(&self, scope: ScopeId, budget: usize) -> Result<usize, RuntimeError> {
+        let mut state = self.shared.state.lock().expect("runtime ledger lock");
+        if !state.scopes.contains_key(&scope) {
+            return Err(RuntimeError::UnknownScope);
+        }
+        let bounds = (scope, WorkId::new(1).expect("minimum work identity"))
+            ..=(scope, WorkId::new(u64::MAX).expect("maximum work identity"));
+        let mut retired = 0;
+        for _ in 0..budget {
+            let Some((owner, work)) = state
+                .pending_retirement
+                .range(bounds.clone())
+                .next()
+                .copied()
+            else {
+                break;
+            };
+            state.pending_retirement.remove(&(owner, work));
+            self.retire_work_locked(&mut state, owner, work)?;
+            retired += 1;
+        }
+        drop(state);
+        if retired != 0 {
+            self.shared.changed.notify();
+        }
+        Ok(retired)
+    }
+    fn retire_work_locked(
+        &self,
+        state: &mut LedgerState,
+        scope: ScopeId,
+        work: WorkId,
+    ) -> Result<(), RuntimeError> {
+        let parent = state
+            .scopes
+            .get_mut(&scope)
+            .ok_or(RuntimeError::UnknownScope)?
+            .retire_work(work)?;
+        state.clear_unresolved(scope, work);
+        self.shared.record(HistoryFact::WorkRetired { scope, work });
+        if let Some(parent) = parent {
+            state.pending_retirement.insert((scope, parent));
+        }
+        Ok(())
     }
     pub fn remove_scope(&self, id: ScopeId) -> Result<(), RuntimeError> {
         let mut state = self.shared.state.lock().expect("runtime ledger lock");
@@ -631,7 +679,11 @@ impl ScopeHandle {
         let (ledger, scope) = state.parts(self.id)?;
         let work = scope.next_work_id()?;
         let reservation = ledger.next_reservation_id()?;
-        ledger.try_reserve_bundle(
+        // The fixed dimension inventory is plain metadata. Capture a denial
+        // in this transaction, rather than sampling counters after unlocking
+        // and attaching another thread's later state to the original refusal.
+        let requested = resources.clone();
+        let reserved = ledger.try_reserve_bundle(
             scope,
             ReservationRequest {
                 id: reservation,
@@ -641,7 +693,16 @@ impl ScopeHandle {
                 admission,
                 kind,
             },
-        )?;
+        );
+        if let Err(CapacityError::Exhausted(dimension)) = reserved {
+            return Err(RuntimeError::CapacityDenied(CapacityDenial {
+                dimension,
+                requested: requested.get(dimension),
+                committed: ledger.used(dimension),
+                limit: ledger.limit(dimension),
+            }));
+        }
+        reserved?;
         self.runtime.shared.record(HistoryFact::Admitted {
             scope: self.id,
             work,

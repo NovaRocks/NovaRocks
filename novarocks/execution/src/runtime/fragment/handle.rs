@@ -57,6 +57,8 @@ pub struct FragmentPrepareContext {
     result_spec: Option<ResultWriteSpec>,
     result_identity: Option<novarocks_execution_contract::TaskIdentity>,
     task_control: Option<Arc<crate::runtime::task_control::TaskExecutionControl>>,
+    completion_roles:
+        Option<novarocks_execution_contract::AdmittedFragmentRoles<super::ExecutionFailure>>,
     root_sink_dop: Option<i32>,
     execution_runtime: Option<Arc<ExecutionRuntime>>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
@@ -929,6 +931,101 @@ mod owner_tests {
         assert!(matches!(original.outcome(), FragmentOutcome::Succeeded));
         assert!(matches!(repeated.outcome(), FragmentOutcome::Succeeded));
         assert_eq!(owner.pending_settlements(), 0);
+    }
+
+    #[test]
+    fn supplied_roles_keep_the_original_finisher_through_settlement_and_late_publisher_binding() {
+        use novarocks_execution_contract::{
+            AdmittedFinisher, AdmittedFragmentRoles, CompletionWorkCapability, SettledContinuation,
+            SettlementCapability, SettlementPermit,
+        };
+        type Child = SettledContinuation<super::super::ExecutionFailure>;
+        struct Registration(Arc<Mutex<Option<Child>>>);
+        impl SettlementCapability<super::super::ExecutionFailure> for Registration {
+            fn register(self: Box<Self>, callback: Child) {
+                let mut slot = self.0.lock().unwrap();
+                assert!(slot.is_none());
+                *slot = Some(callback);
+            }
+            fn revoke_unused(self: Box<Self>) {}
+        }
+        struct Work {
+            role: &'static str,
+            events: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
+        }
+        impl CompletionWorkCapability for Work {
+            fn started(&mut self) {
+                self.events.lock().unwrap().push((self.role, "started"));
+            }
+            fn completed(self: Box<Self>) {
+                self.events.lock().unwrap().push((self.role, "completed"));
+            }
+            fn unused_exited(self: Box<Self>) {
+                self.events.lock().unwrap().push((self.role, "unused"));
+            }
+            fn unresolved(self: Box<Self>) {
+                self.events.lock().unwrap().push((self.role, "unresolved"));
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let work = |role| {
+            Box::new(Work {
+                role,
+                events: events.clone(),
+            }) as Box<dyn CompletionWorkCapability>
+        };
+        let child = Arc::new(Mutex::new(None));
+        let permit =
+            SettlementPermit::from_admitted_local_role(Box::new(Registration(child.clone())));
+        let roles = AdmittedFragmentRoles::from_admitted_roles(
+            AdmittedFinisher::from_admitted_role(permit, work("finisher")),
+            work("wall_time"),
+            work("publisher"),
+        );
+        let context = FragmentPrepareContext::default().with_completion_roles(roles);
+        let running =
+            prepare_compiled_fragment(empty_result_submission(UniqueId::new(84037, 1)), context)
+                .unwrap()
+                .start();
+        wait_for_fragment_probe(|| child.lock().unwrap().is_some());
+        assert!(running.stopped_fact().is_none());
+        {
+            let events = events.lock().unwrap();
+            assert!(events.contains(&("finisher", "started")));
+            assert!(!events.contains(&("finisher", "completed")));
+            assert!(!events.iter().any(|(role, _)| *role == "publisher"));
+        }
+        let callback = child.lock().unwrap().take().unwrap();
+        callback(None);
+        let first = running.join();
+        let repeated = running.clone().join();
+        assert!(matches!(first.outcome(), FragmentOutcome::Succeeded));
+        assert!(matches!(repeated.outcome(), FragmentOutcome::Succeeded));
+        assert!(child.lock().unwrap().is_none());
+        wait_for_fragment_probe(|| events.lock().unwrap().contains(&("finisher", "completed")));
+        let published = Arc::new(AtomicUsize::new(0));
+        let seen = published.clone();
+        running.bind_test_publisher(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        let events = events.lock().unwrap();
+        for role in ["finisher", "wall_time", "publisher"] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == (role, "started"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == (role, "completed"))
+                    .count(),
+                1
+            );
+        }
     }
     #[test]
     fn cancellation_accepted_after_settlement_still_retires_as_cancelled() {
@@ -2034,6 +2131,7 @@ impl Default for FragmentPrepareContext {
             result_spec: None,
             result_identity: None,
             task_control: None,
+            completion_roles: None,
             root_sink_dop: None,
             execution_runtime: Some(crate::runtime::execution_runtime::test_execution_runtime()),
             query_memory: None,
@@ -2078,6 +2176,7 @@ impl FragmentPrepareContext {
             result_spec: None,
             result_identity: None,
             task_control: None,
+            completion_roles: None,
             root_sink_dop: None,
             execution_runtime: None,
             query_memory: None,
@@ -2098,6 +2197,21 @@ impl FragmentPrepareContext {
         binding: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     ) -> Self {
         self.query_memory = binding;
+        self
+    }
+
+    /// The preparation owner moves these roles before this fragment acquires
+    /// an original finisher or publisher. Task handles and joiners cannot
+    /// create another registration authority.
+    pub fn with_completion_roles(
+        mut self,
+        roles: novarocks_execution_contract::AdmittedFragmentRoles<super::ExecutionFailure>,
+    ) -> Self {
+        assert!(
+            self.completion_roles.is_none(),
+            "one original completion role set"
+        );
+        self.completion_roles = Some(roles);
         self
     }
 
@@ -2245,6 +2359,7 @@ impl FragmentPrepareContext {
             result_spec,
             result_identity: None,
             task_control: None,
+            completion_roles: None,
             root_sink_dop,
             execution_runtime: None,
             query_memory: None,
@@ -2380,6 +2495,8 @@ pub struct DormantFragmentHandle {
     /// report the hierarchy the fragment actually charged against.
     mem_tracker: Option<Arc<MemTracker>>,
     start_failure: Option<StartFailurePoint>,
+    settlement: Option<novarocks_execution_contract::SettlementPermit<super::ExecutionFailure>>,
+    publisher_work: Option<novarocks_execution_contract::CompletionWork>,
 }
 
 #[derive(Debug)]
@@ -2473,6 +2590,8 @@ impl DormantFragmentHandle {
             fragment_instance_id,
             profiler,
             mem_tracker,
+            settlement,
+            publisher_work,
             ..
         } = self;
         let control = prepared.failure_control();
@@ -2487,9 +2606,16 @@ impl DormantFragmentHandle {
                 terminal: None,
             }),
             terminal_cv: std::sync::Condvar::new(),
-            publisher: crate::exec::pipeline::global_driver_executor::once_role::OnceRole::new(
-                crate::exec::pipeline::global_driver_executor::once_role::Role::TerminalPublisher,
-            ),
+            publisher: match publisher_work {
+                Some(work) => crate::exec::pipeline::global_driver_executor::once_role::OnceRole::from_admitted(
+                    crate::exec::pipeline::global_driver_executor::once_role::Role::TerminalPublisher,
+                    work,
+                ),
+                None => crate::exec::pipeline::global_driver_executor::once_role::OnceRole::new(
+                    crate::exec::pipeline::global_driver_executor::once_role::Role::TerminalPublisher,
+                ),
+            },
+            settlement: std::sync::Mutex::new(settlement),
             finisher: Arc::downgrade(&finisher),
             query_id,
             fragment_instance_id,
@@ -2536,6 +2662,9 @@ struct RunningFragmentLifecycle {
     control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     state: std::sync::Mutex<RunningFragmentState>,
     terminal_cv: std::sync::Condvar,
+    settlement: std::sync::Mutex<
+        Option<novarocks_execution_contract::SettlementPermit<super::ExecutionFailure>>,
+    >,
     publisher: Arc<
         crate::exec::pipeline::global_driver_executor::once_role::OnceRole<FragmentTerminalFact>,
     >,
@@ -2678,11 +2807,23 @@ impl RunningFragmentLifecycle {
     // Design: ADR-0193 (docs/adr/ADR-0193-task-conclusion-proposals-and-settled-points.md)
     fn settle_after_stop(self: &Arc<Self>, result: super::ExecutionResult<()>) -> bool {
         let lifecycle = Arc::clone(self);
-        self.control.on_settled(Box::new(move |_snapshot| {
+        let continuation: novarocks_execution_contract::SettledContinuation<
+            super::ExecutionFailure,
+        > = Box::new(move |_snapshot| {
             // Settlement is a barrier, not a frozen outcome. Retirement keeps
             // reading the current owner snapshot at the actual decision point.
             lifecycle.finish_from_stopped(result);
-        }));
+        });
+        let permit = self
+            .settlement
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(permit) = permit {
+            permit.register(continuation);
+        } else {
+            self.control.on_settled(continuation);
+        }
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())

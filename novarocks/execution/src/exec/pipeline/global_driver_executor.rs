@@ -78,6 +78,7 @@ pub struct FragmentCompletion {
     resources_finisher: Arc<once_role::OnceRole<FragmentStoppedFact>>,
     wall_time: Arc<once_role::OnceRole<FragmentStoppedFact>>,
     control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+    local_completion: std::sync::OnceLock<crate::runtime::local_completion::LocalCompletionDriver>,
 }
 
 /// Immutable proof that every submitted driver has actually stopped.
@@ -123,6 +124,7 @@ impl FragmentCompletion {
             resources_finisher: once_role::OnceRole::new(once_role::Role::PipelineFinisher),
             wall_time: once_role::OnceRole::new(once_role::Role::WallTime),
             control,
+            local_completion: std::sync::OnceLock::new(),
         })
     }
 
@@ -172,8 +174,7 @@ impl FragmentCompletion {
             self.cv.notify_all();
             stopped
         };
-        self.wall_time.invoke(&stopped, &self.control);
-        self.resources_finisher.invoke(&stopped, &self.control);
+        self.run_completion_roles(&stopped);
     }
 
     pub fn should_abort(&self) -> bool {
@@ -207,8 +208,7 @@ impl FragmentCompletion {
         };
         // The body proof is frozen before either named role. Their independent
         // capture scopes cannot revoke it or suppress the sibling role.
-        self.wall_time.invoke(&stopped, &self.control);
-        self.resources_finisher.invoke(&stopped, &self.control);
+        self.run_completion_roles(&stopped);
         true
     }
 
@@ -238,6 +238,39 @@ impl FragmentCompletion {
         Arc::clone(&self.resources_finisher)
     }
 
+    pub(crate) fn admit_completion_work(
+        &self,
+        finisher: novarocks_execution_contract::CompletionWork,
+        wall_time: novarocks_execution_contract::CompletionWork,
+    ) {
+        self.resources_finisher
+            .admit_work(&mut Some(finisher))
+            .expect("original dormant finisher has no bound callback or prior work");
+        self.wall_time
+            .admit_work(&mut Some(wall_time))
+            .expect("original dormant wall-time role has no bound callback or prior work");
+    }
+
+    pub(crate) fn admit_local_completion_driver(
+        &self,
+        driver: crate::runtime::local_completion::LocalCompletionDriver,
+    ) {
+        assert!(
+            self.local_completion.set(driver).is_ok(),
+            "one local completion driver"
+        );
+    }
+
+    fn run_completion_roles(&self, stopped: &FragmentStoppedFact) {
+        self.wall_time.invoke(stopped, &self.control);
+        self.resources_finisher.invoke(stopped, &self.control);
+        if let Some(driver) = self.local_completion.get() {
+            // The original callback's stack and return-publication step have
+            // finished before this taskless barrier can invoke its one child.
+            driver.run();
+        }
+    }
+
     /// Bind the unique original resource owner before submitting its drivers.
     pub(crate) fn bind_resources_finisher(
         &self,
@@ -246,6 +279,9 @@ impl FragmentCompletion {
         self.resources_finisher.bind(slot)?;
         if let Some(stopped) = self.stopped_fact() {
             self.resources_finisher.invoke(&stopped, &self.control);
+            if let Some(driver) = self.local_completion.get() {
+                driver.run();
+            }
         }
         Ok(())
     }

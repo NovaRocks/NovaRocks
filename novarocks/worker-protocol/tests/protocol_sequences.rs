@@ -37,7 +37,9 @@ use novarocks_worker_protocol::{
     context::{
         ContextConfig, ContextCore, ContextEffect, ContextInput, PhysicalFact, RequestResult,
     },
-    creation::{AdmissionNeed, AdmissionPort, CreationCost, PayloadId, RequestContext},
+    creation::{
+        AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestContext,
+    },
     lease::{InstalledLease, LeaseBounds, MonotonicInstant},
     observation::{
         CoveredObservationFact, CoveredObservationFrame, CoveredSubscriptionError,
@@ -102,12 +104,16 @@ struct Port {
     calls: Vec<AdmissionNeed>,
     next: u64,
     reject: Option<OperationOutcome>,
+    typed_reject: Option<AdmissionRefusal>,
 }
 impl AdmissionPort for Port {
-    fn try_reserve(&mut self, need: AdmissionNeed) -> Result<ReservationId, OperationOutcome> {
+    fn try_reserve(&mut self, need: AdmissionNeed) -> Result<ReservationId, AdmissionRefusal> {
         self.calls.push(need);
+        if let Some(refusal) = &self.typed_reject {
+            return Err(refusal.clone());
+        }
         if let Some(reject) = self.reject {
-            return Err(reject);
+            return Err(reject.into());
         }
         self.next += 1;
         Ok(ReservationId::new(self.next).unwrap())
@@ -999,8 +1005,71 @@ fn a_losing_summary_releases_its_source_without_republishing_the_accepted_genera
     assert_eq!(core.task(task(1)).unwrap().version, version);
     assert_eq!(
         keep.effects,
-        vec![ContextEffect::DisposeSource(SourceId(2))]
+        vec![ContextEffect::DisposeSource {
+            task: task(1),
+            source: SourceId(2)
+        }]
     );
+}
+
+#[test]
+fn source_disposal_is_addressed_to_the_exact_task_when_occurrence_ordinals_match() {
+    use novarocks_execution_contract::{
+        SafeDetail, TaskFailure,
+        failure::{FailureClass, FailureFact, FailureReason, domain},
+    };
+    use novarocks_worker_protocol::proposal_summary::{ProposalSummary, SourceId};
+    let mut core = core(8, 2);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    let proposal = |source| Proposal {
+        conclusion: TaskConclusion::Terminated(TerminationDetail::Failed(TaskFailure::new(
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(65000).unwrap()),
+            ),
+            SafeDetail::truncating("source routing probe"),
+        ))),
+        evidence: None,
+        source: Some(SourceId(source)),
+        diagnostic: None,
+    };
+    for number in [1, 2] {
+        create(&mut core, &mut port, number);
+        loaded(&mut core, &mut port, number);
+        for occurrence in [1, 2] {
+            let mut summary = ProposalSummary::default();
+            summary.push(proposal(occurrence));
+            let step = core
+                .handle(
+                    at(0),
+                    ContextInput::Summary {
+                        task: task(u32::from(number)),
+                        generation: Generation::new(1).unwrap(),
+                        cut: None,
+                        summary,
+                    },
+                    &mut port,
+                )
+                .unwrap();
+            let disposed: Vec<_> = step
+                .effects
+                .into_iter()
+                .filter(|effect| matches!(effect, ContextEffect::DisposeSource { .. }))
+                .collect();
+            if occurrence == 1 {
+                assert!(disposed.is_empty());
+            } else {
+                assert_eq!(
+                    disposed,
+                    vec![ContextEffect::DisposeSource {
+                        task: task(u32::from(number)),
+                        source: SourceId(2),
+                    }]
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1810,11 +1879,10 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
         core.task(task(1)).unwrap().conclusion.source,
         Some(SourceId(17))
     );
-    assert!(
-        !closed
-            .effects
-            .contains(&ContextEffect::DisposeSource(SourceId(17)))
-    );
+    assert!(!closed.effects.contains(&ContextEffect::DisposeSource {
+        task: task(1),
+        source: SourceId(17)
+    }));
     assert!(closed.effects.contains(&ContextEffect::Reply {
         request: operation(5),
         outcome: OperationOutcome::Accepted
@@ -2161,4 +2229,711 @@ fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
     );
     assert!(core.task(task(1)).unwrap().waiting_replies.is_empty());
     assert_eq!(port.calls.len(), 2);
+}
+fn inbound_refusal() -> AdmissionRefusal {
+    use novarocks_execution_contract::{
+        OperationDomainFailure, SafeDetail,
+        failure::{
+            FailureClass, FailureFact, FailureReason, ResourceDimension, ResourceFacts,
+            ResourceScope, domain,
+        },
+        operation::DomainFailureOutcome,
+    };
+    let fact = FailureFact::new(
+        FailureClass::Resource,
+        FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(73).unwrap()),
+    )
+    .with_resource(ResourceFacts {
+        request_scope: Some(ResourceScope::Task),
+        constraint_scope: Some(ResourceScope::Process),
+        dimension: ResourceDimension::Bytes,
+        requested: Some(9),
+        required_growth: Some(9),
+        limit: Some(10),
+        live: None,
+        committed: Some(8),
+    });
+    AdmissionRefusal::Domain(
+        DomainFailureOutcome::ResourceExhausted,
+        OperationDomainFailure::new(
+            fact,
+            SafeDetail::truncating("inbound normal-close byte capacity exhausted"),
+        ),
+    )
+}
+#[test]
+fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
+    use novarocks_worker_protocol::context::DomainRefusal;
+    let refusal = inbound_refusal();
+    let AdmissionRefusal::Domain(outcome, failure) = refusal.clone() else {
+        unreachable!();
+    };
+    let expected = DomainRefusal { outcome, failure };
+    let mut core = core(8, 2);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    core.handle_request(
+        at(0),
+        RequestContext {
+            token: InputId::new(1).unwrap(),
+            operation: operation(1),
+            deadline: at(100),
+        },
+        ContextInput::Create {
+            request: operation(1),
+            task: task(1),
+            payload: PayloadId(1),
+        },
+        &mut port,
+    )
+    .unwrap();
+    port.typed_reject = Some(refusal.clone());
+    let rejected = core
+        .handle(
+            at(1),
+            ContextInput::Loaded {
+                task: task(1),
+                result: Ok(cost()),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        rejected
+            .effects
+            .contains(&ContextEffect::DomainFailureReply {
+                request: operation(1),
+                refusal: expected.clone()
+            })
+    );
+    assert_eq!(
+        rejected.requests[0].result,
+        RequestResult::Outcome(outcome.outcome())
+    );
+    assert!(!rejected.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::EnqueuePreparation { .. }
+            | ContextEffect::RetireTask { .. }
+            | ContextEffect::PublishTask { .. }
+            | ContextEffect::PublishTaskConvergence { .. }
+    )));
+    assert!(!core.task(task(1)).unwrap().loader_exited);
+    assert!(
+        core.task(task(1))
+            .unwrap()
+            .preparation_reservation
+            .is_none()
+    );
+    assert_eq!(core.task(task(1)).unwrap().creation_refusal, Some(refusal));
+    assert!(core.status(task(1)).is_none());
+    let exited = core
+        .handle(
+            at(2),
+            ContextInput::Physical {
+                task: task(1),
+                fact: PhysicalFact::LoaderExited,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(exited.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::RetireTask {
+            preparation: None,
+            ..
+        }
+    )));
+    assert_eq!(
+        core.task(task(1)).unwrap().phase,
+        novarocks_worker_protocol::task::CreationPhase::Retained
+    );
+    port.typed_reject = None;
+    for (token, op, deadline) in [(2, 2, 100), (3, 3, 1)] {
+        let replay = core
+            .handle_request(
+                at(3),
+                RequestContext {
+                    token: InputId::new(token).unwrap(),
+                    operation: operation(op),
+                    deadline: at(deadline),
+                },
+                ContextInput::Create {
+                    request: operation(op),
+                    task: task(1),
+                    payload: PayloadId(99),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(replay.effects.contains(&ContextEffect::DomainFailureReply {
+            request: operation(op),
+            refusal: expected.clone()
+        }));
+        assert_eq!(
+            replay.requests[0].result,
+            RequestResult::Outcome(outcome.outcome())
+        );
+    }
+    assert_eq!(
+        port.calls.len(),
+        2,
+        "a retained refusal never starts preparation or re-reserves capacity on replay"
+    );
+}
+#[test]
+fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_body() {
+    let refusal = inbound_refusal();
+    let mut core = core(8, 2);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    port.typed_reject = Some(refusal.clone());
+    let first = core
+        .handle(
+            at(0),
+            ContextInput::Create {
+                request: operation(1),
+                task: task(1),
+                payload: PayloadId(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        matches!(&first.effects[0], ContextEffect::DomainFailureReply { refusal: value, .. } if value.outcome.outcome() == refusal.outcome())
+    );
+    assert!(
+        core.task(task(1)).is_none(),
+        "a failed active reservation cannot create an uncharged entity record"
+    );
+    port.typed_reject = None;
+    create(&mut core, &mut port, 1);
+    let loaded = core
+        .handle(
+            at(0),
+            ContextInput::Loaded {
+                task: task(1),
+                result: Err(refusal.clone()),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(matches!(
+        &loaded.effects[0],
+        ContextEffect::DomainFailureReply { .. }
+    ));
+    assert_eq!(core.task(task(1)).unwrap().creation_refusal, Some(refusal));
+    assert_eq!(
+        port.calls.len(),
+        2,
+        "loader failure never attempts a preparation reservation"
+    );
+}
+#[test]
+fn typed_ticket_capacity_refusal_is_replayed_without_losing_its_failure_facts() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let refusal = inbound_refusal();
+    let mut control = control();
+    let mut port = Port {
+        typed_reject: Some(refusal.clone()),
+        ..Port::default()
+    };
+    let request = AcquireQueryContextAdmissionTicket::new(
+        operation(1),
+        context(),
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        control.admission().capability(),
+    );
+    let ticket = AdmissionTicketId::try_from_bytes([4; 16]).unwrap();
+    for token in 1..=2 {
+        let step = control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(token).unwrap(),
+                    operation: operation(1),
+                    deadline: at(100),
+                },
+                ControlInput::Acquire { request, ticket },
+                &mut port,
+            )
+            .unwrap();
+        assert!(
+            matches!(&step.effects[0], ControlEffect::DomainFailureReply { refusal: value, .. } if value.outcome.outcome() == refusal.outcome() && Some(&value.failure) == match &refusal { AdmissionRefusal::Domain(_, failure) => Some(failure), _ => None })
+        );
+        assert_eq!(
+            step.requests[0].result,
+            RequestResult::Outcome(refusal.outcome())
+        );
+        port.typed_reject = None;
+    }
+    assert_eq!(port.calls.len(), 1);
+}
+#[test]
+fn a_single_task_byte_refusal_keeps_precedence_over_a_full_preparation_position() {
+    let mut core = core(8, 1);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    create(&mut core, &mut port, 1);
+    loaded(&mut core, &mut port, 1);
+    create(&mut core, &mut port, 2);
+    let mut oversized = cost();
+    oversized.input_retained_bytes = 101;
+    let rejected = core
+        .handle(
+            at(0),
+            ContextInput::Loaded {
+                task: task(2),
+                result: Ok(oversized),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(rejected.effects.contains(&ContextEffect::Reply {
+        request: operation(2),
+        outcome: OperationOutcome::ResourceExhausted
+    }));
+    create(&mut core, &mut port, 3);
+    let full = loaded(&mut core, &mut port, 3);
+    assert!(full.contains(&ContextEffect::Reply {
+        request: operation(3),
+        outcome: OperationOutcome::PreparationBusy
+    }));
+}
+#[test]
+fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let refusal = inbound_refusal();
+    let mut control = control();
+    let mut port = Port::default();
+    let ticket = grant(&mut control, &mut port);
+    port.typed_reject = Some(refusal.clone());
+    let step = control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(1).unwrap(),
+                operation: operation(2),
+                deadline: at(100),
+            },
+            ControlInput::Establish {
+                request: operation(2),
+                context: context(),
+                ticket,
+                payload: PayloadId(1),
+                semantics: semantics(),
+                compared_payload: None,
+                same_credential: false,
+                generation: Generation::new(1).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        matches!(&step.effects[0], ControlEffect::DomainFailureReply { refusal: value, .. } if value.outcome.outcome() == refusal.outcome() && Some(&value.failure) == match &refusal { AdmissionRefusal::Domain(_, failure) => Some(failure), _ => None })
+    );
+    assert_eq!(
+        step.requests[0].result,
+        RequestResult::Outcome(refusal.outcome())
+    );
+    assert!(!step.effects.iter().any(|effect| matches!(
+        effect,
+        ControlEffect::Materialize { .. } | ControlEffect::RetireReservation(_)
+    )));
+    assert_eq!(control.route(context()), QueryContextState::Absent);
+}
+#[test]
+fn aggregate_preparation_capacity_refusal_remains_preparation_busy() {
+    let mut core = core(8, 2);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    create(&mut core, &mut port, 1);
+    port.reject = Some(OperationOutcome::PreparationBusy);
+    let step = core
+        .handle(
+            at(0),
+            ContextInput::Loaded {
+                task: task(1),
+                result: Ok(cost()),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(step.effects.contains(&ContextEffect::Reply {
+        request: operation(1),
+        outcome: OperationOutcome::PreparationBusy
+    }));
+    assert!(!step.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::DomainFailureReply { .. } | ContextEffect::EnqueuePreparation { .. }
+    )));
+    assert!(!core.task(task(1)).unwrap().loader_exited);
+    assert_eq!(port.calls.len(), 2);
+}
+#[test]
+fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeric_order() {
+    use novarocks_worker_protocol::context::CoreError;
+    let mut core = core(8, 2);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    // The earlier issued role 10 belongs to another source. Runtime fairness
+    // may consume role 20 first; neither token has been retired or reused.
+    for (token, op, number) in [(20, 1, 1), (10, 2, 2)] {
+        let step = core
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(token).unwrap(),
+                    operation: operation(op),
+                    deadline: at(100),
+                },
+                ContextInput::Create {
+                    request: operation(op),
+                    task: task(number),
+                    payload: PayloadId(u64::from(number)),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(step.requests.is_empty());
+    }
+    let duplicate = core
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(20).unwrap(),
+                operation: operation(3),
+                deadline: at(100),
+            },
+            ContextInput::Create {
+                request: operation(3),
+                task: task(3),
+                payload: PayloadId(3),
+            },
+            &mut port,
+        )
+        .unwrap_err();
+    assert_eq!(duplicate, CoreError::WrongIdentity);
+    let mismatched = core
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(30).unwrap(),
+                operation: operation(4),
+                deadline: at(100),
+            },
+            ContextInput::Create {
+                request: operation(5),
+                task: task(3),
+                payload: PayloadId(3),
+            },
+            &mut port,
+        )
+        .unwrap_err();
+    assert_eq!(mismatched, CoreError::WrongIdentity);
+    assert!(core.task(task(3)).is_none());
+    assert_eq!(
+        port.calls.len(),
+        2,
+        "invalid tokens cannot start another loader"
+    );
+    let mut replies = Vec::new();
+    for number in [1, 2] {
+        replies.extend(
+            core.handle(
+                at(0),
+                ContextInput::Loaded {
+                    task: task(number),
+                    result: Ok(cost()),
+                },
+                &mut port,
+            )
+            .unwrap()
+            .requests,
+        );
+    }
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0].request.token, InputId::new(20).unwrap());
+    assert_eq!(replies[1].request.token, InputId::new(10).unwrap());
+    assert!(
+        replies
+            .iter()
+            .all(|reply| reply.result == RequestResult::Outcome(OperationOutcome::Accepted))
+    );
+    assert!(
+        core.handle(at(0), ContextInput::Tick, &mut port)
+            .unwrap()
+            .requests
+            .is_empty()
+    );
+}
+#[test]
+fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_duplicates() {
+    use novarocks_worker_protocol::{context::CoreError, control::ControlInput};
+    let mut control = control();
+    let mut port = Port::default();
+    let second = QueryContextRef::new(
+        QueryExecutionId::new(QueryId::new(7201, 7202), AttemptId::new(1).unwrap()).unwrap(),
+        context().frontend_process_id(),
+        context().backend_process_id(),
+    );
+    let ticket_a = AdmissionTicketId::try_from_bytes([4; 16]).unwrap();
+    let ticket_b = AdmissionTicketId::try_from_bytes([5; 16]).unwrap();
+    for (token, op, identity, ticket) in [(1, 1, context(), ticket_a), (2, 2, second, ticket_b)] {
+        let request = AcquireQueryContextAdmissionTicket::new(
+            operation(op),
+            identity,
+            LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+            NativeCompatibilityId::new([3; 32]),
+            control.admission().capability(),
+        );
+        control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(token).unwrap(),
+                    operation: operation(op),
+                    deadline: at(100),
+                },
+                ControlInput::Acquire { request, ticket },
+                &mut port,
+            )
+            .unwrap();
+    }
+    let establish = |op, identity, ticket, payload| ControlInput::Establish {
+        request: operation(op),
+        context: identity,
+        ticket,
+        payload: PayloadId(payload),
+        semantics: semantics(),
+        compared_payload: None,
+        same_credential: false,
+        generation: Generation::new(1).unwrap(),
+    };
+    for (token, op, identity, ticket, payload) in [
+        (20, 3, context(), ticket_a, 1),
+        (10, 4, second, ticket_b, 2),
+    ] {
+        let step = control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(token).unwrap(),
+                    operation: operation(op),
+                    deadline: at(100),
+                },
+                establish(op, identity, ticket, payload),
+                &mut port,
+            )
+            .unwrap();
+        assert!(step.requests.is_empty());
+    }
+    let duplicate = control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(20).unwrap(),
+                operation: operation(5),
+                deadline: at(100),
+            },
+            establish(5, second, ticket_b, 2),
+            &mut port,
+        )
+        .unwrap_err();
+    assert_eq!(duplicate, CoreError::WrongIdentity);
+    let mismatch = control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(30).unwrap(),
+                operation: operation(6),
+                deadline: at(100),
+            },
+            establish(7, second, ticket_b, 2),
+            &mut port,
+        )
+        .unwrap_err();
+    assert_eq!(mismatch, CoreError::WrongIdentity);
+    assert_eq!(
+        port.calls.len(),
+        4,
+        "two distinct actual context roles were admitted"
+    );
+    let mut replies = Vec::new();
+    for identity in [context(), second] {
+        replies.extend(
+            control
+                .handle(
+                    at(0),
+                    ControlInput::Materialized {
+                        context: identity,
+                        result: Ok(()),
+                    },
+                    &mut port,
+                )
+                .unwrap()
+                .requests,
+        );
+    }
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0].request.token, InputId::new(20).unwrap());
+    assert_eq!(replies[1].request.token, InputId::new(10).unwrap());
+    assert!(
+        replies
+            .iter()
+            .all(|reply| reply.result == RequestResult::Outcome(OperationOutcome::Accepted))
+    );
+    assert!(
+        control
+            .handle(at(0), ControlInput::Tick, &mut port)
+            .unwrap()
+            .requests
+            .is_empty()
+    );
+}
+
+#[test]
+fn physically_retained_context_returns_the_active_ticket_before_metadata_eviction() {
+    use novarocks_worker_protocol::control::{
+        ControlConfig, ControlCore, ControlEffect, ControlInput,
+    };
+    let mut control = ControlCore::new(
+        ControlConfig {
+            max_contexts: 3,
+            max_waiters: 8,
+            max_pending_requests: 16,
+            step_budget: ControlCore::MAX_STEP_WORK,
+            retained_contexts: 2,
+            gone_fences: 3,
+            retention: Duration::from_secs(10),
+        },
+        AdmissionTicketConfig::new(1, Duration::from_secs(10), Duration::from_secs(120), 8)
+            .unwrap(),
+        [1; 8],
+        at(0),
+    )
+    .unwrap();
+    let mut port = Port::default();
+    let ticket = grant(&mut control, &mut port);
+    control
+        .handle(
+            at(0),
+            ControlInput::Establish {
+                request: operation(2),
+                context: context(),
+                ticket,
+                payload: PayloadId(1),
+                semantics: semantics(),
+                compared_payload: None,
+                same_credential: false,
+                generation: Generation::new(1).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    control
+        .handle(
+            at(1),
+            ControlInput::Materialized {
+                context: context(),
+                result: Ok(()),
+            },
+            &mut port,
+        )
+        .unwrap();
+    let revoked = control
+        .handle(
+            at(1),
+            ControlInput::RevokeTicket { context: context() },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        revoked.effects.is_empty(),
+        "closing external admission cannot release a live redeemed context"
+    );
+    assert_eq!(
+        control.admission().observe(ticket, context(), at(1)),
+        AdmissionTicketObservation::Redeemed
+    );
+    let retained = control
+        .handle(
+            at(1),
+            ControlInput::Retained { context: context() },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        retained.effects.contains(&ControlEffect::RetireReservation(
+            ReservationId::new(1).unwrap()
+        )),
+        "the converged context's active ticket cannot be held throughout metadata retention"
+    );
+    assert_eq!(
+        control.admission().observe(ticket, context(), at(1)),
+        AdmissionTicketObservation::Closed
+    );
+    let replay = control
+        .handle(
+            at(1),
+            ControlInput::Retained { context: context() },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        replay.effects.is_empty(),
+        "the original physical receipt neither double-releases nor extends retention"
+    );
+    let c = context();
+    let next = QueryContextRef::new(
+        QueryExecutionId::new(QueryId::new(7203, 7204), AttemptId::new(1).unwrap()).unwrap(),
+        c.frontend_process_id(),
+        c.backend_process_id(),
+    );
+    let next_ticket = AdmissionTicketId::try_from_bytes([5; 16]).unwrap();
+    let request = AcquireQueryContextAdmissionTicket::new(
+        operation(3),
+        next,
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        control.admission().capability(),
+    );
+    let acquired = control
+        .handle(
+            at(1),
+            ControlInput::Acquire {
+                request,
+                ticket: next_ticket,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(acquired.effects.iter().any(|effect| matches!(effect,
+        ControlEffect::AdmissionReply { result: Ok(receipt), .. } if receipt.ticket_id() == next_ticket)));
+    let revoked = control
+        .handle(
+            at(1),
+            ControlInput::RevokeTicket { context: next },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(
+        revoked.effects,
+        vec![ControlEffect::RetireReservation(
+            ReservationId::new(3).unwrap()
+        )]
+    );
+    assert_eq!(
+        control.admission().observe(next_ticket, next, at(1)),
+        AdmissionTicketObservation::Closed
+    );
+    let removed = control
+        .handle(at(2), ControlInput::HostRemoved { context: c }, &mut port)
+        .unwrap();
+    assert_eq!(
+        removed.effects,
+        vec![ControlEffect::RetireReservation(
+            ReservationId::new(2).unwrap()
+        )]
+    );
 }
