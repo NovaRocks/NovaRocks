@@ -79,6 +79,7 @@ pub(crate) enum ProjectionError {
     ConclusionGeneration,
     MissingSource(SourceId),
     InvalidSource(ConclusionSourceError),
+    StatusVersionExhausted,
 }
 impl TaskProjection {
     fn bootstrap(identity: TaskIdentity) -> Self {
@@ -145,6 +146,22 @@ pub(crate) struct TaskRuntimePort {
     stop_published: Arc<AtomicBool>,
     wait: Mutex<()>,
     changed: Condvar,
+}
+#[derive(Debug)]
+struct ProtocolOwnerFailed;
+impl std::fmt::Display for ProtocolOwnerFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Task protocol owner failed")
+    }
+}
+impl std::error::Error for ProtocolOwnerFailed {}
+impl novarocks_execution_contract::failure::FailureProjection for ProtocolOwnerFailed {
+    fn failure_fact(&self) -> FailureFact {
+        FailureFact::new(
+            novarocks_execution_contract::failure::FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::ProtocolOwnerFailed.reason(),
+        )
+    }
 }
 impl TaskRuntimePort {
     /// The admission owner retains the role and its storage reservation. This
@@ -216,6 +233,64 @@ impl TaskRuntimePort {
     }
     pub(crate) fn health(&self) -> Arc<ExecutionHealth> {
         self.health.clone()
+    }
+
+    /// Fixed failure projection from the actual published inventory. This
+    /// cannot revoke an existing result or inspect the failed protocol Core.
+    /// The host still commits through its original failure publication session
+    /// before publishing producer stop or running registered continuations.
+    pub(crate) fn prepare_owner_failure(&self) -> Result<TaskProjection, ProjectionError> {
+        let current = self.published.read();
+        if current.accepted.is_some() {
+            return Ok((*current).clone());
+        }
+        let version = current
+            .status
+            .version()
+            .next()
+            .ok_or(ProjectionError::StatusVersionExhausted)?;
+        let cause = ExecutionFailure::from_domain(ProtocolOwnerFailed);
+        let (proposal, original) =
+            crate::task_conclusion::PreparedTaskConclusion::new(TaskConclusionProposal::Failed {
+                cause,
+                phase: if current.status.installed() {
+                    TaskFailurePhase::Execution
+                } else {
+                    TaskFailurePhase::Preparation
+                },
+            })
+            .into_protocol();
+        let accepted = Arc::new(
+            AcceptedTaskConclusion::new(
+                AcceptedConclusion::new(
+                    self.identity,
+                    NonZeroU64::new(1).unwrap(),
+                    proposal.conclusion,
+                ),
+                original,
+            )
+            .expect("fixed owner failure has its original cause"),
+        );
+        let TaskConclusion::Terminated(termination) = accepted.neutral().conclusion() else {
+            unreachable!("fixed owner failure is a termination");
+        };
+        let mut status = TaskStatus::try_new_with_installed(
+            self.identity,
+            version,
+            novarocks_execution_contract::TaskState::Failing,
+            Some(termination.clone()),
+            current.status.output(),
+            current.status.installed(),
+        )
+        .expect("fixed owner failure preserves the installed and output facts")
+        .with_resources(current.status.resources());
+        if let Some(filters) = current.status.dynamic_filters() {
+            status = status.with_dynamic_filters(filters);
+        }
+        if let Some(writer) = current.status.writer() {
+            status = status.with_writer(writer);
+        }
+        current.with_conclusion(accepted)?.with_status(status)
     }
 
     /// Only a host publication job takes a rich source. It must commit the
@@ -449,6 +524,55 @@ mod tests {
             self.runtime.remove_actor(actor()).unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();
             assert!(self.ledger.is_empty());
+        }
+    }
+    #[test]
+    fn owner_failure_projection_publishes_a_nonterminal_invariant_and_preserves_prior_promises() {
+        let f = fixture();
+        let projection = f.port.prepare_owner_failure().unwrap();
+        assert!(f.port.accepted().is_none(), "preparing is not publication");
+        assert!(!f.port.is_stopped());
+        assert_eq!(projection.status().state(), TaskState::Failing);
+        assert!(!projection.status().installed());
+        assert!(!projection.status().is_terminal());
+        let failure = projection.accepted().unwrap();
+        let TaskConclusion::Terminated(novarocks_execution_contract::TerminationDetail::Failed(
+            detail,
+        )) = failure.neutral().conclusion()
+        else {
+            panic!("an unpublished Task gets the fixed owner failure");
+        };
+        assert_eq!(detail.fact().class(), FailureClass::Invariant);
+        assert_eq!(detail.phase(), TaskFailurePhase::Preparation);
+        f.publish(projection);
+        f.port.notify_stopped();
+        let again = f.port.prepare_owner_failure().unwrap();
+        assert!(Arc::ptr_eq(&failure, &again.accepted().unwrap()));
+        assert_eq!(&f.port.current(), again.status());
+        f.finish();
+
+        for conclusion in [
+            TaskConclusion::Succeeded,
+            TaskConclusion::Terminated(novarocks_execution_contract::TerminationDetail::Aborted(
+                AbortCause::PeerTaskFailed,
+            )),
+        ] {
+            let f = fixture();
+            let accepted = f
+                .port
+                .prepare_conclusion(NonZeroU64::new(1).unwrap(), conclusion, None)
+                .unwrap();
+            f.publish(
+                f.port
+                    .publication()
+                    .read()
+                    .with_conclusion(accepted.clone())
+                    .unwrap(),
+            );
+            let failure = f.port.prepare_owner_failure().unwrap();
+            assert!(Arc::ptr_eq(&accepted, &failure.accepted().unwrap()));
+            assert_eq!(failure.status(), &f.port.current());
+            f.finish();
         }
     }
     #[test]

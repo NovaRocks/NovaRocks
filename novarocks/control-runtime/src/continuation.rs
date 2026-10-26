@@ -24,6 +24,7 @@ use crate::{
     sync::{Arc, Mutex},
     transaction::RuntimeError,
 };
+use novarocks_control_runtime_core::{identity::Generation, scope::ScopeError};
 use std::{
     any::Any,
     mem::ManuallyDrop,
@@ -227,9 +228,40 @@ impl<T: Send + 'static> ContinuationSlot<T> {
         state.phase = ContinuationPhase::Ready;
         Ok(())
     }
+    /// A previously committed barrier remains valid after owner failure, but
+    /// its input is not a frozen result. Before a delayed start, the host may
+    /// supply its latest actually published projection. Both old and rejected
+    /// values return to the host; no foreign destructor runs under this lock.
+    pub fn refresh_ready_value(&self, value: T) -> Result<T, (ContinuationError, T)> {
+        let value = ManuallyDrop::new(value);
+        let mut state = self.0.state.lock().expect("continuation custody lock");
+        if state.phase != ContinuationPhase::Ready {
+            let error = ContinuationError::InvalidPhase(state.phase);
+            drop(state);
+            return Err((error, ManuallyDrop::into_inner(value)));
+        }
+        let old = state.value.replace(value).expect("published barrier input");
+        drop(state);
+        Ok(ManuallyDrop::into_inner(old))
+    }
     /// Runs only on a host executor. No custody, inbox or ledger lock spans the
     /// callback call, argument disposal, capture disposal or panic unwinding.
     pub fn invoke(&self) -> Result<InvocationResult, ContinuationError> {
+        self.invoke_guarded(None)
+    }
+    /// Retryable generation rejection keeps the complete registered callback,
+    /// published input and original work ready for the failure owner. It is
+    /// neither a callback panic nor evidence of unresolved physical exit.
+    pub fn invoke_in_generation(
+        &self,
+        generation: Generation,
+    ) -> Result<InvocationResult, ContinuationError> {
+        self.invoke_guarded(Some(generation))
+    }
+    fn invoke_guarded(
+        &self,
+        generation: Option<Generation>,
+    ) -> Result<InvocationResult, ContinuationError> {
         let (callback, value, mut work) = {
             let mut state = self.0.state.lock().expect("continuation custody lock");
             if state.phase != ContinuationPhase::Ready {
@@ -242,11 +274,19 @@ impl<T: Send + 'static> ContinuationSlot<T> {
                 state.work.take().expect("original continuation work"),
             )
         };
-        if let Err(error) = work.start() {
+        let start = match generation {
+            Some(generation) => work.start_in_generation(generation),
+            None => work.start(),
+        };
+        if let Err(error) = start {
             let mut state = self.0.state.lock().expect("continuation custody lock");
             state.callback = Some(callback);
             state.value = Some(value);
             state.work = Some(work);
+            if error == RuntimeError::Scope(ScopeError::GenerationMismatch) {
+                state.phase = ContinuationPhase::Ready;
+                return Err(error.into());
+            }
             state.phase = ContinuationPhase::Unresolved;
             state
                 .work

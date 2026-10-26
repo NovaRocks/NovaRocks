@@ -120,6 +120,7 @@ pub(crate) enum WorkerFailureReason {
     RootReadUnknown = 165,
     SettlementCall = 166,
     CompletionWorkUnresolved = 167,
+    ProtocolOwnerFailed = 168,
 }
 impl WorkerFailureReason {
     pub(crate) const fn reason(self) -> FailureReason {

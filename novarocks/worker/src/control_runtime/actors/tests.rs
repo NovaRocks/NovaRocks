@@ -32,6 +32,7 @@ use novarocks_control_runtime_core::{
     mailbox::InputClass,
     scope::{WorkAdmission, WorkKind},
 };
+use novarocks_execution_contract::failure::FailureProjection;
 use novarocks_execution_contract::{
     LeaseValidFor, OperationOutcome, QueryContextRef, TaskOperationId,
 };
@@ -1089,7 +1090,7 @@ fn host_publications_follow_core_order_without_waiting_for_old_body_capture_reti
 #[test]
 fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visibility() {
     use crate::control_runtime::effect_dispatch::EffectDispatch;
-    use novarocks_control_runtime::publication::PublishedSnapshot;
+    use novarocks_control_runtime::publication::{PublishedReply, PublishedSnapshot};
     use novarocks_execution_contract::{CancelReason, TaskConclusion, TaskState, TaskStatus};
     use std::sync::Arc;
     let mut f = Fixture::new();
@@ -1126,6 +1127,16 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
         2,
     );
     f.runtime.poll_one(Tick(1)).unwrap();
+    let settled = f.send(
+        ContextInput::Settle {
+            task: identity,
+            work: f.roles[2].0.id(),
+        },
+        None,
+        InputClass::Lifecycle,
+        2,
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
     let mut dispatch = EffectDispatch::new(actor(), ContextCore::MAX_STEP_WORK);
     dispatch.index_committed(&f.runtime, 32).unwrap();
     let conclusion = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
@@ -1167,12 +1178,26 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
     assert_eq!(current.read().state(), TaskState::Canceling);
     let mut stopped = false;
     let mut replied = false;
+    let mut barrier_published = false;
+    let barrier_target = PublishedReply::new(&f.scope);
     while let Some(ticket) = dispatch.take_ready(&f.runtime, 16).unwrap() {
         stopped |= matches!(
             ticket.effect,
             WorkerAction::Context(ContextEffect::StopTask { .. })
         );
         replied |= matches!(ticket.effect, WorkerAction::Reply(_));
+        if matches!(
+            ticket.effect,
+            WorkerAction::Context(ContextEffect::SettlementBarrier { .. })
+        ) {
+            assert!(accepted.read().is_some());
+            assert_eq!(current.read().state(), TaskState::Canceling);
+            f.runtime
+                .commit_reply(&ticket, &barrier_target, Arc::new(true))
+                .unwrap();
+            dispatch.publication_committed(&f.runtime, &ticket).unwrap();
+            barrier_published = true;
+        }
         let action = ticket.descriptor.id;
         f.runtime.effect_completed(ticket).unwrap();
         for (dependent, state) in f
@@ -1187,15 +1212,23 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
             }
         }
     }
-    assert!(stopped && replied);
+    assert!(stopped && replied && barrier_published);
     assert!(dispatch.is_empty());
     f.runtime.effect_completed(status).unwrap();
     f.runtime.effect_completed(conclusion).unwrap();
     f.runtime.retire_input(actor(), input).unwrap();
+    f.runtime.retire_input(actor(), settled).unwrap();
     f.finish();
 }
 
-fn exercise_original_fragment_roles(task_stopped: bool) {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SettlementScenario {
+    Unused,
+    Registered,
+    FailBeforeBarrier,
+    FailAfterBarrier,
+}
+fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementScenario) {
     use crate::control_runtime::{
         effect_dispatch::EffectDispatch,
         preparation::PreparationOutcome,
@@ -1510,23 +1543,167 @@ fn exercise_original_fragment_roles(task_stopped: bool) {
         !completion.try_retire(),
         "the original capabilities are still live"
     );
-    // Simulate true unused original holder exit. Scope stop alone supplies no
-    // such observation; a port clone has no factory for another capability.
-    f.scope.request_stop().unwrap();
-    assert!(!completion.try_retire());
-    drop(admitted);
-    completion.observe_unused_settlement();
-    assert_eq!(registration.load(Ordering::SeqCst), 2);
+    let failed = matches!(
+        settlement,
+        SettlementScenario::FailBeforeBarrier | SettlementScenario::FailAfterBarrier
+    );
+    if settlement == SettlementScenario::Unused {
+        // Stop is not actual holder exit. A port clone cannot sign another role.
+        f.scope.request_stop().unwrap();
+        assert!(!completion.try_retire());
+        drop(admitted);
+        completion.observe_unused_settlement();
+        assert_eq!(registration.load(Ordering::SeqCst), 2);
+    } else {
+        use crate::settlement::{SettlementDispatchError, SettlementRun};
+        let (finisher, wall_time, publisher) = admitted.into_parts();
+        let (permit, mut original) = finisher.into_parts();
+        original.bind();
+        original.started();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        let expected = port.clone();
+        permit.register(Box::new(move |snapshot| {
+            if failed {
+                let accepted = snapshot.expect("failure conclusion is published before callback");
+                assert_eq!(
+                    accepted
+                        .originating_failure()
+                        .unwrap()
+                        .failure_fact()
+                        .class(),
+                    novarocks_execution_contract::failure::FailureClass::Invariant
+                );
+                assert!(std::ptr::eq(
+                    accepted.as_ref(),
+                    expected.accepted().unwrap().as_ref()
+                ));
+            } else if task_stopped {
+                assert!(snapshot.is_some());
+            } else {
+                assert!(snapshot.is_none());
+            }
+            called.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(registration.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            completion.dispatch_settlement(&port).unwrap(),
+            SettlementRun::Deferred
+        );
+        let work = completion.settlement_work();
+        let settled = f
+            .runtime
+            .reserve_input(actor(), ActorId::new(2).unwrap(), InputClass::Lifecycle)
+            .unwrap()
+            .fill(WorkerMessage::Context(ContextMessage::Command {
+                work,
+                request: None,
+                command: ContextInput::Settle { task, work },
+            }))
+            .unwrap();
+        f.runtime.poll_one(Tick(4)).unwrap();
+        let mut ordered = EffectDispatch::new(actor(), 15);
+        ordered.index_committed(&f.runtime, 32).unwrap();
+        let barrier = ordered.take_ready(&f.runtime, 15).unwrap().unwrap();
+        assert!(matches!(barrier.effect,
+            WorkerAction::Context(ContextEffect::SettlementBarrier { task: t, work: w })
+                if t == task && w == work));
+        if settlement != SettlementScenario::FailBeforeBarrier {
+            completion
+                .commit_settlement_barrier(&f.runtime, &barrier, &port)
+                .unwrap();
+            ordered.publication_committed(&f.runtime, &barrier).unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        if failed {
+            let bad = f.send(
+                ContextInput::Installed {
+                    task: self::task(f.identity, 999),
+                },
+                None,
+                InputClass::Lifecycle,
+                2,
+            );
+            f.runtime.poll_one(Tick(5)).unwrap();
+            assert!(f.runtime.snapshot(actor()).unwrap().failed);
+            assert_eq!(
+                completion.dispatch_settlement(&port).unwrap(),
+                SettlementRun::Deferred
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(port.accepted().is_none());
+            let cleanup = f
+                .runtime
+                .take_effect(actor(), bad, ActionId::new(1).unwrap())
+                .unwrap();
+            f.roles[0].0.start().unwrap();
+            let mut session = f.runtime.claim_failure_publication(&cleanup).unwrap();
+            assert!(matches!(
+                completion.commit_failure_settlement_barrier(&mut session, &port),
+                Err(SettlementDispatchError::FailureSnapshotMissing)
+            ));
+            if settlement == SettlementScenario::FailBeforeBarrier {
+                assert!(matches!(
+                    completion.commit_settlement_barrier(&f.runtime, &barrier, &port),
+                    Err(SettlementDispatchError::Driver(DriverError::Effect(
+                        novarocks_control_runtime_core::effect::EffectError::StaleGeneration
+                    )))
+                ));
+            }
+            let projection = port.prepare_owner_failure().unwrap();
+            drop(
+                session
+                    .commit_snapshot(port.publication(), Arc::new(projection))
+                    .unwrap_or_else(|(error, _)| panic!("actual failure projection: {error}")),
+            );
+            port.notify_stopped();
+            if settlement == SettlementScenario::FailBeforeBarrier {
+                completion
+                    .commit_failure_settlement_barrier(&mut session, &port)
+                    .unwrap();
+            } else {
+                assert!(matches!(
+                    completion.commit_failure_settlement_barrier(&mut session, &port),
+                    Err(SettlementDispatchError::Driver(
+                        DriverError::ReplyAlreadyCommitted
+                    ))
+                ));
+            }
+            f.runtime.effect_completed(cleanup).unwrap();
+            f.runtime.retire_input(actor(), bad).unwrap();
+        }
+        assert_eq!(
+            completion.dispatch_settlement(&port).unwrap(),
+            SettlementRun::Exited
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            completion.dispatch_settlement(&port).is_err(),
+            "original FnOnce is not retried"
+        );
+        original.completed();
+        drop(wall_time);
+        drop(publisher);
+        f.runtime.effect_completed(barrier).unwrap();
+        f.runtime.retire_input(actor(), settled).unwrap();
+    }
     for role in [
         TaskLifecycleRole::Finisher,
         TaskLifecycleRole::Settlement,
         TaskLifecycleRole::WallTime,
         TaskLifecycleRole::TerminalPublisher,
     ] {
-        completion
-            .report(role)
-            .consume(ConsumerId::new(1).unwrap())
-            .unwrap();
+        if failed {
+            completion
+                .report(role)
+                .abandon_failed_owner(ConsumerId::new(1).unwrap(), &f.scope, generation())
+                .unwrap();
+        } else {
+            completion
+                .report(role)
+                .consume(ConsumerId::new(1).unwrap())
+                .unwrap();
+        }
         completion
             .report(role)
             .consume(ConsumerId::new(2).unwrap())
@@ -1561,9 +1738,26 @@ fn exercise_original_fragment_roles(task_stopped: bool) {
 
 #[test]
 fn original_fragment_roles_belong_to_task_lifetime_and_do_not_hold_preparation_positions() {
-    exercise_original_fragment_roles(false);
+    exercise_original_fragment_roles(false, SettlementScenario::Unused);
 }
 #[test]
 fn task_stop_prevents_queued_preparation_start_without_stopping_the_context_scope() {
-    exercise_original_fragment_roles(true);
+    exercise_original_fragment_roles(true, SettlementScenario::Unused);
+}
+
+#[test]
+fn registered_fragment_settlement_consumes_its_actual_core_barrier_before_invocation() {
+    exercise_original_fragment_roles(false, SettlementScenario::Registered);
+}
+#[test]
+fn registered_fragment_settlement_reads_the_already_published_cancellation() {
+    exercise_original_fragment_roles(true, SettlementScenario::Registered);
+}
+#[test]
+fn failed_core_settles_an_unpublished_original_barrier_only_after_failure_projection() {
+    exercise_original_fragment_roles(false, SettlementScenario::FailBeforeBarrier);
+}
+#[test]
+fn failure_after_barrier_commit_preserves_the_call_and_waits_for_actual_failure_publication() {
+    exercise_original_fragment_roles(false, SettlementScenario::FailAfterBarrier);
 }

@@ -121,7 +121,8 @@ impl EffectDispatch {
                 ContextEffect::PublishTask { task, .. }
                 | ContextEffect::PublishMetrics { task, .. }
                 | ContextEffect::PublishTaskConvergence { task, .. }
-                | ContextEffect::PublishConclusion { task, .. },
+                | ContextEffect::PublishConclusion { task, .. }
+                | ContextEffect::SettlementBarrier { task, .. },
             ) => Some((LaneKey::Task(*task), true)),
             // Only the preceding publications gate dispatch. The original
             // started stop job retains its own actual exit/capture liability.

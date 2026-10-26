@@ -33,8 +33,8 @@ use novarocks_execution::runtime::{
     fragment::ExecutionFailure,
 };
 use novarocks_execution_contract::{
-    AcceptedTaskConclusion, AdmittedFinisher, AdmittedFragmentRoles, CompletionWorkCapability,
-    TaskFailurePhase, TaskIdentity,
+    AdmittedFinisher, AdmittedFragmentRoles, CompletionWorkCapability, TaskFailurePhase,
+    TaskIdentity,
     failure::{FailureClass, FailureFact},
 };
 use std::sync::{Arc, Mutex};
@@ -186,13 +186,50 @@ impl TaskCompletionRoles {
     pub(crate) fn settlement_phase(&self) -> SettlementPhase {
         self.settlement.phase()
     }
+    pub(crate) fn settlement_work(&self) -> novarocks_control_runtime_core::identity::WorkId {
+        self.settlement.work_id()
+    }
+    pub(crate) fn commit_settlement_barrier(
+        &self,
+        runtime: &novarocks_control_runtime::driver::ActorRuntime<
+            crate::control_runtime::actors::WorkerActor,
+        >,
+        ticket: &novarocks_control_runtime::driver::EffectTicket<
+            crate::control_runtime::actors::WorkerAction,
+        >,
+        port: &crate::task_port::TaskRuntimePort,
+    ) -> Result<(), crate::settlement::SettlementDispatchError> {
+        self.settlement.commit_barrier(runtime, ticket, port)
+    }
+    pub(crate) fn commit_failure_settlement_barrier(
+        &self,
+        session: &mut novarocks_control_runtime::driver::FailurePublicationSession<
+            crate::control_runtime::actors::WorkerActor,
+        >,
+        port: &crate::task_port::TaskRuntimePort,
+    ) -> Result<(), crate::settlement::SettlementDispatchError> {
+        self.settlement.commit_failure_barrier(session, port)
+    }
+    pub(crate) fn dispatch_settlement(
+        &self,
+        port: &crate::task_port::TaskRuntimePort,
+    ) -> Result<crate::settlement::SettlementRun, crate::settlement::SettlementDispatchError> {
+        let result = self.settlement.run(port)?;
+        if result != crate::settlement::SettlementRun::Deferred {
+            self.pending.pending();
+        }
+        Ok(result)
+    }
+    #[cfg(test)]
     pub(crate) fn publish_settlement_barrier(
         &self,
-        snapshot: Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>>,
+        snapshot: Option<
+            Arc<novarocks_execution_contract::AcceptedTaskConclusion<ExecutionFailure>>,
+        >,
     ) {
         self.settlement.publish_barrier(snapshot);
     }
-    /// Called by the host executor after the actual predecessor publications.
+    #[cfg(test)]
     pub(crate) fn run_settlement(&self) {
         self.settlement.invoke();
         self.pending.pending();

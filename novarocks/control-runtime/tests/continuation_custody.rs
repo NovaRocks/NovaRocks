@@ -155,6 +155,55 @@ fn unique_registration_waits_for_the_actual_barrier_and_all_report_consumers() {
 }
 
 #[test]
+fn failure_before_delayed_start_keeps_original_callback_ready_for_the_new_generation() {
+    use novarocks_control_runtime::{continuation::ContinuationError, transaction::RuntimeError};
+    use novarocks_control_runtime_core::scope::ScopeError;
+    let mut f = fixture::<u64>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    f.token
+        .take()
+        .unwrap()
+        .register(Box::new(move |value| {
+            assert_eq!(
+                value, 42,
+                "the failure owner supplies its actual published value"
+            );
+            seen.fetch_add(1, Ordering::SeqCst);
+        }))
+        .unwrap_or_else(|_| panic!("one original registration"));
+    f.slot.publish_barrier(0).unwrap();
+    let next = f.scope.fail().unwrap();
+    assert_eq!(
+        f.slot.invoke_in_generation(generation()),
+        Err(ContinuationError::Runtime(RuntimeError::Scope(
+            ScopeError::GenerationMismatch
+        )))
+    );
+    assert_eq!(f.slot.phase(), Phase::Ready);
+    assert!(!f.slot.body_exited());
+    assert!(!f.slot.captures_exited());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(f.ledger.unresolved_work().is_empty());
+    assert_eq!(f.slot.refresh_ready_value(42).unwrap(), 0);
+    assert_eq!(
+        f.slot.invoke_in_generation(next).unwrap(),
+        InvocationResult::Exited
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    f.report
+        .abandon_failed_owner(f.owner, &f.scope, generation())
+        .unwrap();
+    assert!(!f.slot.try_retire().unwrap());
+    assert_eq!(f.ledger.used(dimension()), 1);
+    f.report.consume(f.observer).unwrap();
+    assert!(f.slot.try_retire().unwrap());
+    f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap();
+    f.ledger.remove_scope(f.scope.id()).unwrap();
+    assert!(f.ledger.is_empty());
+}
+
+#[test]
 fn dropping_unused_authority_waits_for_the_original_holders_real_exit() {
     let mut f = fixture::<()>();
     drop(f.token.take().unwrap());

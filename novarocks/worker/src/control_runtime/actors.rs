@@ -205,6 +205,13 @@ impl Actor for ContextActor {
                     }
                     EffectKind::Cleanup
                 }
+                ContextEffect::SettlementBarrier { task, work: role } => {
+                    assert_eq!(*role, work, "settlement uses its original admitted Work");
+                    if let Some(previous) = publications.get(task) {
+                        dependencies.push(*previous);
+                    }
+                    EffectKind::Publication
+                }
                 ContextEffect::DisposeSource { .. }
                 | ContextEffect::CancelLoader { .. }
                 | ContextEffect::RetireTask { .. }

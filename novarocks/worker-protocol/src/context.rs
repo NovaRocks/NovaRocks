@@ -27,7 +27,7 @@ use crate::{
     proposal_summary::{CutId, Proposal, ProposalSummary, SourceId},
     task::{CreationPhase, TaskRecord},
 };
-use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
+use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId, WorkId};
 use novarocks_execution_contract::operation::DomainFailureOutcome;
 use novarocks_execution_contract::{
     AbortCause, LeaseSequence, LeaseValidFor, OperationOutcome, QueryContextRef, QueryContextState,
@@ -284,6 +284,12 @@ pub enum ContextInput {
     Adjudicate {
         task: TaskIdentity,
     },
+    /// The admitted role's causal prefix has reached this same Task FIFO.
+    /// Work and callback custody remain outside the pure protocol owner.
+    Settle {
+        task: TaskIdentity,
+        work: WorkId,
+    },
     Finish {
         task: TaskIdentity,
     },
@@ -434,6 +440,10 @@ pub enum ContextEffect {
         generation: u64,
         conclusion: TaskConclusion,
         source: Option<SourceId>,
+    },
+    SettlementBarrier {
+        task: TaskIdentity,
+        work: WorkId,
     },
     DisposeSource {
         task: TaskIdentity,
@@ -1224,6 +1234,11 @@ impl ContextCore {
             }
             ContextInput::Adjudicate { task } => {
                 self.flush(task, &mut step)?;
+            }
+            ContextInput::Settle { task, work } => {
+                self.flush(task, &mut step)?;
+                step.effects
+                    .push(ContextEffect::SettlementBarrier { task, work });
             }
             ContextInput::Finish { task } => {
                 self.flush(task, &mut step)?;

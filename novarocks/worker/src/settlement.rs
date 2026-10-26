@@ -18,12 +18,20 @@
 //! Task identity, registration notification and failure projection over the
 //! shared runtime's single continuation-custody implementation.
 
+use crate::{
+    control_runtime::actors::{WorkerAction, WorkerActor},
+    task_port::TaskRuntimePort,
+};
 pub(crate) use novarocks_control_runtime::continuation::ContinuationPhase as SettlementPhase;
 use novarocks_control_runtime::{
     completion::ReportSlot,
     continuation::{ContinuationSlot, InvocationResult, RegistrationToken},
+    driver::{ActorRuntime, DriverError, EffectTicket, FailurePublicationSession},
     lease::{CapacityBundle, WorkLease},
+    publication::PublishedReply,
+    transaction::{RuntimeError, ScopeHandle},
 };
+use novarocks_control_runtime_core::{identity::WorkId, scope::ScopeError};
 use novarocks_execution::{
     runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth},
     runtime::fragment::ExecutionFailure,
@@ -33,8 +41,33 @@ use novarocks_execution_contract::{
     TaskFailurePhase, TaskIdentity,
     failure::{FailureClass, FailureFact},
 };
-use std::{mem::ManuallyDrop, sync::Arc};
+use std::{
+    mem::ManuallyDrop,
+    sync::{Arc, Mutex, Weak},
+};
 type Snapshot = Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>>;
+// The original barrier projection is a real callback argument capture. Even
+// after refinement it is disposed inside the supervised invocation, rather
+// than on the routing executor before its work has started.
+struct InvocationInput {
+    snapshot: Snapshot,
+    _committed: Arc<Snapshot>,
+}
+
+#[derive(Debug)]
+pub(crate) enum SettlementDispatchError {
+    WrongRole,
+    Driver(DriverError),
+    Runtime(RuntimeError),
+    Continuation(novarocks_control_runtime::continuation::ContinuationError),
+    FailureSnapshotMissing,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettlementRun {
+    Exited,
+    Unresolved,
+    Deferred,
+}
 
 /// A role's already reserved neutral mailbox position. It cannot wait for its
 /// actor or invoke the continuation; it only transfers the admitted role ID.
@@ -43,12 +76,14 @@ pub(crate) trait RegistrationNotice: Send {
     fn unused(self: Box<Self>);
 }
 struct Registration {
-    token: RegistrationToken<Snapshot>,
+    token: RegistrationToken<InvocationInput>,
     notice: Box<dyn RegistrationNotice>,
 }
 impl SettlementCapability<ExecutionFailure> for Registration {
     fn register(self: Box<Self>, continuation: SettledContinuation<ExecutionFailure>) {
-        if let Err((error, callback)) = self.token.register(continuation) {
+        if let Err((error, callback)) = self.token.register(Box::new(move |input| {
+            continuation(input.snapshot);
+        })) {
             let _callback = ManuallyDrop::new(callback);
             tracing::error!(
                 ?error,
@@ -67,7 +102,13 @@ impl SettlementCapability<ExecutionFailure> for Registration {
 #[derive(Clone)]
 pub(crate) struct SettlementRole {
     identity: TaskIdentity,
-    slot: ContinuationSlot<Snapshot>,
+    work: WorkId,
+    scope: ScopeHandle,
+    barrier: PublishedReply<Snapshot>,
+    // Weak metadata cannot keep a superseded rich source alive. Actual input
+    // custody remains in the common continuation slot until invocation exit.
+    committed_input: Arc<Mutex<Weak<Snapshot>>>,
+    slot: ContinuationSlot<InvocationInput>,
     health: Arc<ExecutionHealth>,
 }
 impl SettlementRole {
@@ -79,6 +120,9 @@ impl SettlementRole {
         health: Arc<ExecutionHealth>,
         notice: Box<dyn RegistrationNotice>,
     ) -> (Self, SettlementPermit<ExecutionFailure>) {
+        let scope = work.scope().clone();
+        let work_id = work.id();
+        let barrier = PublishedReply::new(&scope);
         let (slot, token) = ContinuationSlot::from_admitted(work, capacity, completion);
         let permit = SettlementPermit::from_admitted_role(
             identity,
@@ -87,6 +131,10 @@ impl SettlementRole {
         (
             Self {
                 identity,
+                work: work_id,
+                scope,
+                barrier,
+                committed_input: Arc::new(Mutex::new(Weak::new())),
                 slot,
                 health,
             },
@@ -96,16 +144,122 @@ impl SettlementRole {
     pub(crate) fn phase(&self) -> SettlementPhase {
         self.slot.phase()
     }
-    /// Only the ordered, actually published barrier effect grants this input.
+    pub(crate) fn work_id(&self) -> WorkId {
+        self.work
+    }
+    /// The original barrier is itself an actual runtime publication. Taking a
+    /// started ticket or observing a Core effect is not publication authority.
+    pub(crate) fn commit_barrier(
+        &self,
+        runtime: &ActorRuntime<WorkerActor>,
+        ticket: &EffectTicket<WorkerAction>,
+        port: &TaskRuntimePort,
+    ) -> Result<(), SettlementDispatchError> {
+        if port.identity() != self.identity
+            || ticket.descriptor.work != self.work
+            || !matches!(&ticket.effect,
+                WorkerAction::Context(novarocks_worker_protocol::context::ContextEffect::SettlementBarrier { task, work })
+                    if *task == self.identity && *work == self.work)
+        {
+            return Err(SettlementDispatchError::WrongRole);
+        }
+        runtime
+            .commit_reply(ticket, &self.barrier, Arc::new(port.accepted()))
+            .map_err(|(error, _snapshot)| SettlementDispatchError::Driver(error))
+    }
+    /// The supervisor publishes OwnerFailed (or preserves an existing
+    /// conclusion) before granting an uncommitted role's barrier. Its original
+    /// running failure Work, rather than the failed Core, signs publication.
+    pub(crate) fn commit_failure_barrier(
+        &self,
+        session: &mut FailurePublicationSession<WorkerActor>,
+        port: &TaskRuntimePort,
+    ) -> Result<(), SettlementDispatchError> {
+        if port.identity() != self.identity {
+            return Err(SettlementDispatchError::WrongRole);
+        }
+        let snapshot = port
+            .accepted()
+            .ok_or(SettlementDispatchError::FailureSnapshotMissing)?;
+        session
+            .commit_reply(&self.barrier, Arc::new(Some(snapshot)))
+            .map_err(|(error, _snapshot)| SettlementDispatchError::Driver(error))
+    }
+    /// Publication and callback start have separate generation gates. Failure
+    /// between them preserves the admitted call and waits for actual failure
+    /// projection; an empty old snapshot cannot fabricate successful exit.
+    pub(crate) fn run(
+        &self,
+        port: &TaskRuntimePort,
+    ) -> Result<SettlementRun, SettlementDispatchError> {
+        if port.identity() != self.identity {
+            return Err(SettlementDispatchError::WrongRole);
+        }
+        let gates = self
+            .scope
+            .gates()
+            .map_err(SettlementDispatchError::Runtime)?;
+        let snapshot = port.accepted();
+        if gates.failed && snapshot.is_none() {
+            return Ok(SettlementRun::Deferred);
+        }
+        if self.slot.phase() == SettlementPhase::Registered {
+            let Some(committed) = self.barrier.take_once() else {
+                return Ok(SettlementRun::Deferred);
+            };
+            *self
+                .committed_input
+                .lock()
+                .expect("settlement input metadata") = Arc::downgrade(&committed);
+            self.slot
+                .publish_barrier(InvocationInput {
+                    snapshot,
+                    _committed: committed,
+                })
+                .map_err(|(error, _snapshot)| SettlementDispatchError::Continuation(error))?;
+        } else if self.slot.phase() == SettlementPhase::Ready {
+            let committed = self
+                .committed_input
+                .lock()
+                .expect("settlement input metadata")
+                .upgrade()
+                .expect("ready continuation owns its committed input");
+            drop(
+                self.slot
+                    .refresh_ready_value(InvocationInput {
+                        snapshot,
+                        _committed: committed,
+                    })
+                    .map_err(|(error, _snapshot)| SettlementDispatchError::Continuation(error))?,
+            );
+        }
+        match self.slot.invoke_in_generation(gates.generation) {
+            Ok(InvocationResult::Exited) => Ok(SettlementRun::Exited),
+            Ok(InvocationResult::Unresolved) => {
+                self.report_call_panic();
+                Ok(SettlementRun::Unresolved)
+            }
+            Err(novarocks_control_runtime::continuation::ContinuationError::Runtime(
+                RuntimeError::Scope(ScopeError::GenerationMismatch),
+            )) => Ok(SettlementRun::Deferred),
+            Err(error) => Err(SettlementDispatchError::Continuation(error)),
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn publish_barrier(&self, snapshot: Snapshot) {
         if let Some(snapshot) = snapshot.as_ref() {
             assert_eq!(snapshot.neutral().identity(), self.identity);
         }
-        if let Err((error, snapshot)) = self.slot.publish_barrier(snapshot) {
+        let committed = Arc::new(snapshot.clone());
+        if let Err((error, snapshot)) = self.slot.publish_barrier(InvocationInput {
+            snapshot,
+            _committed: committed,
+        }) {
             drop(snapshot);
             panic!("Task settlement barrier failed: {error}");
         }
     }
+    #[cfg(test)]
     pub(crate) fn invoke(&self) {
         match self
             .slot
@@ -113,19 +267,20 @@ impl SettlementRole {
             .expect("admitted Task settlement invocation")
         {
             InvocationResult::Exited => {}
-            InvocationResult::Unresolved => {
-                self.health.report_unresolved(
-                    ExecutionExitOrigin::Task {
-                        identity: self.identity,
-                        phase: TaskFailurePhase::Execution,
-                    },
-                    FailureFact::new(
-                        FailureClass::Unexpected,
-                        crate::failure_reason::WorkerFailureReason::SettlementCall.reason(),
-                    ),
-                );
-            }
+            InvocationResult::Unresolved => self.report_call_panic(),
         }
+    }
+    fn report_call_panic(&self) {
+        self.health.report_unresolved(
+            ExecutionExitOrigin::Task {
+                identity: self.identity,
+                phase: TaskFailurePhase::Execution,
+            },
+            FailureFact::new(
+                FailureClass::Unexpected,
+                crate::failure_reason::WorkerFailureReason::SettlementCall.reason(),
+            ),
+        );
     }
     pub(crate) fn unused_role_exited(&self) {
         self.slot

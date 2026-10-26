@@ -37,6 +37,83 @@ fn model(run: impl Fn() + Send + Sync + 'static) {
     model.check(run);
 }
 #[test]
+fn delayed_continuation_start_and_scope_failure_share_the_actual_generation_gate() {
+    use novarocks_control_runtime::transaction::RuntimeError;
+    use novarocks_control_runtime_core::scope::ScopeError;
+    model(|| {
+        let generation = Generation::new(1).unwrap();
+        let dimension = DimensionId::new(1).unwrap();
+        let resources = ResourceVector::new([(dimension, 1)]).unwrap();
+        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
+        let scope = ledger.open_scope_next(None, generation, 1, 1).unwrap();
+        let (work, capacity) = scope
+            .reserve_next(
+                generation,
+                resources,
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        let owner = ConsumerId::new(1).unwrap();
+        let observer = ConsumerId::new(2).unwrap();
+        let report = ReportSlot::reserve_next(
+            &scope,
+            generation,
+            work.id(),
+            2,
+            [
+                (
+                    owner,
+                    ConsumerKind::Owner {
+                        scope: scope.id(),
+                        generation,
+                    },
+                ),
+                (observer, ConsumerKind::Observer),
+            ],
+        )
+        .unwrap();
+        let (slot, token) = ContinuationSlot::<()>::from_admitted(work, capacity, report.clone());
+        token
+            .register(Box::new(|_| {}))
+            .unwrap_or_else(|_| panic!("one original registration"));
+        slot.publish_barrier(()).unwrap();
+        let running = slot.clone();
+        let invoke = thread::spawn(move || running.invoke_in_generation(generation));
+        let failing = scope.clone();
+        let fail = thread::spawn(move || failing.fail().unwrap());
+        let next = fail.join().unwrap();
+        match invoke.join().unwrap() {
+            Ok(InvocationResult::Exited) => assert_eq!(slot.phase(), ContinuationPhase::Exited),
+            Err(ContinuationError::Runtime(RuntimeError::Scope(
+                ScopeError::GenerationMismatch,
+            ))) => {
+                assert_eq!(slot.phase(), ContinuationPhase::Ready);
+                assert!(!slot.body_exited());
+                assert!(!slot.captures_exited());
+                assert!(ledger.unresolved_work().is_empty());
+                assert_eq!(
+                    slot.invoke_in_generation(next).unwrap(),
+                    InvocationResult::Exited
+                );
+            }
+            other => panic!("unexpected generation-gated start: {other:?}"),
+        }
+        report
+            .abandon_failed_owner(owner, &scope, generation)
+            .unwrap();
+        assert!(!slot.try_retire().unwrap());
+        assert_eq!(ledger.used(dimension), 1);
+        report.consume(observer).unwrap();
+        assert!(slot.try_retire().unwrap());
+        ledger.reap_scope_ready(scope.id(), 1).unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    });
+}
+#[test]
 fn actual_invocation_and_owner_abandonment_preserve_the_other_consumer() {
     model(|| {
         let generation = Generation::new(1).unwrap();

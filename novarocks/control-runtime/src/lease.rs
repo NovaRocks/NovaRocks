@@ -21,7 +21,7 @@ use crate::transaction::{RuntimeError, ScopeHandle};
 use novarocks_control_runtime_core::{
     capacity::{ReservationRequest, ResourceVector},
     history::HistoryFact,
-    identity::{ReservationId, WorkId},
+    identity::{Generation, ReservationId, WorkId},
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
 
@@ -174,6 +174,14 @@ impl WorkLease {
         }
     }
     pub fn start(&mut self) -> Result<(), RuntimeError> {
+        self.start_guarded(None)
+    }
+    /// The host grants a delayed call start in the same transaction as scope
+    /// failure. A rejected old generation has not started or lost its work.
+    pub fn start_in_generation(&mut self, generation: Generation) -> Result<(), RuntimeError> {
+        self.start_guarded(Some(generation))
+    }
+    fn start_guarded(&mut self, generation: Option<Generation>) -> Result<(), RuntimeError> {
         let mut state = self
             .scope
             .runtime
@@ -181,11 +189,14 @@ impl WorkLease {
             .state
             .lock()
             .expect("runtime ledger lock");
-        state
+        let scope = state
             .scopes
             .get_mut(&self.scope.id)
-            .ok_or(RuntimeError::UnknownScope)?
-            .start(self.id)?;
+            .ok_or(RuntimeError::UnknownScope)?;
+        if generation.is_some_and(|generation| generation != scope.generation()) {
+            return Err(ScopeError::GenerationMismatch.into());
+        }
+        scope.start(self.id)?;
         self.scope.runtime.shared.record(HistoryFact::Started {
             scope: self.scope.id,
             work: self.id,

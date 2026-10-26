@@ -176,6 +176,87 @@ fn proposal(conclusion: TaskConclusion) -> Proposal {
 }
 
 #[test]
+fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_claiming_exit() {
+    use novarocks_control_runtime_core::identity::WorkId;
+    let mut core = core(4, 1);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    create(&mut core, &mut port, 1);
+    loaded(&mut core, &mut port, 1);
+    let admission_calls = port.calls.len();
+    let first = core
+        .handle(
+            at(0),
+            ContextInput::Settle {
+                task: task(1),
+                work: WorkId::new(1).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(
+        first.effects,
+        [ContextEffect::SettlementBarrier {
+            task: task(1),
+            work: WorkId::new(1).unwrap(),
+        }]
+    );
+    assert!(core.task(task(1)).unwrap().conclusion.accepted.is_none());
+    let cancellation = TaskConclusion::Terminated(TerminationDetail::Canceled(
+        CancelReason::UpstreamNoLongerNeeded,
+    ));
+    let queued = core
+        .handle(
+            at(1),
+            ContextInput::Proposal {
+                task: task(1),
+                proposal: proposal(cancellation.clone()),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(queued.effects.is_empty());
+    let second = core
+        .handle(
+            at(1),
+            ContextInput::Settle {
+                task: task(1),
+                work: WorkId::new(2).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(second.charged_work() <= ContextCore::MAX_STEP_WORK);
+    let publication = second
+        .effects
+        .iter()
+        .position(|effect| {
+            matches!(effect,
+        ContextEffect::PublishConclusion { conclusion, .. } if conclusion == &cancellation)
+        })
+        .unwrap();
+    let barrier = second
+        .effects
+        .iter()
+        .position(|effect| {
+            matches!(effect,
+        ContextEffect::SettlementBarrier { work, .. } if work.get() == 2)
+        })
+        .unwrap();
+    assert!(publication < barrier);
+    let task = core.task(task(1)).unwrap();
+    assert_eq!(task.conclusion.accepted, Some(cancellation));
+    assert!(!task.actual_stopped);
+    assert!(!task.output_released);
+    assert!(!task.resources_converged);
+    assert_eq!(
+        port.calls.len(),
+        admission_calls,
+        "settlement consumes its original admission instead of reserving more capacity"
+    );
+}
+
+#[test]
 fn exact_create_replays_share_one_loader_and_reserve_the_complete_preparation_cost() {
     let mut core = core(8, 2);
     let mut port = Port::default();
