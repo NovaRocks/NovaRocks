@@ -549,3 +549,49 @@ fn concurrent_id_selection_and_admission_never_reorder_the_owner_watermark() {
         assert!(ledger.is_empty());
     });
 }
+
+#[test]
+fn input_reservation_racing_removal_cannot_reopen_a_stale_node_with_two_preemptions() {
+    model(|| {
+        use novarocks_control_runtime::driver::DriverError;
+        let ledger = RuntimeLedger::new(resources(0), 1, 1);
+        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
+        let runtime = ActorRuntime::new(1);
+        runtime
+            .register_next(
+                aid(1),
+                scope.clone(),
+                Counter { seen: Vec::new() },
+                ActorConfig {
+                    mailbox: [1; 4],
+                    max_batches: 1,
+                    max_effects_per_step: 1,
+                    max_dependencies_per_effect: 0,
+                    turn_budget: 8,
+                    max_step_work: 1,
+                },
+            )
+            .unwrap_or_else(|(error, _)| panic!("model registration: {error:?}"));
+        scope.close_external().unwrap();
+        let admitting = runtime.clone();
+        let producer = thread::spawn(move || {
+            match admitting.reserve_input(aid(1), aid(2), InputClass::Ordinary) {
+                Ok(permit) => permit.revoke_unused().unwrap(),
+                Err(DriverError::Closed | DriverError::UnknownActor) => (),
+                Err(error) => panic!("unexpected admission result: {error:?}"),
+            }
+        });
+        let retiring = runtime.clone();
+        let removal = thread::spawn(move || retiring.remove_actor(aid(1)));
+        producer.join().unwrap();
+        let actor = match removal.join().unwrap() {
+            Ok(actor) => actor,
+            Err(DriverError::ActorNotRetired) => runtime.remove_actor(aid(1)).unwrap(),
+            Err(error) => panic!("unexpected retirement result: {error:?}"),
+        };
+        assert!(actor.seen.is_empty());
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(runtime.is_empty());
+        assert!(ledger.is_empty());
+    });
+}

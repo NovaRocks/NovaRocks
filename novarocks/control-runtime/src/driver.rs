@@ -150,6 +150,8 @@ struct FailurePublicationRecord {
     work: WorkId,
 }
 struct Inbox<A: Actor> {
+    external_open: bool,
+    sealed: bool,
     payloads: BTreeMap<InputId, A::Input>,
     mailbox: MailboxState,
     inputs: BTreeMap<InputId, InputRecord>,
@@ -280,6 +282,9 @@ impl<A: Actor> InputRole<A> {
             Err(error) => return Err((error, value)),
         };
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        if inbox.sealed {
+            return Err((DriverError::Closed, value));
+        }
         let scope_failed = match node.scope.gates() {
             Ok(gates) => gates.failed,
             Err(error) => return Err((error.into(), value)),
@@ -406,6 +411,9 @@ impl<A: Actor> InputPermit<A> {
             Err(e) => return Err((e, value)),
         };
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        if inbox.sealed {
+            return Err((DriverError::Closed, value));
+        }
         if inbox.failed {
             return Err((DriverError::ActorFailed, value));
         }
@@ -639,6 +647,8 @@ impl<A: Actor> FailurePublicationSession<A> {
 pub struct ActorSnapshot {
     pub generation: Generation,
     pub failed: bool,
+    pub external_open: bool,
+    pub sealed: bool,
     pub inputs: usize,
     pub roles: usize,
     pub batches: usize,
@@ -804,6 +814,8 @@ impl<A: Actor> ActorRuntime<A> {
                 failure_work,
                 core: Mutex::new(Some(actor)),
                 inbox: Mutex::new(Inbox {
+                    external_open: true,
+                    sealed: false,
                     payloads: BTreeMap::new(),
                     mailbox: MailboxState::new(config.mailbox),
                     inputs: BTreeMap::new(),
@@ -847,6 +859,9 @@ impl<A: Actor> ActorRuntime<A> {
         if inbox.failed {
             return Err(DriverError::ActorFailed);
         }
+        if !inbox.external_open || inbox.sealed {
+            return Err(DriverError::Closed);
+        }
         if inbox.counts[class.index()] >= node.config.mailbox[class.index()] {
             return Err(DriverError::InputCapacity);
         }
@@ -877,11 +892,48 @@ impl<A: Actor> ActorRuntime<A> {
         Ok(ActorSnapshot {
             generation: inbox.generation,
             failed: inbox.failed,
+            external_open: inbox.external_open,
+            sealed: inbox.sealed,
             inputs: inbox.inputs.len(),
             roles: inbox.roles.len(),
             batches: inbox.batches.len(),
             last_progress: inbox.last_progress,
         })
+    }
+    /// Stop issuing new positions for one actor. Existing permits and prepaid
+    /// roles still drain, including after process-wide external admission closes.
+    /// This is not a stop request, failure, work exit or retirement proof.
+    pub fn close_actor_admission(&self, actor: ActorId) -> Result<(), DriverError> {
+        let node = self.node(actor)?;
+        node.inbox.lock().expect("actor inbox lock").external_open = false;
+        self.shared.changed.notify();
+        Ok(())
+    }
+    /// After all actual input/role/effect holders have retired, seal timer and
+    /// mailbox ingress before the host exits its last housekeeping leases.
+    /// Work remains counted and remove_actor still independently requires join.
+    pub fn seal_actor(&self, actor: ActorId) -> Result<(), DriverError> {
+        let node = self.node(actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        if inbox.external_open
+            || !inbox.inputs.is_empty()
+            || !inbox.roles.is_empty()
+            || !inbox.batches.is_empty()
+            || inbox.failure.is_some()
+        {
+            return Err(DriverError::ActorNotRetired);
+        }
+        let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+        if !state.ready.is_idle(actor)? || !state.effect_ready.is_idle(actor)? {
+            return Err(SchedulerError::Busy.into());
+        }
+        inbox.sealed = true;
+        state.timers.cancel(actor);
+        state.timers.acknowledge_tick(actor);
+        drop(state);
+        drop(inbox);
+        self.shared.changed.notify();
+        Ok(())
     }
     pub fn close_admission(&self) {
         self.shared
@@ -908,20 +960,36 @@ impl<A: Actor> ActorRuntime<A> {
             if let Some(history) = &self.shared.history {
                 history.observe_time(now);
             }
-            (state.timers.advance(now, budget)?, now)
+            // Retain the exact selected node before releasing the scheduler
+            // lock. Concurrent retirement may remove its directory entry.
+            let actors = state
+                .timers
+                .advance(now, budget)?
+                .into_iter()
+                .map(|actor| {
+                    state
+                        .actors
+                        .get(&actor)
+                        .cloned()
+                        .expect("timer retains a registered actor")
+                })
+                .collect::<Vec<_>>();
+            (actors, now)
         };
         let mut filled = 0;
-        for actor in actors {
-            let node = self.node(actor)?;
+        for node in actors {
+            let actor = node.id;
             let timer_value = A::timer_input(now);
             let mut inbox = node.inbox.lock().expect("actor inbox lock");
-            if inbox.failed {
-                self.shared
-                    .state
-                    .lock()
-                    .expect("runtime scheduler lock")
-                    .timers
-                    .acknowledge_tick(actor);
+            if inbox.failed || inbox.sealed {
+                let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+                if state
+                    .actors
+                    .get(&actor)
+                    .is_some_and(|current| Arc::ptr_eq(current, &node))
+                {
+                    state.timers.acknowledge_tick(actor);
+                }
                 continue;
             }
             if inbox.timer_input.is_some() {
@@ -1000,7 +1068,7 @@ impl<A: Actor> ActorRuntime<A> {
         loop {
             let next = {
                 let mut inbox = node.inbox.lock().expect("actor inbox lock");
-                if inbox.failed || inbox.batches.len() >= node.config.max_batches {
+                if inbox.failed || inbox.sealed || inbox.batches.len() >= node.config.max_batches {
                     None
                 } else {
                     let ready =
@@ -1892,7 +1960,7 @@ impl<A: Actor> ActorRuntime<A> {
     /// in scope storage until all actual input/effect custody has retired here.
     pub fn remove_actor(&self, actor: ActorId) -> Result<A, DriverError> {
         let node = self.node(actor)?;
-        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
         if !inbox.inputs.is_empty()
             || !inbox.roles.is_empty()
             || !inbox.batches.is_empty()
@@ -1905,6 +1973,10 @@ impl<A: Actor> ActorRuntime<A> {
         if !state.ready.is_idle(actor)? || !state.effect_ready.is_idle(actor)? {
             return Err(SchedulerError::Busy.into());
         }
+        // A producer may already have looked up this exact Arc and be waiting
+        // for the inbox lock. It must observe the seal after removal as well.
+        inbox.external_open = false;
+        inbox.sealed = true;
         state.ready.unregister(actor)?;
         state.effect_ready.unregister(actor)?;
         state.timers.cancel(actor);

@@ -59,8 +59,14 @@ pub(crate) enum ContextMessage {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ContextAction {
-    Protocol(ContextEffect),
+pub(crate) enum WorkerAction {
+    Context(ContextEffect),
+    Control {
+        effect: novarocks_worker_protocol::control::ControlEffect,
+        /// The original guard is in the same batch. Ticket grants have no
+        /// host I/O effect of their own, so their body adopts it here.
+        admitted: Option<novarocks_control_runtime_core::identity::ReservationId>,
+    },
     Reply(RequestSettlement),
     OwnerFailed {
         scope: ScopeId,
@@ -96,7 +102,7 @@ impl ContextActor {
 }
 impl Actor for ContextActor {
     type Input = ContextMessage;
-    type Effect = ContextAction;
+    type Effect = WorkerAction;
     fn timer_input(_: Tick) -> Self::Input {
         ContextMessage::Timer
     }
@@ -105,7 +111,7 @@ impl Actor for ContextActor {
         now: Tick,
         envelope: InputEnvelope,
         message: ContextMessage,
-        step: &mut StepContext<'_, ContextAction>,
+        step: &mut StepContext<'_, WorkerAction>,
     ) {
         let now = MonotonicInstant::from_origin(Duration::from_nanos(now.0));
         let (work, request, command) = match message {
@@ -221,7 +227,7 @@ impl Actor for ContextActor {
                     kind,
                     dependencies,
                 },
-                ContextAction::Protocol(effect),
+                WorkerAction::Context(effect),
             )
             .unwrap_or_else(|(error, _)| panic!("bounded context effect handoff: {error:?}"));
         }
@@ -238,7 +244,7 @@ impl Actor for ContextActor {
                     kind: EffectKind::Reply,
                     dependencies,
                 },
-                ContextAction::Reply(reply),
+                WorkerAction::Reply(reply),
             )
             .unwrap_or_else(|(error, _)| panic!("bounded context reply handoff: {error:?}"));
         }
@@ -252,7 +258,7 @@ impl Actor for ContextActor {
         scope: ScopeId,
         generation: Generation,
         _: InputEnvelope,
-        step: &mut StepContext<'_, ContextAction>,
+        step: &mut StepContext<'_, WorkerAction>,
     ) {
         let work = step
             .failure_work()
@@ -264,7 +270,7 @@ impl Actor for ContextActor {
                 kind: EffectKind::Cleanup,
                 dependencies: Vec::new(),
             },
-            ContextAction::OwnerFailed { scope, generation },
+            WorkerAction::OwnerFailed { scope, generation },
         )
         .unwrap_or_else(|(error, _)| panic!("fixed context failure handoff: {error:?}"));
     }
@@ -272,3 +278,8 @@ impl Actor for ContextActor {
 
 #[cfg(test)]
 mod tests;
+
+mod control;
+mod worker;
+pub(crate) use control::{ControlActor, ControlMessage};
+pub(crate) use worker::{WorkerActor, WorkerMessage};
