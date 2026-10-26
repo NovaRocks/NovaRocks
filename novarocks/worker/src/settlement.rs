@@ -72,6 +72,9 @@ pub(crate) enum SettlementRun {
 /// A role's already reserved neutral mailbox position. It cannot wait for its
 /// actor or invoke the continuation; it only transfers the admitted role ID.
 pub(crate) trait RegistrationNotice: Send {
+    /// Binds metadata to the exact original admitted role before its permit
+    /// can escape. This cannot allocate input positions or run host work.
+    fn bind_work(&mut self, work: WorkId);
     fn registered(self: Box<Self>);
     fn unused(self: Box<Self>);
 }
@@ -118,10 +121,11 @@ impl SettlementRole {
         capacity: CapacityBundle,
         completion: ReportSlot,
         health: Arc<ExecutionHealth>,
-        notice: Box<dyn RegistrationNotice>,
+        mut notice: Box<dyn RegistrationNotice>,
     ) -> (Self, SettlementPermit<ExecutionFailure>) {
         let scope = work.scope().clone();
         let work_id = work.id();
+        notice.bind_work(work_id);
         let barrier = PublishedReply::new(&scope);
         let (slot, token) = ContinuationSlot::from_admitted(work, capacity, completion);
         let permit = SettlementPermit::from_admitted_role(
@@ -195,18 +199,21 @@ impl SettlementRole {
         if port.identity() != self.identity {
             return Err(SettlementDispatchError::WrongRole);
         }
-        let gates = self
-            .scope
-            .gates()
-            .map_err(SettlementDispatchError::Runtime)?;
-        let snapshot = port.accepted();
-        if gates.failed && snapshot.is_none() {
+        // This is an execution claim, not a mutex spanning foreign work. A
+        // reentrant observer or another executor returns without waiting;
+        // only this original role may prepare/refresh its invocation input.
+        let Some(mut dispatch) = self.slot.try_claim_dispatch() else {
             return Ok(SettlementRun::Deferred);
-        }
+        };
         if self.slot.phase() == SettlementPhase::Registered {
             let Some(committed) = self.barrier.take_once() else {
                 return Ok(SettlementRun::Deferred);
             };
+            // The actual committed prefix supplies the normal barrier input.
+            // An ambient read performed before taking it could race a new
+            // publication and hand None to a barrier that committed Some.
+            // Retirement still reads the current Task port at its own point.
+            let snapshot = (*committed).clone();
             *self
                 .committed_input
                 .lock()
@@ -217,23 +224,37 @@ impl SettlementRole {
                     _committed: committed,
                 })
                 .map_err(|(error, _snapshot)| SettlementDispatchError::Continuation(error))?;
-        } else if self.slot.phase() == SettlementPhase::Ready {
+        } else if self.slot.phase() != SettlementPhase::Ready {
+            return Err(SettlementDispatchError::Continuation(
+                novarocks_control_runtime::continuation::ContinuationError::InvalidPhase(
+                    self.slot.phase(),
+                ),
+            ));
+        }
+        let gates = self
+            .scope
+            .gates()
+            .map_err(SettlementDispatchError::Runtime)?;
+        if gates.failed {
+            let Some(snapshot) = port.accepted() else {
+                return Ok(SettlementRun::Deferred);
+            };
             let committed = self
                 .committed_input
                 .lock()
                 .expect("settlement input metadata")
                 .upgrade()
-                .expect("ready continuation owns its committed input");
+                .expect("ready continuation retains its original published input");
             drop(
-                self.slot
+                dispatch
                     .refresh_ready_value(InvocationInput {
-                        snapshot,
+                        snapshot: Some(snapshot),
                         _committed: committed,
                     })
-                    .map_err(|(error, _snapshot)| SettlementDispatchError::Continuation(error))?,
+                    .map_err(|(error, _input)| SettlementDispatchError::Continuation(error))?,
             );
         }
-        match self.slot.invoke_in_generation(gates.generation) {
+        match dispatch.invoke_in_generation(gates.generation) {
             Ok(InvocationResult::Exited) => Ok(SettlementRun::Exited),
             Ok(InvocationResult::Unresolved) => {
                 self.report_call_panic();
@@ -323,6 +344,7 @@ mod tests {
 
     struct Notice(Arc<AtomicUsize>);
     impl RegistrationNotice for Notice {
+        fn bind_work(&mut self, _: WorkId) {}
         fn registered(self: Box<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }

@@ -37,6 +37,87 @@ fn model(run: impl Fn() + Send + Sync + 'static) {
     model.check(run);
 }
 #[test]
+fn one_dispatch_claim_serializes_input_refresh_and_reentrant_invocation() {
+    use loom::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    model(|| {
+        let generation = Generation::new(1).unwrap();
+        let dimension = DimensionId::new(1).unwrap();
+        let resources = ResourceVector::new([(dimension, 1)]).unwrap();
+        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
+        let scope = ledger.open_scope_next(None, generation, 1, 1).unwrap();
+        let (work, capacity) = scope
+            .reserve_next(
+                generation,
+                resources,
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        let observer = ConsumerId::new(1).unwrap();
+        let report = ReportSlot::reserve_next(
+            &scope,
+            generation,
+            work.id(),
+            1,
+            [(observer, ConsumerKind::Observer)],
+        )
+        .unwrap();
+        let (slot, token) =
+            ContinuationSlot::<usize>::from_admitted(work, capacity, report.clone());
+        let winner = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let original = slot.clone();
+        let seen = winner.clone();
+        let called = calls.clone();
+        token
+            .register(Box::new(move |value| {
+                assert_eq!(value, seen.load(Ordering::Acquire));
+                assert_eq!(original.invoke(), Err(ContinuationError::DispatchBusy));
+                called.fetch_add(1, Ordering::SeqCst);
+            }))
+            .unwrap_or_else(|_| panic!("one admitted registration"));
+        slot.publish_barrier(0).unwrap();
+        let mut threads = Vec::new();
+        for id in 1..=2 {
+            let slot = slot.clone();
+            let winner = winner.clone();
+            threads.push(thread::spawn(move || {
+                let Some(mut dispatch) = slot.try_claim_dispatch() else {
+                    return;
+                };
+                match dispatch.refresh_ready_value(id) {
+                    Ok(_) => {
+                        winner.store(id, Ordering::Release);
+                        assert_eq!(
+                            dispatch.invoke_in_generation(generation).unwrap(),
+                            InvocationResult::Exited
+                        );
+                    }
+                    Err((ContinuationError::InvalidPhase(ContinuationPhase::Exited), _)) => {}
+                    other => panic!("unexpected dispatch preparation: {other:?}"),
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(slot.phase(), ContinuationPhase::Exited);
+        assert!(!slot.try_retire().unwrap());
+        report.consume(observer).unwrap();
+        assert!(slot.try_retire().unwrap());
+        ledger.reap_scope_ready(scope.id(), 1).unwrap();
+        scope.close_external().unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    });
+}
+#[test]
 fn delayed_continuation_start_and_scope_failure_share_the_actual_generation_gate() {
     use novarocks_control_runtime::transaction::RuntimeError;
     use novarocks_control_runtime_core::scope::ScopeError;

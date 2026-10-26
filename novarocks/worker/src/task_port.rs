@@ -43,7 +43,9 @@ use crate::task_proposal_ingress::TaskProposalIngress;
 
 /// One prepaid/coalesced ready position. Implementations only mark this exact
 /// Task pending; they never wait for its actor, run an observer, or execute I/O.
-/// A role whose target failed ignores the pending hint; this proves no exit.
+/// An admitted role keeps waking its live host custodian after Core failure;
+/// that custodian routes work to failure cleanup instead of the dead Core.
+/// Ignoring late registration/revocation/exit would strand original duties.
 pub(crate) trait TaskPendingNotice: Send + Sync {
     fn pending(&self);
 }

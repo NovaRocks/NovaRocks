@@ -1253,6 +1253,7 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
     }
     struct Registered(Arc<AtomicUsize>);
     impl RegistrationNotice for Registered {
+        fn bind_work(&mut self, _: novarocks_control_runtime_core::identity::WorkId) {}
         fn registered(self: Box<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
@@ -1299,6 +1300,8 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         &ticket,
         TaskHostBinding {
             context: f.identity,
+            task_source: ActorId::new(2).unwrap(),
+            protocol_generation: generation(),
             max_cuts: 4,
             pending: Arc::new(Pending),
             health: Arc::new(
@@ -1309,6 +1312,17 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
     .unwrap();
     f.runtime.effect_completed(ticket).unwrap();
     f.drain(create);
+    assert!(matches!(
+        host.admit_settlement_notice(1),
+        Err(crate::control_runtime::causal::CausalError::BeforeAccepted)
+    ));
+    assert!(
+        f.runtime
+            .role_inventory(actor(), None, 32)
+            .unwrap()
+            .is_empty(),
+        "loading cannot borrow post-Accepted input positions from another Task"
+    );
     let registration = Arc::new(AtomicUsize::new(0));
     let (error, notice) =
         match host.issue_completion_roles(Box::new(Registered(registration.clone()))) {
@@ -1317,6 +1331,9 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         };
     assert!(matches!(error, TaskHostError::CompletionBeforeAccepted));
     assert_eq!(registration.load(Ordering::SeqCst), 0);
+    notice.unused();
+    assert_eq!(registration.load(Ordering::SeqCst), 2);
+    registration.store(0, Ordering::SeqCst);
     let input = TaskCreationInput::new(
         FrozenBytes::freeze(bytes::Bytes::new()),
         Box::new(Assignment),
@@ -1402,8 +1419,37 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
     let job = host
         .adopt_preparation(&f.runtime, &preparation)
         .unwrap_or_else(|error| panic!("actual Task prep: {error}"));
+    struct CountedRegistration {
+        notice: Box<dyn RegistrationNotice>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl RegistrationNotice for CountedRegistration {
+        fn bind_work(&mut self, work: novarocks_control_runtime_core::identity::WorkId) {
+            self.notice.bind_work(work);
+        }
+        fn registered(self: Box<Self>) {
+            self.notice.registered();
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn unused(self: Box<Self>) {
+            self.notice.unused();
+            self.calls.fetch_add(2, Ordering::SeqCst);
+        }
+    }
+    let (cut, notice) = host.admit_settlement_notice(1).unwrap();
+    assert!(matches!(
+        host.admit_settlement_notice(1),
+        Err(crate::control_runtime::causal::CausalError::AlreadyAdmitted)
+    ));
+    assert_eq!(
+        f.runtime.role_inventory(actor(), None, 32).unwrap().len(),
+        2
+    );
     let admitted = host
-        .issue_completion_roles(notice)
+        .issue_completion_roles(Box::new(CountedRegistration {
+            notice,
+            calls: registration.clone(),
+        }))
         .unwrap_or_else(|(error, _)| panic!("original completion issuer: {error}"));
     assert!(matches!(
         host.issue_completion_roles(Box::new(Registered(registration.clone()))),
@@ -1547,6 +1593,7 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         settlement,
         SettlementScenario::FailBeforeBarrier | SettlementScenario::FailAfterBarrier
     );
+    let nested_dispatch = Arc::new(AtomicUsize::new(0));
     if settlement == SettlementScenario::Unused {
         // Stop is not actual holder exit. A port clone cannot sign another role.
         f.scope.request_stop().unwrap();
@@ -1563,7 +1610,20 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         let calls = Arc::new(AtomicUsize::new(0));
         let called = calls.clone();
         let expected = port.clone();
+        let nested = nested_dispatch.clone();
+        let reentrant = completion.clone();
         permit.register(Box::new(move |snapshot| {
+            nested.store(
+                if matches!(
+                    reentrant.dispatch_settlement(&expected),
+                    Ok(crate::settlement::SettlementRun::Deferred)
+                ) {
+                    1
+                } else {
+                    2
+                },
+                Ordering::SeqCst,
+            );
             if failed {
                 let accepted = snapshot.expect("failure conclusion is published before callback");
                 assert_eq!(
@@ -1591,16 +1651,17 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
             SettlementRun::Deferred
         );
         let work = completion.settlement_work();
-        let settled = f
-            .runtime
-            .reserve_input(actor(), ActorId::new(2).unwrap(), InputClass::Lifecycle)
-            .unwrap()
-            .fill(WorkerMessage::Context(ContextMessage::Command {
-                work,
-                request: None,
-                command: ContextInput::Settle { task, work },
-            }))
-            .unwrap();
+        let delivery = host.causal().deliver_next().unwrap().unwrap();
+        assert_eq!(delivery.cut, cut);
+        assert!(
+            delivery.prefix.is_none(),
+            "a genuinely empty prefix needs no extra Core dispatch"
+        );
+        let settled = delivery.event;
+        assert_eq!(
+            host.causal().observe_core(cut).unwrap(),
+            novarocks_control_runtime_core::completion::Consumption::Pending
+        );
         f.runtime.poll_one(Tick(4)).unwrap();
         let mut ordered = EffectDispatch::new(actor(), 15);
         ordered.index_committed(&f.runtime, 32).unwrap();
@@ -1685,8 +1746,21 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         drop(wall_time);
         drop(publisher);
         f.runtime.effect_completed(barrier).unwrap();
+        assert_eq!(
+            host.causal().observe_core(cut).unwrap(),
+            novarocks_control_runtime_core::completion::Consumption::Consumed,
+            "an actual pre-failure Core commitment remains positive consumption"
+        );
         f.runtime.retire_input(actor(), settled).unwrap();
+        port.ingress().consume_cut(cut, 0).unwrap();
     }
+    assert!(
+        host.causal().retire_after_exit(cut).is_err(),
+        "input retirement cannot manufacture source/capture/effect exit"
+    );
+    port.ingress().observe_cut_exit(cut, true, true).unwrap();
+    host.causal().retire_after_exit(cut).unwrap();
+    assert!(host.causal().is_empty());
     for role in [
         TaskLifecycleRole::Finisher,
         TaskLifecycleRole::Settlement,
@@ -1722,7 +1796,10 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         preparation,
         mut preparation_remainder,
         completion,
+        causal,
     } = host.into_resources();
+    assert!(causal.is_empty());
+    drop(causal);
     drop(completion);
     drop(preparation);
     drop(loader);
@@ -1734,6 +1811,11 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
     let retained = preparation_remainder.as_mut().unwrap();
     retained.release(&retained.resources().unwrap()).unwrap();
     f.finish();
+    assert_eq!(
+        nested_dispatch.load(Ordering::SeqCst),
+        usize::from(settlement != SettlementScenario::Unused),
+        "a reentrant executor cannot refresh or run the same original callback"
+    );
 }
 
 #[test]
@@ -1760,4 +1842,326 @@ fn failed_core_settles_an_unpublished_original_barrier_only_after_failure_projec
 #[test]
 fn failure_after_barrier_commit_preserves_the_call_and_waits_for_actual_failure_publication() {
     exercise_original_fragment_roles(false, SettlementScenario::FailAfterBarrier);
+}
+
+// These tests exercise only neutral causal authors. The full TaskHostRecord
+// tests above separately bind the original callback Work and capture reports.
+struct CausalHarness {
+    fixture: Fixture,
+    task: TaskIdentity,
+    ingress: std::sync::Arc<crate::task_proposal_ingress::TaskProposalIngress>,
+    inbox: crate::control_runtime::causal::TaskCausalInbox,
+}
+struct CausalPending;
+impl crate::task_port::TaskPendingNotice for CausalPending {
+    fn pending(&self) {}
+}
+impl CausalHarness {
+    fn new(cuts: usize) -> Self {
+        let mut fixture = Fixture::new();
+        let task = task(fixture.identity, 1);
+        fixture.run(
+            ContextInput::Create {
+                request: operation(1),
+                task,
+                payload: PayloadId(1),
+            },
+            Some(operation(1)),
+        );
+        fixture.run(
+            ContextInput::Loaded {
+                task,
+                result: Ok(CreationCost {
+                    input_retained_bytes: 1,
+                    ingress_retained_bytes: 1,
+                    structural_bytes: 1,
+                    inbound_records: 0,
+                    inbound_bytes: 0,
+                }),
+            },
+            None,
+        );
+        let ingress = std::sync::Arc::new(
+            crate::task_proposal_ingress::TaskProposalIngress::new(cuts).unwrap(),
+        );
+        let inbox = crate::control_runtime::causal::TaskCausalInbox::new(
+            fixture.runtime.clone(),
+            actor(),
+            ActorId::new(7001).unwrap(),
+            task,
+            generation(),
+            ingress.clone(),
+        );
+        Self {
+            fixture,
+            task,
+            ingress,
+            inbox,
+        }
+    }
+    fn work(&mut self) -> WorkId {
+        let (work, capacity) = self
+            .fixture
+            .scope
+            .reserve_next(
+                generation(),
+                empty(),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        let id = work.id();
+        self.fixture.roles.push((work, capacity));
+        id
+    }
+    fn settlement(
+        &mut self,
+    ) -> (
+        novarocks_worker_protocol::proposal_summary::CutId,
+        Box<dyn crate::settlement::RegistrationNotice>,
+    ) {
+        let work = self.work();
+        let (cut, mut sender) = self
+            .inbox
+            .admit_settlement(1, std::sync::Arc::new(CausalPending))
+            .unwrap();
+        sender.bind_work(work);
+        (cut, sender)
+    }
+    fn retire(
+        &mut self,
+        delivery: crate::control_runtime::causal::CausalDelivery,
+    ) -> Vec<WorkerAction> {
+        use novarocks_control_runtime_core::completion::Consumption;
+        assert_eq!(
+            self.inbox.observe_core(delivery.cut).unwrap(),
+            Consumption::Consumed
+        );
+        assert!(self.inbox.retire_after_exit(delivery.cut).is_err());
+        let mut result = Vec::new();
+        if let Some(prefix) = delivery.prefix {
+            result.extend(self.fixture.drain(prefix));
+        }
+        result.extend(self.fixture.drain(delivery.event));
+        assert!(
+            self.inbox.retire_after_exit(delivery.cut).is_err(),
+            "Core consumption is not physical exit"
+        );
+        // The neutral test executor returned and disposed all of these values;
+        // no opaque source/callback is attached to these component authors.
+        self.ingress
+            .observe_cut_exit(delivery.cut, true, true)
+            .unwrap();
+        self.ingress.consume_cut(delivery.cut, 0).unwrap();
+        self.inbox.retire_after_exit(delivery.cut).unwrap();
+        result
+    }
+    fn finish(self) {
+        assert!(self.inbox.is_empty());
+        drop(self.inbox);
+        self.fixture.finish();
+    }
+}
+
+#[test]
+fn actual_causal_registration_order_seals_each_prefix_and_does_not_wait_for_host_effect_exit() {
+    use novarocks_control_runtime_core::completion::Consumption;
+    use novarocks_execution_contract::{
+        CancelReason, TaskConclusion, TaskConclusionProposal, TerminationDetail,
+    };
+    let mut h = CausalHarness::new(2);
+    let (first, first_sender) = h.settlement();
+    let (second, second_sender) = h.settlement();
+    assert!(first < second);
+    h.ingress.submit(TaskConclusionProposal::Canceled(
+        CancelReason::UpstreamNoLongerNeeded,
+    ));
+    second_sender.registered();
+    h.ingress.submit(TaskConclusionProposal::Aborted(
+        novarocks_execution_contract::AbortCause::PeerTaskFailed,
+    ));
+    first_sender.registered();
+    let earlier = h.inbox.deliver_next().unwrap().unwrap();
+    assert_eq!(
+        earlier.cut, second,
+        "handoff order is independent of reservation order"
+    );
+    assert!(earlier.prefix.is_some());
+    assert!(h.inbox.deliver_next().unwrap().is_none());
+    assert_eq!(h.inbox.observe_core(second).unwrap(), Consumption::Pending);
+    h.fixture.runtime.poll_one(Tick(1)).unwrap();
+    assert_eq!(h.inbox.observe_core(second).unwrap(), Consumption::Consumed);
+    // The original prefix's publications/captures remain unretired, but the
+    // next already-paid role can enter the same Task FIFO after Core consumed.
+    assert_eq!(
+        h.fixture
+            .runtime
+            .retire_input(actor(), earlier.prefix.unwrap()),
+        Err(DriverError::EffectsRemain)
+    );
+    let later = h.inbox.deliver_next().unwrap().unwrap();
+    assert_eq!(later.cut, first);
+    h.fixture.runtime.poll_one(Tick(2)).unwrap();
+    assert!(!h.fixture.runtime.snapshot(actor()).unwrap().failed);
+    assert_eq!(h.inbox.observe_core(first).unwrap(), Consumption::Consumed);
+    let earlier_effects = h.retire(earlier);
+    let later_effects = h.retire(later);
+    assert!(earlier_effects.iter().any(|effect| matches!(effect,
+        WorkerAction::Context(ContextEffect::PublishConclusion { conclusion, .. })
+            if *conclusion == TaskConclusion::Terminated(TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded)))));
+    assert!(!later_effects.iter().any(|effect| matches!(
+        effect,
+        WorkerAction::Context(ContextEffect::PublishConclusion { .. })
+    )));
+    h.finish();
+}
+
+#[test]
+fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fifo() {
+    use novarocks_control_runtime_core::completion::Consumption;
+    use novarocks_execution_contract::{AbortCause, CancelReason, TaskConclusionProposal};
+    let mut h = CausalHarness::new(2);
+    let mut closing = h.fixture.run(
+        ContextInput::Abort {
+            request: operation(2),
+            cause: AbortCause::PeerTaskFailed,
+        },
+        Some(operation(2)),
+    );
+    assert!(closing.iter().any(|effect| matches!(
+        effect,
+        WorkerAction::Context(ContextEffect::ContinueClose { .. })
+    )));
+    closing.extend(h.fixture.run(ContextInput::ContinueClose, None));
+    let next = closing
+        .iter()
+        .find_map(|effect| match effect {
+            WorkerAction::Context(ContextEffect::ApplyTaskClose { task, generation })
+                if *task == h.task =>
+            {
+                Some(*generation)
+            }
+            _ => None,
+        })
+        .expect("the pure close owner emits this Task's finite causal role");
+    assert_ne!(next, generation());
+    let work = h.work();
+    let (close_cut, close) = h
+        .inbox
+        .admit_close(next, work, 1, std::sync::Arc::new(CausalPending))
+        .unwrap();
+    h.ingress
+        .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+    close.send();
+    let close = h.inbox.deliver_next().unwrap().unwrap();
+    assert_eq!(close.cut, close_cut);
+    assert!(close.prefix.is_some());
+    let (_, settle) = h.settlement();
+    h.ingress.submit(TaskConclusionProposal::Canceled(
+        CancelReason::UpstreamNoLongerNeeded,
+    ));
+    settle.registered();
+    h.fixture.runtime.poll_one(Tick(1)).unwrap();
+    assert_eq!(
+        h.inbox.observe_core(close_cut).unwrap(),
+        Consumption::Consumed
+    );
+    let settled = h.inbox.deliver_next().unwrap().unwrap();
+    assert!(settled.prefix.is_some());
+    h.fixture.runtime.poll_one(Tick(2)).unwrap();
+    assert!(
+        !h.fixture.runtime.snapshot(actor()).unwrap().failed,
+        "the post-close summary must carry the new protocol epoch"
+    );
+    h.retire(close);
+    h.retire(settled);
+    h.finish();
+}
+
+#[test]
+fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder_waits_for_exit() {
+    use crate::control_runtime::causal::CausalError;
+    use novarocks_worker_protocol::proposal_summary::CutError;
+    let mut h = CausalHarness::new(1);
+    let (cut, sender) = h.settlement();
+    assert_eq!(
+        h.fixture
+            .runtime
+            .role_inventory(actor(), None, 32)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(matches!(
+        h.inbox
+            .admit_settlement(1, std::sync::Arc::new(CausalPending)),
+        Err(CausalError::Cut(CutError::Full))
+    ));
+    assert_eq!(
+        h.fixture
+            .runtime
+            .role_inventory(actor(), None, 32)
+            .unwrap()
+            .len(),
+        2,
+        "a failed cut admission returns both unbound input positions"
+    );
+    sender.unused();
+    assert!(h.inbox.retire_after_exit(cut).is_err());
+    assert_eq!(
+        h.fixture
+            .runtime
+            .role_inventory(actor(), None, 32)
+            .unwrap()
+            .len(),
+        2
+    );
+    h.ingress.observe_cut_exit(cut, true, true).unwrap();
+    h.inbox.retire_after_exit(cut).unwrap();
+    assert!(
+        h.fixture
+            .runtime
+            .role_inventory(actor(), None, 32)
+            .unwrap()
+            .is_empty()
+    );
+    h.finish();
+}
+
+#[test]
+fn missing_actual_input_observation_cannot_be_reconstructed_from_a_retired_queue() {
+    use crate::control_runtime::causal::CausalError;
+    use novarocks_control_runtime::driver::InputPhase;
+    let mut h = CausalHarness::new(1);
+    let (cut, sender) = h.settlement();
+    sender.registered();
+    let delivery = h.inbox.deliver_next().unwrap().unwrap();
+    assert!(delivery.prefix.is_none());
+    h.fixture.runtime.poll_one(Tick(1)).unwrap();
+    let actual = h
+        .fixture
+        .runtime
+        .input_custody(actor(), delivery.event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.phase, InputPhase::Committed);
+    h.fixture.drain(delivery.event);
+    assert_eq!(
+        h.inbox.observe_core(cut),
+        Err(CausalError::InputObservationMissing)
+    );
+    assert_eq!(
+        h.ingress.cut_consumption(cut),
+        Some(novarocks_control_runtime_core::completion::Consumption::Pending)
+    );
+    // This fixture saved the real committed record before retiring it. Use
+    // that actual proof for teardown, rather than infer it from absence.
+    assert_eq!(actual.phase, InputPhase::Committed);
+    h.ingress.summary_consumed(Some(cut)).unwrap();
+    h.ingress.observe_cut_exit(cut, true, true).unwrap();
+    h.ingress.consume_cut(cut, 0).unwrap();
+    h.inbox.retire_after_exit(cut).unwrap();
+    h.finish();
 }

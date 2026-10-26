@@ -18,8 +18,14 @@
 //! A Task's short handoff lock: compressed proposals and prepaid causal cuts.
 //! Rich source disposal is always returned to a submitter or a host executor.
 
+use novarocks_control_runtime_core::{
+    completion::Consumption,
+    identity::{Generation, WorkId},
+};
 use novarocks_execution::runtime::fragment::ExecutionFailure;
 use novarocks_execution_contract::TaskConclusionProposal;
+use novarocks_execution_contract::TaskIdentity;
+use novarocks_worker_protocol::context::ContextInput;
 use novarocks_worker_protocol::proposal_summary::{
     CausalSegments, CutError, CutId, Diagnostic, ProposalSummary, SourceId,
 };
@@ -29,7 +35,32 @@ struct State {
     segments: CausalSegments,
     sources: BTreeMap<SourceId, ManuallyDrop<ExecutionFailure>>,
     last_source: u64,
+    last_cut: u64,
+    events: BTreeMap<CutId, EventCell>,
     failed: bool,
+}
+struct EventCell {
+    task: TaskIdentity,
+    work: Option<WorkId>,
+    phase: EventPhase,
+    kind: CausalEventKind,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum CausalEventKind {
+    Settlement,
+    ApplyClose(Generation),
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EventPhase {
+    Reserved,
+    Registered,
+    Taken,
+    Unused,
+}
+pub(crate) struct CausalEventInput {
+    pub prefix: SummaryInput,
+    pub work: WorkId,
+    pub event: ContextInput,
 }
 
 pub(crate) struct TaskProposalIngress {
@@ -60,6 +91,8 @@ impl TaskProposalIngress {
                 segments: CausalSegments::new(max_cuts),
                 sources: BTreeMap::new(),
                 last_source: 0,
+                last_cut: 0,
+                events: BTreeMap::new(),
                 failed: false,
             }),
         })
@@ -132,11 +165,143 @@ impl TaskProposalIngress {
 
     /// Called before the role acquires captures, not at registration time.
     pub(crate) fn reserve_cut(&self, cut: CutId, consumers: u64) -> Result<(), CutError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        if state.failed {
+            return Err(CutError::NotReady);
+        }
+        state.segments.reserve_cut(cut, consumers)?;
+        state.last_cut = cut.0;
+        Ok(())
+    }
+    pub(crate) fn reserve_event_cut(
+        &self,
+        task: TaskIdentity,
+        kind: CausalEventKind,
+        consumers: u64,
+    ) -> Result<CutId, CutError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        if state.failed {
+            return Err(CutError::NotReady);
+        }
+        let cut = CutId(
+            state
+                .last_cut
+                .checked_add(1)
+                .ok_or(CutError::IdentityExhausted)?,
+        );
+        state.segments.reserve_cut(cut, consumers)?;
+        state.last_cut = cut.0;
+        assert!(
+            state
+                .events
+                .insert(
+                    cut,
+                    EventCell {
+                        task,
+                        work: None,
+                        phase: EventPhase::Reserved,
+                        kind
+                    }
+                )
+                .is_none()
+        );
+        Ok(cut)
+    }
+    pub(crate) fn bind_event_work(&self, cut: CutId, work: WorkId) -> Result<(), CutError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        let event = state.events.get_mut(&cut).ok_or(CutError::Unknown)?;
+        if event.phase != EventPhase::Reserved || event.work.is_some() {
+            return Err(CutError::NotReserved);
+        }
+        event.work = Some(work);
+        Ok(())
+    }
+    /// Existing admitted cleanup authority can register after failure. It
+    /// still occupies its original cut for supervisor takeover; no fresh
+    /// source, normal input position or work is admitted here.
+    pub(crate) fn register_causal_event(&self, cut: CutId) -> Result<(), CutError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        let event = state.events.get(&cut).ok_or(CutError::Unknown)?;
+        if event.phase != EventPhase::Reserved || event.work.is_none() {
+            return Err(CutError::NotReserved);
+        }
+        state.segments.seal_cut(cut)?;
+        state
+            .events
+            .get_mut(&cut)
+            .expect("original event cell")
+            .phase = EventPhase::Registered;
+        Ok(())
+    }
+    pub(crate) fn revoke_event(&self, cut: CutId) -> Result<(), CutError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        let event = state.events.get_mut(&cut).ok_or(CutError::Unknown)?;
+        if event.phase != EventPhase::Reserved {
+            return Err(CutError::NotReserved);
+        }
+        event.phase = EventPhase::Unused;
+        Ok(())
+    }
+    pub(crate) fn event_unused(&self, cut: CutId) -> Result<bool, CutError> {
+        let state = self.state.lock().expect("task proposal handoff lock");
+        Ok(state.events.get(&cut).ok_or(CutError::Unknown)?.phase == EventPhase::Unused)
+    }
+    pub(crate) fn take_next_event(&self, abandon: bool) -> Result<CausalEventInput, CutError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        if state.failed != abandon {
+            return Err(CutError::NotReady);
+        }
+        let cut = state.segments.next_cut().ok_or(CutError::NotReady)?;
+        let event = state.events.get(&cut).ok_or(CutError::NotReady)?;
+        if event.phase != EventPhase::Registered {
+            return Err(CutError::NotReady);
+        }
+        let (task, work, kind) = (
+            event.task,
+            event.work.expect("bound admitted event"),
+            event.kind,
+        );
+        let summary = if abandon {
+            state.segments.begin_abandon(cut)?
+        } else {
+            state.segments.begin_consume(cut)?
+        };
+        state
+            .events
+            .get_mut(&cut)
+            .expect("original event cell")
+            .phase = EventPhase::Taken;
+        if abandon {
+            state.segments.finish_abandon(cut)?;
+        }
+        let event = match kind {
+            CausalEventKind::Settlement => ContextInput::Settle { task, work },
+            CausalEventKind::ApplyClose(generation) => {
+                ContextInput::ApplyTaskClose { task, generation }
+            }
+        };
+        Ok(CausalEventInput {
+            prefix: SummaryInput {
+                cut: Some(cut),
+                summary,
+            },
+            work,
+            event,
+        })
+    }
+    pub(crate) fn cut_consumption(&self, cut: CutId) -> Option<Consumption> {
         self.state
             .lock()
             .expect("task proposal handoff lock")
             .segments
-            .reserve_cut(cut, consumers)
+            .core_consumption(cut)
+    }
+    pub(crate) fn abandon_consuming_event(&self, cut: CutId) -> Result<(), CutError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        if !state.failed {
+            return Err(CutError::NotReady);
+        }
+        state.segments.abandon_consuming(cut)
     }
 
     /// The actual input handoff linearizes here with proposals, independently
@@ -151,7 +316,13 @@ impl TaskProposalIngress {
 
     pub(crate) fn take_next_summary(&self) -> Result<SummaryInput, CutError> {
         let mut state = self.state.lock().expect("task proposal handoff lock");
+        if state.failed {
+            return Err(CutError::NotReady);
+        }
         if let Some(cut) = state.segments.next_cut() {
+            if state.events.contains_key(&cut) {
+                return Err(CutError::NotReady);
+            }
             let summary = state.segments.begin_consume(cut)?;
             Ok(SummaryInput {
                 cut: Some(cut),
@@ -221,19 +392,17 @@ impl TaskProposalIngress {
     }
 
     pub(crate) fn retire_cut(&self, cut: CutId) -> Result<(), CutError> {
-        self.state
-            .lock()
-            .expect("task proposal handoff lock")
-            .segments
-            .retire(cut)
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        state.segments.retire(cut)?;
+        state.events.remove(&cut);
+        Ok(())
     }
 
     pub(crate) fn revoke_unused_cut(&self, cut: CutId) -> Result<(), CutError> {
-        self.state
-            .lock()
-            .expect("task proposal handoff lock")
-            .segments
-            .revoke_unused(cut)
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        state.segments.revoke_unused(cut)?;
+        state.events.remove(&cut);
+        Ok(())
     }
 
     /// Failure seals handoff, but does not adjudicate or dispose any candidate.
@@ -436,6 +605,10 @@ mod tests {
                 .is_none()
         );
         ingress.fail();
+        assert!(
+            matches!(ingress.take_next_summary(), Err(CutError::NotReady)),
+            "a failed target cannot resume normal summary adjudication"
+        );
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(ingress.submit(failure(&ingress, &drops)));
         assert_eq!(drops.load(Ordering::SeqCst), 1);

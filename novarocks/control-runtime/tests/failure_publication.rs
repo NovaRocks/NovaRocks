@@ -258,6 +258,132 @@ fn drain(mut f: Fixture) {
     assert!(f.ledger.is_empty());
 }
 
+struct Incarnation {
+    scope: ScopeHandle,
+    work: [(WorkLease, CapacityBundle); 2],
+    input: InputId,
+    cleanup: EffectTicket<u64>,
+}
+fn failed_incarnation(runtime: &ActorRuntime<FailingActor>, ledger: &RuntimeLedger) -> Incarnation {
+    let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
+    let admit = |kind| {
+        let (mut work, capacity) = scope
+            .reserve_next(generation(), vector(1), kind, WorkAdmission::External)
+            .unwrap()
+            .bind(kind)
+            .unwrap();
+        work.start().unwrap();
+        (work, capacity)
+    };
+    let work = [admit(WorkKind::Business), admit(WorkKind::Cleanup)];
+    runtime
+        .register_next(
+            aid(),
+            scope.clone(),
+            FailingActor,
+            ActorConfig {
+                mailbox: [1; 4],
+                max_batches: 1,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+        )
+        .unwrap();
+    let input = runtime
+        .reserve_input(aid(), aid(), InputClass::Ordinary)
+        .unwrap()
+        .fill(99)
+        .unwrap();
+    runtime.poll_one(Tick(1)).unwrap();
+    let cleanup = runtime.take_effect(aid(), input, action(17)).unwrap();
+    Incarnation {
+        scope,
+        work,
+        input,
+        cleanup,
+    }
+}
+fn retire_incarnation(
+    runtime: &ActorRuntime<FailingActor>,
+    ledger: &RuntimeLedger,
+    incarnation: Incarnation,
+) {
+    for (mut work, mut capacity) in incarnation.work {
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        capacity.release(&vector(1)).unwrap();
+    }
+    runtime.effect_completed(incarnation.cleanup).unwrap();
+    runtime.retire_input(aid(), incarnation.input).unwrap();
+    ledger.reap_scope_ready(incarnation.scope.id(), 2).unwrap();
+    drop(runtime.take_failure_payload(aid()).unwrap());
+    while let Some(actor) = runtime.claim_effect_actor() {
+        runtime.release_effect_actor(actor, false).unwrap();
+    }
+    runtime.remove_actor(aid()).unwrap();
+    ledger.remove_scope(incarnation.scope.id()).unwrap();
+    assert!(ledger.is_empty());
+}
+
+fn reject_reused_actor_session(different_ledger: bool) {
+    let ledger = RuntimeLedger::new(vector(2), 2, 1);
+    let runtime = ActorRuntime::new(1);
+    let first = failed_incarnation(&runtime, &ledger);
+    let mut stale = runtime.claim_failure_publication(&first.cleanup).unwrap();
+    let original_scope = first.scope.id();
+    let original_input = first.input;
+    let original_work = first.cleanup.descriptor.work;
+    let original_generation = first.cleanup.generation;
+    retire_incarnation(&runtime, &ledger, first);
+
+    let next_ledger = if different_ledger {
+        RuntimeLedger::new(vector(2), 2, 1)
+    } else {
+        ledger.clone()
+    };
+    let second = failed_incarnation(&runtime, &next_ledger);
+    if different_ledger {
+        assert_eq!(second.scope.id(), original_scope);
+    } else {
+        assert_ne!(second.scope.id(), original_scope);
+    }
+    assert_eq!(second.input, original_input);
+    assert_eq!(second.cleanup.descriptor.work, original_work);
+    assert_eq!(second.cleanup.generation, original_generation);
+    let mut current = runtime.claim_failure_publication(&second.cleanup).unwrap();
+    let stale_matches = stale.matches_actor_runtime(&runtime, aid());
+    let current_matches = current.matches_actor_runtime(&runtime, aid());
+    let target = PublishedSnapshot::new(&second.scope, Arc::new("new bootstrap"));
+    let rejected = stale.commit_snapshot(&target, Arc::new("stale owner"));
+    let after_stale = *target.read();
+    let replacement = current.commit_snapshot(&target, Arc::new("current owner"));
+    let after_current = *target.read();
+    // Always retire actual work before asserting the intended regression, so
+    // an old implementation fails once rather than unwinding live actor custody.
+    retire_incarnation(&runtime, &next_ledger, second);
+    assert_eq!(stale_matches, Err(DriverError::PublicationTargetMismatch));
+    assert_eq!(current_matches, Ok(true));
+    assert!(
+        matches!(rejected, Err((DriverError::PublicationTargetMismatch, _))),
+        "a retired scope's session must not acquire the new actor incarnation: {rejected:?}"
+    );
+    assert_eq!(after_stale, "new bootstrap");
+    assert!(replacement.is_ok());
+    assert_eq!(after_current, "current owner");
+}
+
+#[test]
+fn stale_session_cannot_publish_into_a_reused_actor_with_matching_local_identifiers() {
+    reject_reused_actor_session(false);
+}
+
+#[test]
+fn stale_session_cannot_follow_reused_scope_numbers_in_another_ledger() {
+    reject_reused_actor_session(true);
+}
+
 #[test]
 fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing_its_ticket() {
     let f = fixture(WorkKind::Cleanup, true);
@@ -269,6 +395,19 @@ fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing
         "old generation cannot claim"
     );
     let mut session = f.runtime.claim_failure_publication(initial).unwrap();
+    assert!(session.matches_actor_runtime(&f.runtime, aid()).unwrap());
+    assert!(
+        session
+            .matches_actor_runtime(&f.runtime.clone(), aid())
+            .unwrap()
+    );
+    assert!(
+        !session
+            .matches_actor_runtime(&f.runtime, ActorId::new(2).unwrap())
+            .unwrap()
+    );
+    let unrelated = ActorRuntime::<FailingActor>::new(1);
+    assert!(!session.matches_actor_runtime(&unrelated, aid()).unwrap());
     assert_eq!(
         f.runtime.claim_failure_publication(initial).unwrap_err(),
         DriverError::FailurePublicationAlreadyClaimed
@@ -369,7 +508,12 @@ fn cleanup_work_must_be_started_and_still_have_a_live_body_for_each_commit() {
         .claim_failure_publication(f.initial.as_ref().unwrap())
         .unwrap();
     let target = PublishedSnapshot::new(&f.scope, Arc::new(0));
+    assert!(session.matches_actor_runtime(&f.runtime, aid()).unwrap());
     f.cleanup.body_exited().unwrap();
+    assert_eq!(
+        session.matches_actor_runtime(&f.runtime, aid()),
+        Err(DriverError::FailureWorkInactive)
+    );
     assert_eq!(
         session.commit_snapshot(&target, Arc::new(1)).unwrap_err().0,
         DriverError::FailureWorkInactive

@@ -223,6 +223,7 @@ pub struct CutId(pub u64);
 pub enum CutError {
     Full,
     IdentityOrder,
+    IdentityExhausted,
     Unknown,
     NotReserved,
     NotReady,

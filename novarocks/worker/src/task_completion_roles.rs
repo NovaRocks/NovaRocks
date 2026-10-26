@@ -298,6 +298,7 @@ mod tests {
     }
     struct Registered(Arc<AtomicUsize>);
     impl RegistrationNotice for Registered {
+        fn bind_work(&mut self, _: novarocks_control_runtime_core::identity::WorkId) {}
         fn registered(self: Box<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }

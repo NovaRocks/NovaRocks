@@ -21,6 +21,7 @@
 
 use super::{
     actors::{WorkerAction, WorkerActor},
+    causal::{CausalError, TaskCausalInbox},
     loading::{LoaderCustody, LoaderJob, LoadingSources, TaskCreatePayload},
     preparation::{
         PreparationAdoptionError, PreparationBinding, PreparationCustody, PreparationJob,
@@ -42,7 +43,7 @@ use novarocks_control_runtime::{
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
     completion::ConsumerKind,
-    identity::{ConsumerId, Generation, ReservationId},
+    identity::{ActorId, ConsumerId, Generation, ReservationId},
     scope::WorkKind,
 };
 use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
@@ -52,6 +53,10 @@ use std::sync::Arc;
 
 pub(crate) struct TaskHostBinding {
     pub context: QueryContextRef,
+    /// One host-issued source identity shared by this Task's causal authors.
+    /// It is neither a WorkId cast nor one independent source per role.
+    pub task_source: ActorId,
+    pub protocol_generation: Generation,
     pub max_cuts: usize,
     pub pending: Arc<dyn TaskPendingNotice>,
     pub health: Arc<ExecutionHealth>,
@@ -115,6 +120,7 @@ pub(crate) struct TaskHostResources {
     pub preparation: Option<PreparationCustody>,
     pub preparation_remainder: Option<CapacityBundle>,
     pub completion: Option<Arc<TaskCompletionRoles>>,
+    pub causal: TaskCausalInbox,
 }
 
 /// The original request is a real preparation capture, not retained Task
@@ -182,6 +188,7 @@ pub(crate) struct TaskHostRecord {
     // One original fragment factory, including a failed partial admission.
     // Replaying a request or cloning the port never reissues these positions.
     completion_issued: bool,
+    settlement_notice_issued: bool,
     loader_issued: bool,
 }
 impl TaskHostRecord {
@@ -213,7 +220,7 @@ impl TaskHostRecord {
         let port = Arc::new(TaskRuntimePort::from_admitted(
             task,
             &scope,
-            ingress,
+            ingress.clone(),
             binding.pending.clone(),
             binding.health.clone(),
         ));
@@ -233,13 +240,48 @@ impl TaskHostRecord {
                 preparation: None,
                 preparation_remainder: None,
                 completion: None,
+                causal: TaskCausalInbox::new(
+                    runtime.clone(),
+                    ticket.actor,
+                    binding.task_source,
+                    task,
+                    binding.protocol_generation,
+                    ingress,
+                ),
             },
             completion_issued: false,
+            settlement_notice_issued: false,
             loader_issued: false,
         })
     }
     pub(crate) fn port(&self) -> Arc<TaskRuntimePort> {
         self.resources.port.clone()
+    }
+    pub(crate) fn admit_settlement_notice(
+        &mut self,
+        consumers: u64,
+    ) -> Result<
+        (
+            novarocks_worker_protocol::proposal_summary::CutId,
+            Box<dyn RegistrationNotice>,
+        ),
+        CausalError,
+    > {
+        if self.resources.preparation.is_none() {
+            return Err(CausalError::BeforeAccepted);
+        }
+        if self.settlement_notice_issued {
+            return Err(CausalError::AlreadyAdmitted);
+        }
+        let admitted = self
+            .resources
+            .causal
+            .admit_settlement(consumers, self.pending.clone())?;
+        self.settlement_notice_issued = true;
+        Ok(admitted)
+    }
+    pub(crate) fn causal(&mut self) -> &mut TaskCausalInbox {
+        &mut self.resources.causal
     }
     pub(crate) fn begin_loader(
         &mut self,

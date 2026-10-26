@@ -21,7 +21,7 @@
 use crate::{
     completion::ReportSlot,
     lease::{CapacityBundle, WorkLease},
-    sync::{Arc, Mutex},
+    sync::{Arc, AtomicBool, Mutex, Ordering},
     transaction::RuntimeError,
 };
 use novarocks_control_runtime_core::{identity::Generation, scope::ScopeError};
@@ -48,6 +48,7 @@ pub enum ContinuationPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContinuationError {
     InvalidPhase(ContinuationPhase),
+    DispatchBusy,
     Runtime(RuntimeError),
 }
 impl From<RuntimeError> for ContinuationError {
@@ -86,6 +87,34 @@ struct Custody<T: Send + 'static> {
     // The original work, captures and panic remain owned if external handles
     // disappear. Only successful explicit retirement breaks this custody cycle.
     retained: Mutex<Option<Arc<Self>>>,
+    dispatching: AtomicBool,
+}
+
+/// One nonblocking host execution claim over preparation, optional input
+/// refresh, invocation and capture disposal. No mutex spans foreign work.
+/// Mutable access prevents two executors from refreshing one ready call with
+/// independently read snapshots. The claim grants no work/registration credit.
+pub struct ContinuationDispatch<T: Send + 'static> {
+    slot: ContinuationSlot<T>,
+}
+impl<T: Send + 'static> Drop for ContinuationDispatch<T> {
+    fn drop(&mut self) {
+        self.slot.0.dispatching.store(false, Ordering::Release);
+    }
+}
+impl<T: Send + 'static> ContinuationDispatch<T> {
+    pub fn refresh_ready_value(&mut self, value: T) -> Result<T, (ContinuationError, T)> {
+        self.slot.refresh_ready_value(value)
+    }
+    pub fn invoke(&mut self) -> Result<InvocationResult, ContinuationError> {
+        self.slot.invoke_guarded(None)
+    }
+    pub fn invoke_in_generation(
+        &mut self,
+        generation: Generation,
+    ) -> Result<InvocationResult, ContinuationError> {
+        self.slot.invoke_guarded(Some(generation))
+    }
 }
 
 /// Clones address the same prepaid role; they cannot issue another token.
@@ -171,6 +200,7 @@ impl<T: Send + 'static> ContinuationSlot<T> {
             }),
             report,
             retained: Mutex::new(None),
+            dispatching: AtomicBool::new(false),
         });
         *custody
             .retained
@@ -189,6 +219,13 @@ impl<T: Send + 'static> ContinuationSlot<T> {
             .lock()
             .expect("continuation custody lock")
             .phase
+    }
+    pub fn try_claim_dispatch(&self) -> Option<ContinuationDispatch<T>> {
+        self.0
+            .dispatching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| ContinuationDispatch { slot: self.clone() })
     }
     pub fn body_exited(&self) -> bool {
         self.0
@@ -232,7 +269,7 @@ impl<T: Send + 'static> ContinuationSlot<T> {
     /// its input is not a frozen result. Before a delayed start, the host may
     /// supply its latest actually published projection. Both old and rejected
     /// values return to the host; no foreign destructor runs under this lock.
-    pub fn refresh_ready_value(&self, value: T) -> Result<T, (ContinuationError, T)> {
+    fn refresh_ready_value(&self, value: T) -> Result<T, (ContinuationError, T)> {
         let value = ManuallyDrop::new(value);
         let mut state = self.0.state.lock().expect("continuation custody lock");
         if state.phase != ContinuationPhase::Ready {
@@ -247,7 +284,9 @@ impl<T: Send + 'static> ContinuationSlot<T> {
     /// Runs only on a host executor. No custody, inbox or ledger lock spans the
     /// callback call, argument disposal, capture disposal or panic unwinding.
     pub fn invoke(&self) -> Result<InvocationResult, ContinuationError> {
-        self.invoke_guarded(None)
+        self.try_claim_dispatch()
+            .ok_or(ContinuationError::DispatchBusy)?
+            .invoke()
     }
     /// Retryable generation rejection keeps the complete registered callback,
     /// published input and original work ready for the failure owner. It is
@@ -256,7 +295,9 @@ impl<T: Send + 'static> ContinuationSlot<T> {
         &self,
         generation: Generation,
     ) -> Result<InvocationResult, ContinuationError> {
-        self.invoke_guarded(Some(generation))
+        self.try_claim_dispatch()
+            .ok_or(ContinuationError::DispatchBusy)?
+            .invoke_in_generation(generation)
     }
     fn invoke_guarded(
         &self,

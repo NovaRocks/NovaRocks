@@ -531,6 +531,10 @@ pub struct EffectTicket<E> {
 pub struct FailurePublicationSession<A: Actor> {
     runtime: ActorRuntime<A>,
     actor: ActorId,
+    // ActorIds may be registered again after actual removal, and WorkIds are
+    // scope-local. Preserve the original scope and ledger identity even after
+    // its work exits; a later incarnation cannot inherit this authority.
+    scope: ScopeHandle,
     input: InputId,
     generation: Generation,
     action: ActionId,
@@ -540,6 +544,7 @@ impl<A: Actor> std::fmt::Debug for FailurePublicationSession<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FailurePublicationSession")
             .field("actor", &self.actor)
+            .field("scope", &self.scope.id())
             .field("generation", &self.generation)
             .field("work", &self.work)
             .finish()
@@ -549,14 +554,38 @@ impl<A: Actor> FailurePublicationSession<A> {
     pub const fn generation(&self) -> Generation {
         self.generation
     }
+    /// Read-only qualification of this original, still-running failure job.
+    /// It signs no publication action and changes no watermark or custody.
+    pub fn matches_actor_runtime(
+        &self,
+        runtime: &ActorRuntime<A>,
+        actor: ActorId,
+    ) -> Result<bool, DriverError> {
+        if actor != self.actor || !Arc::ptr_eq(&runtime.shared, &self.runtime.shared) {
+            return Ok(false);
+        }
+        let node = runtime.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let ledger = node
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        self.validate(&node, &inbox, &ledger, &self.scope)?;
+        Ok(true)
+    }
     fn validate(
         &self,
         node: &ActorCell<A>,
         inbox: &Inbox<A>,
         ledger: &crate::transaction::LedgerState,
         target: &ScopeHandle,
-    ) -> Result<ActionId, DriverError> {
-        if node.scope.id() != target.id()
+    ) -> Result<(), DriverError> {
+        if node.scope.id() != self.scope.id()
+            || !Arc::ptr_eq(&node.scope.runtime.shared, &self.scope.runtime.shared)
+            || node.scope.id() != target.id()
             || !Arc::ptr_eq(&node.scope.runtime.shared, &target.runtime.shared)
         {
             return Err(DriverError::PublicationTargetMismatch);
@@ -581,6 +610,9 @@ impl<A: Actor> FailurePublicationSession<A> {
         {
             return Err(EffectError::StaleGeneration.into());
         }
+        Ok(())
+    }
+    fn next_publication_action(inbox: &Inbox<A>) -> Result<ActionId, DriverError> {
         inbox
             .failure_action_watermark
             .checked_add(1)
@@ -605,7 +637,10 @@ impl<A: Actor> FailurePublicationSession<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let action = match self.validate(&node, &inbox, &ledger, &target.owner) {
+        let action = match self
+            .validate(&node, &inbox, &ledger, &target.owner)
+            .and_then(|()| Self::next_publication_action(&inbox))
+        {
             Ok(action) => action,
             Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
         };
@@ -646,7 +681,10 @@ impl<A: Actor> FailurePublicationSession<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let action = match self.validate(&node, &inbox, &ledger, &target.owner) {
+        let action = match self
+            .validate(&node, &inbox, &ledger, &target.owner)
+            .and_then(|()| Self::next_publication_action(&inbox))
+        {
             Ok(action) => action,
             Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
         };
@@ -1511,6 +1549,7 @@ impl<A: Actor> ActorRuntime<A> {
         Ok(FailurePublicationSession {
             runtime: self.clone(),
             actor: ticket.actor,
+            scope: node.scope.clone(),
             input: ticket.input,
             generation: ticket.generation,
             action: ticket.descriptor.id,
@@ -1960,6 +1999,23 @@ impl<A: Actor> ActorRuntime<A> {
             .collect())
     }
     /// Actual input custody is available to bounded scope-failure teardown, never from core private tables.
+    pub fn input_custody(
+        &self,
+        actor: ActorId,
+        input: InputId,
+    ) -> Result<Option<InputCustody>, DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        Ok(inbox.inputs.get(&input).map(|record| InputCustody {
+            input,
+            source: record.source,
+            class: record.class,
+            phase: record.phase,
+            role: record.role,
+        }))
+    }
+    /// Enumerates the same actual input records; a point read grants no start
+    /// or publication authority and changes no consumption or exit fact.
     pub fn input_inventory(
         &self,
         actor: ActorId,

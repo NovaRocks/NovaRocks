@@ -185,12 +185,14 @@ fn failure_before_delayed_start_keeps_original_callback_ready_for_the_new_genera
     assert!(!f.slot.captures_exited());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(f.ledger.unresolved_work().is_empty());
-    assert_eq!(f.slot.refresh_ready_value(42).unwrap(), 0);
+    let mut dispatch = f.slot.try_claim_dispatch().unwrap();
+    assert_eq!(dispatch.refresh_ready_value(42).unwrap(), 0);
     assert_eq!(
-        f.slot.invoke_in_generation(next).unwrap(),
+        dispatch.invoke_in_generation(next).unwrap(),
         InvocationResult::Exited
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(dispatch);
     f.report
         .abandon_failed_owner(f.owner, &f.scope, generation())
         .unwrap();

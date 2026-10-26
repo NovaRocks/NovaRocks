@@ -31,7 +31,17 @@ use novarocks_control_runtime_core::{
 /// them would exceed the fixed step budget, while reusing one position would
 /// make event progress wait for the predecessor's actual capture/source exit.
 pub(crate) const CAUSAL_INPUT_POSITIONS: usize = 2;
+#[cfg(test)]
 type FillResult<T> = Result<(Option<InputId>, InputId), (DriverError, Option<T>, T)>;
+pub(crate) struct CausalFillFailure<T> {
+    pub error: DriverError,
+    pub predecessor: Option<T>,
+    pub event: T,
+    /// The prefix may have transferred even when the event fill was refused.
+    /// Keep its exact original identity; queue/role disappearance is not proof
+    /// that a concurrent failure owner never received that prefix.
+    pub predecessor_input: Option<InputId>,
+}
 
 pub(crate) struct CausalInputRole<A: Actor> {
     predecessor: InputRole<A>,
@@ -96,11 +106,23 @@ impl<A: Actor> CausalInputRole<A> {
     /// Errors return all values not handed off. `None` in the error's prefix
     /// means it was absent or is already real runtime custody; failure teardown
     /// must use that actual inventory instead of rolling back published input.
+    #[cfg(test)]
     pub(crate) fn fill(
         &mut self,
         predecessor: Option<A::Input>,
         event: A::Input,
     ) -> FillResult<A::Input> {
+        self.fill_with_receipt(predecessor, event)
+            .map_err(|failure| (failure.error, failure.predecessor, failure.event))
+    }
+    pub(crate) fn in_flight(&self) -> Result<[Option<InputId>; 2], DriverError> {
+        Ok([self.predecessor.in_flight()?, self.event.in_flight()?])
+    }
+    pub(crate) fn fill_with_receipt(
+        &mut self,
+        predecessor: Option<A::Input>,
+        event: A::Input,
+    ) -> Result<(Option<InputId>, InputId), CausalFillFailure<A::Input>> {
         let idle = self.predecessor.in_flight().and_then(|prefix| {
             self.event
                 .in_flight()
@@ -108,20 +130,46 @@ impl<A: Actor> CausalInputRole<A> {
         });
         match idle {
             Ok(true) => {}
-            Ok(false) => return Err((DriverError::RoleBusy, predecessor, event)),
-            Err(error) => return Err((error, predecessor, event)),
+            Ok(false) => {
+                return Err(CausalFillFailure {
+                    error: DriverError::RoleBusy,
+                    predecessor,
+                    event,
+                    predecessor_input: None,
+                });
+            }
+            Err(error) => {
+                return Err(CausalFillFailure {
+                    error,
+                    predecessor,
+                    event,
+                    predecessor_input: None,
+                });
+            }
         }
         let predecessor = if let Some(value) = predecessor {
             match self.predecessor.fill(value) {
                 Ok(input) => Some(input),
-                Err((error, value)) => return Err((error, Some(value), event)),
+                Err((error, value)) => {
+                    return Err(CausalFillFailure {
+                        error,
+                        predecessor: Some(value),
+                        event,
+                        predecessor_input: None,
+                    });
+                }
             }
         } else {
             None
         };
         match self.event.fill(event) {
             Ok(input) => Ok((predecessor, input)),
-            Err((error, value)) => Err((error, None, value)),
+            Err((error, value)) => Err(CausalFillFailure {
+                error,
+                predecessor: None,
+                event: value,
+                predecessor_input: predecessor,
+            }),
         }
     }
     /// The higher-level owner has proved actual holder/capture/report exit.

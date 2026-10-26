@@ -25,4 +25,6 @@ pub(crate) mod preparation;
 
 pub(crate) mod task;
 
+pub(crate) mod causal;
+pub(crate) mod failure;
 pub(crate) mod loading;
