@@ -70,6 +70,147 @@ fn operation(n: u8) -> TaskOperationId {
     bytes[8] = 0x80;
     TaskOperationId::try_from_bytes(bytes).unwrap()
 }
+
+#[test]
+fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_close_capacity() {
+    use crate::control_runtime::preparation::{
+        PREPARATION_CORE_CONSUMER, PREPARATION_OBSERVER_CONSUMER, PreparationCustody,
+        PreparationOutcome, PreparationQueue,
+    };
+    use crate::task_port::TaskPendingNotice;
+    use novarocks_execution_contract::{CreationContent, FrozenBytes, TaskCreationInput};
+    use std::{any::Any, sync::Arc};
+    struct Pending;
+    impl TaskPendingNotice for Pending {
+        fn pending(&self) {}
+    }
+    #[derive(Debug)]
+    struct Assignment;
+    impl CreationContent for Assignment {
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn retained_bytes(&self) -> usize {
+            0
+        }
+        fn into_stored(self: Box<Self>) -> Box<dyn Any + Send> {
+            self
+        }
+    }
+    let mut f = Fixture::new();
+    let task = task(f.identity, 1);
+    let input = TaskCreationInput::new(
+        FrozenBytes::freeze(bytes::Bytes::new()),
+        Box::new(Assignment),
+    );
+    let cost = CreationCost {
+        input_retained_bytes: u64::try_from(input.retained_bytes()).unwrap(),
+        ingress_retained_bytes: 2,
+        structural_bytes: 4,
+        inbound_records: 1,
+        inbound_bytes: 9,
+    };
+    f.run(
+        ContextInput::Create {
+            request: operation(1),
+            task,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+    );
+    let loaded = f.send(
+        ContextInput::Loaded {
+            task,
+            result: Ok(cost),
+        },
+        None,
+        InputClass::Lifecycle,
+        2,
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
+    let mut dispatch = crate::control_runtime::effect_dispatch::EffectDispatch::new(actor(), 15);
+    dispatch.index_committed(&f.runtime, 32).unwrap();
+    let publication = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
+    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &publication.effect
+    else {
+        panic!("Accepted snapshot is the first actual publication");
+    };
+    assert!(
+        dispatch.take_ready(&f.runtime, 15).unwrap().is_none(),
+        "preparation and reply cannot precede Accepted visibility"
+    );
+    let target = novarocks_control_runtime::publication::PublishedSnapshot::new(
+        &f.scope,
+        Arc::new(novarocks_execution_contract::TaskStatus::created(task)),
+    );
+    drop(
+        f.runtime
+            .commit_snapshot(&publication, &target, Arc::new(snapshot.clone()))
+            .unwrap(),
+    );
+    dispatch
+        .publication_committed(&f.runtime, &publication)
+        .unwrap();
+    let ticket = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
+    let reservation = match ticket.effect {
+        WorkerAction::Context(ContextEffect::EnqueuePreparation { reservation, .. }) => reservation,
+        _ => unreachable!(),
+    };
+    let (custody, job) = PreparationCustody::adopt(
+        &f.runtime,
+        &ticket,
+        input,
+        Arc::new(Pending),
+        Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+    )
+    .unwrap_or_else(|(error, _)| panic!("original Accepted guard adoption: {error}"));
+    assert!(matches!(
+        f.runtime.take_step_reservation(&ticket, reservation),
+        Err(DriverError::UnknownReservation)
+    ));
+    let queue = PreparationQueue::new(1, 1, 1, 1);
+    queue
+        .enqueue(job)
+        .unwrap_or_else(|_| panic!("prepaid actual queue position"));
+    f.runtime.effect_completed(ticket).unwrap();
+    f.runtime.effect_completed(publication).unwrap();
+    f.drain(loaded);
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
+    assert!(matches!(
+        queue.pop().unwrap().run(|input, _| {
+            let (_, assignment) = input.into_parts();
+            assert!(assignment.into_stored().downcast::<Assignment>().is_ok());
+        }),
+        PreparationOutcome::Returned(())
+    ));
+    f.run(
+        ContextInput::Physical {
+            task,
+            fact: PhysicalFact::PreparationBodyExited,
+        },
+        None,
+    );
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
+    assert!(custody.publish_whole_exit().unwrap());
+    f.run(
+        ContextInput::Physical {
+            task,
+            fact: PhysicalFact::PreparationExited,
+        },
+        None,
+    );
+    for report in [custody.body_report(), custody.exit_report()] {
+        report.consume(PREPARATION_CORE_CONSUMER).unwrap();
+        report.consume(PREPARATION_OBSERVER_CONSUMER).unwrap();
+    }
+    let mut retained = custody.take_after_exit().unwrap().unwrap();
+    assert_eq!(retained.id(), reservation);
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 0);
+    assert_eq!(f.ledger.used(Dimension::InboundBytes.id()), 9);
+    let resources = retained.resources().unwrap();
+    retained.release(&resources).unwrap();
+    f.finish();
+}
 fn empty() -> ResourceVector {
     ResourceVector::default()
 }

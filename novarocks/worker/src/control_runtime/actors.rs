@@ -58,6 +58,10 @@ pub(crate) enum ContextMessage {
     Timer,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Prepaid effect positions store bounded neutral protocol values inline; no host payload or foreign destructor is carried."
+)]
 #[derive(Clone, Debug)]
 pub(crate) enum WorkerAction {
     Context(ContextEffect),
@@ -163,11 +167,23 @@ impl Actor for ContextActor {
             let mut dependencies = Vec::new();
             let mut effect_work = work;
             let kind = match &effect {
-                ContextEffect::LoadInput { reservation, .. }
-                | ContextEffect::EnqueuePreparation { reservation, .. } => {
+                ContextEffect::LoadInput { reservation, .. } => {
                     effect_work = *reservations
                         .get(reservation)
                         .expect("original step reservation accompanies host admission");
+                    EffectKind::Business
+                }
+                ContextEffect::EnqueuePreparation {
+                    task, reservation, ..
+                } => {
+                    effect_work = *reservations
+                        .get(reservation)
+                        .expect("original Accepted reservation accompanies preparation");
+                    dependencies.push(
+                        *publications
+                            .get(task)
+                            .expect("Accepted publication precedes preparation dispatch"),
+                    );
                     EffectKind::Business
                 }
                 ContextEffect::PublishTask { task, .. }

@@ -58,7 +58,7 @@ struct Work {
     health: Arc<ExecutionHealth>,
 }
 impl Work {
-    fn exited(mut self: Box<Self>) {
+    fn exited(mut self) {
         self.authority
             .take()
             .expect("unique original role exit authority")

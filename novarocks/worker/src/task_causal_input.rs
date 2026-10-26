@@ -31,6 +31,7 @@ use novarocks_control_runtime_core::{
 /// them would exceed the fixed step budget, while reusing one position would
 /// make event progress wait for the predecessor's actual capture/source exit.
 pub(crate) const CAUSAL_INPUT_POSITIONS: usize = 2;
+type FillResult<T> = Result<(Option<InputId>, InputId), (DriverError, Option<T>, T)>;
 
 pub(crate) struct CausalInputRole<A: Actor> {
     predecessor: InputRole<A>,
@@ -99,7 +100,7 @@ impl<A: Actor> CausalInputRole<A> {
         &mut self,
         predecessor: Option<A::Input>,
         event: A::Input,
-    ) -> Result<(Option<InputId>, InputId), (DriverError, Option<A::Input>, A::Input)> {
+    ) -> FillResult<A::Input> {
         let idle = self.predecessor.in_flight().and_then(|prefix| {
             self.event
                 .in_flight()

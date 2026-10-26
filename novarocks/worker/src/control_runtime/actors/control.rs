@@ -36,6 +36,10 @@ use novarocks_worker_protocol::{
 };
 use std::{collections::BTreeMap, time::Duration};
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Each paid input position stores one neutral command inline, including the payload-free timer alternative."
+)]
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
     Command {

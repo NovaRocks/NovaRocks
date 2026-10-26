@@ -69,6 +69,9 @@ impl StepGuard {
     pub const fn reservation_id(&self) -> ReservationId {
         self.reservation
     }
+    pub fn scope(&self) -> &ScopeHandle {
+        &self.scope
+    }
     pub(crate) fn belongs_to(&self, scope: &ScopeHandle) -> bool {
         self.scope.id() == scope.id()
             && crate::sync::Arc::ptr_eq(&self.scope.runtime.shared, &scope.runtime.shared)
@@ -174,7 +177,7 @@ impl WorkLease {
     }
     /// Records unknown exit while the actual custodian keeps this lease.
     /// Diagnostic responsibility is not a substitute for physical exit.
-    pub(crate) fn mark_unresolved(&self) {
+    pub fn mark_unresolved(&self) {
         self.scope
             .runtime
             .shared
