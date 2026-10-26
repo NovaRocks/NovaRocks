@@ -595,3 +595,52 @@ fn input_reservation_racing_removal_cannot_reopen_a_stale_node_with_two_preempti
         assert!(ledger.is_empty());
     });
 }
+
+#[test]
+fn reservation_parent_exit_and_unused_child_rollback_share_one_retirement_order() {
+    model(|| {
+        use novarocks_control_runtime_core::{capacity::CapacityError, scope::ScopeError};
+        let ledger = RuntimeLedger::new(resources(2), 4, 1);
+        let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+        let (mut parent, mut capacity) = scope
+            .reserve_next(
+                generation(),
+                resources(1),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Business)
+            .unwrap();
+        let parent_reservation = capacity.id();
+        scope.close_external().unwrap();
+        ledger.close_admission();
+        let exiting = thread::spawn(move || {
+            parent.body_exited().unwrap();
+            parent.captures_exited().unwrap();
+            parent
+        });
+        let deriving = scope.clone();
+        let child = thread::spawn(move || {
+            match deriving.reserve_child_next(
+                generation(),
+                parent_reservation,
+                resources(1),
+                WorkKind::Business,
+            ) {
+                Ok(unbound) => drop(unbound),
+                Err(RuntimeError::Capacity(CapacityError::Scope(
+                    ScopeError::InvalidTransition,
+                ))) => (),
+                Err(error) => panic!("unexpected parent admission result: {error}"),
+            }
+        });
+        let parent = exiting.join().unwrap();
+        child.join().unwrap();
+        assert!(parent.actual_exit_ready().unwrap());
+        assert_eq!(ledger.reap_scope_ready(scope.id(), 1).unwrap(), 1);
+        capacity.release(&resources(1)).unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    });
+}

@@ -87,12 +87,29 @@ impl Drop for StepGuard {
                 .state
                 .lock()
                 .expect("runtime ledger lock");
+            let parent = state
+                .scopes
+                .get(&self.scope.id)
+                .and_then(|scope| scope.work(self.work))
+                .expect("live unbound guard work")
+                .parent;
             let (ledger, scope) = state
                 .parts(self.scope.id)
                 .expect("live scope retains its reservation");
             ledger
                 .rollback_unbound(scope, self.reservation)
                 .expect("only a pure unbound guard rolls back");
+            // An exiting parent can have waited on precisely this child.
+            // Rollback is its real unused-child retirement, so enqueue the
+            // newly ready parent under the same transaction as that removal.
+            let ready_parent = parent.filter(|parent| {
+                scope
+                    .work_exited(*parent)
+                    .expect("unbound child retains its actual parent")
+            });
+            if let Some(parent) = ready_parent {
+                state.pending_retirement.insert((self.scope.id, parent));
+            }
             self.scope
                 .runtime
                 .shared

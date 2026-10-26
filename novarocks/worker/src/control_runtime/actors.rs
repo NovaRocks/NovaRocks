@@ -86,6 +86,7 @@ pub(crate) struct ContextActor {
     runtime_generation: Generation,
     storage: AdmissionStorage,
     timer_work: WorkId,
+    lifetime_work: WorkId,
 }
 impl ContextActor {
     pub(crate) fn new(
@@ -93,6 +94,7 @@ impl ContextActor {
         scope: ScopeHandle,
         storage: AdmissionStorage,
         timer_work: WorkId,
+        lifetime_work: WorkId,
     ) -> Self {
         let runtime_generation = scope.gates().expect("live context scope").generation;
         Self {
@@ -101,6 +103,7 @@ impl ContextActor {
             runtime_generation,
             storage,
             timer_work,
+            lifetime_work,
         }
     }
 }
@@ -131,7 +134,8 @@ impl Actor for ContextActor {
             self.runtime_generation,
             Some(self.core.identity()),
             self.storage.clone(),
-        );
+        )
+        .with_parent(self.lifetime_work);
         let result = match request {
             Some(request) => self.core.handle_request(
                 now,

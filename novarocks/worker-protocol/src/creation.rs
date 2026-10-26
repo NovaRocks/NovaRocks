@@ -49,6 +49,9 @@ pub enum AdmissionNeed {
     Preparation {
         context: QueryContextRef,
         task: TaskIdentity,
+        /// The actual loading/Task lifetime reservation. The synchronous port
+        /// resolves its live parent work inside the same ledger transaction.
+        active: ReservationId,
         generation: Generation,
         preparing_in_context: usize,
         bytes: u64,

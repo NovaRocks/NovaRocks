@@ -25,7 +25,7 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     capacity::{CapacityError, ResourceVector},
-    identity::{DimensionId, Generation, ReservationId},
+    identity::{DimensionId, Generation, ReservationId, WorkId},
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::{
@@ -134,6 +134,7 @@ pub(crate) struct ScopeAdmissionPort {
     context: Option<QueryContextRef>,
     storage: AdmissionStorage,
     guards: BTreeMap<ReservationId, StepGuard>,
+    admission: WorkAdmission,
 }
 impl ScopeAdmissionPort {
     pub(crate) fn new(
@@ -148,7 +149,14 @@ impl ScopeAdmissionPort {
             context,
             storage,
             guards: BTreeMap::new(),
+            admission: WorkAdmission::External,
         }
+    }
+    /// Existing context responsibility admits its drain work even after the
+    /// process closes external intake. The actual ledger validates this parent.
+    pub(crate) fn with_parent(mut self, parent: WorkId) -> Self {
+        self.admission = WorkAdmission::Derived(parent);
+        self
     }
 
     /// Transfers the same reservations to the step/batch custodian. These
@@ -212,12 +220,21 @@ impl AdmissionPort for ScopeAdmissionPort {
             assert_eq!(bound, context, "scope admission exact context binding");
         }
         let resources = self.storage.request(need);
-        let guard = match self.scope.reserve_next(
-            self.generation,
-            resources,
-            WorkKind::Business,
-            WorkAdmission::External,
-        ) {
+        let reserved = match need {
+            AdmissionNeed::Preparation { active, .. } => self.scope.reserve_child_next(
+                self.generation,
+                active,
+                resources,
+                WorkKind::Business,
+            ),
+            _ => self.scope.reserve_next(
+                self.generation,
+                resources,
+                WorkKind::Business,
+                self.admission,
+            ),
+        };
+        let guard = match reserved {
             Ok(guard) => guard,
             Err(RuntimeError::CapacityDenied(denial)) => return Err(Self::refusal(need, denial)),
             Err(RuntimeError::Capacity(CapacityError::Scope(
@@ -324,10 +341,15 @@ mod tests {
             storage(),
         )
     }
-    fn preparing(context: QueryContextRef, inbound_records: u64) -> AdmissionNeed {
+    fn preparing(
+        context: QueryContextRef,
+        active: ReservationId,
+        inbound_records: u64,
+    ) -> AdmissionNeed {
         AdmissionNeed::Preparation {
             context,
             task: task(context),
+            active,
             generation: generation(),
             preparing_in_context: 0,
             bytes: 14,
@@ -336,18 +358,46 @@ mod tests {
         }
     }
 
+    fn active_task(
+        port: &mut ScopeAdmissionPort,
+        context: QueryContextRef,
+    ) -> (
+        ReservationId,
+        novarocks_control_runtime::lease::WorkLease,
+        novarocks_control_runtime::lease::CapacityBundle,
+    ) {
+        let id = port
+            .try_reserve(AdmissionNeed::ActiveTask {
+                context,
+                task: task(context),
+                generation: generation(),
+            })
+            .unwrap();
+        let mut guards = port.take_guards();
+        assert_eq!(guards.len(), 1);
+        let (mut work, capacity) = guards.pop().unwrap().bind(WorkKind::Business).unwrap();
+        work.start().unwrap();
+        (id, work, capacity)
+    }
+    fn finish_parent(
+        ledger: &RuntimeLedger,
+        mut work: novarocks_control_runtime::lease::WorkLease,
+        mut capacity: novarocks_control_runtime::lease::CapacityBundle,
+    ) {
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        ledger.reap_scope_ready(work.scope().id(), 16).unwrap();
+        let resources = capacity.resources().unwrap();
+        capacity.release(&resources).unwrap();
+    }
+
     #[test]
     fn failed_inbound_dimension_keeps_typed_resource_facts_and_reserves_no_other_dimension() {
         let ledger = RuntimeLedger::new(limits(2, 2), 16, 1);
         let context = context();
         let mut port = port(&ledger, context);
-        port.try_reserve(AdmissionNeed::ActiveTask {
-            context,
-            task: task(context),
-            generation: generation(),
-        })
-        .unwrap();
-        let refusal = port.try_reserve(preparing(context, 3)).unwrap_err();
+        let (active, work, capacity) = active_task(&mut port, context);
+        let refusal = port.try_reserve(preparing(context, active, 3)).unwrap_err();
         let AdmissionRefusal::Domain(outcome, failure) = refusal else {
             panic!("preserve typed inbound rejection");
         };
@@ -366,8 +416,11 @@ mod tests {
         assert_eq!(ledger.used(Dimension::InboundBytes.id()), 0);
         assert_eq!(ledger.used(Dimension::ActiveTasks.id()), 1);
         assert_eq!(port.scope.snapshot().unwrap().work, 1);
-        drop(port.take_guards());
+        assert!(port.take_guards().is_empty());
+        finish_parent(&ledger, work, capacity);
         assert_eq!(ledger.used(Dimension::ActiveTasks.id()), 0);
+        port.scope.close_external().unwrap();
+        ledger.remove_scope(port.scope.id()).unwrap();
     }
 
     #[test]
@@ -375,8 +428,9 @@ mod tests {
         let ledger = RuntimeLedger::new(limits(2, 2), 16, 1);
         let context = context();
         let mut port = port(&ledger, context);
-        port.try_reserve(preparing(context, 1)).unwrap();
-        assert_eq!(port.scope.snapshot().unwrap().work, 1);
+        let (active, parent, parent_capacity) = active_task(&mut port, context);
+        port.try_reserve(preparing(context, active, 1)).unwrap();
+        assert_eq!(port.scope.snapshot().unwrap().work, 2);
         let mut guards = port.take_guards();
         let (mut work, mut bundle) = guards.pop().unwrap().bind(WorkKind::Business).unwrap();
         let resources = bundle.resources().unwrap();
@@ -386,10 +440,11 @@ mod tests {
         assert!(!port.scope.snapshot().unwrap().join_ready);
         work.captures_exited().unwrap();
         ledger.reap_ready(1).unwrap();
-        assert!(port.scope.snapshot().unwrap().join_ready);
+        assert!(!port.scope.snapshot().unwrap().join_ready);
         assert!(!port.scope.snapshot().unwrap().retirement_ready);
         assert_eq!(ledger.used(Dimension::PreparingTasks.id()), 1);
         bundle.release(&resources).unwrap();
+        finish_parent(&ledger, parent, parent_capacity);
         assert!(port.scope.snapshot().unwrap().retirement_ready);
         ledger.remove_scope(port.scope.id()).unwrap();
     }
@@ -405,17 +460,19 @@ mod tests {
         );
         let mut a = port(&ledger, first);
         let mut b = port(&ledger, second);
+        let (aid, aw, ac) = active_task(&mut a, first);
+        let (bid, bw, bc) = active_task(&mut b, second);
         let gate = std::sync::Arc::new(std::sync::Barrier::new(3));
         let ga = gate.clone();
         let gb = gate.clone();
         let a = std::thread::spawn(move || {
             ga.wait();
-            let result = a.try_reserve(preparing(first, 1));
+            let result = a.try_reserve(preparing(first, aid, 1));
             (a, result)
         });
         let b = std::thread::spawn(move || {
             gb.wait();
-            let result = b.try_reserve(preparing(second, 1));
+            let result = b.try_reserve(preparing(second, bid, 1));
             (b, result)
         });
         gate.wait();
@@ -431,5 +488,12 @@ mod tests {
         drop(a.take_guards());
         drop(b.take_guards());
         assert_eq!(ledger.used(Dimension::PreparingTasks.id()), 0);
+        finish_parent(&ledger, aw, ac);
+        finish_parent(&ledger, bw, bc);
+        for port in [a, b] {
+            port.scope.close_external().unwrap();
+            ledger.remove_scope(port.scope.id()).unwrap();
+        }
+        assert!(ledger.is_empty());
     }
 }

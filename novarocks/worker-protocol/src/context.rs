@@ -1611,6 +1611,7 @@ impl ContextCore {
                 capacity.try_reserve(AdmissionNeed::Preparation {
                     context: self.identity,
                     task,
+                    active: t.active_reservation,
                     generation: self.generation,
                     preparing_in_context: preparing,
                     bytes,

@@ -667,12 +667,57 @@ impl ScopeHandle {
         kind: WorkKind,
         admission: WorkAdmission,
     ) -> Result<StepGuard, RuntimeError> {
+        self.reserve_next_parent(generation, resources, kind, admission, None)
+    }
+    /// Derives from the actual work holding an existing bound reservation.
+    /// Owner lookup, parent liveness, stop/generation checks, identity issuance
+    /// and capacity admission are one transaction. No host map or copied
+    /// parent identity participates. External closure permits existing drain;
+    /// actual parent exit prevents zero-to-nonzero resurrection.
+    pub fn reserve_child_next(
+        &self,
+        generation: Generation,
+        parent: ReservationId,
+        resources: ResourceVector,
+        kind: WorkKind,
+    ) -> Result<StepGuard, RuntimeError> {
+        self.reserve_next_parent(
+            generation,
+            resources,
+            kind,
+            WorkAdmission::External,
+            Some(parent),
+        )
+    }
+    fn reserve_next_parent(
+        &self,
+        generation: Generation,
+        resources: ResourceVector,
+        kind: WorkKind,
+        admission: WorkAdmission,
+        parent: Option<ReservationId>,
+    ) -> Result<StepGuard, RuntimeError> {
         let mut state = self
             .runtime
             .shared
             .state
             .lock()
             .expect("runtime ledger lock");
+        let admission = if let Some(parent) = parent {
+            let record = state
+                .ledger
+                .reservation(parent)
+                .ok_or(CapacityError::UnknownReservation)?;
+            if record.scope != self.id {
+                return Err(CapacityError::WrongOwner.into());
+            }
+            if !record.bound {
+                return Err(CapacityError::UnboundReservation.into());
+            }
+            WorkAdmission::Derived(record.work)
+        } else {
+            admission
+        };
         if !state.external_open && admission == WorkAdmission::External {
             return Err(ScopeError::Closed.into());
         }

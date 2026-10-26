@@ -284,6 +284,7 @@ impl Fixture {
                 ticket: empty(),
             },
             roles[1].0.id(),
+            roles[2].0.id(),
         );
         runtime
             .register_supervised_next(
