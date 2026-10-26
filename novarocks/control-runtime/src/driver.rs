@@ -26,7 +26,9 @@ use crate::{
 use novarocks_control_runtime_core::{
     effect::{EffectDescriptor, EffectError, EffectKind, EffectState},
     history::HistoryFact,
-    identity::{ActionId, ActorId, Generation, InputId, ReservationId, SlotId, Tick, WorkId},
+    identity::{
+        ActionId, ActorId, BatchId, Generation, InputId, ReservationId, SlotId, Tick, WorkId,
+    },
     mailbox::{InputClass, InputEnvelope, MailboxError, MailboxState},
     scheduler::{ReadyQueue, SchedulerError, TurnBudget},
     scope::{WorkKind, WorkPhase},
@@ -159,6 +161,8 @@ struct Inbox<A: Actor> {
     counts: [usize; 4],
     next_input: u64,
     batches: BTreeMap<InputId, StepEnvelope<A::Effect>>,
+    batch_order: BTreeMap<BatchId, InputId>,
+    next_batch: u64,
     generation: Generation,
     failed: bool,
     timer_input: Option<InputId>,
@@ -166,6 +170,28 @@ struct Inbox<A: Actor> {
     last_progress: Tick,
     failure_publication: Option<FailurePublicationRecord>,
     failure_action_watermark: u64,
+}
+impl<A: Actor> Inbox<A> {
+    fn commit_batch(
+        &mut self,
+        input: InputId,
+        mut batch: StepEnvelope<A::Effect>,
+    ) -> Result<(), DriverError> {
+        let next = self
+            .next_batch
+            .checked_add(1)
+            .ok_or(DriverError::IdentityExhausted)?;
+        let ordinal = BatchId::new(next).expect("incremented committed batch ordinal");
+        assert!(batch.ordinal.is_none(), "one atomic batch commitment");
+        batch.ordinal = Some(ordinal);
+        assert!(
+            self.batches.insert(input, batch).is_none(),
+            "one batch per input occurrence"
+        );
+        assert!(self.batch_order.insert(ordinal, input).is_none());
+        self.next_batch = next;
+        Ok(())
+    }
 }
 impl<A: Actor> Drop for Inbox<A> {
     fn drop(&mut self) {
@@ -180,6 +206,10 @@ impl<A: Actor> Drop for Inbox<A> {
         assert!(
             self.inputs.is_empty(),
             "actor input custody must retire before driver removal"
+        );
+        assert!(
+            self.batch_order.is_empty(),
+            "actual committed-batch index retires with its batch"
         );
     }
 }
@@ -823,6 +853,8 @@ impl<A: Actor> ActorRuntime<A> {
                     counts: [0; 4],
                     next_input: 0,
                     batches: BTreeMap::new(),
+                    batch_order: BTreeMap::new(),
+                    next_batch: 0,
                     generation,
                     failed: false,
                     timer_input: None,
@@ -1130,7 +1162,7 @@ impl<A: Actor> ActorRuntime<A> {
                 Ok(deadline) => {
                     let batch = step.finish();
                     let mut inbox = node.inbox.lock().expect("actor inbox lock");
-                    inbox.batches.insert(input.input, batch);
+                    inbox.commit_batch(input.input, batch)?;
                     inbox
                         .inputs
                         .get_mut(&input.input)
@@ -1178,7 +1210,7 @@ impl<A: Actor> ActorRuntime<A> {
                     let batch = failure_step.finish();
                     inbox.failure_action_watermark =
                         batch.state.last_action_id().map_or(0, ActionId::get);
-                    inbox.batches.insert(input.input, batch);
+                    inbox.commit_batch(input.input, batch)?;
                     inbox
                         .inputs
                         .get_mut(&input.input)
@@ -1252,6 +1284,29 @@ impl<A: Actor> ActorRuntime<A> {
             .ok_or(DriverError::UnknownInput)?
             .state
             .records(after, budget))
+    }
+    /// Copy plain routing metadata before an effect becomes eligible to start.
+    /// This grants no execution/publication authority and leaves the original
+    /// payload in the committed batch. An application's host dispatcher uses
+    /// it to index per-owner FIFO lanes in actual batch commitment order.
+    /// As required by Actor, this value and its Clone contain no foreign code,
+    /// runnable, rich source or opaque destructor.
+    pub fn pending_effect_metadata(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        action: ActionId,
+    ) -> Result<Option<A::Effect>, DriverError>
+    where
+        A::Effect: Clone,
+    {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let batch = inbox.batches.get(&input).ok_or(DriverError::UnknownInput)?;
+        if batch.state.record(action).is_none() {
+            return Err(EffectError::UnknownAction.into());
+        }
+        Ok(batch.payloads.get(&action).cloned())
     }
     /// Start is synchronized with the same failure fence as batch commitment.
     pub fn take_effect(
@@ -1806,7 +1861,12 @@ impl<A: Actor> ActorRuntime<A> {
                 return Err(DriverError::InputNotReserved);
             }
         }
-        inbox.batches.remove(&input);
+        if let Some(batch) = inbox.batches.remove(&input) {
+            let ordinal = batch
+                .ordinal
+                .expect("a resident batch was atomically committed");
+            assert_eq!(inbox.batch_order.remove(&ordinal), Some(input));
+        }
         inbox.inputs.remove(&input);
         if let Some(role) = role {
             inbox
@@ -1862,6 +1922,8 @@ impl<A: Actor> ActorRuntime<A> {
         Ok(())
     }
     /// Bounded projection of actual runtime batches, including timer-generated batches.
+    /// Input IDs describe issuance, not consumption order. Host publication
+    /// dispatch uses committed_batches, preserving the actual core decisions.
     pub fn pending_batches(
         &self,
         actor: ActorId,
@@ -1876,6 +1938,25 @@ impl<A: Actor> ActorRuntime<A> {
             .range((lower, std::ops::Bound::Unbounded))
             .take(budget)
             .map(|(input, _)| *input)
+            .collect())
+    }
+    /// Bounded actual commitment order within this actor. Fair scheduling may
+    /// consume a numerically later input first; a host cannot sort InputIds to
+    /// recover publication FIFO. The cursor survives earlier batch retirement.
+    pub fn committed_batches(
+        &self,
+        actor: ActorId,
+        after: Option<BatchId>,
+        budget: usize,
+    ) -> Result<Vec<(BatchId, InputId)>, DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let lower = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        Ok(inbox
+            .batch_order
+            .range((lower, std::ops::Bound::Unbounded))
+            .take(budget)
+            .map(|(ordinal, input)| (*ordinal, *input))
             .collect())
     }
     /// Actual input custody is available to bounded scope-failure teardown, never from core private tables.

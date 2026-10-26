@@ -431,8 +431,26 @@ fn reserved_input_remains_bounded_until_effects_and_explicit_retirement() {
         runtime.retire_input(aid(1), input),
         Err(DriverError::EffectsRemain)
     );
+    assert_eq!(
+        runtime
+            .pending_effect_metadata(aid(1), input, action(2))
+            .unwrap(),
+        Some(107)
+    );
+    assert_eq!(
+        runtime.take_effect(aid(1), input, action(2)).err(),
+        Some(DriverError::Effect(
+            novarocks_control_runtime_core::effect::EffectError::NotReady
+        ))
+    );
     let first = runtime.take_effect(aid(1), input, action(1)).unwrap();
     assert_eq!(first.effect, 7);
+    assert_eq!(
+        runtime
+            .pending_effect_metadata(aid(1), input, action(1))
+            .unwrap(),
+        None
+    );
     runtime.observe_external_publication(&first).unwrap();
     // A publication alone does not silently satisfy a completion dependency.
     assert!(runtime.ready_effects(aid(1), input, 4).unwrap().is_empty());
@@ -1476,5 +1494,71 @@ fn targeted_scope_reaping_excludes_other_owners_and_budgets_the_ready_parent() {
         Err(RuntimeError::UnknownScope)
     );
     ledger.remove_scope(earlier.id()).unwrap();
+    assert!(ledger.is_empty());
+}
+
+#[test]
+fn host_batch_cursor_preserves_core_commit_order_across_fair_input_reordering_and_retirement() {
+    let ledger = ledger();
+    let scope = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
+    let runtime = ActorRuntime::new(1);
+    runtime
+        .register(
+            aid(1),
+            scope.clone(),
+            slot(1),
+            Recorder {
+                seen: Vec::new(),
+                effects: false,
+                panic_on: None,
+                deadline: None,
+            },
+            config(),
+        )
+        .unwrap();
+    let first_issued = runtime
+        .reserve_input(aid(1), aid(2), InputClass::Ordinary)
+        .unwrap()
+        .fill(1)
+        .unwrap();
+    let later_issued = runtime
+        .reserve_input(aid(1), aid(3), InputClass::Control)
+        .unwrap()
+        .fill(2)
+        .unwrap();
+    assert!(later_issued > first_issued);
+    runtime.poll_one(Tick(1)).unwrap();
+    let committed = runtime.committed_batches(aid(1), None, 2).unwrap();
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(_, input)| *input)
+            .collect::<Vec<_>>(),
+        vec![later_issued, first_issued]
+    );
+    assert_eq!(
+        runtime.committed_batches(aid(1), None, 1).unwrap(),
+        committed[..1]
+    );
+    runtime.retire_input(aid(1), later_issued).unwrap();
+    assert_eq!(
+        runtime
+            .committed_batches(aid(1), Some(committed[0].0), 2)
+            .unwrap(),
+        committed[1..]
+    );
+    runtime.retire_input(aid(1), first_issued).unwrap();
+    assert!(
+        runtime
+            .committed_batches(aid(1), None, 2)
+            .unwrap()
+            .is_empty()
+    );
+    scope.close_external().unwrap();
+    assert_eq!(
+        remove_actor(&runtime, aid(1)).unwrap().seen,
+        vec![(3, 2), (2, 1)]
+    );
+    ledger.remove_scope(scope.id()).unwrap();
     assert!(ledger.is_empty());
 }

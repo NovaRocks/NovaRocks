@@ -139,6 +139,7 @@ impl Actor for ControlActor {
         let mut next = 0u64;
         let mut reply_bodies = BTreeMap::<TaskOperationId, ActionId>::new();
         let mut released_admission = Vec::new();
+        let mut route_publications = Vec::new();
         for effect in result.effects {
             let mut dependencies = Vec::new();
             let admitted = match &effect {
@@ -181,8 +182,12 @@ impl Actor for ControlActor {
                 ControlEffect::AdmissionReply { request, .. }
                 | ControlEffect::Reply { request, .. }
                 | ControlEffect::DomainFailureReply { request, .. } => {
+                    // Establish must not acknowledge Active before the
+                    // corresponding actual route snapshot becomes visible.
+                    dependencies.extend(route_publications.iter().copied());
                     reply_bodies.insert(*request, id);
                 }
+                ControlEffect::Route { .. } => route_publications.push(id),
                 ControlEffect::RetireReservation(_) => released_admission.push(id),
                 _ => {}
             }

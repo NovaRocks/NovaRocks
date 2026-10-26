@@ -218,6 +218,10 @@ impl Actor for ContextActor {
                 _ => None,
             };
             if let Some(operation) = reply {
+                // A reply body or covered read cannot run ahead of the
+                // snapshots this same Core step promised to make visible.
+                // Opaque source disposal is deliberately not a predecessor.
+                dependencies.extend(publications.values().copied());
                 reply_bodies.entry(operation).or_default().push(id);
             }
             step.effect(

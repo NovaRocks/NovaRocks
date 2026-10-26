@@ -446,6 +446,13 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
         .runtime
         .step_reservations(actor(), earlier, None, 1)
         .unwrap()[0];
+    let mut dispatch = crate::control_runtime::effect_dispatch::EffectDispatch::new(
+        actor(),
+        ContextCore::MAX_STEP_WORK,
+    );
+    dispatch.index_committed(&f.runtime, 16).unwrap();
+    assert!(!dispatch.is_empty());
+    assert!(dispatch.clear_failed_index(&f.runtime).is_err());
     let failed = f.send(
         ContextInput::Installed {
             task: task(f.identity, 999),
@@ -456,6 +463,20 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
     );
     f.runtime.poll_one(Tick(1)).unwrap();
     assert!(f.runtime.snapshot(actor()).unwrap().failed);
+    assert!(matches!(
+        dispatch.take_ready(&f.runtime, 16),
+        Err(crate::control_runtime::effect_dispatch::DispatchError::OwnerFailed)
+    ));
+    dispatch.clear_failed_index(&f.runtime).unwrap();
+    assert!(dispatch.is_empty());
+    assert_eq!(
+        f.runtime
+            .step_reservations(actor(), earlier, None, 1)
+            .unwrap()
+            .len(),
+        1,
+        "clearing a routing index cannot release the runtime's actual guard"
+    );
     let failure = f
         .runtime
         .take_effect(actor(), failed, ActionId::new(1).unwrap())
@@ -667,6 +688,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     );
     let ticket_id = AdmissionTicketId::try_from_bytes([4; 16]).unwrap();
     let send = |f: &mut Fixture, command, request: Option<TaskOperationId>| {
+        let materialized = matches!(&command, ControlInput::Materialized { .. });
         let input = f
             .runtime
             .reserve_input(target, ActorId::new(3).unwrap(), InputClass::Ordinary)
@@ -681,6 +703,29 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
             }))
             .unwrap();
         f.runtime.poll_one(Tick(1)).unwrap();
+        if materialized {
+            let ready = f
+                .runtime
+                .ready_effects(target, input, ControlCore::MAX_STEP_WORK)
+                .unwrap();
+            assert_eq!(
+                ready.len(),
+                1,
+                "the establish reply must wait for actual route publication"
+            );
+            assert!(matches!(
+                f.runtime
+                    .pending_effect_metadata(target, input, ready[0])
+                    .unwrap(),
+                Some(WorkerAction::Control {
+                    effect: ControlEffect::Route {
+                        state: QueryContextState::Active,
+                        ..
+                    },
+                    ..
+                })
+            ));
+        }
         f.drain_for(target, input)
     };
     let request = AcquireQueryContextAdmissionTicket::new(
@@ -781,5 +826,216 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         .remove_actor(target)
         .unwrap_or_else(|e| panic!("control removal: {e:?}"));
     f.ledger.remove_scope(control_scope.id()).unwrap();
+    f.finish();
+}
+
+#[test]
+fn host_publications_follow_core_order_without_waiting_for_old_body_capture_retirement() {
+    use crate::control_runtime::effect_dispatch::{DispatchError, EffectDispatch};
+    use novarocks_control_runtime::publication::PublishedSnapshot;
+    use novarocks_execution_contract::{TaskState, TaskStatus};
+    use std::sync::Arc;
+    let mut f = Fixture::new();
+    let identity = task(f.identity, 1);
+    f.run(
+        ContextInput::Create {
+            request: operation(1),
+            task: identity,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+    );
+    f.run(
+        ContextInput::Loaded {
+            task: identity,
+            result: Ok(CreationCost {
+                input_retained_bytes: 1,
+                ingress_retained_bytes: 1,
+                structural_bytes: 1,
+                inbound_records: 0,
+                inbound_bytes: 0,
+            }),
+        },
+        None,
+    );
+    let installed = f.send(
+        ContextInput::Installed { task: identity },
+        None,
+        InputClass::Ordinary,
+        2,
+    );
+    let running = f.send(
+        ContextInput::Running { task: identity },
+        None,
+        InputClass::Lifecycle,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    let mut dispatch = EffectDispatch::new(actor(), ContextCore::MAX_STEP_WORK * 2);
+    assert!(
+        dispatch
+            .index_committed(&f.runtime, 1)
+            .unwrap()
+            .inputs
+            .is_empty()
+    );
+    assert_eq!(
+        dispatch.index_committed(&f.runtime, 32).unwrap().inputs,
+        vec![installed, running]
+    );
+    let first = dispatch.take_ready(&f.runtime, 8).unwrap().unwrap();
+    assert_eq!(first.input, installed);
+    assert!(matches!(
+        dispatch.publication_committed(&f.runtime, &first),
+        Err(DispatchError::InvalidPublication)
+    ));
+    assert!(
+        dispatch.take_ready(&f.runtime, 8).unwrap().is_none(),
+        "the later snapshot cannot overtake its original predecessor"
+    );
+    let target = PublishedSnapshot::new(&f.scope, Arc::new(TaskStatus::created(identity)));
+    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &first.effect else {
+        panic!("installed snapshot effect")
+    };
+    let previous = f
+        .runtime
+        .commit_snapshot(&first, &target, Arc::new(snapshot.clone()))
+        .unwrap();
+    drop(previous);
+    dispatch.publication_committed(&f.runtime, &first).unwrap();
+    assert_eq!(
+        f.runtime.retire_input(actor(), installed),
+        Err(DriverError::EffectsRemain)
+    );
+    let second = dispatch.take_ready(&f.runtime, 8).unwrap().unwrap();
+    assert_eq!(second.input, running);
+    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &second.effect else {
+        panic!("running snapshot effect")
+    };
+    let previous = f
+        .runtime
+        .commit_snapshot(&second, &target, Arc::new(snapshot.clone()))
+        .unwrap();
+    drop(previous);
+    dispatch.publication_committed(&f.runtime, &second).unwrap();
+    assert_eq!(target.read().state(), TaskState::Running);
+    assert!(
+        dispatch.is_empty(),
+        "ordering is released by actual publication, not original body exit"
+    );
+    // Independent actual body/capture owners can finish in the reverse order.
+    f.runtime.effect_completed(second).unwrap();
+    f.runtime.retire_input(actor(), running).unwrap();
+    f.runtime.effect_completed(first).unwrap();
+    f.runtime.retire_input(actor(), installed).unwrap();
+    f.finish();
+}
+
+#[test]
+fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visibility() {
+    use crate::control_runtime::effect_dispatch::EffectDispatch;
+    use novarocks_control_runtime::publication::PublishedSnapshot;
+    use novarocks_execution_contract::{CancelReason, TaskConclusion, TaskState, TaskStatus};
+    use std::sync::Arc;
+    let mut f = Fixture::new();
+    let identity = task(f.identity, 1);
+    f.run(
+        ContextInput::Create {
+            request: operation(1),
+            task: identity,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+    );
+    f.run(
+        ContextInput::Loaded {
+            task: identity,
+            result: Ok(CreationCost {
+                input_retained_bytes: 1,
+                ingress_retained_bytes: 1,
+                structural_bytes: 1,
+                inbound_records: 0,
+                inbound_bytes: 0,
+            }),
+        },
+        None,
+    );
+    let input = f.send(
+        ContextInput::Cancel {
+            request: operation(2),
+            task: identity,
+            reason: CancelReason::UpstreamNoLongerNeeded,
+        },
+        Some(operation(2)),
+        InputClass::Control,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    let mut dispatch = EffectDispatch::new(actor(), ContextCore::MAX_STEP_WORK);
+    dispatch.index_committed(&f.runtime, 32).unwrap();
+    let conclusion = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
+    assert!(matches!(
+        conclusion.effect,
+        WorkerAction::Context(ContextEffect::PublishConclusion { .. })
+    ));
+    assert!(
+        dispatch.take_ready(&f.runtime, 16).unwrap().is_none(),
+        "neither stop nor the accepted reply may precede actual publication"
+    );
+    let accepted = PublishedSnapshot::new(&f.scope, Arc::new(None::<TaskConclusion>));
+    let WorkerAction::Context(ContextEffect::PublishConclusion {
+        conclusion: value, ..
+    }) = &conclusion.effect
+    else {
+        unreachable!()
+    };
+    drop(
+        f.runtime
+            .commit_snapshot(&conclusion, &accepted, Arc::new(Some(value.clone())))
+            .unwrap(),
+    );
+    dispatch
+        .publication_committed(&f.runtime, &conclusion)
+        .unwrap();
+    let status = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
+    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &status.effect else {
+        panic!("Task status must follow the conclusion")
+    };
+    let current = PublishedSnapshot::new(&f.scope, Arc::new(TaskStatus::created(identity)));
+    drop(
+        f.runtime
+            .commit_snapshot(&status, &current, Arc::new(snapshot.clone()))
+            .unwrap(),
+    );
+    dispatch.publication_committed(&f.runtime, &status).unwrap();
+    assert!(accepted.read().is_some());
+    assert_eq!(current.read().state(), TaskState::Canceling);
+    let mut stopped = false;
+    let mut replied = false;
+    while let Some(ticket) = dispatch.take_ready(&f.runtime, 16).unwrap() {
+        stopped |= matches!(
+            ticket.effect,
+            WorkerAction::Context(ContextEffect::StopTask { .. })
+        );
+        replied |= matches!(ticket.effect, WorkerAction::Reply(_));
+        let action = ticket.descriptor.id;
+        f.runtime.effect_completed(ticket).unwrap();
+        for (dependent, state) in f
+            .runtime
+            .effect_inventory(actor(), input, None, ContextCore::MAX_STEP_WORK)
+            .unwrap()
+        {
+            if state == EffectState::Pending && dependent.dependencies.contains(&action) {
+                f.runtime
+                    .acknowledge_dependency(actor(), input, dependent.id, action)
+                    .unwrap();
+            }
+        }
+    }
+    assert!(stopped && replied);
+    assert!(dispatch.is_empty());
+    f.runtime.effect_completed(status).unwrap();
+    f.runtime.effect_completed(conclusion).unwrap();
+    f.runtime.retire_input(actor(), input).unwrap();
     f.finish();
 }

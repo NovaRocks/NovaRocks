@@ -19,7 +19,7 @@
 
 use novarocks_control_runtime_core::{
     effect::{EffectBatchState, EffectDescriptor, EffectError},
-    identity::{Generation, InputId, ReservationId, ScopeId, Tick, WorkId},
+    identity::{BatchId, Generation, InputId, ReservationId, ScopeId, Tick, WorkId},
     mailbox::InputEnvelope,
     scheduler::TurnBudget,
 };
@@ -154,6 +154,7 @@ impl<'a, E> StepContext<'a, E> {
             .expect("one atomic step envelope handoff");
         self.turn.return_unused(self.work_remaining);
         StepEnvelope {
+            ordinal: None,
             state: self.batch,
             payloads: self.payloads,
             reservations: self.reservations,
@@ -161,6 +162,7 @@ impl<'a, E> StepContext<'a, E> {
     }
 }
 pub(crate) struct StepEnvelope<E> {
+    pub(crate) ordinal: Option<BatchId>,
     pub(crate) state: EffectBatchState,
     pub(crate) payloads:
         std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,

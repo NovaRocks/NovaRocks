@@ -41,7 +41,8 @@ identity!(
     DimensionId,
     ReservationId,
     ConsumerId,
-    InputId
+    InputId,
+    BatchId
 );
 
 impl Generation {
