@@ -263,6 +263,12 @@ class LinuxEnvironment:
     def run(self, args: list[str], *, account: bool = False, check: bool = True,
             timeout: int | None = None) -> subprocess.CompletedProcess:
         env = self.environment if account else None
+        if not account and args[0] == "docker":
+            # System daemon maintenance must observe this node even when the
+            # invoking root shell selected another Docker endpoint.
+            env = dict(os.environ)
+            env.pop("DOCKER_HOST", None)
+            env["DOCKER_CONTEXT"] = "default"
         if account and os.geteuid() != self.account.uid:
             if os.geteuid() != 0:
                 raise EnvironmentFailure("observing another account requires root")

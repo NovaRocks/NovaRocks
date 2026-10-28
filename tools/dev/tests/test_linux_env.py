@@ -111,7 +111,9 @@ class FakeCommands:
             json.loads(Path(args[-1]).read_text())
         elif command == "docker":
             if args[1:3] == ["ps", "-q"]:
-                output = self.containers
+                selected = environment if environment is not None else os.environ
+                local = selected.get("DOCKER_CONTEXT", "default") == "default" and not selected.get("DOCKER_HOST")
+                output = self.containers if local else ""
             elif args[1] == "info":
                 output = json.dumps(self.daemon_mirrors) if "RegistryConfig.Mirrors" in args[-1] else self.daemon_platform
             elif args[1] == "version":
@@ -342,6 +344,19 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(path.read_text(), old)
         self.assertFalse(self.commands_matching("dockerd"))
         self.assertEqual(self.commands_matching("systemctl"), [["systemctl", "is-active", "--quiet", "docker"]])
+
+    def test_daemon_maintenance_observes_local_containers_despite_remote_caller_context(self):
+        path = self.system / "etc/docker/daemon.json"
+        path.parent.mkdir()
+        original = '{"log-driver":"local"}\n'
+        path.write_text(original)
+        self.commands.active = True
+        self.commands.containers = "local-container\n"
+        with patch.dict(os.environ, {"DOCKER_HOST": "tcp://remote.test:2376", "DOCKER_CONTEXT": "remote"}):
+            with self.assertRaisesRegex(linux.EnvironmentFailure, "maintenance window"):
+                self.installer.ensure_docker()
+        self.assertEqual(path.read_text(), original)
+        self.assertFalse(self.commands_matching("dockerd"))
 
     def test_healthy_external_engine_is_not_replaced_by_distribution_package(self):
         self.commands.packages.update(self.inputs["packages"])
