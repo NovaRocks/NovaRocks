@@ -209,6 +209,26 @@ impl ExitRole {
     }
 }
 impl ExitAuthority {
+    /// A read loan transfers this same preadmitted holder, never an observer
+    /// or numerically matching Work from another runtime. This is an origin
+    /// check, not admission credit or a new execution/generation permission.
+    pub(crate) fn read_resource_origin(&self, root: &ScopeHandle) -> bool {
+        let state = self
+            .role
+            .0
+            .state
+            .lock()
+            .expect("original role custody lock");
+        self.active
+            && matches!(
+                state.phase,
+                ExitRolePhase::Admitted | ExitRolePhase::Started
+            )
+            && state
+                .work
+                .as_ref()
+                .is_some_and(|work| Arc::ptr_eq(&work.scope().runtime.shared, &root.runtime.shared))
+    }
     /// Derives an actual child scope from this original active holder. The
     /// caller already pays its finite parent-link/root storage; this performs
     /// no new capacity reservation beyond the existing zero-resource bootstrap.
