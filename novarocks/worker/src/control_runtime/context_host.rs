@@ -95,6 +95,7 @@ pub(crate) struct ContextHostBinding {
 #[derive(Debug)]
 pub(crate) enum ContextHostError {
     WrongEffect,
+    WrongRuntime,
     WrongContext,
     WrongEstablishment,
     InvalidGeometry,
@@ -741,6 +742,9 @@ impl ContextHostRecord {
         ticket: &EffectTicket<WorkerAction>,
         binding: TaskHostBinding,
     ) -> Result<(), ContextHostError> {
+        if !self.control_runtime.same_runtime(runtime) {
+            return Err(ContextHostError::WrongRuntime);
+        }
         let task = match &ticket.effect {
             WorkerAction::Context(
                 novarocks_worker_protocol::context::ContextEffect::LoadInput { task, .. },
@@ -936,6 +940,21 @@ mod tests {
             profile: StorageNeed,
             task_positions: usize,
         ) -> Self {
+            Self::new_with_context_identity(
+                context_storage,
+                requests,
+                profile,
+                task_positions,
+                None,
+            )
+        }
+        fn new_with_context_identity(
+            context_storage: StorageNeed,
+            requests: usize,
+            profile: StorageNeed,
+            task_positions: usize,
+            identity: Option<QueryContextRef>,
+        ) -> Self {
             let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
                 ordinary_running: 1,
                 ordinary_waiting: 0,
@@ -1022,12 +1041,14 @@ mod tests {
                 }
                 roles.push(ContextMetadataRole { work, capacity });
             }
-            let identity = QueryContextRef::new(
-                QueryExecutionId::new(QueryId::new(8701, 8702), AttemptId::new(1).unwrap())
-                    .unwrap(),
-                FrontendProcessId::new_v7(),
-                BackendProcessId::new_v7(),
-            );
+            let identity = identity.unwrap_or_else(|| {
+                QueryContextRef::new(
+                    QueryExecutionId::new(QueryId::new(8701, 8702), AttemptId::new(1).unwrap())
+                        .unwrap(),
+                    FrontendProcessId::new_v7(),
+                    BackendProcessId::new_v7(),
+                )
+            });
             let storage = AdmissionStorage {
                 loading: policy.loading.resources().unwrap(),
                 accepted: policy.accepted.resources().unwrap(),

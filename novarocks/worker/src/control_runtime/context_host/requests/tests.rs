@@ -950,12 +950,21 @@ fn complete_model_effects_with_preparation(
         }
     }
 }
-fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
-    let mut f = Harness::new_with_request_and_task_capacity(
+fn pending_loading_task_fixture(
+    identity: Option<QueryContextRef>,
+) -> (
+    Harness,
+    TaskIdentity,
+    WorkId,
+    crate::control_runtime::context_host::requests::ContextRequestHandle,
+    EffectTicket<WorkerAction>,
+) {
+    let mut f = Harness::new_with_context_identity(
         CONTEXT_BOOTSTRAP_STORAGE,
         1,
         StorageNeed::role(true),
         1,
+        identity,
     );
     let materialize = f.materialize();
     let binding = f.binding(context_actor(), &materialize);
@@ -972,7 +981,7 @@ fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
     f.runtime.retire_input(context_actor(), activated).unwrap();
     let task = crate::control_runtime::actors::tests::task(f.identity, 1);
     let ready = ready(&f, 1);
-    let (work, mut create) = f
+    let (work, create) = f
         .service
         .context(f.identity)
         .unwrap()
@@ -1009,6 +1018,10 @@ fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
         load.effect,
         WorkerAction::Context(ContextEffect::LoadInput { .. })
     ));
+    (f, task, work, create, load)
+}
+fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
+    let (mut f, task, work, create, load) = pending_loading_task_fixture(None);
     f.service
         .context(f.identity)
         .unwrap()
@@ -1027,6 +1040,16 @@ fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
             },
         )
         .unwrap();
+    finish_create_waiter(&mut f, work, create, load);
+    (f, task)
+}
+fn finish_create_waiter(
+    f: &mut Harness,
+    work: WorkId,
+    mut create: crate::control_runtime::context_host::requests::ContextRequestHandle,
+    load: EffectTicket<WorkerAction>,
+) {
+    let input = create.request().token;
     f.runtime.effect_completed(load).unwrap();
     assert!(
         !f.service
@@ -1043,8 +1066,8 @@ fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
     );
     // The Create waiter expires; its elected Task/loader responsibility stays.
     // No timeout or reply is used to claim that the loader actually exited.
-    let tick = model_fact(&mut f, ContextInput::Tick, 5);
-    complete_model_effects(&mut f, tick);
+    let tick = model_fact(f, ContextInput::Tick, 5);
+    complete_model_effects(f, tick);
     f.runtime.retire_input(context_actor(), tick).unwrap();
     let delivered = create.try_take().expect("original Create timeout reply");
     assert!(matches!(
@@ -1052,9 +1075,8 @@ fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
         ContextReplyBody::Verdict(RequestResult::TimeoutWhileAccepted)
     ));
     drop((create, delivered));
-    assert!(advance(&mut f, work));
+    assert!(advance(f, work));
     assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
-    (f, task)
 }
 fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
     use crate::task_proposal_ingress::PairRoute;
@@ -1390,4 +1412,80 @@ fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_pr
         && f.ledger.used(Dimension::ActiveTasks.id()) == 1;
     finish_accepted_task_fixture(f, task, preparation);
     assert!(own_r_returned && queued_preparation_still_paid);
+}
+
+#[test]
+fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and_actor_identities()
+{
+    let mut owner = original_context(1, StorageNeed::default());
+    let (mut original, task, work, create, load) =
+        pending_loading_task_fixture(Some(owner.identity));
+    assert_eq!(owner.identity, original.identity);
+    let before = original
+        .runtime
+        .step_reservations(load.actor, load.input, None, ContextCore::MAX_STEP_WORK)
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    let binding = || crate::control_runtime::task::TaskHostBinding {
+        context: original.identity,
+        task_source: ActorId::new(86).unwrap(),
+        protocol_generation: generation(),
+        max_cuts: 4,
+        pending: Arc::new(RpcTaskPending),
+        health: Arc::new(
+            novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+        ),
+    };
+    let refused = owner.service.context(owner.identity).unwrap().adopt_task(
+        &original.runtime,
+        &load,
+        binding(),
+    );
+    let wrong_runtime = matches!(refused, Err(ContextHostError::WrongRuntime));
+    let guard_preserved = original
+        .runtime
+        .step_reservations(load.actor, load.input, None, ContextCore::MAX_STEP_WORK)
+        .unwrap()
+        == before;
+    let foreign_not_owned = owner
+        .service
+        .context(owner.identity)
+        .unwrap()
+        .task(task)
+        .is_none();
+    // Teardown also remains honest if this origin regression reappears: move
+    // that same wrongly adopted inventory back to its actual original Scope.
+    // No replacement guard, admission, Work or physical-exit fact is invented.
+    if refused.is_ok() {
+        let actual = owner
+            .service
+            .context(owner.identity)
+            .unwrap()
+            .tasks
+            .remove(&task)
+            .unwrap();
+        assert!(
+            original
+                .service
+                .context(original.identity)
+                .unwrap()
+                .tasks
+                .insert(task, actual)
+                .is_none()
+        );
+    } else {
+        original
+            .service
+            .context(original.identity)
+            .unwrap()
+            .adopt_task(&original.runtime, &load, binding())
+            .unwrap();
+    }
+    finish_create_waiter(&mut original, work, create, load);
+    finish_task_fixture(original, task);
+    finish(owner);
+    assert!(
+        wrong_runtime && guard_preserved && foreign_not_owned,
+        "wrong_runtime={wrong_runtime}, guard_preserved={guard_preserved}, foreign_not_owned={foreign_not_owned}"
+    );
 }
