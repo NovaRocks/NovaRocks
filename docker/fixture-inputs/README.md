@@ -36,7 +36,36 @@ BOM schema 2 记录 platform、锁身份、镜像/派生定义和 artifact 证�
 
 传输 repository 可用 `--image-source logical-name=transport-repository` 配置。来源不是内容身份：digest、平台、artifact 长度/hash 不变。数据集 producer 的语义 key 使用对应平台的实际 recipe/基础镜像/artifact 子投影；无关镜像别名或传输变化不应改变 key，producer 源码变化仍按原规则产生新 key。
 
+artifact 下载可显式使用可重复的 `--artifact-url-prefix ORIGINAL=TRANSPORT`，只替换已选择 artifact URL 的传输前缀：
+
+```bash
+docker/fixture-inputs/provision.sh --consumer iceberg-rest-oss --platform linux/amd64 \
+  --artifact-url-prefix https://repo.maven.apache.org/maven2/=https://maven.aliyun.com/repository/public/ \
+  --artifact-url-prefix https://files.pythonhosted.org/packages/=https://mirrors.aliyun.com/pypi/packages/
+```
+
+两侧必须是 HTTPS 目录 URL，以 `/` 结尾，不带 userinfo、query 或 fragment；原始前缀重复或互相包含时拒绝。只匹配原锁 URL 一次，不递归改写。选择的镜像不可达或内容不符直接失败，不自动回退来源。原锁中的 URL、bytes、SHA1/SHA256、lock identity 与内容缓存键均不变；镜像返回同名文件也须通过原始校验。相同内容缓存可跨传输地址复用，但每次仍核验字节。
+
+Linux profile 的 `fixture_artifact_url_prefixes` 使用原始前缀到传输前缀的 JSON 映射；阿里云 profile 显式配置上述 Maven、PyPI 映射。installer 仅在 prepare 时将每条映射传给 provision，context-only 同样接受显式 CLI 参数；check 和 verify 不新增网络访问或下载修复。
+
 镜像或平台变更由 fixture 维护者更新唯一源锁，保留上游 index、平台 manifest 和 config 的原始证据，再执行 provision 和实际消费者验证。仅修改 JSON 不能证明平台运行可用。单测入口：`bash docker/fixture-inputs/tests/run.sh`；machine、Paimon 和 benchmark reader 回归由各自原测试入口维护。
+
+## OSS 独立闭包
+
+阿里云环境显式选择 `iceberg-rest-oss`；它保留 REST、REST-MV、Spark，提供各自的官方 ECS RAM Role 凭证桥接依赖，以及 host 对象操作的 Python SDK 环境。它不供给 MinIO/mc 或它们的 Go 构建闭包。`iceberg-rest` 继续表示本地 MinIO 完整栈，`object-store` 仅表示 MinIO/mc；省略 consumer 不会自动推断部署方的对象存储选择。
+
+```bash
+docker/fixture-inputs/provision.sh --consumer iceberg-rest-oss --platform linux/amd64
+docker/fixture-inputs/verify.sh --consumer iceberg-rest-oss --platform linux/amd64
+```
+
+当前 OSS host SDK 环境只声明 Ubuntu 26.04、原生 amd64、Python 3.14。provision 从唯一锁取得固定版本、URL、长度和 SHA256 的 Python 及 Java 完整依赖闭包，并在账户 store 中准备独立 Python venv。Python 构建工具也固定在闭包中；GCC、Python headers 等系统前置由 Linux 准备入口安装。REST/Spark 包装镜像复用已验证的派生基础镜像，运行不解析 Maven 版本范围或临时 pip install。BOM 中的 `python_environments` 记录环境定义、解释器版本、包和实际文件证明，verify 只核验已有内容，缺失或不同直接失败。
+
+源锁中的 `derived_bases` 显式描述派生镜像之间的依赖，供给按依赖顺序消费准确 image ID；这与外部基础镜像的 `bases` 分开。相同 lock/platform 补充 OSS 闭包仍遵守原部分 BOM 合并与原子发布规则，不凭旧回执继承未核验内容。host SDK 的 store 路径定位实际安装环境，不因缓存目录不同改变机器的语义版本。
+
+供给不申请 Bucket、不绑定 ECS 角色、不安装长期密钥。新机先绑定已有 RAM 角色，再通过 [Linux 准备入口](../../tools/dev/README.md) 提供 `--object-store-config <absolute-path>`，或按 [OSS 机器维护说明](../iceberg-rest/README.md#阿里云-oss) 使用五字段配置显式 start/check。机器 activation 固定规范化配置和已验证 SDK 的实际位置，worktree publication 继续绑定这一代；verify 成功本身不证明角色权限、IMDSv2 可达、服务健康或 SQL 可用。
+
+普通建写使用 REST catalog；生产 Hadoop catalog 的条件 metadata 发布协议保持原状，OSS 的 S3 兼容接口不支持该条件写。MinIO IAM/STS、vended 和 Paimon 专项不由 OSS 闭包替代，OSS 模式下在副作用前拒绝。旧机器数据保留，TTL 和机器换代均不授予清理未知 writer 数据的权利。
 
 ## MinIO 官方源码与发布物
 
@@ -48,7 +77,7 @@ docker/fixture-inputs/provision.sh --consumer object-store --platform linux/amd6
 docker/fixture-inputs/verify.sh --consumer object-store --platform linux/amd64
 ```
 
-这只准备MinIO/mc及必要的Go工具链归档/Alpine闭包；`verify --consumer iceberg-rest`仍要求完整REST/Spark输入，单独object-store BOM不能代表整栈ready。正式Linux准备入口仍显式选择iceberg-rest。旧 `--image-source minio=...` / `minio-mc=...` 不再适用；传输覆盖应对`minio-runtime` 基础镜像，两个源码归档通过锁内官方URL取得。Go模块代理由构建recipe的GOPROXY设置选择，内容由原go.sum验证。
+这只准备MinIO/mc及必要的Go工具链归档/Alpine闭包；`verify --consumer iceberg-rest`仍要求完整REST/Spark输入，单独object-store BOM不能代表整栈ready。通用本地 MinIO 准备显式选择 `iceberg-rest`；阿里云 OSS profile 的 Linux 准备入口显式选择 `iceberg-rest-oss`。旧 `--image-source minio=...` / `minio-mc=...` 不再适用；传输覆盖应对`minio-runtime` 基础镜像，两个源码归档通过锁内官方URL取得。Go模块代理由构建recipe的GOPROXY设置选择，内容由原go.sum验证。
 
 更新官方版本时一并核对源归档、客户端源码/许可证、Go工具链归档及recipe自报元数据，并实际构建、读写和验证权限。已有共享fixture须按原显式upgrade切换；不自动认领或删除旧卷/旧输入。研究和原生运行材料按任务约定在库外保留。
 

@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "object_store_kind": "aliyun-oss",
   "support": {
     "os_id": "ubuntu",
     "version_id": "26.04",
@@ -16,5 +17,9 @@
   "fixture_image_sources": {},
   "tool_download_urls": {
     "rustup": "https://rsproxy.cn/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init"
+  },
+  "fixture_artifact_url_prefixes": {
+    "https://repo.maven.apache.org/maven2/": "https://maven.aliyun.com/repository/public/",
+    "https://files.pythonhosted.org/packages/": "https://mirrors.aliyun.com/pypi/packages/"
   }
 }

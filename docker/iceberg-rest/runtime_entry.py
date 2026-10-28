@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 import fixture_runtime as runtime
 import machine_runtime as machine
 import entry_publication as publication
+import oss_ops
 
 HERE = Path(__file__).resolve().parent
 FILES = runtime.ENTRY_FILES
@@ -50,6 +51,7 @@ NOVA_ENV_REST_MV_PORT NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI NOVAROCKS_SPARK_REST
 NOVAROCKS_ICEBERG_REST_MV_URI NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE
 NOVA_ENV_FE_HTTP_PORT NOVA_ENV_BE_GRPC_PORT NOVA_ENV_BE_CONTROL_GRPC_PORT NOVA_ENV_BE_HTTP_PORT NOVAROCKS_NATIVE_SHARED_SECRET
 AWS_S3_ENDPOINT AWS_S3_ACCESS_KEY_ID AWS_S3_SECRET_ACCESS_KEY MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
 iceberg_object_store_credential_name iceberg_object_store_credential_generation CATALOG_WAREHOUSE_URI
 NOVAROCKS_ICEBERG_TEST_WAREHOUSE NOVAROCKS_ICEBERG_REST_URI NOVA_ENV_REST_SERVER_WAREHOUSE_URI
 NOVA_ENV_REST_WAREHOUSE_URI NOVAROCKS_ICEBERG_REST_WAREHOUSE NOVA_ENV_SHARED_BENCHMARK_ROOT
@@ -63,6 +65,15 @@ NOVA_ENV_SHARED_COMPOSE_PROJECT NOVA_ENV_SHARED_REST_WAREHOUSE_URI NOVA_ENV_PUBL
 NOVA_FIXTURE_MACHINE_ID NOVA_FIXTURE_MACHINE_DAEMON NOVA_FIXTURE_MACHINE_VERSION NOVA_FIXTURE_MACHINE_GENERATION
 NOVA_FIXTURE_MACHINE_ROOT NOVAROCKS_PAIMON_DOCKER_NETWORK NOVA_FIXTURE_SCRATCH_TTL_SECONDS
 NOVA_FIXTURE_MAX_RUN_SECONDS NOVA_FIXTURE_CLEANUP_GRACE_SECONDS""".split()
+MANAGED += "NOVA_ENV_OBJECT_STORE_CONFIG NOVA_ENV_OBJECT_STORE_KIND NOVA_OSS_ROLE_NAME NOVA_OSS_OPS_PYTHON iceberg_object_store_credential_mode iceberg_object_store_metadata_credential_name iceberg_object_store_data_credential_name oss_region oss_path_style".split()
+
+
+def cloud_generation(config):
+    return "v1-" + hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
+def cloud_base(config):
+    return f"s3://{config['bucket']}/{config['root_prefix']}"
 
 
 def text_file(directory: Path, name: str, text: str) -> None:
@@ -116,8 +127,9 @@ def storage_domains(config: dict, record: dict, *, shared: bool) -> dict:
     owned_children = {}
     if shared:
         env_id = config["env_id"]
-        independent.update(worktree=storage_root(f"s3://novarocks/{env_id}"),
-                           private_catalog=storage_root(f"s3://warehouse/{env_id}"))
+        cloud = owner["config"].get("object_store")
+        independent.update(worktree=storage_root(cloud_base(cloud) + f"worktrees/{env_id}" if cloud else f"s3://novarocks/{env_id}"),
+                           private_catalog=storage_root(cloud_base(cloud) + f"catalogs/{env_id}" if cloud else f"s3://warehouse/{env_id}"))
         for name, uri in config["warehouses"].items():
             base = independent["private_catalog" if name in ("rest_client", "rest_mv_client") else "worktree"]
             if not root_contains(base, uri):
@@ -177,11 +189,20 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
         external = record.get("external_minio")
         machine_record = record if shared else external
         endpoint = machine.endpoints(record) if shared else runtime.endpoints(record)
-        credentials = record["credentials"] if shared else record["config"]["credentials"]
+        cloud = record["config"].get("object_store") if shared else None
+        if cloud and cloud != config.get("object_store"):
+            raise runtime.RuntimeFailure("MachineVersionMismatch", "worktree object store differs from machine configuration")
+        credentials = None if cloud else (record["credentials"] if shared else record["config"]["credentials"])
         server_warehouses = {service: storage_root(uri) for service, uri in
             (record["server_warehouses"] if shared else {service: runtime.server_warehouse(record, service) for service in runtime.rest_services(record)}).items()}
         domains = storage_domains(config, record, shared=shared)
-        ak, sk = credentials["access_key"], credentials["secret_key"]
+        ak, sk = (None, None) if cloud else (credentials["access_key"], credentials["secret_key"])
+        store_endpoint = endpoint["object_store_endpoint"] if cloud else endpoint["minio_endpoint"]
+        container_endpoint = store_endpoint if cloud else endpoint["container_minio_endpoint"]
+        region, path_style = (cloud["region"], "false") if cloud else ("us-east-1", "true")
+        mode = "node-local" if cloud else "static"
+        generation = cloud_generation(cloud) if cloud else "v1"
+        metadata_name, data_name = ("iceberg-oss-metadata", "iceberg-oss-data") if cloud else ("iceberg-test-data", "iceberg-test-data")
         warehouse = config["warehouses"]
         ports, trust = config["local_ports"], config["native_trust"]
         rest = warehouse["rest_client"]
@@ -193,10 +214,14 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             manifest["runtime"]["producer_receipt"] = record["producer_receipt"]
         elif external:
             manifest["runtime"]["machine"] = copy.deepcopy(external)
-        manifest["minio"] = {"endpoint": endpoint["minio_endpoint"], "console": endpoint["minio_console"],
+        if cloud:
+            manifest["object_store"] = {"config": cloud, "endpoint": store_endpoint,
+                "config_file": record["object_store_config_file"], "ops_python": record["oss_ops_python"]}
+        else:
+            manifest["minio"] = {"endpoint": endpoint["minio_endpoint"], "console": endpoint["minio_console"],
                               "access_key_id": ak, "secret_access_key": sk, "volume": machine_record["config"]["minio_volume"] if machine_record else record["volumes"][0]}
         if machine_record:
-            manifest["storage_owner"] = {"daemon_id": machine_record["daemon_id"],
+            manifest["storage_owner"] = copy.deepcopy(record["storage_owner"]) if cloud else {"daemon_id": machine_record["daemon_id"],
                                          "minio_volume": machine_record["config"]["minio_volume"]}
             manifest["storage_domains"] = domains
         manifest["iceberg_rest"] = {"uri": endpoint["rest_uri"], "warehouse": rest, "server_default_warehouse": server_warehouses["rest"]}
@@ -204,7 +229,7 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             manifest["iceberg_rest_mv"] = {"uri": endpoint["rest_mv_uri"], "warehouse": warehouse["rest_mv_client"],
                                            "server_default_warehouse": server_warehouses["rest-mv"]}
         manifest["spark"] = {"image": record["images"]["spark"]["tag"], "spark_version": versions["spark"], "iceberg_version": versions["iceberg"],
-            "ui": endpoint["spark_ui"], "container_rest_uri": endpoint["container_rest_uri"], "container_minio_endpoint": endpoint["container_minio_endpoint"],
+            "ui": endpoint["spark_ui"], "container_rest_uri": endpoint["container_rest_uri"], "object_store_endpoint": container_endpoint,
             "defaults_file": str(publication / "spark-defaults.conf"), "v3_smoke_sql": str(publication / "spark-iceberg-v3-smoke.sql"), "helper": str(repo / "docker/iceberg-rest/spark-sql.sh")}
         manifest["novarocks"] = {**{name + "_port": value for name, value in ports.items()},
             "native_trust_deployment_id": trust["deployment_id"], "fe_config": str(publication / "fe.toml"),
@@ -213,14 +238,14 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             "iceberg_catalog_warehouse": warehouse["catalog"], "iceberg_test_warehouse": warehouse["test"]}
         exports.update({
             "NOVA_ENV_COMPOSE_PROJECT": record["project"], "NOVA_ENV_COMPOSE_FILE": record["compose_file"], "NOVA_ENV_COMPOSE_ENV": record["compose_env"],
-            "NOVA_ENV_MINIO_PORT": record["ports"]["minio"], "NOVA_ENV_MINIO_CONSOLE_PORT": record["ports"]["minio_console"],
             "NOVA_ENV_REST_PORT": record["ports"]["rest"], "NOVA_ENV_SPARK_UI_PORT": record["ports"]["spark"],
             "NOVA_ENV_OBJECT_STORE_RUNTIME": (machine_record or record)["id"], "NOVA_ENV_CATALOG_RUNTIME": record["id"],
             "NOVA_ENV_OBJECT_STORE_CONTAINER": (machine_record or record).get("containers", {}).get("minio", ""),
             "NOVAROCKS_NATIVE_SHARED_SECRET": trust["shared_secret"],
-            "AWS_S3_ENDPOINT": endpoint["minio_endpoint"], "AWS_S3_ACCESS_KEY_ID": ak, "AWS_S3_SECRET_ACCESS_KEY": sk,
-            "MINIO_ROOT_USER": ak, "MINIO_ROOT_PASSWORD": sk,
-            "iceberg_object_store_credential_name": "iceberg-test-data", "iceberg_object_store_credential_generation": "v1",
+            "AWS_S3_ENDPOINT": store_endpoint,
+            "iceberg_object_store_credential_name": data_name, "iceberg_object_store_credential_generation": generation,
+            "iceberg_object_store_metadata_credential_name": metadata_name, "iceberg_object_store_data_credential_name": data_name,
+            "iceberg_object_store_credential_mode": mode, "oss_region": region, "oss_path_style": path_style,
             "CATALOG_WAREHOUSE_URI": warehouse["catalog"], "NOVAROCKS_ICEBERG_TEST_WAREHOUSE": warehouse["test"],
             "NOVAROCKS_ICEBERG_REST_URI": endpoint["rest_uri"], "NOVA_ENV_REST_SERVER_WAREHOUSE_URI": server_warehouses["rest"],
             "NOVA_ENV_REST_WAREHOUSE_URI": rest, "NOVAROCKS_ICEBERG_REST_WAREHOUSE": rest,
@@ -229,10 +254,17 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             "NOVAROCKS_ICE_REST_CATALOG_SQL": str(publication / "ice-rest-catalog.sql"), "NOVAROCKS_SPARK_IMAGE": record["images"]["spark"]["tag"],
             "NOVA_ENV_SPARK_VERSION": versions["spark"], "NOVA_ENV_ICEBERG_VERSION": versions["iceberg"],
             "NOVAROCKS_SPARK_UI": endpoint["spark_ui"], "NOVAROCKS_SPARK_REST_URI": endpoint["container_rest_uri"],
-            "NOVAROCKS_SPARK_S3_ENDPOINT": endpoint["container_minio_endpoint"], "NOVAROCKS_SPARK_DEFAULTS": str(publication / "spark-defaults.conf"),
+            "NOVAROCKS_SPARK_S3_ENDPOINT": container_endpoint, "NOVAROCKS_SPARK_DEFAULTS": str(publication / "spark-defaults.conf"),
             "NOVAROCKS_SPARK_V3_SMOKE_SQL": str(publication / "spark-iceberg-v3-smoke.sql"), "NOVAROCKS_SPARK_SQL": manifest["spark"]["helper"],
             "NOVA_FIXTURE_INPUT_BOM": config["fixture_inputs"]["bom"], "NOVA_FIXTURE_INPUT_LOCK_SHA256": config["fixture_inputs"]["lock_sha256"],
         })
+        if cloud:
+            exports.update(NOVA_ENV_OBJECT_STORE_KIND="aliyun-oss", NOVA_ENV_OBJECT_STORE_CONFIG=record["object_store_config_file"],
+                NOVA_OSS_ROLE_NAME=cloud["role_name"], NOVA_OSS_OPS_PYTHON=record["oss_ops_python"])
+        else:
+            exports.update(NOVA_ENV_MINIO_PORT=record["ports"]["minio"], NOVA_ENV_MINIO_CONSOLE_PORT=record["ports"]["minio_console"],
+                AWS_S3_ACCESS_KEY_ID=ak, AWS_S3_SECRET_ACCESS_KEY=sk, MINIO_ROOT_USER=ak, MINIO_ROOT_PASSWORD=sk)
+            manifest["spark"]["container_minio_endpoint"] = container_endpoint
         exports.update({"NOVA_ENV_" + name.upper() + "_PORT": value for name, value in ports.items()})
         if machine_record:
             exports.update(NOVA_FIXTURE_MACHINE_ID=machine_record["id"], NOVA_FIXTURE_MACHINE_DAEMON=machine_record["daemon_id"],
@@ -252,31 +284,54 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             })
         if context.get("control_uri"):
             exports["NOVA_ENV_PUBLICATION_HOOK_CONTROL_URI"] = context["control_uri"]
-        render_role_configs(staging, stable, env_id, ports, trust)
-        values = {"url": "http://127.0.0.1:8030", "oss_ak": ak, "oss_sk": sk, "oss_endpoint": endpoint["minio_endpoint"],
+        render_role_configs(staging, stable, env_id, ports, trust, object_store=cloud)
+        values = {"url": "http://127.0.0.1:8030", "oss_endpoint": store_endpoint,
                   "iceberg_catalog_type": "hadoop", "iceberg_catalog_warehouse": warehouse["catalog"], "iceberg_test_warehouse": warehouse["test"],
                   "iceberg_rest_uri": endpoint["rest_uri"], "iceberg_rest_warehouse": rest, "iceberg_object_store_credential_name": "iceberg-test-data",
-                  "iceberg_object_store_credential_generation": "v1", "benchmark_shared_root": config["benchmark"]["shared_root"], "fixture_env_file": str(publication / "env.sh")}
+                  "iceberg_object_store_credential_generation": generation, "benchmark_shared_root": config["benchmark"]["shared_root"], "fixture_env_file": str(publication / "env.sh"),
+                  "fixture_object_store_kind": "aliyun-oss" if cloud else "minio", "oss_region": region, "oss_path_style": path_style,
+                  "iceberg_object_store_credential_mode": mode, "iceberg_object_store_metadata_credential_name": metadata_name,
+                  "iceberg_object_store_data_credential_name": data_name}
+        values["iceberg_object_store_credential_name"] = data_name
+        if not cloud:
+            values.update(oss_ak=ak, oss_sk=sk)
         if "rest-mv" in record["images"]:
             values.update(iceberg_rest_mv_uri=endpoint["rest_mv_uri"], iceberg_rest_mv_warehouse=warehouse["rest_mv_client"])
         text_file(staging, "sql-test.toml", '[cluster]\nhost = "127.0.0.1"\nport = ' + json_string(ports["mysql"]) + '\nuser = "root"\npassword = ""\n\n[env]\n' + ''.join(f'{key} = {json_string(value)}\n' for key, value in sorted(values.items())))
         sql_values = {"type": "iceberg", "iceberg.catalog.type": "rest", "uri": endpoint["rest_uri"], "warehouse": rest,
-                      "aws.s3.endpoint": endpoint["minio_endpoint"],
-                      "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
+                      "aws.s3.endpoint": store_endpoint,
+                      "aws.s3.region": region, "aws.s3.enable_path_style_access": path_style}
         for purpose, role in (("metadata", "frontend"), ("data", "backend")):
             prefix = f"credential.object-store-{purpose}."
-            sql_values.update({prefix + "consumer-role": role, prefix + "mode": "static",
-                               prefix + "name": "iceberg-test-data", prefix + "generation": "v1"})
+            sql_values.update({prefix + "consumer-role": role, prefix + "mode": mode,
+                               prefix + "name": metadata_name if purpose == "metadata" else data_name, prefix + "generation": generation})
         sql_quote = lambda value: "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
         text_file(staging, "ice-rest-catalog.sql", "CREATE EXTERNAL CATALOG ice_rest PROPERTIES (\n" + ',\n'.join(f'  {sql_quote(k)} = {sql_quote(v)}' for k, v in sorted(sql_values.items())) + "\n);\n")
         spark = {"spark.master": "local[*]", "spark.app.name": "NovaRocksIcebergSpark", "spark.ui.bindAddress": "0.0.0.0", "spark.driver.bindAddress": "0.0.0.0",
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions", "spark.sql.catalog.ice_rest": "org.apache.iceberg.spark.SparkCatalog",
             "spark.sql.catalog.ice_rest.type": "rest", "spark.sql.catalog.ice_rest.uri": endpoint["container_rest_uri"], "spark.sql.catalog.ice_rest.warehouse": rest,
-            "spark.sql.catalog.ice_rest.io-impl": "org.apache.iceberg.aws.s3.S3FileIO", "spark.sql.catalog.ice_rest.s3.endpoint": endpoint["container_minio_endpoint"],
+            "spark.sql.catalog.ice_rest.io-impl": "org.apache.iceberg.aws.s3.S3FileIO", "spark.sql.catalog.ice_rest.s3.endpoint": container_endpoint,
             "spark.sql.catalog.ice_rest.s3.path-style-access": "true", "spark.sql.catalog.ice_rest.s3.access-key-id": ak, "spark.sql.catalog.ice_rest.s3.secret-access-key": sk,
-            "spark.sql.catalog.ice_rest.s3.region": "us-east-1", "spark.sql.defaultCatalog": "ice_rest", "spark.hadoop.fs.s3a.endpoint": endpoint["container_minio_endpoint"],
+            "spark.sql.catalog.ice_rest.s3.region": "us-east-1", "spark.sql.defaultCatalog": "ice_rest", "spark.hadoop.fs.s3a.endpoint": container_endpoint,
             "spark.hadoop.fs.s3a.access.key": ak, "spark.hadoop.fs.s3a.secret.key": sk, "spark.hadoop.fs.s3a.path.style.access": "true",
             "spark.hadoop.fs.s3a.connection.ssl.enabled": "false", "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"}
+        if cloud:
+            for key in list(spark):
+                if key.endswith((".access-key-id", ".secret-access-key", ".access.key", ".secret.key")):
+                    del spark[key]
+            spark.update({
+                "spark.sql.catalog.ice_rest.s3.endpoint": container_endpoint,
+                "spark.sql.catalog.ice_rest.s3.path-style-access": path_style,
+                "spark.sql.catalog.ice_rest.s3.region": region,
+                "spark.sql.catalog.ice_rest.client.region": region,
+                "spark.sql.catalog.ice_rest.client.credentials-provider": "org.novarocks.fixture.auth.AliyunEcsCredentialsProvider",
+                "spark.sql.catalog.ice_rest.client.credentials-provider.role-name": cloud["role_name"],
+                "spark.hadoop.fs.s3a.endpoint": container_endpoint,
+                "spark.hadoop.fs.s3a.endpoint.region": region,
+                "spark.hadoop.fs.s3a.path.style.access": path_style,
+                "spark.hadoop.fs.s3a.connection.ssl.enabled": "true",
+                "spark.hadoop.fs.s3a.aws.credentials.provider": "org.novarocks.fixture.auth.AliyunEcsV1CredentialsProvider",
+            })
         if "rest-mv" in record["images"]:
             spark.update({key.replace("spark.sql.catalog.ice_rest", "spark.sql.catalog.ice_rest_mv", 1): value
                           for key, value in spark.items() if key.startswith("spark.sql.catalog.ice_rest")})
@@ -293,12 +348,12 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
         text_file(staging, "spark-iceberg-v3-smoke.sql", smoke_sql)
     text_file(staging, "env.sh", '# Generated fixture publication.\nunset ' + ' '.join(MANAGED) + '\n' + ''.join(f'export {key}={shlex.quote(str(value))}\n' for key, value in sorted(exports.items())))
     text_file(staging, "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + '\n')
-    text_file(staging, "README.md", f'# NovaRocks fixture {env_id}\n\nReady: {str(ready).lower()}\n\nPublication: `{publication}`\n\nStable runtime data: `{stable}`\n\n' + (f'REST: {manifest["iceberg_rest"]["uri"]}\n\nObject store: {manifest["minio"]["endpoint"]}\n' if ready else 'Run `docker/iceberg-rest/up.sh` to bind this worktree.\n') +
-              ('\nShared REST and Spark use shared storage credentials. Run IAM policies constrain only writers using the run credentials; shared writers rely on run names, location checks, the original budget, and catalog-first cleanup. Run identity and deadlines belong to the caller and are not stored in this publication.\n' if ready and machine_record else ''))
+    text_file(staging, "README.md", f'# NovaRocks fixture {env_id}\n\nReady: {str(ready).lower()}\n\nPublication: `{publication}`\n\nStable runtime data: `{stable}`\n\n' + (f'REST: {manifest["iceberg_rest"]["uri"]}\n\nObject store: {store_endpoint}\n' if ready else 'Run `docker/iceberg-rest/up.sh` to bind this worktree.\n') +
+              ('\nShared writers use run names, location checks, the original budget, and catalog-first cleanup. Node-local cloud credentials do not grant per-run IAM isolation or TTL deletion rights. Run identity and deadlines belong to the caller.\n' if ready and machine_record and cloud else '\nShared REST and Spark use shared storage credentials. Run IAM policies constrain only writers using the run credentials; shared writers rely on run names, location checks, the original budget, and catalog-first cleanup. Run identity and deadlines belong to the caller and are not stored in this publication.\n' if ready and machine_record else ''))
     return list(FILES)
 
 
-def render_role_configs(staging: Path, stable: Path, env_id: str, ports: dict, trust: dict) -> None:
+def render_role_configs(staging: Path, stable: Path, env_id: str, ports: dict, trust: dict, *, object_store=None) -> None:
     for role in ("fe", "be"):
         control = f'control_grpc_port = {ports["be_control_grpc"]}\n' if role == "be" else ""
         value = f'''[native_trust]
@@ -355,7 +410,17 @@ max_library_validation_work = 33554432
 max_library_validation_bytes = 33554432
 '''
         purpose = "metadata" if role == "fe" else "data"
-        value += f'''\n[[connector.credentials]]
+        if object_store:
+            value += f'''\n[[connector.credentials]]
+purpose = "object-store-{purpose}"
+name = "iceberg-oss-{purpose}"
+generation = {json_string(cloud_generation(object_store))}
+kind = "aliyun-ecs-ram-role"
+role_name = {json_string(object_store["role_name"])}
+scope_prefixes = [{json_string(cloud_base(object_store))}]
+'''
+        else:
+            value += f'''\n[[connector.credentials]]
 purpose = "object-store-{purpose}"
 name = "iceberg-test-data"
 generation = "v1"
@@ -475,6 +540,7 @@ def render_isolated_stack(bom: dict, project: str, ports: dict, out: Path, confi
 
 def load_settings(path: Path) -> dict[str, str]:
     allowed = {"NOVA_ENV_SHARED_DOCKER", "NOVA_ENV_COMPOSE_PROJECT", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "NOVA_ENV_SPARK_VERSION", "NOVA_ENV_ICEBERG_VERSION", "NOVA_ENV_SHARED_BENCHMARK_ROOT", "NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS", "NOVA_ENV_RUNTIME_PORT_START", "NOVA_ENV_RUNTIME_PORT_END"}
+    allowed.add("NOVA_ENV_OBJECT_STORE_CONFIG")
     for name in LOCAL_RANGES:
         allowed.update({"NOVA_ENV_" + name.upper() + "_PORT_START", "NOVA_ENV_" + name.upper() + "_PORT_RANGE"})
     values = {}
@@ -532,27 +598,50 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
     missing = {name: base for name, base in starts.items() if name not in ports}
     if missing:
         ports.update(choose_ports(missing, offset, ranges, reserved=set(ports.values())))
-    benchmark_root = storage_root(settings.get('NOVA_ENV_SHARED_BENCHMARK_ROOT', 's3://novarocks/shared/benchmarks'))
+    cloud_path = os.environ.get('NOVA_ENV_OBJECT_STORE_CONFIG', settings.get('NOVA_ENV_OBJECT_STORE_CONFIG'))
+    cloud = old_config.get('object_store')
+    if cloud_path:
+        if not Path(cloud_path).is_absolute():
+            raise runtime.RuntimeFailure('InvalidConfiguration', 'object store configuration path must be absolute')
+        try:
+            cloud = oss_ops.validate_config(runtime.read_json(Path(cloud_path)))
+        except (OSError, ValueError, oss_ops.OpsError) as error:
+            raise runtime.RuntimeFailure('InvalidConfiguration', 'invalid object store configuration') from error
+    if cloud and not shared:
+        raise runtime.RuntimeFailure('UnsupportedFixtureProvider', 'private MinIO fixture profiles do not support OSS')
+    benchmark_root = storage_root(settings.get('NOVA_ENV_SHARED_BENCHMARK_ROOT', cloud_base(cloud) + 'benchmarks' if cloud else 's3://novarocks/shared/benchmarks'))
+    if cloud:
+        machine.machine_config({'object_store': cloud, 'benchmark_root': benchmark_root})
     timeout = int(settings.get('NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS', '3600'))
     if timeout < 1:
         raise runtime.RuntimeFailure('InvalidConfiguration', 'benchmark timeout must be positive')
     store = Path(os.environ.get('NOVA_FIXTURE_STORE', str(Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'novarocks/fixture-inputs'))).resolve()
-    return {'workspace_root': str(workspace), 'repo_root': str(HERE.parent.parent), 'config_file': str(config_file),
+    result = {'workspace_root': str(workspace), 'repo_root': str(HERE.parent.parent), 'config_file': str(config_file),
             'env_id': env_id, 'shared_docker': shared, 'current_link': str(entry.parent / 'current'), 'update_current': update_current,
-            'credentials': {'access_key': settings['MINIO_ROOT_USER'], 'secret_key': settings['MINIO_ROOT_PASSWORD']}, 'buckets': ['warehouse', 'novarocks'],
+            'credentials': None if cloud else {'access_key': settings['MINIO_ROOT_USER'], 'secret_key': settings['MINIO_ROOT_PASSWORD']}, 'buckets': ['warehouse', 'novarocks'],
             'local_ports': ports, 'native_trust': old_config.get('native_trust') or {'deployment_id': env_id, 'shared_secret': 'local-native-trust-fixture-' + hashlib.sha256(str(workspace).encode()).hexdigest()},
             'benchmark': {'shared_root': benchmark_root, 'build_timeout_seconds': timeout},
             'versions': {'spark': settings.get('NOVA_ENV_SPARK_VERSION', '3.5.5-java17'), 'iceberg': settings.get('NOVA_ENV_ICEBERG_VERSION', '1.11.0')},
             'fixture_inputs': old_config.get('fixture_inputs') or {'bom': str(store / 'bom.json'), 'lock_sha256': None, 'verified': False},
             'warehouses': {'catalog': f's3://novarocks/{env_id}/iceberg-catalog', 'test': f's3://novarocks/{env_id}/novarocks-sql-test-iceberg-extra',
                            'rest_client': f's3://warehouse/{env_id}/rest', 'rest_mv_client': f's3://warehouse/{env_id}/rest-mv'}}
+    if cloud:
+        result.pop('credentials')
+        result['object_store'] = cloud
+        result['buckets'] = [cloud['bucket']]
+        base = cloud_base(cloud)
+        result['warehouses'] = {'catalog': base + f'worktrees/{env_id}/iceberg-catalog',
+            'test': base + f'worktrees/{env_id}/novarocks-sql-test-iceberg-extra',
+            'rest_client': base + f'catalogs/{env_id}/rest', 'rest_mv_client': base + f'catalogs/{env_id}/rest-mv'}
+    return result
 
 
 def verify_inputs(config: dict) -> dict:
     # Consume the verifier's locked snapshot, not a later read of mutable bom.json.
     # The closed consumer and offline verification remain owned by ADR-0155.
-    bom = machine.verified_bom(Path(config['repo_root']), Path(config['fixture_inputs']['bom']).parent)
-    config['fixture_inputs'].update(lock_sha256=bom['lock_sha256'], platform=bom['platform'], verified=True, consumer='iceberg-rest')
+    consumer = 'iceberg-rest-oss' if config.get('object_store') else 'iceberg-rest'
+    bom = machine.verified_bom(Path(config['repo_root']), Path(config['fixture_inputs']['bom']).parent, consumer=consumer)
+    config['fixture_inputs'].update(lock_sha256=bom['lock_sha256'], platform=bom['platform'], verified=True, consumer=consumer)
     return bom
 
 

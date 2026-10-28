@@ -11,7 +11,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-for module_name in ("fixture_inputs", "provision", "verify"):
+for module_name in ("fixture_inputs", "python_environment", "provision", "verify"):
     spec = importlib.util.spec_from_file_location(module_name, ROOT / f"{module_name}.py")
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -44,7 +44,8 @@ def setUpModule():
     global daemon_patches
     daemon_patches = [mock.patch.object(verify_module, "require_native_daemon"),
                       mock.patch.object(provision_module, "require_native_daemon"),
-                      mock.patch.object(fixture_inputs, "native_platform", return_value="linux/arm64")]
+                      mock.patch.object(fixture_inputs, "native_platform", return_value="linux/arm64"),
+                      mock.patch.object(provision_module, "native_platform", return_value="linux/arm64")]
     for patch in daemon_patches:
         patch.start()
 
@@ -55,6 +56,49 @@ def tearDownModule():
 
 
 class FixtureInputsTest(unittest.TestCase):
+    def test_oss_closure_excludes_minio_and_builds_original_recipes_first(self):
+        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/amd64", consumer="iceberg-rest-oss")
+        self.assertNotIn("minio", lock["derived_images"])
+        self.assertNotIn("minio-mc", lock["derived_images"])
+        self.assertEqual(set(lock["python_environments"]), {"oss-sdk"})
+        order = fixture_inputs.derived_build_order(lock)
+        self.assertLess(order.index("iceberg-spark"), order.index("iceberg-spark-oss"))
+        self.assertLess(order.index("rest-mv"), order.index("rest-mv-oss"))
+        original, _ = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/arm64", consumer="iceberg-rest")
+        self.assertEqual(original["python_environments"], {})
+        with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "unsupported fixture input platform"):
+            fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/arm64", consumer="iceberg-rest-oss")
+
+    def test_derived_recipe_cycle_is_rejected_before_build(self):
+        lock = {"images": {}, "artifacts": {}, "derived_images": {
+            "first": {"bases": {}, "artifacts": [], "derived_bases": {"BASE": "second"}},
+            "second": {"bases": {}, "artifacts": [], "derived_bases": {"BASE": "first"}},
+        }}
+        with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "cycle"):
+            fixture_inputs.selected_input_names(lock, "derived:first")
+
+    def test_python_receipt_verification_is_read_only_and_detects_changed_sdk(self):
+        sdk = sys.modules["python_environment"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "definition.py").write_text("# SDK environment definition\n")
+            directory = root / "generations/one/python-environments/sdk"
+            (directory / "bin").mkdir(parents=True)
+            (directory / "bin/python").write_bytes(b"interpreter")
+            (directory / "sdk.py").write_bytes(b"original")
+            item = {"definition_files": ["definition.py"], "packages": {"sdk": "1.0"}, "python_version": "3.14"}
+            receipt = {"path": str(directory.relative_to(root)), "definition_sha256": sdk.definition(root, item),
+                "packages": item["packages"], "python_version": "3.14", "files": sdk.environment_files(directory)}
+            lock = {"python_environments": {"sdk": item}}
+            bom = {"python_environments": {"sdk": receipt}}
+            before = {str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            with mock.patch.object(sdk, "run", side_effect=AssertionError("verify dispatched a process")):
+                sdk.verify_environments(root, root, lock, bom)
+            self.assertEqual(before, {str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()})
+            (directory / "sdk.py").write_bytes(b"changed")
+            with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "content mismatch"):
+                sdk.verify_environments(root, root, lock, bom)
+
     def test_default_arm64_variant_matches_locked_platform(self) -> None:
         item = {"platform": "linux/arm64", "manifest_digest": "sha256:expected"}
         image = {
@@ -270,6 +314,113 @@ class FixtureInputsTest(unittest.TestCase):
                 ["paimon-spark-base=example.invalid/spark@sha256:override"],
                 set(lock["images"]),
             )
+
+    def test_artifact_url_prefixes_require_closed_https_directory_urls(self):
+        valid = "https://upstream.invalid/maven2/=https://mirror.invalid/public/"
+        parsed = provision_module.parse_artifact_url_prefixes([valid])
+        self.assertEqual({"https://upstream.invalid/maven2/": "https://mirror.invalid/public/"}, parsed)
+        invalid = ["missing-separator", "http://upstream.invalid/path/=https://mirror.invalid/",
+                   "https://upstream.invalid/path/=http://mirror.invalid/",
+                   "https://user:secret@upstream.invalid/path/=https://mirror.invalid/",
+                   "https://upstream.invalid/path/=https://user@mirror.invalid/",
+                   "https://upstream.invalid/path?query/=https://mirror.invalid/",
+                   "https://upstream.invalid/path/=https://mirror.invalid/path/#fragment/",
+                   "https://upstream.invalid/path/=https://mirror.invalid/path?/",
+                   "https://upstream.invalid/path=https://mirror.invalid/",
+                   "https://upstream.invalid/path/=https://mirror.invalid/path",
+                   "https://upstream.invalid/pa\tth/=https://mirror.invalid/",
+                   "https://upstream.invalid/path/=https://mirror.invalid:70000/",
+                   "https:///path/=https://mirror.invalid/", "=https://mirror.invalid/"]
+        for spec in invalid:
+            with self.subTest(spec=spec), self.assertRaises(fixture_inputs.FixtureInputError):
+                provision_module.parse_artifact_url_prefixes([spec])
+        for specs in ([valid, valid], [valid, "https://upstream.invalid/maven2/nested/=https://other.invalid/"],
+                      [valid, "https://upstream.invalid/=https://other.invalid/"]):
+            with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "overlapping"):
+                provision_module.parse_artifact_url_prefixes(specs)
+
+    def test_artifact_transport_rewrite_matches_original_once(self):
+        prefixes = provision_module.parse_artifact_url_prefixes([
+            "https://upstream.invalid/maven2/=https://mirror.invalid/public/",
+            "https://mirror.invalid/public/=https://another.invalid/maven/"])
+        self.assertEqual("https://mirror.invalid/public/group/artifact.jar",
+            provision_module.artifact_transport_url("https://upstream.invalid/maven2/group/artifact.jar", prefixes))
+        self.assertEqual("https://upstream.invalid/maven20/a.jar",
+            provision_module.artifact_transport_url("https://upstream.invalid/maven20/a.jar", prefixes))
+
+    def test_invalid_artifact_transport_fails_before_daemon_or_store(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(provision_module, "require_native_daemon") as daemon:
+            store = Path(temporary) / "absent-store"
+            with self.assertRaises(fixture_inputs.FixtureInputError):
+                provision_module.provision(store, ROOT.parents[1], ROOT / "lock.json", [], 30,
+                    artifact_url_prefix_specs=["https://user@host.invalid/=https://mirror.invalid/"])
+            daemon.assert_not_called()
+            self.assertFalse(store.exists())
+
+    def test_mirrored_artifact_keeps_locked_identity_and_content_cache(self):
+        data = b"exact locked upstream bytes"
+        item = {"url": "https://upstream.invalid/maven2/group/input.jar", "bytes": len(data),
+                "sha1": hashlib.sha1(data).hexdigest(), "sha256": hashlib.sha256(data).hexdigest()}
+        lock = {"artifacts": {"input.jar": item}}
+        original = json.dumps(lock, sort_keys=True)
+        prefixes = provision_module.parse_artifact_url_prefixes([
+            "https://upstream.invalid/maven2/=https://mirror.invalid/public/"])
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary)
+            first = store / ".staging-first"; first.mkdir()
+            with mock.patch.object(provision_module, "download", side_effect=lambda _, path: path.write_bytes(data)) as download:
+                receipt = provision_module.prepare_artifacts(lock, first, prefixes)
+            download.assert_called_once_with("https://mirror.invalid/public/group/input.jar", first / "artifacts/input.jar")
+            self.assertEqual(original, json.dumps(lock, sort_keys=True))
+            cache = store / "downloads" / f"sha256-{item['sha256']}-{len(data)}"
+            self.assertEqual(data, cache.read_bytes())
+            second = store / ".staging-second"; second.mkdir()
+            with mock.patch.object(provision_module, "download") as download:
+                reused = provision_module.prepare_artifacts(lock, second)
+            download.assert_not_called()
+            self.assertEqual(receipt, reused)
+            self.assertEqual([cache], list((store / "downloads").iterdir()))
+            self.assertFalse((store / "READY").exists())
+
+    def test_wrong_mirror_bytes_fail_original_size_sha1_and_sha256_without_fallback(self):
+        data = b"locked-content"
+        base = {"url": "https://upstream.invalid/maven2/input.jar", "bytes": len(data),
+                "sha1": hashlib.sha1(data).hexdigest(), "sha256": hashlib.sha256(data).hexdigest()}
+        prefixes = provision_module.parse_artifact_url_prefixes([
+            "https://upstream.invalid/maven2/=https://mirror.invalid/public/"])
+        for fault in ("mirror-content", "bytes", "sha1", "sha256"):
+            item = dict(base)
+            mirror_bytes = data[::-1] if fault == "mirror-content" else data
+            if fault != "mirror-content":
+                item[fault] = len(data) + 1 if fault == "bytes" else "0" * len(item[fault])
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                staging = Path(temporary) / ".staging-failed"; staging.mkdir()
+                with mock.patch.object(provision_module, "download", side_effect=lambda _, path: path.write_bytes(mirror_bytes)) as download:
+                    with self.assertRaises(fixture_inputs.FixtureInputError):
+                        provision_module.prepare_artifacts({"artifacts": {"input.jar": item}}, staging, prefixes)
+                self.assertEqual(1, download.call_count)
+                self.assertFalse((staging.parent / "downloads").exists())
+                self.assertFalse((staging.parent / "READY").exists())
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(provision_module, "download",
+                side_effect=fixture_inputs.FixtureInputError("mirror unavailable")) as download:
+            with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "mirror unavailable"):
+                provision_module.prepare_artifacts({"artifacts": {"input.jar": base}}, Path(temporary), prefixes)
+            self.assertEqual(1, download.call_count)
+            self.assertEqual("https://mirror.invalid/public/input.jar", download.call_args.args[0])
+
+    def test_provision_cli_forwards_repeatable_artifact_transports(self):
+        prefixes = ["https://upstream.invalid/maven2/=https://mirror.invalid/public/",
+                    "https://files.invalid/packages/=https://mirror.invalid/packages/"]
+        args = ["provision.py", "--consumer", "iceberg-rest-oss", "--platform", "linux/amd64"]
+        for spec in prefixes:
+            args += ["--artifact-url-prefix", spec]
+        with mock.patch.object(sys, "argv", args), mock.patch.object(provision_module, "provision") as provision:
+            self.assertEqual(0, provision_module.main())
+        self.assertEqual(prefixes, provision.call_args.kwargs["artifact_url_prefix_specs"])
+        context_args = args + ["--context-only", "rest-mv", "--out", "/example/output"]
+        with mock.patch.object(sys, "argv", context_args), mock.patch.object(provision_module, "context_only") as context:
+            self.assertEqual(0, provision_module.main())
+        self.assertEqual(prefixes, context.call_args.kwargs["artifact_url_prefix_specs"])
 
     def test_provision_reuses_a_verified_local_image_before_pulling(self) -> None:
         item = {

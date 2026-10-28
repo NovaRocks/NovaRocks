@@ -28,6 +28,7 @@ import io
 import json
 import os
 import signal
+import shutil
 import time
 from pathlib import Path
 import subprocess
@@ -245,6 +246,153 @@ class EnvironmentTests(unittest.TestCase):
 
     def commands_matching(self, name):
         return [args for args, _ in self.commands.calls if args[0] == name]
+
+    def test_fixture_artifact_transports_are_forwarded_only_during_prepare(self):
+        self.profile["fixture_artifact_url_prefixes"] = {
+            "https://upstream.invalid/maven2/": "https://mirror.invalid/public/",
+            "https://files.invalid/packages/": "https://mirror.invalid/packages/"}
+        self.installer.fixture(prepare=True)
+        provision = [args for args, _ in self.commands.calls if args[0].endswith("/provision.sh")]
+        self.assertEqual(1, len(provision))
+        for original, transport in self.profile["fixture_artifact_url_prefixes"].items():
+            index = provision[0].index(f"{original}={transport}")
+            self.assertEqual("--artifact-url-prefix", provision[0][index - 1])
+        self.commands.calls.clear()
+        self.installer.fixture(prepare=False)
+        self.assertFalse(any("--artifact-url-prefix" in args for args, _ in self.commands.calls))
+        self.assertFalse(any(args[0].endswith("/provision.sh") for args, _ in self.commands.calls))
+
+    def test_artifact_transport_profile_requires_string_mapping(self):
+        for value in ([], {"https://upstream.invalid/": None}, {3: "https://mirror.invalid/"}):
+            with self.subTest(value=value), self.assertRaises(linux.EnvironmentFailure):
+                linux.LinuxEnvironment(self.repo, self.inputs, {**self.profile, "fixture_artifact_url_prefixes": value},
+                    self.account, commands=self.commands, system_root=self.system)
+
+    def cloud_installer(self, *, config=None):
+        author = self.repo / "docker/iceberg-rest/oss_ops.py"
+        if not author.exists():
+            author.parent.mkdir(parents=True)
+            shutil.copyfile(MODULE.parents[2] / "docker/iceberg-rest/oss_ops.py", author)
+        config_path = self.root / "object-store-input.json"
+        if config is None:
+            config = {"kind": "aliyun-oss", "region": "cn-beijing", "bucket": "fixture-bucket",
+                      "role_name": "fixture-role", "root_prefix": "development"}
+        config_path.write_text(json.dumps(config))
+        installer = linux.LinuxEnvironment(
+            self.repo, self.inputs, dict(self.profile, object_store_kind="aliyun-oss"), self.account,
+            commands=self.commands, system_root=self.system, object_store_config=config_path)
+        return installer, config_path
+
+    def test_cloud_profile_requires_an_explicit_absolute_config_before_commands(self):
+        profile = dict(self.profile, object_store_kind="aliyun-oss")
+        for config_path in (None, Path("relative.json")):
+            with self.assertRaisesRegex(linux.EnvironmentFailure, "absolute --object-store-config"):
+                linux.LinuxEnvironment(self.repo, self.inputs, profile, self.account,
+                                       commands=self.commands, system_root=self.system,
+                                       object_store_config=config_path)
+        self.assertEqual(self.commands.calls, [])
+
+    def test_cloud_configuration_uses_closed_shared_validation_without_fallback(self):
+        config = {"kind": "aliyun-oss", "region": "cn-beijing", "bucket": "fixture-bucket",
+                  "role_name": "fixture-role", "root_prefix": "development", "access_key": "do-not-use"}
+        with self.assertRaisesRegex(linux.EnvironmentFailure, "invalid OSS configuration") as failure:
+            self.cloud_installer(config=config)
+        self.assertNotIn("do-not-use", str(failure.exception))
+        self.assertEqual(self.commands.calls, [])
+        self.assertFalse(self.installer.cache.exists())
+
+    def test_minio_profile_does_not_ignore_an_object_store_argument(self):
+        with self.assertRaisesRegex(linux.EnvironmentFailure, "requires an aliyun-oss profile"):
+            linux.LinuxEnvironment(self.repo, self.inputs, self.profile, self.account,
+                                   commands=self.commands, system_root=self.system,
+                                   object_store_config=self.root / "unread.json")
+        self.assertEqual(self.commands.calls, [])
+
+    def test_cloud_prepare_selects_oss_closure_and_forwards_machine_config(self):
+        installer, _ = self.cloud_installer()
+        installer.prepare()
+        expected = {"kind": "aliyun-oss", "region": "cn-beijing", "bucket": "fixture-bucket",
+                    "role_name": "fixture-role", "root_prefix": "development/"}
+        self.assertEqual(json.loads(installer.object_store_path.read_text()), expected)
+        self.assertEqual(json.loads(installer.fixture_machine_config_path.read_text()), {"object_store": expected})
+        for args, environment in self.commands.calls:
+            if args[0].endswith(("provision.sh", "verify.sh")):
+                self.assertEqual(args[args.index("--consumer") + 1], "iceberg-rest-oss")
+            if args[0].endswith("fixture-runtime.sh"):
+                self.assertEqual(args[args.index("--config") + 1], str(installer.fixture_machine_config_path))
+            if args[0].endswith(("provision.sh", "verify.sh", "fixture-runtime.sh", "up.sh", "status.sh")):
+                self.assertEqual(environment["NOVA_ENV_OBJECT_STORE_CONFIG"], str(installer.object_store_path))
+        self.assertIn("NOVA_ENV_OBJECT_STORE_CONFIG", installer.environment_text())
+
+    def test_cloud_repeat_is_idempotent_and_check_does_not_write_or_install(self):
+        installer, _ = self.cloud_installer()
+        installer.prepare()
+        paths = (installer.object_store_path, installer.fixture_machine_config_path, installer.env_path)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        installer.prepare()
+        self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths})
+        self.commands.calls.clear()
+        tree = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        installer.check()
+        self.assertEqual(tree, {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()})
+        for args, _ in self.commands.calls:
+            self.assertFalse(args[0].endswith(("provision.sh", "up.sh")))
+            self.assertNotIn(args[0], ("curl", "apt-get", "locale-gen", "systemctl", "dockerd"))
+            self.assertNotIn("install", args)
+
+    def test_cloud_check_missing_or_changed_copy_fails_without_repair(self):
+        installer, _ = self.cloud_installer()
+        before = sorted(str(path) for path in self.root.rglob("*"))
+        with self.assertRaisesRegex(linux.EnvironmentFailure, "prepared OSS configuration"):
+            installer.fixture(prepare=False)
+        self.assertEqual(before, sorted(str(path) for path in self.root.rglob("*")))
+        self.assertEqual(self.commands.calls, [])
+        installer.fixture(prepare=True)
+        changed = json.loads(installer.object_store_path.read_text())
+        changed["role_name"] = "other-role"
+        installer.object_store_path.write_text(json.dumps(changed))
+        self.commands.calls.clear()
+        with self.assertRaisesRegex(linux.EnvironmentFailure, "differs from input"):
+            installer.fixture(prepare=False)
+        self.assertEqual(json.loads(installer.object_store_path.read_text()), changed)
+        self.assertEqual(self.commands.calls, [])
+
+    def test_cloud_check_compares_existing_copies_with_new_input(self):
+        installer, config_path = self.cloud_installer()
+        installer.fixture(prepare=True)
+        original = installer.object_store_path.read_bytes()
+        config = json.loads(config_path.read_text())
+        config["bucket"] = "different-bucket"
+        changed, _ = self.cloud_installer(config=config)
+        self.commands.calls.clear()
+        with self.assertRaisesRegex(linux.EnvironmentFailure, "differs from input"):
+            changed.fixture(prepare=False)
+        self.assertEqual(installer.object_store_path.read_bytes(), original)
+        self.assertEqual(self.commands.calls, [])
+
+    def test_generic_profile_keeps_local_minio_consumer(self):
+        self.installer.fixture(prepare=True)
+        for args, environment in self.commands.calls:
+            if args[0].endswith(("provision.sh", "verify.sh")):
+                self.assertEqual(args[args.index("--consumer") + 1], "iceberg-rest")
+                self.assertNotIn("NOVA_ENV_OBJECT_STORE_CONFIG", environment)
+            if args[0].endswith("fixture-runtime.sh"):
+                self.assertNotIn("--config", args)
+
+    def test_cli_forwards_explicit_object_store_config_without_writing_on_env(self):
+        installer, config_path = self.cloud_installer()
+        profile_path = self.root / "cloud-profile.json"
+        profile_path.write_text(json.dumps(dict(self.profile, object_store_kind="aliyun-oss")))
+        before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        with patch.object(linux, "LinuxEnvironment", return_value=installer) as factory, \
+                patch.object(linux.Account, "lookup", return_value=self.account), \
+                patch("linux_env.sys.stdout", new_callable=io.StringIO) as output:
+            result = linux.main(["env", "--user", "test", "--profile", str(profile_path),
+                                 "--fixture", "iceberg-rest", "--object-store-config", str(config_path)])
+        self.assertEqual(result, 0)
+        self.assertEqual(factory.call_args.kwargs["object_store_config"], config_path)
+        self.assertIn(str(installer.object_store_path), output.getvalue())
+        self.assertEqual(before, {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()})
 
     def test_empty_check_is_read_only_and_does_not_download(self):
         before = sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*"))

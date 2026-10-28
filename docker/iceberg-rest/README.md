@@ -17,9 +17,60 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# Iceberg REST + MinIO + Spark Test Environment
+# Iceberg REST + Object Storage + Spark Test Environment
 
-本目录提供机器级共享 MinIO、stock REST、支持 MV `storage-table` 的 rest-mv、Spark 和 mc。每个 Docker daemon 只有一个固定项目 `nr-fixture-machine`、一个固定网络 `nr-fixture-machine_iceberg_net`；输入变化通过显式维护切换，普通 worktree 不创建并存共享栈。私有 stock/publication-hook catalog 和 HMS 各自保留原 owner。
+本目录提供机器级共享 stock REST、支持 MV `storage-table` 的 rest-mv 和 Spark。对象存储可显式选择阿里云 OSS，或使用本地 MinIO/mc。每个 Docker daemon 只有一个固定项目 `nr-fixture-machine`、一个固定网络 `nr-fixture-machine_iceberg_net`；输入变化通过显式维护切换，普通 worktree 不创建并存共享栈。私有 stock/publication-hook catalog 和 HMS 各自保留原 owner。
+
+## 阿里云 OSS
+
+新 Linux 节点优先使用 [Linux 环境准备入口](../../tools/dev/README.md)，先为 ECS 绑定可访问测试 Bucket 的 RAM 角色，再提供独立的非秘密配置。配置恰好包含以下五个字段，示例中的 Bucket 和角色须替换为自己的值：
+
+```json
+{
+  "kind": "aliyun-oss",
+  "region": "cn-beijing",
+  "bucket": "YOUR_TEST_BUCKET",
+  "role_name": "YOUR_ECS_ROLE",
+  "root_prefix": "novarocks-development"
+}
+```
+
+`root_prefix` 限定本环境的对象范围，规范化后带尾 `/`；benchmark、worktree、私有 catalog 和机器 warehouse 分别位于其 `benchmarks/`、`worktrees/`、`catalogs/` 和 `machines/<machine-id>/<generation>/` 子域。不要在配置中加入 AccessKey、SecretKey 或临时 token。FE、BE 各自通过节点本地 ECS RAM Role 来源取得和刷新材料；REST、Spark 和 host 对象操作各用官方 Alibaba provider。各入口固定启用 IMDSv2，凭证只保留在各自进程内存中。容器也须能访问 ECS 的 IMDSv2 服务。
+
+手动维护时，先将这份五字段 JSON 保存到绝对路径，再生成机器输入。以下命令使用默认账户 fixture store；若显式选择 store，provision、verify、机器和 worktree 必须消费同一位置。
+
+```bash
+object_store_config=/absolute/path/object-store.json
+machine_config=/absolute/path/fixture-machine.json
+python3 - "$object_store_config" "$machine_config" <<'PYCONFIG'
+import json
+from pathlib import Path
+import sys
+config = json.loads(Path(sys.argv[1]).read_text())
+Path(sys.argv[2]).write_text(json.dumps({"object_store": config}, indent=2) + "\n")
+PYCONFIG
+
+docker/fixture-inputs/provision.sh --consumer iceberg-rest-oss --platform linux/amd64 \
+  --artifact-url-prefix https://repo.maven.apache.org/maven2/=https://maven.aliyun.com/repository/public/ \
+  --artifact-url-prefix https://files.pythonhosted.org/packages/=https://mirrors.aliyun.com/pypi/packages/
+docker/fixture-inputs/verify.sh --consumer iceberg-rest-oss --platform linux/amd64
+docker/iceberg-rest/fixture-runtime.sh start --config "$machine_config"
+export NOVA_ENV_OBJECT_STORE_CONFIG="$object_store_config"
+docker/iceberg-rest/up.sh
+docker/iceberg-rest/fixture-runtime.sh check --config "$machine_config"
+```
+
+手动 provision 的 `--artifact-url-prefix` 仅选择传输位置，原锁的长度和 hash、BOM identity、内容缓存键不变，错误镜像直接失败且不回退。Linux prepare 从 profile 的 `fixture_artifact_url_prefixes` 显式转发相同设置，check/verify 不下载；完整约束见 [输入来源说明](../fixture-inputs/README.md)。
+
+当前 OSS host SDK 闭包仅声明 Ubuntu 26.04、原生 amd64、Python 3.14。provision 准备固定依赖的独立 venv 和 REST/Spark 凭证桥接镜像；verify、check、运行层不会临时执行 pip/Maven 下载。`iceberg-rest-oss` 只选择对应闭包，不拉取或编译 MinIO/mc；普通本地 MinIO 仍选择 `iceberg-rest`。OSS 配置缺失或错误时明确失败，不回退到 MinIO。
+
+机器将规范化五字段配置保存为 activation 目录中的不可变 `object-store.json`。publication 中的 `NOVA_ENV_OBJECT_STORE_CONFIG` 和 host SDK 路径固定到原激活输入，不能通过改写安装器的期望配置切换旧运行。配置或输入版本变化须显式 `upgrade --config "$machine_config"`，随后重新 attach；同一健康定义的 `start` 复用原 generation。升级停止原共享 writer，确认旧 REST catalog 屏障，再使用新的机器 warehouse，保留旧 OSS 对象；不创建或撤销云 IAM，也不把换代当成旧 token 已失效。MinIO 与 OSS 的机器 owner 不在原地互相转换。
+
+旧 ECS 释放后，在新 ECS 绑定同一 RAM 角色，取得相同源码、profile 和五字段配置，再执行同一 Linux prepare 命令。新机器重新取得本机 BOM、image ID、daemon 身份和 catalog generation，不复制旧 READY、SQLite 或运行定位信息。
+
+普通建表、写入验证使用 REST catalog。Hadoop catalog 的生产 metadata 条件发布协议没有改变，而 OSS 的当前 S3 兼容接口不支持该条件写；不能将普通对象读写可用解释为 Hadoop catalog 提交可用。MinIO IAM/STS、vended 和 Paimon 专项在 OSS 模式下于副作用前明确拒绝，不能以 OSS 冒充这些前置。
+
+OSS 的普通启动不扫描并删除 TTL 遗留；显式 sweep 返回 `status=NOT_RUN`、`scope=cloud-ttl`、`cleanup_performed=false` 和保留原因。原运行清理独立核对 writer 实际退出、原 catalog 屏障及准确 run scope，再清其对象和 multipart；未知 writer、兄弟前缀、benchmark 和旧 generation 不因 TTL 或换机获得删除授权。
 
 ## 输入与机器维护
 
@@ -55,9 +106,9 @@ docker/iceberg-rest/fixture-runtime.sh resolve-readonly-observation --journal /a
 
 此命令只在原机器维护锁内核对当前 daemon、机器身份和该 journal 的原请求，以原 owner 共用的只读命令分类验证后记录处置；重复调用返回已验证的原处置，不重写记录。它不运行 start、upgrade、sweep，不遍历或结算其他操作。原失败、phase 及原进程退出事实完整保留，缺少退出证明仍为 Unknown；status 分别展示失败和处置。未知 mutation、外来或不可信请求继续报错。该处置不证明 CLI 或远程 writer 已退出，不提供 scratch 清理权限，也不改写旧运行的 cleanup violation；后续运行清理仍须满足原 context、期限、writer 退出及准确 scope 条件。
 
-`start` 幂等恢复同一输入定义，版本不同要求显式 `upgrade`。首次维护可在 start 后传 `--config /absolute/machine.json`；JSON字段为 `ports`、`policy`、`benchmark_root`、`minio_volume`。端口是准确固定配置，默认 MinIO API/console=28000/28001、REST/rest-mv=28002/28003、Spark UI=28004、HMS接入槽=28005；冲突报错，不扫描替代端口。FE/BE listener 仍由 worktree/harness 分配。`shared.env` 属于 worktree/private 输入，不是机器端口、root凭证或维护状态的权威。
+`start` 幂等恢复同一输入定义，版本不同要求显式 `upgrade`。首次维护可在 start 后传 `--config /absolute/machine.json`；本地 MinIO JSON 字段为 `ports`、`policy`、`benchmark_root`、`minio_volume`；OSS 使用上述 `object_store`，不接受 `minio_volume`。端口是准确固定配置，默认 MinIO API/console=28000/28001、REST/rest-mv=28002/28003、Spark UI=28004、HMS接入槽=28005；冲突报错，不扫描替代端口。FE/BE listener 仍由 worktree/harness 分配。`shared.env` 属于 worktree/private 输入，不是机器端口、root凭证或维护状态的权威。
 
-完整 version 包含协议、验证后的有效 BOM/derived 定义、实际 image ID、机器模板和配置，不把时间、cache路径或可变tag当版本。generation标记一次实际激活。升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，先移除准确旧REST实例及数据库卷，原生确认absence并持久记录catalog屏障，再保持准确MinIO在线清理scratch。benchmark全部对象保留；切换服务、核实资源/image/端点/健康后才提交ready。固定REST恢复后旧请求仍可能成功重建scratch，不承诺这些请求失效。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。
+完整 version 包含协议、验证后的有效 BOM/derived 定义、实际 image ID、机器模板和配置，不把时间、cache路径或可变tag当版本。generation标记一次实际激活。以下 root/IAM 维护步骤属于本地 MinIO；OSS 的维护与保留范围见上节。MinIO 升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，先移除准确旧REST实例及数据库卷，原生确认absence并持久记录catalog屏障，再保持准确MinIO在线清理scratch。benchmark全部对象保留；切换服务、核实资源/image/端点/健康后才提交ready。固定REST恢复后旧请求仍可能成功重建scratch，不承诺这些请求失效。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。
 
 已有 MinIO 卷只有维护者明确指定准确来源才可迁入，原卷和全部 benchmark 数据保留；不猜“最近一个”。历史版本化项目、旧 `nr-iceberg-rest` / `nr-iceberg-hive` 资源不自动认领、迁移或删除。首次切换须先记录资源/数据清单和维护窗口。
 
@@ -87,7 +138,7 @@ source "$fixture_publication/env.sh"
 
 共享 manifest 的 `runtime.machine` 包含准确 machine ID、daemon、完整version、activation generation、image/container/network/volume facts和producer receipt。私有栈使用 `runtime.catalog`；vended额外携带共享MinIO machine事实。没有旧owner locator或多版本绑定协议。
 
-env导出 `NOVA_FIXTURE_MACHINE_ID/DAEMON/VERSION/GENERATION/ROOT`、TTL/max-run/cleanup policy，以及原有FE/BE/SQL/Spark配置和物理端点。`NOVA_ENV_OBJECT_STORE_RUNTIME` 与 `NOVA_ENV_CATALOG_RUNTIME` 在共享模式投影同一machine ID，不是旧管理API。host使用保存的实际端口；容器内协议别名仍为 `minio:9000`、`rest:8181`、`rest-mv:8181`。客户端warehouse不能当作REST服务端实际数据位置。
+env导出 `NOVA_FIXTURE_MACHINE_ID/DAEMON/VERSION/GENERATION/ROOT`、TTL/max-run/cleanup policy，以及原有FE/BE/SQL/Spark配置和物理端点。`NOVA_ENV_OBJECT_STORE_RUNTIME` 与 `NOVA_ENV_CATALOG_RUNTIME` 在共享模式投影同一machine ID，不是旧管理API。host使用保存的实际端口；容器内 REST 别名为 `rest:8181`、`rest-mv:8181`；本地 MinIO 使用 `minio:9000`，OSS 使用配置地域的 S3 兼容内网 HTTPS endpoint 与 virtual-host 寻址。客户端warehouse不能当作REST服务端实际数据位置。
 
 ```bash
 docker/iceberg-rest/up.sh --prepare-only
@@ -101,13 +152,13 @@ docker/iceberg-rest/up.sh --prepare-only
 
 run名称为 `nr_scratch_<13digit epoch_ms>_<32lowerhex>`，共享namespace为完整run ID加 `_` 和最多5字符用途后缀。`NOVA_FIXTURE_RUN_STORAGE` 与原预算分开，开始前固定三个范围：原worktree/run目录根、REST warehouse下的 `<run-id>_` 名称前缀、rest-mv warehouse下的同类前缀。目录根用单个尾 `/`，名称前缀的 `_` 后不加 `/`。原生JDBC默认建表使用服务端warehouse/namespace，不继承namespace location；SQL与Java原行为不改。普通表/view、同运行rename、显式位置及CTAS统一核对所属运行范围，客户端warehouse只约束显式CTAS。Hadoop可变warehouse绑定run root，已有只读READY保持原绑定。
 
-共享REST/Spark使用共享凭证，运行IAM只约束使用运行凭证的writer。Python/Rust按准确MinIO owner核实继承投影；s3a仅作为同绑定比较别名。原始控制字符、重复斜杠、dot组件及歧义URI拒绝，不折叠成其他S3 key。
+本地 MinIO 的共享 REST/Spark 使用共享凭证，运行 IAM 只约束使用运行凭证的 writer。OSS 各消费者独立刷新节点凭证，存储身份固定 provider、endpoint、region、bucket 和 root_prefix，不能伪装成 MinIO 卷。Python/Rust 按准确存储 owner 核实继承投影；s3a仅作为同绑定比较别名。原始控制字符、重复斜杠、dot组件及歧义URI拒绝，不折叠成其他S3 key。
 
 发布前按bucket/key组件核实REST、rest-mv、benchmark与准确worktree/private基础根不相交，交叠即拒绝；公共祖先不是删除域。CTAS与vended的明确运行子根可以位于原运行根内，不能据此扩大独立基础根或删除范围。
 
-实际写入入口在首次副作用前执行一次显式启动清扫，固定原publication与原预算，最多使用5秒或原工作剩余期限。只清过期scratch；确认完成退出的清扫超时保留pending供后续继续，I/O/权限/清理错误仍失败。通用context准入和READY `--check`保持只读。
+本地 MinIO 的实际写入入口在首次副作用前执行一次显式启动清扫，固定原publication与原预算，最多使用5秒或原工作剩余期限。只清过期scratch；确认完成退出的清扫超时保留pending供后续继续，I/O/权限/清理错误仍失败。通用context准入和READY `--check`保持只读。
 
-独立运行结束确认writer实际退出后，先清两个REST服务中该运行所有条目与namespace并确认不存在，再撤销IAM，最后清原根及实际枚举出的合法namespace目录。catalog/IAM失败或未知保留文件。同运行rename可保留旧目录，不能只凭一个namespace消失清文件。嵌套producer将文件责任交原外层owner并明确记录deferred；失败保留登记和原始退出。显式sweep有总期限，以原生时间/名称/准确scope分类TTL遗留；无法确认的资源不删除。自定义benchmark root、祖先/后代及所有对象（包括staging）先保护。TTL不代替正常teardown。未知namespace命名不回收；status显示其数量及最近scratch观察的采样时间、count/oldest、部分枚举和activation适用范围；未观察为UNKNOWN。
+独立运行结束确认writer实际退出后，先清两个REST服务中该运行所有条目与namespace并确认不存在，本地 MinIO 再撤销 IAM，最后清原根及实际枚举出的合法 namespace 目录；OSS 不执行 IAM 操作。catalog 或必要的 IAM 步骤失败、结果未知时保留文件。同运行rename可保留旧目录，不能只凭一个namespace消失清文件。嵌套producer将文件责任交原外层owner并明确记录deferred；失败保留登记和原始退出。显式sweep有总期限，以原生时间/名称/准确scope分类TTL遗留；无法确认的资源不删除。自定义benchmark root、祖先/后代及所有对象（包括staging）先保护。TTL不代替正常teardown。未知namespace命名不回收；status显示其数量及最近scratch观察的采样时间、count/oldest、部分枚举和activation适用范围；未观察为UNKNOWN。
 
 ```bash
 export NOVA_FIXTURE_RUN_CONTEXT="$(python3 docker/iceberg-rest/fixture_run.py context --env-file "$NOVA_ENV_REST_ENV_FILE" --fixture-budget-secs 3600)"
@@ -133,7 +184,7 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 HMS只接入准确machine网络，使用机器预留HMS端口；其Derby卷和项目由HMS入口自己管理，不计为核心栈。机器换activation后先显式退出旧HMS记录再附着，不由REST owner递归删除。
 
-共享benchmark默认 `s3://novarocks/shared/benchmarks`，显式输入owner按BOM producer供给；已有消费者只check准确READY，不bind/up/ensure或改写warehouse。见 [ADR-0173](../../docs/adr/ADR-0173-prepared-dataset-consumption-is-check-only.md)。
+本地 MinIO 的共享 benchmark 默认 `s3://novarocks/shared/benchmarks`，OSS 默认为配置 Bucket/root_prefix 下的 `benchmarks`；显式输入owner按BOM producer供给；已有消费者只check准确READY，不bind/up/ensure或改写warehouse。见 [ADR-0173](../../docs/adr/ADR-0173-prepared-dataset-consumption-is-check-only.md)。
 
 ```bash
 docker/iceberg-rest/down.sh --runtime-only

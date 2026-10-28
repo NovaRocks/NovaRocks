@@ -63,6 +63,73 @@ class RendererCase(unittest.TestCase):
 
 
 class RendererTests(RendererCase):
+    def test_cloud_request_attaches_to_the_same_default_benchmark_domain(self):
+        from test_machine_oss import CLOUD, CloudMachineTests
+        fixture = CloudMachineTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        snapshot = fixture.start()
+        cloud_file = self.root / "cloud-attach.json"
+        cloud_file.write_text(json.dumps(CLOUD))
+        settings = entry.load_settings(HERE / "shared.env")
+        settings["NOVA_ENV_OBJECT_STORE_CONFIG"] = str(cloud_file)
+        config = entry.request_config(self.workspace, settings, HERE / "shared.env", self.entry, shared=True, update_current=False)
+        result = entry.attach_entry(fixture.owner, config["env_id"], self.entry, config, fixture.inputs)
+        self.assertTrue(result["ready"])
+        self.assertEqual(config["benchmark"]["shared_root"].rstrip('/'), snapshot["config"]["benchmark_root"])
+        self.assertEqual(fixture.backend.events, ["ensure"])
+        self.assertNotIn("minio", json.loads((Path(result["published_dir"]) / "manifest.json").read_text()))
+
+    def test_cloud_render_has_independent_role_sources_and_no_static_material(self):
+        cloud = {"kind": "aliyun-oss", "region": "cn-beijing", "bucket": "test-bucket",
+                 "role_name": "test-role", "root_prefix": "fixture/"}
+        cloud_file = self.root / "cloud.json"
+        cloud_file.write_text(json.dumps(cloud))
+        settings = entry.load_settings(HERE / "shared.env")
+        settings["NOVA_ENV_OBJECT_STORE_CONFIG"] = str(cloud_file)
+        config = entry.request_config(self.workspace, settings, HERE / "shared.env", self.entry, shared=True, update_current=False)
+        self.assertNotIn("credentials", config)
+        self.assertEqual(config["benchmark"]["shared_root"], "s3://test-bucket/fixture/benchmarks/")
+        snapshot = copy.deepcopy(self.snapshot)
+        snapshot["config"] = {"object_store": cloud, "benchmark_root": "s3://test-bucket/fixture/benchmarks"}
+        snapshot.pop("credentials")
+        snapshot["server_warehouses"] = {"rest": "s3://test-bucket/fixture/machines/id/gen/rest",
+                                         "rest-mv": "s3://test-bucket/fixture/machines/id/gen/rest-mv"}
+        snapshot["storage_owner"] = {"provider": "aliyun-oss", "endpoint": "https://s3.oss-cn-beijing-internal.aliyuncs.com",
+                                     "region": "cn-beijing", "bucket": "test-bucket", "root_prefix": "fixture/"}
+        snapshot["oss_ops_python"] = "/locked-sdk/bin/python"
+        snapshot["object_store_config_file"] = str(self.root / "machine-generation/object-store.json")
+        snapshot["images"] = {key: value for key, value in snapshot["images"].items() if key in {"rest", "rest-mv", "spark"}}
+        endpoints = {"object_store_endpoint": snapshot["storage_owner"]["endpoint"], "rest_uri": "http://127.0.0.1:28002",
+            "rest_mv_uri": "http://127.0.0.1:28003", "container_rest_uri": "http://rest:8181",
+            "container_rest_mv_uri": "http://rest-mv:8181", "spark_ui": "http://127.0.0.1:28004"}
+        output = self.root / "cloud-render"
+        with mock.patch.object(machine, "endpoints", return_value=endpoints):
+            entry.render_entry({"ready": True, "worktree": config["env_id"], "config": config, "machine": snapshot,
+                "publication_dir": str(output), "stable_runtime_dir": str(self.entry)}, output)
+        environment = self.environment(output / "env.sh", AWS_S3_ACCESS_KEY_ID="old", AWS_S3_SECRET_ACCESS_KEY="old", MINIO_ROOT_USER="old")
+        for name in ("AWS_S3_ACCESS_KEY_ID", "AWS_S3_SECRET_ACCESS_KEY", "MINIO_ROOT_USER", "NOVA_ENV_MINIO_PORT"):
+            self.assertNotIn(name, environment)
+        self.assertEqual(environment["NOVA_ENV_OBJECT_STORE_CONFIG"], snapshot["object_store_config_file"])
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertNotIn("minio", manifest)
+        self.assertEqual(manifest["storage_owner"], snapshot["storage_owner"])
+        names = []
+        for role in ("fe", "be"):
+            source = tomllib.loads((output / (role + ".toml")).read_text())["connector"]["credentials"][0]
+            self.assertEqual(source["kind"], "aliyun-ecs-ram-role")
+            self.assertEqual(source["scope_prefixes"], ["s3://test-bucket/fixture/"])
+            self.assertNotIn("access_key_id", source)
+            names.append(source["name"])
+        self.assertEqual(names, ["iceberg-oss-metadata", "iceberg-oss-data"])
+        values = tomllib.loads((output / "sql-test.toml").read_text())["env"]
+        self.assertNotIn("oss_ak", values)
+        self.assertEqual(values["oss_path_style"], "false")
+        spark = (output / "spark-defaults.conf").read_text()
+        self.assertIn("AliyunEcsCredentialsProvider", spark)
+        self.assertIn("AliyunEcsV1CredentialsProvider", spark)
+        self.assertNotIn("access-key-id", spark)
+
     def publication_hashes(self, directory):
         return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
                 for name in runtime.ENTRY_FILES}
@@ -486,7 +553,7 @@ class SharedEnvironmentTests(RendererCase):
         results = []
         for label in ('definition-a', 'definition-b'):
             source = self.root / label / 'docker/iceberg-rest'; source.mkdir(parents=True)
-            for name in ('up.sh', 'fixture_runtime.py', 'machine_runtime.py', 'entry_publication.py', 'runtime_entry.py', 'shared.env'):
+            for name in ('up.sh', 'fixture_runtime.py', 'machine_runtime.py', 'oss_ops.py', 'entry_publication.py', 'runtime_entry.py', 'shared.env'):
                 shutil.copy2(HERE / name, source / name)
             environment = {**os.environ, 'PATH': str(fakebin) + ':' + os.environ['PATH'],
                 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace), 'NOVA_ENV_CONFIG_FILE': str(source / 'shared.env')}
@@ -786,7 +853,7 @@ class IsolatedEntryTests(RendererCase):
         copied = self.root / 'checkout'
         fixture = copied / 'docker/iceberg-rest'
         fixture.mkdir(parents=True)
-        for name in ['up.sh', 'down.sh', 'fixture_runtime.py', 'machine_runtime.py', 'entry_publication.py', 'runtime_entry.py', 'shared.env']:
+        for name in ['up.sh', 'down.sh', 'fixture_runtime.py', 'machine_runtime.py', 'oss_ops.py', 'entry_publication.py', 'runtime_entry.py', 'shared.env']:
             shutil.copy2(HERE / name, fixture / name)
         for name in ['templates', 'spark']:
             shutil.copytree(HERE / name, fixture / name)
@@ -850,7 +917,7 @@ class ConsumerInputVerificationTests(unittest.TestCase):
         with mock.patch.object(machine, 'verified_bom', return_value=snapshot) as verify, mock.patch.object(runtime, 'read_json', side_effect=AssertionError('reread mutable BOM')):
             actual = entry.verify_inputs(config)
         self.assertIs(actual, snapshot)
-        verify.assert_called_once_with(Path('/fixture-repository'), Path('/fixture-store'))
+        verify.assert_called_once_with(Path('/fixture-repository'), Path('/fixture-store'), consumer='iceberg-rest')
         self.assertEqual(config['fixture_inputs']['consumer'], 'iceberg-rest')
         self.assertEqual(config['fixture_inputs']['lock_sha256'], 'verified-lock')
         self.assertTrue(config['fixture_inputs']['verified'])

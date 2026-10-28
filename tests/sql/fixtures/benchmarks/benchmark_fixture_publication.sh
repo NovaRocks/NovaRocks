@@ -17,7 +17,8 @@
 # under the License.
 
 # Direct S3 publication helpers.  The local storage mode exists only for the
-# hermetic lifecycle tests; production always uses SigV4 curl requests.
+# hermetic lifecycle tests. OSS uses the original machine's supervised SDK
+# entrypoint; static MinIO retains its SigV4 transport.
 
 fixture_publication_uri_path() {
   local uri="$1" root="${BENCHMARK_FIXTURE_STORAGE_DIR:?local storage root is required}"
@@ -27,6 +28,35 @@ fixture_publication_uri_path() {
 
 fixture_publication_curl_capable() {
   curl --help all 2>/dev/null | grep -q -- '--aws-sigv4'
+}
+
+fixture_publication_capable() {
+  [[ -n "${BENCHMARK_FIXTURE_STORAGE_DIR:-}" ]] && return 0
+  if [[ "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" == aliyun-oss ]]; then
+    [[ -n "${NOVA_ENV_OBJECT_STORE_CONFIG:-}" && -x "${NOVA_OSS_OPS_PYTHON:-}" && -n "${NOVA_FIXTURE_MACHINE_ROOT:-}" ]]
+  else
+    fixture_publication_curl_capable
+  fi
+}
+
+fixture_publication_oss_operation() {
+  # No SDK process is launched here. The existing machine owner revalidates
+  # this exact benchmark contract, original budget and actual child exit.
+  local operation="$1" uri="$2" file="${3:-}"
+  python3 - "${resolved_dataset_file:?resolved benchmark contract is required}" "$operation" "$uri" "$file" <<'PYREQUEST' | \
+    python3 "$SOURCE_ROOT/docker/iceberg-rest/machine_mc.py" \
+      --root "${NOVA_FIXTURE_MACHINE_ROOT:?original machine root is required}" \
+      --daemon "${NOVA_FIXTURE_MACHINE_DAEMON:?original machine daemon is required}" \
+      --expected-version "${NOVA_FIXTURE_MACHINE_VERSION:?original machine version is required}" \
+      --expected-generation "${NOVA_FIXTURE_MACHINE_GENERATION:?original machine generation is required}" \
+      --benchmark-oss
+import json, sys
+resolved, operation, uri, path = sys.argv[1:]
+request = dict(resolved=json.load(open(resolved)), operation=operation, uri=uri)
+if operation == 'put': request['input'] = path
+elif operation == 'get': request['output'] = path
+print(json.dumps(request, separators=(',', ':')))
+PYREQUEST
 }
 
 fixture_publication_s3_url() {
@@ -68,6 +98,17 @@ fixture_publication_list_prefix() {
     find "$path" -type f ! -name '*.etag' -print | while IFS= read -r object; do
       printf 's3://%s\n' "${object#"$root"}"
     done
+    return
+  fi
+  if [[ "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" == aliyun-oss ]]; then
+    local receipt
+    receipt="$(fixture_publication_oss_operation list "$prefix_uri")" || return
+    python3 - "$receipt" <<'PYLIST'
+import json, sys
+value = json.loads(sys.argv[1])
+if value.get('ok') is not True: raise SystemExit(1)
+for item in value['objects']: print(item['uri'])
+PYLIST
     return
   fi
   fixture_publication_curl_capable || return 64
@@ -113,6 +154,21 @@ fixture_publication_get() {
     FIXTURE_PUBLICATION_BODY="$(cat "$path")"
     return
   fi
+  if [[ "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" == aliyun-oss ]]; then
+    local body receipt
+    body="$(mktemp)"
+    if ! receipt="$(fixture_publication_oss_operation get "$uri" "$body")"; then rm -f "$body"; return 44; fi
+    if ! FIXTURE_PUBLICATION_ETAG="$(python3 - "$receipt" <<'PYGET'
+import json, sys
+value=json.loads(sys.argv[1])
+if value.get('ok') is not True or not value.get('etag'): raise SystemExit(1)
+print(value['etag'])
+PYGET
+)"; then rm -f "$body"; return 1; fi
+    FIXTURE_PUBLICATION_BODY="$(cat "$body")"
+    rm -f "$body"
+    return
+  fi
   fixture_publication_curl_capable || return 64
   local config headers body status
   config="$(mktemp)"; headers="$(mktemp)"; body="$(mktemp)"
@@ -135,6 +191,16 @@ fixture_publication_head() {
   local uri="$1"
   if [[ -n "${BENCHMARK_FIXTURE_STORAGE_DIR:-}" ]]; then
     [[ -f "$(fixture_publication_uri_path "$uri")" ]]
+    return
+  fi
+  if [[ "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" == aliyun-oss ]]; then
+    local receipt
+    receipt="$(fixture_publication_oss_operation stat "$uri")" || return
+    python3 - "$receipt" <<'PYHEAD'
+import json, sys
+value=json.loads(sys.argv[1])
+raise SystemExit(0 if value.get('ok') is True and value.get('exists') is True else 1)
+PYHEAD
     return
   fi
   fixture_publication_curl_capable || return 64
@@ -160,6 +226,17 @@ fixture_publication_put() {
     cp "$body" "$path" || return 1
     sha256sum "$path" | awk '{print $1}' > "$path.etag" || return 1
     printf '200\n'; return
+  fi
+  if [[ "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" == aliyun-oss ]]; then
+    local receipt
+    receipt="$(fixture_publication_oss_operation put "$uri" "$body")" || return
+    python3 - "$receipt" <<'PYPUT'
+import json, sys
+value=json.loads(sys.argv[1])
+if value.get('ok') is not True or value.get('status') not in (200, 201): raise SystemExit(1)
+print(value['status'])
+PYPUT
+    return
   fi
   fixture_publication_curl_capable || return 64
   local config status

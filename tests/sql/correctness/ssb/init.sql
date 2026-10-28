@@ -23,15 +23,15 @@ PROPERTIES (
     "iceberg.catalog.type"="${iceberg_catalog_type}",
     "iceberg.catalog.warehouse"="${dataset_iceberg_catalog_warehouse}",
     "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "static",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
+    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
     "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
     "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "static",
-    "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
+    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
     "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
     "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.enable_path_style_access"="true"
+    "aws.s3.enable_path_style_access"="${oss_path_style}"
 );
 
 USE `iceberg_cat_${uuid0}`.`ssb`;

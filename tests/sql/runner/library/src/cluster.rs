@@ -138,6 +138,15 @@ fn fixture_credential_environment(
         if credential.get("purpose").and_then(toml::Value::as_str) != Some(purpose) {
             continue;
         }
+        if credential.get("kind").and_then(toml::Value::as_str) == Some("aliyun-ecs-ram-role") {
+            anyhow::ensure!(
+                ["access_key_id", "access_key_secret", "session_token"]
+                    .iter()
+                    .all(|key| credential.get(*key).is_none()),
+                "node-local fixture sources cannot contain secret material or environment references"
+            );
+            continue;
+        }
         for key in ["access_key_id", "access_key_secret"] {
             let Some(value) = credential.get(key).and_then(toml::Value::as_str) else {
                 continue;
@@ -387,6 +396,32 @@ access_key_secret = "literal-secret"
             })
             .expect("literal config")
             .is_empty()
+        );
+    }
+    #[test]
+    fn node_local_fixture_source_never_resolves_ambient_material() {
+        let source = r#"
+[[connector.credentials]]
+kind = "aliyun-ecs-ram-role"
+purpose = "object-store-data"
+name = "iceberg-oss-data"
+generation = "v1-fixture"
+role_name = "fixture-role"
+scope_prefixes = ["s3://bucket/root/"]
+"#;
+        assert!(
+            fixture_credential_environment(source, "object-store-data", |_| panic!(
+                "node-local source must not resolve environment secrets"
+            ))
+            .unwrap()
+            .is_empty()
+        );
+        let invalid = format!("{source}access_key_id = '${{ENV:AWS_S3_ACCESS_KEY_ID}}'\n");
+        assert!(
+            fixture_credential_environment(&invalid, "object-store-data", |_| panic!(
+                "invalid snapshot rejected before lookup"
+            ))
+            .is_err()
         );
     }
 }

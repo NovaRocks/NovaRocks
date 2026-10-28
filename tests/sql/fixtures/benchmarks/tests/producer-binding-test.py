@@ -147,6 +147,35 @@ class ProducerBindingTest(unittest.TestCase):
             resolver.validate_producer(self.root, self.resolved, self.publication,
                                        "sha256:wrong", "r2-exact-container")
 
+    def test_cloud_producer_requires_actual_oss_recipe_and_original_spark_definition(self):
+        lock, lock_hash = load_lock(self.root / "docker/fixture-inputs/lock.json", consumer="derived:iceberg-spark-oss")
+        receipts = {}
+        for name in ["iceberg-spark", "iceberg-spark-oss"]:
+            derived = lock["derived_images"][name]
+            for relative in derived["definition_files"]:
+                target = self.root / relative
+                if not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(ROOT / relative, target)
+            receipts[name] = {"alias": derived["alias"], "platform": derived["platform"], "definition_sha256": definition_sha256(self.root, derived["definition_files"]), "image_id": "sha256:" + name}
+        bom = {"schema": 2, "platform": lock["platform"], "lock_sha256": lock_hash, "derived_images": receipts}
+        (self.fixture / "bom.json").write_text(json.dumps(bom))
+        manifest = json.loads((self.publication / "manifest.json").read_text())
+        receipt = receipts["iceberg-spark-oss"]
+        catalog = manifest["runtime"]["catalog"]
+        catalog["config"] = {"object_store": {"kind": "aliyun-oss"}}
+        catalog["images"]["spark"] = {"image_id": receipt["image_id"], "receipt": receipt}
+        manifest["runtime"]["producer_receipt"] = {"lock_sha256": lock_hash, **receipt}
+        (self.publication / "manifest.json").write_text(json.dumps(manifest))
+        model = resolver.load_model(self.root / "tests/sql/fixtures/benchmarks/benchmark_tools.toml")
+        resolved = resolver.resolve_fixture(model, self.root, "ssb", "1", object_store_kind="aliyun-oss")
+        resolver.validate_producer(self.root, resolved, self.publication, receipt["image_id"], "r2-exact-container")
+        for image, value in [("sha256:spark-r2", resolved), (receipt["image_id"], self.resolved)]:
+            with self.assertRaises(ValueError): resolver.validate_producer(self.root, value, self.publication, image, "r2-exact-container")
+        path = self.root / "docker/iceberg-rest/spark/Dockerfile"
+        path.write_bytes(path.read_bytes() + b"\n# source changed after receipt\n")
+        with self.assertRaises(ValueError): resolver.validate_producer(self.root, resolved, self.publication, receipt["image_id"], "r2-exact-container")
+
     def test_ready_check_uses_published_input_without_bind_or_spark(self):
         self.environment["NOVA_ENV_REST_ENV_FILE"] = str(self.publication / "env.sh")
         result = self.run_bootstrap("--check")

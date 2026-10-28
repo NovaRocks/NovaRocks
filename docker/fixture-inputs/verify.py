@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fixture_inputs import FixtureInputError, definition_sha256, fixture_store, fixture_store_lock, inspect_image, load_lock, read_json, require_relative, required_input_names, require_native_daemon, validate_artifact, verify_image
+from fixture_inputs import FixtureInputError, definition_sha256, fixture_store, fixture_store_lock, inspect_image, load_lock, read_json, require_relative, require_native_daemon, validate_artifact, verify_image
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -21,11 +21,8 @@ def verify_contents(store: Path, repo_root: Path, lock: dict[str, Any], lock_sha
         raise FixtureInputError("unsupported fixture input BOM schema; explicitly reprovision with schema 2")
     if bom.get("lock_sha256") != lock_sha or bom.get("platform") != lock["platform"]:
         raise FixtureInputError("fixture input BOM lock digest/platform mismatch")
-    images, artifacts, derived_images = required_input_names(lock, "all")
     artifact_dir = store / require_relative(str(bom.get("artifact_dir", "")))
     for name, item in lock["images"].items():
-        if name not in images:
-            continue
         receipt = bom.get("images", {}).get(name, {})
         expected_receipt = {
             "alias": item["alias"],
@@ -38,14 +35,10 @@ def verify_contents(store: Path, repo_root: Path, lock: dict[str, Any], lock_sha
             raise FixtureInputError(f"fixture image BOM receipt mismatch: {name}")
         verify_image(inspect_image(item["alias"]), item)
     for name, item in lock["artifacts"].items():
-        if name not in artifacts:
-            continue
         actual = validate_artifact(artifact_dir / name, item)
         if bom.get("artifacts", {}).get(name) != actual:
             raise FixtureInputError(f"fixture artifact BOM receipt mismatch: {name}")
     for name, item in lock["derived_images"].items():
-        if name not in derived_images:
-            continue
         receipt = bom.get("derived_images", {}).get(name, {})
         expected_definition = definition_sha256(repo_root, item["definition_files"])
         expected_receipt = {
@@ -64,6 +57,8 @@ def verify_contents(store: Path, repo_root: Path, lock: dict[str, Any], lock_sha
             raise FixtureInputError(f"fixture derived image label mismatch: {name}")
         if receipt.get("image_id") != str(info.get("Id", "")):
             raise FixtureInputError(f"fixture derived image BOM receipt mismatch: {name}")
+    from python_environment import verify_environments
+    verify_environments(store, repo_root, lock, bom)
     return bom
 
 
@@ -94,7 +89,7 @@ def main() -> int:
     parser.add_argument("--lock", default=SCRIPT_DIR / "lock.json")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--platform", help="explicit native target, checked against host and Docker daemon")
-    parser.add_argument("--consumer", choices=("all", "iceberg-rest", "object-store"), default="all")
+    parser.add_argument("--consumer", choices=("all", "iceberg-rest", "iceberg-rest-oss", "object-store"), default="all")
     args = parser.parse_args()
     try:
         bom = verify(fixture_store(args.store), Path(args.repo_root).resolve(), Path(args.lock).resolve(), consumer=args.consumer, platform=args.platform)

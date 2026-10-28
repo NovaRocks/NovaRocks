@@ -38,6 +38,7 @@ import struct
 import sys
 import time
 import traceback
+import uuid
 from typing import NamedTuple
 
 import fixture_runtime as runtime
@@ -130,7 +131,7 @@ class CommandOwner:
             self.owner_lost = os.read(self.control_fd, 1) == b""
         return not self.owner_lost
 
-    def command(self, args, output, *, creating=False, cleanup=False, settle_create=False):
+    def command(self, args, output, *, creating=False, cleanup=False, settle_create=False, host=False):
         if settle_create and (not creating or cleanup or args[0] != "create"
                               or self.request.get("operation") == "control"):
             raise runtime.RuntimeFailure("InvalidConfiguration", "reply settlement is only available to mc create")
@@ -145,7 +146,7 @@ class CommandOwner:
                 expired = time.monotonic() >= deadline
                 if expired or not alive:
                     return CommandResult(124 if expired else 130, expired, False)
-            process = subprocess.Popen(["docker", *args], stdout=stdout, stderr=stderr,
+            process = subprocess.Popen(args if host else ["docker", *args], stdout=stdout, stderr=stderr,
                                        env=self.environment, start_new_session=True)
             # waitid(WNOWAIT) observes without reaping the original leader.
             # Its identity pins the PGID through the final group observation.
@@ -288,6 +289,33 @@ class CommandOwner:
                       command_succeeded=command_exit == 0 and not self.owner_lost and not timed_out)
         return 0 if self.fact.get("command_succeeded") else 1
 
+    def run_host_sdk(self):
+        """The same original owner pins one SDK process group through exit."""
+        request = self.request
+        entry = Path(__file__).with_name("oss_ops.py").resolve()
+        python, config = Path(request["sdk_python"]), Path(request["sdk_config"])
+        if (not python.is_absolute() or not python.is_file()
+                or request.get("sdk_entry") != str(entry)
+                or not config.is_absolute() or not config.is_file()):
+            raise runtime.RuntimeFailure("InvalidConfiguration", "host SDK inputs are not fixed absolute files")
+        from oss_ops import validate_config
+        definition = validate_config(runtime.read_json(config))
+        if definition != request.get("object_store"):
+            raise runtime.RuntimeFailure("InvalidConfiguration", "host SDK definition differs from activation")
+        arguments = validate_sdk_arguments(request["args"])
+        remaining = self.deadline - time.monotonic()
+        argv = [str(python), str(entry), "--config", str(config), "--timeout-seconds", str(max(remaining, 0.001)), *arguments]
+        # Publish possible dispatch before Popen. A killed supervisor cannot
+        # turn an unknown live SDK group into a never-started operation.
+        self.save(phase="running", command_dispatched=True)
+        result = self.command(argv, self.journal.with_suffix(".stdout"), host=True)
+        interrupted = not self.alive()
+        self.save(phase="settled", command_exit=result.code, timed_out=result.timed_out,
+                  command_dispatched=result.dispatched, interrupted=interrupted,
+                  remote_outcome="unknown" if result.dispatched and (result.timed_out or result.code != 0) and self.fact["mutating"] else "observed",
+                  command_succeeded=result.code == 0 and not result.timed_out and not interrupted)
+        return 0 if self.fact["command_succeeded"] else 1
+
     def run_control(self):
         alive = self.alive()
         if not alive or time.monotonic() >= self.deadline:
@@ -308,6 +336,81 @@ class CommandOwner:
         return 0 if self.fact["command_succeeded"] else 1
 
 
+def validate_sdk_arguments(arguments):
+    """Closed SDK grammar: callers cannot replace the provider or config."""
+    if (not isinstance(arguments, (list, tuple)) or not arguments
+            or len(arguments) > 7 or not all(isinstance(value, str) and value and "\x00" not in value for value in arguments)):
+        raise runtime.RuntimeFailure("InvalidConfiguration", "invalid host SDK arguments")
+    command = arguments[0]
+    extra = {"put": "--input", "get": "--output", "abort-multipart": "--upload-id"}
+    if command not in {"put", "get", "stat", "list", "delete", "list-multipart", "abort-multipart"}:
+        raise runtime.RuntimeFailure("InvalidConfiguration", "unsupported host SDK operation")
+    expected = 5 if command in extra else 3
+    if len(arguments) != expected or arguments[1] != "--uri" or (command in extra and arguments[3] != extra[command]):
+        raise runtime.RuntimeFailure("InvalidConfiguration", "host SDK arguments differ from the closed grammar")
+    # Validate before the real provider/metadata endpoint can be reached.
+    from scratch import s3_parts
+    s3_parts(arguments[2])
+    return list(arguments)
+
+
+def run_owned_host_sdk_operation(backend, record, args, *, deadline=None):
+    """Reuse the original machine maintenance flock and command supervisor."""
+    from scratch import cloud_storage_owner
+    arguments = validate_sdk_arguments(args)
+    owner = cloud_storage_owner(record)
+    if owner is None or record.get("storage_owner") != owner:
+        raise runtime.RuntimeFailure("InvalidConfiguration", "host SDK requires its exact cloud storage owner")
+    from oss_ops import OpsError, OssOperations
+    # Pure URI validation with a sentinel transport; it creates no SDK/client.
+    try:
+        with OssOperations(record["config"]["object_store"], bucket=object()) as scope:
+            scope._key(arguments[2])
+    except OpsError as error:
+        raise runtime.RuntimeFailure("InvalidScratchScope", "host SDK target leaves the closed cloud owner") from error
+    limits = [time.monotonic() + backend.timeout]
+    limits += [value for value in (deadline, getattr(backend, "operation_deadline", None)) if value is not None]
+    absolute = min(limits)
+    if not math.isfinite(absolute) or absolute <= time.monotonic():
+        raise runtime.RuntimeFailure("OperationDeadlineExceeded", "host SDK deadline elapsed before dispatch")
+    if getattr(backend, "maintenance_fd", None) is None:
+        raise runtime.RuntimeFailure("MaintenanceLockRequired", "host SDK requires the machine maintenance lock")
+    python = Path(record["oss_ops_python"])
+    config = Path(record["object_store_config_file"])
+    activation = Path(record["compose_file"]).parent.resolve()
+    if not python.is_absolute() or not config.is_absolute() or config.parent.resolve() != activation:
+        raise runtime.RuntimeFailure("InvalidConfiguration", "host SDK inputs differ from the frozen activation")
+    base = getattr(backend, "maintenance_base", None)
+    if base is None or Path(base).resolve() != (Path(record["control_root"]) / record["id"]).resolve():
+        raise runtime.RuntimeFailure("MaintenanceLockRequired", "host SDK requires its original machine maintenance base")
+    journal = Path(base) / "operations" / ("oss-" + uuid.uuid4().hex + ".json")
+    runtime.atomic_json(journal, dict(schema=1, operation="host-sdk", kind="host-sdk", phase="intent",
+        control_root=record["control_root"], machine=record["id"],
+        generation=record["generation"], storage_owner=owner,
+        mutating=arguments[0] in {"put", "delete", "abort-multipart"}))
+    environment = dict(backend.environment)
+    for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
+                 "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        environment.pop(name, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["NETRC"] = os.devnull
+    result = backend._supervise(journal, dict(operation="host-sdk", environment=environment,
+        sdk_python=str(python), sdk_entry=str(Path(__file__).with_name("oss_ops.py").resolve()),
+        sdk_config=str(config), object_store=record["config"]["object_store"],
+        args=arguments, deadline_monotonic=absolute), absolute - time.monotonic())
+    output = journal.with_suffix(".stdout")
+    if output.exists() and output.stat().st_size > 16 * 1024 * 1024:
+        raise runtime.RuntimeFailure("ObjectStoreOperationFailed", "host SDK output exceeds its byte bound")
+    text = output.read_text() if output.exists() else ""
+    if (not result.get("command_succeeded") or any(result.get(key) is not True for key in
+            ("group_exit_confirmed", "group_exit_observed", "leader_waited"))):
+        code = "ObjectStoreOperationTimeout" if result.get("timed_out") else "ObjectStoreOperationFailed"
+        error = runtime.RuntimeFailure(code, "host SDK operation did not succeed: " + str(journal))
+        error.stdout = text
+        raise error
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("journal", type=Path)
@@ -321,6 +424,8 @@ def main():
     request = runtime.read_json(args.journal.with_suffix(".request"))
     owner = CommandOwner(request, args.journal, args.control_fd, args.timeout)
     try:
+        if request.get("operation") == "host-sdk":
+            return owner.run_host_sdk()
         return owner.run_control() if request.get("operation") == "control" else owner.run()
     except BaseException as error:
         owner.save(phase="cleanup-failed", error=getattr(error, "code", type(error).__name__),

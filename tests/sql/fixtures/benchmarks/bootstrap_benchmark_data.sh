@@ -220,8 +220,29 @@ source_env() {
   : "${NOVA_ENV_COMPOSE_FILE:?missing NOVA_ENV_COMPOSE_FILE in $ENV_FILE}"
   : "${NOVA_ENV_SHARED_BENCHMARK_ROOT:?missing NOVA_ENV_SHARED_BENCHMARK_ROOT in $ENV_FILE}"
   : "${AWS_S3_ENDPOINT:?missing AWS_S3_ENDPOINT in $ENV_FILE}"
-  : "${AWS_S3_ACCESS_KEY_ID:?missing AWS_S3_ACCESS_KEY_ID in $ENV_FILE}"
-  : "${AWS_S3_SECRET_ACCESS_KEY:?missing AWS_S3_SECRET_ACCESS_KEY in $ENV_FILE}"
+  case "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" in
+    minio)
+      : "${AWS_S3_ACCESS_KEY_ID:?missing AWS_S3_ACCESS_KEY_ID in $ENV_FILE}"
+      : "${AWS_S3_SECRET_ACCESS_KEY:?missing AWS_S3_SECRET_ACCESS_KEY in $ENV_FILE}"
+      ;;
+    aliyun-oss)
+      : "${NOVA_ENV_OBJECT_STORE_CONFIG:?missing immutable OSS config in $ENV_FILE}"
+      : "${NOVA_OSS_OPS_PYTHON:?missing verified OSS SDK Python in $ENV_FILE}"
+      [[ "${NOVA_OSS_ROLE_NAME:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]] || die "invalid OSS role definition"
+      [[ "${oss_region:-}" =~ ^[a-z0-9-]+$ ]] || die "invalid OSS region definition"
+      [[ "$AWS_S3_ENDPOINT" == "https://s3.oss-$oss_region-internal.aliyuncs.com" && "${oss_path_style:-}" == false ]] || die "OSS endpoint or addressing differs from publication"
+      [[ "${NOVAROCKS_SPARK_S3_ENDPOINT:-}" == "$AWS_S3_ENDPOINT" ]] || die "OSS Spark endpoint differs from publication"
+      unset AWS_S3_ACCESS_KEY_ID AWS_S3_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+      ;;
+    *) die "unsupported fixture object-store kind" ;;
+  esac
+  local resolved_kind
+  resolved_kind="$(python3 - "$resolved_dataset_file" <<'PYBINDKIND'
+import json, sys
+print(json.load(open(sys.argv[1]))['producer_fingerprint'].get('object_store_kind', 'minio'))
+PYBINDKIND
+)" || die "invalid resolved producer definition"
+  [[ "$resolved_kind" == "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" ]] || die "resolved producer and fixture storage provider differ"
 }
 
 resolve_paths() {
@@ -294,7 +315,13 @@ assert r['dataset_root'].endswith(suffix)
 print(r['dataset_root'][:-len(suffix)])
 PYROOT
 )" || die "invalid resolved dataset root"
-  expected="$(python3 "$SOURCE_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --workspace-root "$SOURCE_ROOT" --suite "$suite" --scale "$scale" --shared-root "$shared_root")" || die "unable to resolve fixture contract"
+  local object_store_kind
+  object_store_kind="$(python3 - "$resolved_dataset_file" <<'PYKIND'
+import json, sys
+print(json.load(open(sys.argv[1]))['producer_fingerprint'].get('object_store_kind', 'minio'))
+PYKIND
+)" || die "invalid resolved producer kind"
+  expected="$(python3 "$SOURCE_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --workspace-root "$SOURCE_ROOT" --suite "$suite" --scale "$scale" --shared-root "$shared_root" --object-store-kind "$object_store_kind")" || die "unable to resolve fixture contract"
   actual="$(python3 - "$resolved_dataset_file" <<'PY'
 import json, sys
 print(json.dumps(json.load(open(sys.argv[1], encoding='utf-8')), sort_keys=True, separators=(',', ':')))
@@ -607,7 +634,12 @@ run_spark_loader() {
   loader_tmp_dir="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" temp-dir --env-file "$ENV_FILE")" || return
   trap 'primary=$?; cleanup=0; cleanup_spark_tmp_dir '"$(printf '%q' "$loader_tmp_dir")"' || cleanup=$?; if (( primary != 0 )); then exit "$primary"; fi; exit "$cleanup"' EXIT
   local fixture_contract_in_spark="$loader_tmp_dir/fixture-contract.json"
-  local schema_arg=""
+  local schema_arg="" source_args="--object-store-kind 'minio' --s3-region 'us-east-1'"
+  local -a source_environment=()
+  if [[ "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" == aliyun-oss ]]; then
+    source_args="--object-store-kind 'aliyun-oss' --s3-region '$oss_region' --s3-role-name '$NOVA_OSS_ROLE_NAME'"
+    source_environment=(-e "NOVA_OSS_ROLE_NAME=$NOVA_OSS_ROLE_NAME")
+  fi
   local spark_master="${NOVAROCKS_BENCHMARK_SPARK_MASTER:-local[2]}"
   local spark_memory="${NOVAROCKS_BENCHMARK_SPARK_MEMORY:-2g}"
   local spark_shuffle_partitions="${NOVAROCKS_BENCHMARK_SPARK_SHUFFLE_PARTITIONS:-8}"
@@ -619,7 +651,7 @@ run_spark_loader() {
     "${compose_args[@]}" cp "$schema_ddl_file" "spark:$loader_tmp_dir/schema.sql"
     schema_arg="--schema-ddl '$loader_tmp_dir/schema.sql'"
   fi
-  "${compose_args[@]}" exec -T spark /bin/bash -lc "
+  "${compose_args[@]}" exec -T "${source_environment[@]}" spark /bin/bash -lc "
     set -euo pipefail
     spark_submit_bin=\"\${SPARK_SUBMIT_BIN:-}\"
     if [[ -z \"\$spark_submit_bin\" ]]; then
@@ -647,6 +679,7 @@ run_spark_loader() {
       --warehouse '$exact_warehouse' \
       --manifest-output '$manifest_uri' \
       --s3-endpoint '${NOVAROCKS_SPARK_S3_ENDPOINT:-http://minio:9000}' \
+      $source_args \
       --generator '$generator_name' \
       --generator-version '$generator_version' \
       --fixture-contract-json '$fixture_contract_in_spark' \
@@ -849,7 +882,7 @@ main() {
   raw_uri="$staging_parent/$staging_identity/raw"
   manifest_uri="$exact_warehouse/manifest"
   spark_catalog="fixture_${fixture_contract_id:0:12}_${staging_identity//[^a-zA-Z0-9]/_}"
-  fixture_publication_curl_capable || [[ -n "${BENCHMARK_FIXTURE_STORAGE_DIR:-}" ]] || { emit_error publication_failed "curl lacks --aws-sigv4"; exit 1; }
+  fixture_publication_capable || { emit_error publication_failed "object-store publication transport is unavailable"; exit 1; }
   extract_generator_source || { emit_error writer_failed "generator setup failed"; exit 1; }
   patch_generator_source || { emit_error writer_failed "generator patch failed"; exit 1; }
   run_with_timeout generate_raw_files || { emit_error writer_failed "raw generation failed"; exit 1; }

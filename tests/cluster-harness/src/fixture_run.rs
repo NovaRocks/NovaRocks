@@ -267,10 +267,56 @@ struct StorageMachine {
     generation: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StorageOwner {
+    Minio(MinioStorageOwner),
+    Oss(OssStorageOwner),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StorageOwner {
+struct MinioStorageOwner {
     daemon_id: String,
     minio_volume: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OssStorageOwner {
+    provider: String,
+    endpoint: String,
+    region: String,
+    bucket: String,
+    root_prefix: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OssMachineConfig {
+    kind: String,
+    region: String,
+    bucket: String,
+    role_name: String,
+    root_prefix: String,
+}
+impl OssStorageOwner {
+    fn root(&self) -> Result<String> {
+        ensure!(
+            self.provider == "aliyun-oss"
+                && !self.region.is_empty()
+                && self
+                    .region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && self.endpoint == format!("https://s3.oss-{}-internal.aliyuncs.com", self.region)
+                && !self.root_prefix.is_empty()
+                && self.root_prefix.ends_with('/'),
+            "FixtureBudgetRejected: invalid OSS storage owner"
+        );
+        let root = canonical_s3(&format!("s3://{}/{}", self.bucket, self.root_prefix))?;
+        ensure!(
+            format!("{root}/") == format!("s3://{}/{}", self.bucket, self.root_prefix),
+            "FixtureBudgetRejected: invalid OSS storage root"
+        );
+        Ok(root)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -311,8 +357,36 @@ impl RunStorageScope {
                 namespace_prefix: format!("{}_", identity.run_id),
             })
         };
+        let storage_owner = match record["config"].get("object_store") {
+            Some(value)
+                if value.get("kind").and_then(serde_json::Value::as_str) == Some("aliyun-oss") =>
+            {
+                let config: OssMachineConfig = serde_json::from_value(value.clone())
+                    .context("FixtureBudgetRejected: invalid machine OSS configuration")?;
+                ensure!(
+                    config.kind == "aliyun-oss" && !config.role_name.is_empty(),
+                    "FixtureBudgetRejected: invalid machine OSS provider or role"
+                );
+                StorageOwner::Oss(OssStorageOwner {
+                    provider: config.kind,
+                    endpoint: format!("https://s3.oss-{}-internal.aliyuncs.com", config.region),
+                    region: config.region,
+                    bucket: config.bucket,
+                    root_prefix: config.root_prefix,
+                })
+            }
+            None => StorageOwner::Minio(MinioStorageOwner {
+                daemon_id: field(record, "daemon_id")?,
+                minio_volume: field(&record["config"], "minio_volume")?,
+            }),
+            Some(_) => anyhow::bail!("FixtureBudgetRejected: unsupported machine storage provider"),
+        };
         let result = Self {
-            schema: 1,
+            schema: if matches!(storage_owner, StorageOwner::Oss(_)) {
+                2
+            } else {
+                1
+            },
             identity: identity.clone(),
             machine: StorageMachine {
                 id: field(record, "id")?,
@@ -321,10 +395,7 @@ impl RunStorageScope {
                 version: field(record, "version")?,
                 generation: field(record, "generation")?,
             },
-            storage_owner: StorageOwner {
-                daemon_id: field(record, "daemon_id")?,
-                minio_volume: field(&record["config"], "minio_volume")?,
-            },
+            storage_owner,
             ranges: StorageRanges {
                 run_root: format!("{}/", identity.scope_root),
                 rest: range("rest")?,
@@ -401,21 +472,39 @@ impl RunStorageScope {
     fn validate(&self) -> Result<()> {
         self.identity.validate()?;
         ensure!(
-            self.schema == 1
-                && self.ranges.run_root == format!("{}/", self.identity.scope_root)
-                && self.storage_owner.daemon_id == self.machine.daemon_id
+            self.ranges.run_root == format!("{}/", self.identity.scope_root)
                 && [
                     &self.machine.id,
                     &self.machine.control_root,
                     &self.machine.daemon_id,
                     &self.machine.version,
-                    &self.machine.generation,
-                    &self.storage_owner.minio_volume
+                    &self.machine.generation
                 ]
                 .iter()
                 .all(|v| !v.is_empty()),
             "FixtureBudgetRejected: invalid run storage owner or ranges"
         );
+        match &self.storage_owner {
+            StorageOwner::Minio(owner) => ensure!(
+                self.schema == 1
+                    && owner.daemon_id == self.machine.daemon_id
+                    && !owner.minio_volume.is_empty(),
+                "FixtureBudgetRejected: invalid MinIO storage owner or schema"
+            ),
+            StorageOwner::Oss(owner) => {
+                ensure!(
+                    self.schema == 2,
+                    "FixtureBudgetRejected: invalid OSS storage schema"
+                );
+                let owner_root = owner.root()?;
+                for root in self.roots() {
+                    ensure!(
+                        contains_s3(&owner_root, &canonical_s3(root)?),
+                        "FixtureBudgetRejected: run storage leaves its OSS owner root"
+                    );
+                }
+            }
+        }
         for range in [&self.ranges.rest, &self.ranges.rest_mv] {
             ensure!(
                 range.namespace_prefix == format!("{}_", self.identity.run_id)
@@ -465,7 +554,7 @@ impl RunStorageScope {
     pub fn belongs(&self, uri: &str) -> Result<bool> {
         self.validate()?;
         // Scheme aliases are comparisons only and require the exact common
-        // MinIO owner captured in this validated projection.
+        // storage owner captured in this validated projection.
         let alias;
         let uri = if let Some(rest) = uri.strip_prefix("s3a://") {
             alias = format!("s3://{rest}");
@@ -489,6 +578,10 @@ impl RunStorageScope {
 
     pub fn iam_policy(&self) -> Result<serde_json::Value> {
         self.validate()?;
+        ensure!(
+            matches!(self.storage_owner, StorageOwner::Minio(_)),
+            "FixtureBudgetRejected: MinIO IAM policies are unavailable for OSS node-local storage"
+        );
         let prefixes = [
             self.ranges.run_root.clone(),
             format!(
@@ -959,6 +1052,101 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    fn oss_storage_fixture() -> (ScratchIdentity, serde_json::Value) {
+        let mut record = storage_vectors()["record"].clone();
+        let identity = ScratchIdentity::create_at(
+            "s3://novarocks-ci/fixture/worktree",
+            1_800_000_000_000,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        record["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("minio_volume");
+        record["config"]["object_store"] = serde_json::json!({"kind":"aliyun-oss", "region":"cn-beijing", "bucket":"novarocks-ci", "role_name":"fixture-role", "root_prefix":"fixture/"});
+        record["config"]["benchmark_root"] =
+            serde_json::json!("s3://novarocks-ci/fixture/benchmarks");
+        record["protected_benchmark_roots"] =
+            serde_json::json!(["s3://novarocks-ci/fixture/benchmarks"]);
+        record["server_warehouses"] = serde_json::json!({"rest":"s3://novarocks-ci/fixture/service/rest", "rest-mv":"s3://novarocks-ci/fixture/service/rest-mv"});
+        (identity, record)
+    }
+
+    #[test]
+    fn oss_storage_scope_has_closed_owner_without_a_minio_volume() {
+        let (identity, record) = oss_storage_fixture();
+        let scope = RunStorageScope::from_record(&identity, &record).unwrap();
+        let wire = serde_json::to_value(&scope).unwrap();
+        assert_eq!(wire["schema"], 2);
+        assert_eq!(
+            wire["storage_owner"],
+            serde_json::json!({"provider":"aliyun-oss", "endpoint":"https://s3.oss-cn-beijing-internal.aliyuncs.com", "region":"cn-beijing", "bucket":"novarocks-ci", "root_prefix":"fixture/"})
+        );
+        let restored = RunStorageScope::from_json(&scope.to_json().unwrap()).unwrap();
+        restored.validate_against(&identity, &record).unwrap();
+        assert!(
+            restored
+                .belongs(&format!(
+                    "s3a://novarocks-ci/fixture/service/rest/{}_table/data/a",
+                    identity.run_id
+                ))
+                .unwrap()
+        );
+        assert!(
+            !restored
+                .belongs("s3://novarocks-ci/fixture/service/rest/foreign_table/data/a")
+                .unwrap()
+        );
+        assert!(
+            !restored
+                .belongs("s3://other-bucket/fixture/outside")
+                .unwrap()
+        );
+        assert!(restored.iam_policy().is_err());
+    }
+
+    #[test]
+    fn oss_storage_scope_rejects_schema_owner_and_root_mismatches() {
+        let (identity, record) = oss_storage_fixture();
+        let scope = RunStorageScope::from_record(&identity, &record).unwrap();
+        let wire = serde_json::to_value(&scope).unwrap();
+        for (key, replacement) in [
+            ("provider", "minio"),
+            ("endpoint", "https://foreign.invalid"),
+            ("region", "cn-shanghai"),
+            ("bucket", "other-bucket"),
+            ("root_prefix", "other/"),
+            ("minio_volume", "invented-volume"),
+        ] {
+            let mut changed = wire.clone();
+            changed["storage_owner"][key] = serde_json::json!(replacement);
+            assert!(
+                RunStorageScope::from_json(&changed.to_string())
+                    .and_then(|s| s.validate_against(&identity, &record))
+                    .is_err(),
+                "{key}"
+            );
+        }
+        let mut changed = wire.clone();
+        changed["schema"] = serde_json::json!(1);
+        assert!(RunStorageScope::from_json(&changed.to_string()).is_err());
+        for warehouse in [
+            "s3://other-bucket/fixture/service/rest",
+            "s3://novarocks-ci/fixture-sibling/service/rest",
+        ] {
+            let mut changed = record.clone();
+            changed["server_warehouses"]["rest"] = serde_json::json!(warehouse);
+            assert!(RunStorageScope::from_record(&identity, &changed).is_err());
+        }
+        let mut changed = record.clone();
+        changed["config"]["object_store"]["unexpected"] = serde_json::json!(true);
+        assert!(RunStorageScope::from_record(&identity, &changed).is_err());
+        let mut changed = record.clone();
+        changed["generation"] = serde_json::json!("next");
+        assert!(scope.validate_against(&identity, &changed).is_err());
     }
 
     #[test]

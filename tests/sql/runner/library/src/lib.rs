@@ -6169,6 +6169,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
+    FixtureEndpoints::preflight_cloud(&runner_config, &suite_names)?;
     let owns_fixture_run =
         std::env::var_os(novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV).is_none();
     let original_fixture_env = runner_config
@@ -6198,6 +6199,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     };
     let naming_sources =
         fixture_context::selected_sources(&cli, &base_dir, &suite_names, &suite_configs)?;
+    FixtureEndpoints::reject_unsupported_sources(&runner_config, &naming_sources)?;
     let mut fixture_names = fixture_context::RunNames::prepare(&fixture_budget, &naming_sources)?;
     fixture_names.seal_catalogs(&runner_config, &naming_sources, &suite_configs)?;
     runner_config.fixture_names = Some(Arc::new(fixture_names));
@@ -6275,6 +6277,19 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         // SAFETY: no runner-owned server, proxy or case worker exists yet.
         // Publish the physical fixture projection once before starting those threads.
         unsafe {
+            if fixture_endpoints.is_node_local() {
+                for key in [
+                    "AWS_S3_ACCESS_KEY_ID",
+                    "AWS_S3_SECRET_ACCESS_KEY",
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "MINIO_ROOT_USER",
+                    "MINIO_ROOT_PASSWORD",
+                ] {
+                    std::env::remove_var(key);
+                }
+            }
             for (key, value) in &subprocess_environment {
                 std::env::set_var(key, value);
             }

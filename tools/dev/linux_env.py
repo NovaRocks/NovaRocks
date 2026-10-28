@@ -41,6 +41,7 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+import types
 import uuid
 
 
@@ -176,7 +177,8 @@ def atomic_text(path: Path, text: str, *, account: Account | None = None,
 
 class LinuxEnvironment:
     def __init__(self, repo: Path, inputs: dict, profile: dict, account: Account,
-                 *, commands: Commands | None = None, system_root: Path = Path("/")):
+                 *, commands: Commands | None = None, system_root: Path = Path("/"),
+                 object_store_config: Path | None = None):
         self.repo, self.inputs, self.profile, self.account = repo, inputs, profile, account
         self.commands = commands or Commands()
         self.system_root = system_root
@@ -211,6 +213,20 @@ class LinuxEnvironment:
         if not isinstance(mirrors, list) or any(
                 not isinstance(item, str) or not item.startswith("https://") for item in mirrors):
             raise EnvironmentFailure("docker_registry_mirrors must contain HTTPS URLs")
+        prefixes = profile.get("fixture_artifact_url_prefixes", {})
+        if not isinstance(prefixes, dict) or any(not isinstance(original, str) or not isinstance(transport, str)
+                for original, transport in prefixes.items()):
+            raise EnvironmentFailure("fixture_artifact_url_prefixes must map original URLs to transport URLs")
+        self.object_store = None
+        kind = profile.get("object_store_kind", "minio")
+        if kind == "aliyun-oss":
+            if object_store_config is None or not object_store_config.is_absolute():
+                raise EnvironmentFailure("aliyun-oss requires an absolute --object-store-config")
+            self.object_store = self.read_object_store_config(object_store_config)
+        elif kind != "minio":
+            raise EnvironmentFailure("unsupported profile object_store_kind")
+        elif object_store_config is not None:
+            raise EnvironmentFailure("--object-store-config requires an aliyun-oss profile")
         self.environment = self.account_environment()
 
     def path(self, name: str) -> Path:
@@ -228,6 +244,50 @@ class LinuxEnvironment:
     def env_path(self) -> Path:
         return self.account.home / ".config/novarocks/linux-env.sh"
 
+    @property
+    def object_store_path(self) -> Path:
+        return self.cache / "object-store.json"
+
+    @property
+    def fixture_machine_config_path(self) -> Path:
+        return self.cache / "fixture-machine.json"
+
+    @property
+    def fixture_consumer(self) -> str:
+        return "iceberg-rest-oss" if self.object_store is not None else "iceberg-rest"
+
+    def read_object_store_config(self, path: Path) -> dict:
+        # Execute the one validation author without creating a bytecode cache.
+        # The module uses only the standard library until an operation starts.
+        source = self.repo / "docker/iceberg-rest/oss_ops.py"
+        module = types.ModuleType("novarocks_installer_oss_configuration")
+        module.__file__ = str(source)
+        try:
+            exec(compile(source.read_bytes(), str(source), "exec"), module.__dict__)
+            return module.validate_config(read_object(path))
+        except OSError as error:
+            raise EnvironmentFailure("cannot load OSS configuration validation") from error
+        except module.OpsError as error:
+            raise EnvironmentFailure(f"invalid OSS configuration: {error.code}") from error
+
+    def object_store_configuration(self, *, prepare: bool) -> None:
+        if self.object_store is None:
+            return
+        copies = ((self.object_store_path, self.object_store),
+                  (self.fixture_machine_config_path, {"object_store": self.object_store}))
+        if prepare:
+            self.owned_directory(self.cache)
+            for path, value in copies:
+                atomic_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n",
+                            account=self.account, mode=0o600)
+        else:
+            for path, value in copies:
+                if not path.is_file() or read_object(path) != value:
+                    raise EnvironmentFailure(f"prepared OSS configuration is missing or differs from input: {path}")
+
+    def machine_config_arguments(self) -> list[str]:
+        return ["--config", str(self.fixture_machine_config_path)] if self.object_store is not None else []
+
     def account_environment(self) -> dict[str, str]:
         # Never inherit root's HOME/XDG/Cargo stores or Docker context for another
         # account. A caller can explicitly configure sources in the profile.
@@ -243,6 +303,8 @@ class LinuxEnvironment:
             "PYTHONDONTWRITEBYTECODE": "1",
             "LANG": self.locale, "LC_ALL": self.locale,
         }
+        if self.object_store is not None:
+            env["NOVA_ENV_OBJECT_STORE_CONFIG"] = str(self.object_store_path)
         for key, field in (("RUSTUP_DIST_SERVER", "rustup_dist_server"),
                            ("RUSTUP_UPDATE_ROOT", "rustup_update_root"),
                            ("CARGO_REGISTRIES_CRATES_IO_INDEX", "cargo_registry_index")):
@@ -588,22 +650,26 @@ class LinuxEnvironment:
         # Original owner verifies exact source/BOM version, resources and health.
         # Its check entry is an observation, not admission, repair or a lease.
         result = self.run([str(self.repo / "docker/iceberg-rest/fixture-runtime.sh"),
-                           "check", "--store", store], account=True)
+                           "check", "--store", store, *self.machine_config_arguments()], account=True)
         return json.loads(result.stdout)
 
     def fixture(self, *, prepare: bool) -> None:
+        self.object_store_configuration(prepare=prepare)
         store = str(self.fixture_store)
         if prepare:
-            args = [str(self.repo / "docker/fixture-inputs/provision.sh"), "--consumer", "iceberg-rest",
+            args = [str(self.repo / "docker/fixture-inputs/provision.sh"), "--consumer", self.fixture_consumer,
                     "--platform", "linux/amd64", "--store", store,
                     "--docker-pull-timeout-seconds", str(self.timeout)]
             for logical, transport in sorted(self.profile.get("fixture_image_sources", {}).items()):
                 args += ["--image-source", f"{logical}={transport}"]
+            for original, transport in sorted(self.profile.get("fixture_artifact_url_prefixes", {}).items()):
+                args += ["--artifact-url-prefix", f"{original}={transport}"]
             self.run(args, account=True)
-        self.run([str(self.repo / "docker/fixture-inputs/verify.sh"), "--consumer", "iceberg-rest",
+        self.run([str(self.repo / "docker/fixture-inputs/verify.sh"), "--consumer", self.fixture_consumer,
                   "--platform", "linux/amd64", "--store", store], account=True)
         if prepare:
-            self.run([str(self.repo / "docker/iceberg-rest/fixture-runtime.sh"), "start", "--store", store], account=True)
+            self.run([str(self.repo / "docker/iceberg-rest/fixture-runtime.sh"), "start", "--store", store,
+                      *self.machine_config_arguments()], account=True)
         else:
             snapshot = self.observe_fixture_machine(store)
             if not isinstance(snapshot, dict) or snapshot.get("phase") != "ready":
@@ -665,11 +731,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--user", required=True)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--fixture", choices=("iceberg-rest",), required=True)
+    parser.add_argument("--object-store-config", type=Path)
     args = parser.parse_args(argv)
     try:
         repo = Path(__file__).resolve().parents[2]
         installer = LinuxEnvironment(repo, read_object(repo / "tools/dev/linux-env.inputs.json"),
-                                     read_object(args.profile), Account.lookup(args.user))
+                                     read_object(args.profile), Account.lookup(args.user),
+                                     object_store_config=args.object_store_config)
         if args.action == "env":
             installer.preflight(prepare=False)
             print(installer.environment_text(), end="")

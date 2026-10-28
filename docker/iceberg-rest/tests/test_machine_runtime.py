@@ -870,7 +870,7 @@ class MachineTests(unittest.TestCase):
                 mock.patch.object(machine.runtime, "install_signal_handlers"), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(machine.main(["check", "--store", "/original-store"]), 0)
-        verify.assert_called_once_with(runtime.SCRIPT_DIR.parent.parent, Path("/original-store"))
+        verify.assert_called_once_with(runtime.SCRIPT_DIR.parent.parent, Path("/original-store"), consumer="iceberg-rest")
         actual = json.loads(output.getvalue())
         self.assertEqual(actual["phase"], "ready")
         self.assertEqual(actual["generation"], original["generation"])

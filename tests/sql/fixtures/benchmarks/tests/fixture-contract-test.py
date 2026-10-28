@@ -57,6 +57,34 @@ class FixtureContractTest(unittest.TestCase):
         self.assertTrue(first["ready_uri"].endswith("/READY.json"))
         self.assertTrue(first["staging_parent"].endswith("/staging"))
 
+    def test_oss_producer_tracks_its_complete_derived_spark_closure(self):
+        baseline = self.resolve()
+        cloud = RESOLVER.resolve_fixture(self.model, ROOT, "ssb", "1", object_store_kind="aliyun-oss")
+        self.assertNotEqual(baseline["dataset_key"], cloud["dataset_key"])
+        self.assertEqual(cloud["producer_fingerprint"]["object_store_kind"], "aliyun-oss")
+        projection = cloud["producer_fingerprint"]["lock_projections"][0]["projection"]
+        self.assertEqual(projection["derived_image"], "iceberg-spark-oss")
+        base = projection["derived_bases"][0]["projection"]
+        self.assertEqual(base["derived_image"], "iceberg-spark")
+        self.assertTrue(base["definition_sha256"])
+        self.assertTrue(base["bases"][0]["manifest_digest"])
+        self.assertTrue(any(item["name"] == "hadoop-aws-3.3.4.jar" for item in base["artifacts"]))
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            lock = json.loads((ROOT / "docker/fixture-inputs/lock.json").read_text())
+            sources = set(self.model["fixture"]["producer_inputs"].values()) | {"docker/fixture-inputs/lock.json"}
+            for name in ["iceberg-spark", "iceberg-spark-oss"]:
+                sources.update(lock["derived_images"][name]["definition_files"])
+            for name in sources:
+                target = workspace / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / name, target)
+            old = RESOLVER.resolve_fixture(self.model, workspace, "ssb", "1", object_store_kind="aliyun-oss")
+            spark = workspace / "docker/iceberg-rest/spark/Dockerfile"
+            spark.write_bytes(spark.read_bytes() + b"\n# changed Spark recipe\n")
+            changed = RESOLVER.resolve_fixture(self.model, workspace, "ssb", "1", object_store_kind="aliyun-oss")
+            self.assertNotEqual(old["dataset_key"], changed["dataset_key"])
+
     def test_scale_normalization(self):
         self.assertEqual(self.resolve(scale="1.0")["dataset_key"], self.resolve(scale="1")["dataset_key"])
         self.assertEqual(

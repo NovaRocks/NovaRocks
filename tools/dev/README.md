@@ -31,13 +31,31 @@ sudo apt-get install -y ca-certificates git
 install_user=root  # Or choose an existing development account.
 # Clone the project from its authorized repository and checkout the chosen full commit.
 # Run the following commands from that checkout.
+object_store_config=/absolute/path/object-store.json
 sudo tools/dev/linux-env.sh prepare --user "$install_user" \
-  --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest
+  --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest \
+  --object-store-config "$object_store_config"
 ```
 
 `install_user` 必须是现有系统账户；工具从 passwd 记录取得 home，不猜 `SUDO_USER`。prepare 的薄 shell 在 Python 主体运行前补齐 Python、CA、curl、git，随后准备 native 编译依赖、libclang、protoc、OpenSSL、Rust、nextest、Docker/Compose/Buildx 和 locale。调用者须具备系统安装权限，源码目录须可由目标账户使用。
 
-准备 fixture 使用原 `provision -> verify -> fixture-runtime start -> up`，只请求 Iceberg 闭包。已有机器版本不同会要求显式维护；先确认资源、旧数据和维护窗口，再按 [fixture 文档](../../docker/iceberg-rest/README.md) 执行原 upgrade。不会自动清卷、复制旧 READY 或创建第二套共享项目。
+阿里云 profile 明确选择 OSS。首次部署时先在 ECS 控制台为新实例绑定已有 RAM 角色，再创建上述独立非秘密配置文件，内容如下；不要把临时凭证或长期 AccessKey 加入其中：
+
+```json
+{
+  "kind": "aliyun-oss",
+  "region": "cn-beijing",
+  "bucket": "YOUR_TEST_BUCKET",
+  "role_name": "YOUR_ECS_ROLE",
+  "root_prefix": "novarocks-development"
+}
+```
+
+`--object-store-config` 必须是绝对路径。字段与前缀由 [OSS 操作模块](../../docker/iceberg-rest/oss_ops.py) 的同一校验作者解析；缺失或错误时直接失败，不回退到 MinIO。准备在安装账户的 `~/.cache/novarocks/linux-env/` 原子保存规范化的 `object-store.json` 和含 `object_store` 的 `fixture-machine.json`，环境变量 `NOVA_ENV_OBJECT_STORE_CONFIG` 指向前者。它们是本次期望配置，不能替代各代 runtime publication 的不可变输入快照。
+
+准备 fixture 使用原 `provision -> verify -> fixture-runtime start -> up`；OSS profile 请求 `iceberg-rest-oss` 闭包，不供给 MinIO/mc。机器 start/check 显式传入上述 `fixture-machine.json`。SDK 及其固定依赖由 fixture provision 准备，运行和 check 不执行 pip 安装。没有 `object_store_kind` 的通用 profile 保持本地 MinIO/`iceberg-rest` 路径；向此类 profile 传入 OSS 配置会明确失败，避免参数被忽略。
+
+已有机器版本不同会要求显式维护；先确认资源、旧数据和维护窗口，再按 [fixture 文档](../../docker/iceberg-rest/README.md) 执行原 upgrade。不会自动清卷、删除云端旧数据、复制旧 READY 或创建第二套共享项目。释放旧 ECS 后，在新实例绑定同一角色，取得同一源码和非秘密配置，再执行相同准备命令；旧机器的磁盘、venv、BOM、READY 和 target 都不是恢复输入。
 
 ## 日常使用与检查
 
@@ -45,14 +63,16 @@ sudo tools/dev/linux-env.sh prepare --user "$install_user" \
 
 ```bash
 eval "$(tools/dev/linux-env.sh env --user "$install_user" \
-  --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest)"
+  --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest \
+  --object-store-config "$object_store_config")"
 tools/dev/linux-env.sh check --user "$install_user" \
-  --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest
+  --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest \
+  --object-store-config "$object_store_config"
 ```
 
 登录环境按账户实际 shell 与 Bash 启动文件优先级接线，保留原内容。SSH 非交互命令不保证读取登录配置，因此先显式求值 `env` 的输出。环境包含账户自己的工具目录和来源设置；专用配置按本机可用 CPU 导出 Cargo 并发，显式 `CARGO_BUILD_JOBS` 优先。通用开发入口的半核默认不变。`env` 只输出环境，不能证明 fixture ready。
 
-`fixture-runtime.sh check --store <store>` 由原机器 owner 只读核对当前源码/BOM 要求的版本与实际健康实例，避免仅凭旧 machine 和旧 publication 相互一致而误报。检查使用既有维护锁，不建立缺失状态。
+`fixture-runtime.sh check --store <store> --config <machine-config>` 由原机器 owner 只读核对当前源码/BOM 要求的版本与实际健康实例，避免仅凭旧 machine 和旧 publication 相互一致而误报。检查使用既有维护锁，不建立缺失状态。OSS check 同时比较准备时保存的两份配置与本次输入；缺失或不同只报错，不重写配置。
 
 check 只观察本机实际工具、daemon、BOM、机器与 worktree publication，不访问外部下载源，不下载、构建、安装或重启。缺 Python 时 check/env 直接失败，不运行 apt。权限不足时使用具有观察权限的账户，不能用 root 的成功代替普通账户可用。修改 docker 组成员后须开启新会话。
 
