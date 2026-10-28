@@ -823,6 +823,37 @@ class DerivedImageBuildTests(unittest.TestCase):
         self.assertEqual(receipts["rest-mv"]["image_id"], "sha256:rest-mv")
         self.assertEqual(receipts["rest-mv"]["definition_sha256"], fixture_inputs.definition_sha256(self.repo, self.lock["derived_images"]["rest-mv"]["definition_files"]))
 
+    def test_derived_base_uses_verified_content_tag_before_child_build(self):
+        import copy
+        parent = "sha256:" + "a" * 64
+        reference = "novarocks/fixture-build-base:" + "a" * 64
+        self.lock["derived_images"]["wrapper"] = copy.deepcopy(self.lock["derived_images"]["rest-mv"])
+        self.lock["derived_images"]["wrapper"].update(bases={"BUILDER": "builder"}, derived_bases={"REST_BASE": "rest-mv"})
+        self.lock["_build_names"] = ["wrapper"]
+        self.lock["_verified_derived_images"] = {"rest-mv": {"image_id": parent}}
+        def inspect(identity):
+            return self.image_info(parent if identity == reference else identity)
+        with mock.patch.object(provision_module, "run", side_effect=self.build_command) as run, \
+                mock.patch.object(provision_module, "inspect_image", side_effect=inspect):
+            receipts = provision_module.build_derived_images(self.lock, self.repo, self.staging, "lock-sha")
+        self.assertEqual(run.call_args_list[0].args[0], ["docker", "tag", parent, reference])
+        build = run.call_args_list[1].args[0]
+        self.assertIn("REST_BASE=" + reference, build)
+        self.assertNotIn("REST_BASE=" + parent, build)
+        self.assertEqual(set(receipts), {"wrapper"})
+
+    def test_derived_base_tag_mismatch_cannot_start_child_build(self):
+        import copy
+        self.lock["derived_images"]["wrapper"] = copy.deepcopy(self.lock["derived_images"]["rest-mv"])
+        self.lock["derived_images"]["wrapper"].update(bases={}, derived_bases={"REST_BASE": "rest-mv"})
+        self.lock["_build_names"] = ["wrapper"]
+        self.lock["_verified_derived_images"] = {"rest-mv": {"image_id": "sha256:" + "a" * 64}}
+        with mock.patch.object(provision_module, "run") as run, \
+                mock.patch.object(provision_module, "inspect_image", return_value=self.image_info("sha256:" + "b" * 64)), \
+                self.assertRaisesRegex(fixture_inputs.FixtureInputError, "tag differs"):
+            provision_module.build_derived_images(self.lock, self.repo, self.staging, "lock-sha")
+        self.assertEqual(len(run.call_args_list), 1)
+
     def test_definition_digest_changes_when_a_context_input_changes(self):
         definitions = self.lock["derived_images"]["rest-mv"]["definition_files"]
         before = fixture_inputs.definition_sha256(self.repo, definitions)

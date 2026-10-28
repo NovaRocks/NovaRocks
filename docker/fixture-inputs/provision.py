@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import tempfile
 import urllib.request
@@ -265,7 +266,18 @@ def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, l
         for key, base in item.get("derived_bases", {}).items():
             if base not in available:
                 raise FixtureInputError(f"fixture derived base has no verified image: {name}/{base}")
-            build_args.extend(["--build-arg", f"{key}={available[base]['image_id']}"])
+            image_id = available[base]["image_id"]
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+                raise FixtureInputError(f"fixture derived base has an invalid image ID: {name}/{base}")
+            # BuildKit parses a raw sha256:ID as a repository/tag. Give the
+            # already verified local image a content-addressed Docker name.
+            reference = "novarocks/fixture-build-base:" + image_id.removeprefix("sha256:")
+            run(["docker", "tag", image_id, reference])
+            info = inspect_image(reference)
+            verify_image(info, lock["derived_images"][base], derived=True)
+            if info.get("Id") != image_id:
+                raise FixtureInputError(f"fixture derived base tag differs from its verified image: {name}/{base}")
+            build_args.extend(["--build-arg", f"{key}={reference}"])
         for key, value in item.get("build_args", {}).items():
             build_args.extend(["--build-arg", f"{key}={value}"])
         iidfile = context.parent / f"{name}.iid"
