@@ -68,4 +68,4 @@ serde_json.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = ["novarocks/fs/tests/data/writer-corpus/**", "novarocks/fs/tests/fixtures/hdfs/**", "target/hdfs-real-io/java/**", "target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
-env-inputs = [{ name = "NOVA_HDFS_JAVA", kind = "file-content" }]
+env-inputs = [{ name = "NOVA_HDFS_JAVA", kind = "file-content" }, { name = "NOVA_OSS_TEST_CONFIG", kind = "file-content" }]
