@@ -207,6 +207,9 @@ pub(crate) struct ContextExecutorHandles {
     cleanup: HostExecutorHandle<Queued>,
 }
 impl ContextExecutorHandles {
+    pub(super) fn accepts_owner(&self, owner: &ContextHostJobs) -> bool {
+        owner.belongs_to(&self.runtime, self.control)
+    }
     pub(crate) fn try_submit(
         &self,
         job: ContextHostJob,

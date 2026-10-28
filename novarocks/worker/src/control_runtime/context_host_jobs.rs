@@ -814,6 +814,9 @@ impl QueuedPreparation for ContextHostJob {
     }
 }
 impl ContextHostJob {
+    pub(super) fn belongs_to_jobs(&self, original: &ContextHostJobs) -> bool {
+        Arc::ptr_eq(&self.owner.0, &original.0)
+    }
     pub(super) fn belongs_to(&self, runtime: &ActorRuntime<WorkerActor>, control: ActorId) -> bool {
         self.owner.belongs_to(runtime, control)
     }

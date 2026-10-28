@@ -23,12 +23,15 @@ use crate::{
     HostRejection, QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence,
     SharedFactsRequest,
     control_runtime::{
-        actors::ContextMessage,
+        actors::{ContextActor, ContextMessage},
         context_executors::{
             ContextCancelError, ContextExecutorHandles, ContextExecutorStartError,
             ContextExecutors, ContextSubmitError,
         },
-        context_host::{CONTEXT_BOOTSTRAP_STORAGE, ContextHostBinding},
+        context_host::{
+            CONTEXT_BOOTSTRAP_STORAGE, ContextHostBinding, ContextHostProgressError,
+            ContextHostRecord,
+        },
         context_host_jobs::{ContextHostJob, ContextHostJobs},
         context_ready::ContextReadyNotice,
         effect_dispatch::EffectRef,
@@ -36,12 +39,17 @@ use crate::{
     },
     control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits},
 };
-use novarocks_control_runtime::{driver::InputRole, publication::PublishedSnapshot};
-use novarocks_control_runtime_core::{fair_queue::FairQueueError, mailbox::InputClass};
+use novarocks_control_runtime::{
+    actor::ActorConfig, driver::InputRole, publication::PublishedSnapshot,
+};
+use novarocks_control_runtime_core::{
+    effect::EffectState, fair_queue::FairQueueError, mailbox::InputClass,
+};
 use novarocks_execution_contract::QueryContextState;
 use novarocks_worker_protocol::{
     context::{
-        ContextConfig, ContextCore, ContextEffect, ContextEstablishmentDecision, ContextInput,
+        ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
+        ContextEstablishmentDecision, ContextInput, EstablishReplayRequest,
     },
     lease::LeaseBounds,
 };
@@ -116,6 +124,7 @@ struct MaterializationFixture {
     job: ContextHostJob,
     getters: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
+    establishment: ContextEstablishment,
 }
 impl MaterializationFixture {
     fn new(materializing: Arc<Gate>, calls: Arc<AtomicUsize>, releases: Arc<AtomicUsize>) -> Self {
@@ -303,6 +312,7 @@ impl MaterializationFixture {
             job,
             getters,
             drops,
+            establishment,
         }
     }
 }
@@ -362,7 +372,12 @@ fn complete_context(f: &mut Fixture, ticket: EffectTicket<WorkerAction>) {
 
     let input = ticket.input;
     let completed = ticket.descriptor.id;
-    f.runtime.effect_completed(ticket).unwrap();
+    f.root
+        .service()
+        .context(context)
+        .unwrap()
+        .complete_host_effect(ticket)
+        .unwrap();
     for (descriptor, _) in f
         .runtime
         .effect_inventory(context_actor(), input, None, ContextCore::MAX_STEP_WORK)
@@ -709,6 +724,157 @@ fn all_worker_fees(f: &Fixture) -> [u64; 15] {
     .map(|dimension| f.ledger.used(dimension.id()))
 }
 
+// The removed owner's Root inputs and payer are deliberately still live.
+// Register a real, different Context at its former ActorId and produce only a
+// neutral replay probe: no materialization or other foreign I/O is simulated.
+fn removed_owner_rejects_reused_actor(
+    f: &mut Fixture,
+    removed: &ContextHostRecord,
+    mut establishment: ContextEstablishment,
+    now: Tick,
+) -> bool {
+    let before = all_worker_fees(f);
+    let context = QueryContextRef::new(
+        novarocks_types::QueryExecutionId::new(
+            novarocks_types::QueryId::new(9701, 9702),
+            novarocks_types::AttemptId::new(1).unwrap(),
+        )
+        .unwrap(),
+        f.context.frontend_process_id(),
+        f.context.backend_process_id(),
+    );
+    establishment.operation = TaskOperationId::new_v7();
+    establishment.elected_at = MonotonicInstant::from_origin(Duration::from_nanos(now.0));
+    let scope = f.ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+    let (mut work, mut capacity) = scope
+        .reserve_next(
+            generation(),
+            BRIDGE_STORAGE.resources().unwrap(),
+            WorkKind::Step,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Step)
+        .unwrap();
+    work.start().unwrap();
+    let core = ContextCore::new(
+        context,
+        generation(),
+        establishment,
+        ContextConfig {
+            max_tasks: 1,
+            max_creation_waiters: 1,
+            max_pending_requests: 4,
+            max_preparing: 1,
+            max_task_bytes: 1024,
+            step_budget: ContextCore::MAX_STEP_WORK,
+            lease_bounds: LeaseBounds::DEFAULT,
+            metric_publish_interval: Duration::from_millis(100),
+        },
+    )
+    .unwrap();
+    let context_driver = ContextActor::new(
+        core,
+        scope.clone(),
+        AdmissionStorage {
+            loading: ResourceVector::default(),
+            accepted: ResourceVector::default(),
+            context: ResourceVector::default(),
+            ticket: ResourceVector::default(),
+        },
+        work.id(),
+        work.id(),
+    );
+    f.runtime
+        .register_next(
+            context_actor(),
+            scope.clone(),
+            WorkerActor::Context(Box::new(context_driver)),
+            ActorConfig {
+                mailbox: [1; 4],
+                max_batches: 1,
+                max_effects_per_step: ContextCore::MAX_STEP_WORK,
+                max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
+                turn_budget: 64,
+                max_step_work: ContextCore::MAX_STEP_WORK,
+            },
+        )
+        .unwrap_or_else(|(error, _pure_actor)| {
+            panic!("replacement Context actor registration refused: {error:?}")
+        });
+    let permit = f
+        .runtime
+        .reserve_input(context_actor(), actor(), InputClass::Control)
+        .unwrap();
+    let input = permit.id();
+    permit
+        .fill(WorkerMessage::Context(ContextMessage::Command {
+            work: work.id(),
+            request: None,
+            command: ContextInput::ProbeEstablish {
+                context,
+                request: EstablishReplayRequest {
+                    request: RequestContext {
+                        token: input,
+                        operation: establishment.operation,
+                        deadline: MonotonicInstant::from_origin(
+                            Duration::from_nanos(now.0) + Duration::from_secs(1),
+                        ),
+                    },
+                    ticket: establishment.ticket,
+                    payload: establishment.payload,
+                    semantics: establishment.semantics,
+                },
+                comparison: None,
+            },
+        }))
+        .unwrap();
+    assert!(f.runtime.poll_one(now).unwrap());
+    let action = f
+        .runtime
+        .ready_effects(context_actor(), input, ContextCore::MAX_STEP_WORK)
+        .unwrap()[0];
+    let ticket = f
+        .runtime
+        .take_effect(context_actor(), input, action)
+        .unwrap();
+    let funded = all_worker_fees(f);
+    let rejected = match removed.complete_host_effect(ticket) {
+        Err(refusal) => {
+            let untouched = refusal.error == DriverError::EffectTicketOriginMismatch
+                && refusal.ticket.actor == context_actor()
+                && refusal.ticket.input == input
+                && refusal.ticket.descriptor.id == action
+                && matches!(&refusal.ticket.effect,
+                    WorkerAction::Context(ContextEffect::EstablishProbed { context: actual, .. })
+                        if *actual == context)
+                && f.runtime
+                    .effect_inventory(context_actor(), input, None, 1)
+                    .unwrap()[0]
+                    .1
+                    == EffectState::Started
+                && all_worker_fees(f) == funded;
+            // Its actual new owner can still complete the same exclusive
+            // ticket after the unrelated removed record refused it.
+            f.runtime.effect_completed(refusal.ticket).unwrap();
+            untouched
+        }
+        Ok(()) => false,
+    };
+    f.runtime.retire_input(context_actor(), input).unwrap();
+    scope.close_external().unwrap();
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    f.ledger.reap_scope_ready(scope.id(), 4).unwrap();
+    capacity.release(&capacity.resources().unwrap()).unwrap();
+    while let Some(ready) = f.runtime.claim_effect_actor() {
+        f.runtime.release_effect_actor(ready, false).unwrap();
+    }
+    drop(f.runtime.remove_actor(context_actor()).unwrap());
+    f.ledger.remove_scope(scope.id()).unwrap();
+    rejected && before == all_worker_fees(f)
+}
+
 #[test]
 fn the_same_published_instance_releases_while_materialization_is_blocked_and_core_timer_progresses()
 {
@@ -731,6 +897,7 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
         job,
         getters,
         drops,
+        establishment,
     } = MaterializationFixture::with_factory(
         Gate::new(),
         calls.clone(),
@@ -780,7 +947,50 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
         .unwrap();
     let mut continuation: InputRole<WorkerActor> = permit.into_role().unwrap();
 
-    pools.submit(job);
+    let host = f.root.service().context(f.context).unwrap();
+    if let Err((reason, original)) = host.stage_materialization(job) {
+        pools.refused.push(original);
+        panic!("original M staging refused: {reason:?}");
+    }
+    // Matching numeric actors in another runtime grant no submission or
+    // report-consumption authority over this already staged original M.
+    let before_foreign_pool = all_worker_fees(&f);
+    let foreign_owner = match ContextExecutors::start(
+        ActorRuntime::new(1),
+        actor(),
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    ) {
+        Ok(owner) => owner,
+        Err(refusal) => {
+            if let Some(partial) = refusal.owner {
+                join_context_pool_owner(*partial);
+            }
+            panic!("foreign fixture pool startup refused: {:?}", refusal.error);
+        }
+    };
+    let foreign_handles = foreign_owner.handles().unwrap();
+    let notice = f.root.service().next_host_ready().unwrap().unwrap();
+    let foreign_progress = f
+        .root
+        .service()
+        .advance_context_host(&notice, &foreign_handles);
+    drop(foreign_handles);
+    join_context_pool_owner(foreign_owner);
+    let foreign_pool_refused = matches!(
+        foreign_progress,
+        Err(ContextHostProgressError::Host(
+            crate::control_runtime::context_host_jobs::ContextHostJobError::WrongOwner
+        ))
+    );
+    let after_foreign_pool = all_worker_fees(&f);
+    let calls_after_foreign_pool = calls.load(Ordering::SeqCst);
+    let initial_progress = f
+        .root
+        .service()
+        .advance_context_host(&notice, pools.handles.as_ref().unwrap())
+        .unwrap();
     assert!(
         latch.wait_entered(),
         "the fixed M worker entered the actual host call"
@@ -797,6 +1007,7 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     let mut timer_input = None;
     let mut saw_continue = false;
     let mut released_by_core = false;
+    let mut direct_completion_woke_original = false;
     for effect in context_effects(&mut f) {
         timer_input = Some(effect.input);
         match &effect.effect {
@@ -816,7 +1027,22 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
             }
             other => panic!("unexpected actual zero-task lease-close effect: {other:?}"),
         }
+        let direct_close = matches!(
+            &effect.effect,
+            WorkerAction::Context(ContextEffect::CloseExternalAdmission { .. })
+        );
+        if direct_close {
+            // M is held inside the real latch and R has not been submitted.
+            // Remove old coalesced marks before testing the completion wake.
+            while f.root.service().next_host_ready().unwrap().is_some() {}
+        }
         complete_context(&mut f, effect);
+        if direct_close {
+            let ready = f.root.service().next_host_ready().unwrap();
+            direct_completion_woke_original = ready.as_ref().is_some_and(|ready| {
+                f.root.service().ready_context(ready).is_some() && ready.context() == f.context
+            });
+        }
     }
     f.runtime
         .retire_input(context_actor(), timer_input.unwrap())
@@ -850,11 +1076,12 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
         .release(&bridge_capacity.resources().unwrap())
         .unwrap();
 
-    let release = jobs
-        .take_release_job()
-        .unwrap()
-        .expect("the original instance is already published");
-    pools.submit(release);
+    let release_notice = f.root.service().next_host_ready().unwrap().unwrap();
+    let release_progress = f
+        .root
+        .service()
+        .advance_context_host(&release_notice, pools.handles.as_ref().unwrap())
+        .unwrap();
     let r_callbacks = wait_host_returns(&mut f).expect("R returns on the independent cleanup pool");
     let release_count_while_m_blocked = releases.load(Ordering::SeqCst);
     let m_still_blocked_during_r = !latch.is_released();
@@ -1012,13 +1239,14 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     // final M report consumer/header still belongs to the original Context.
     let holder_before_final_callbacks = jobs.take_holder_disposal().unwrap();
     let holder_waited_for_final_callbacks = holder_before_final_callbacks.is_none();
-    let callbacks_retired = jobs.retire_callbacks().unwrap();
-    let holder = holder_before_final_callbacks.unwrap_or_else(|| {
-        jobs.take_holder_disposal()
-            .unwrap()
-            .expect("the accepted removal receipt survives its retired Root source input")
-    });
-    pools.submit(holder);
+    assert!(holder_before_final_callbacks.is_none());
+    let holder_notice = f.root.service().next_host_ready().unwrap().unwrap();
+    let holder_progress = f
+        .root
+        .service()
+        .advance_context_host(&holder_notice, pools.handles.as_ref().unwrap())
+        .unwrap();
+    let callbacks_retired = holder_progress.callbacks_retired;
     let h_callbacks = wait_host_returns(&mut f).expect("H returns on the original cleanup worker");
     let holder_retired = jobs.retire_holder().unwrap();
     let before_child_move = f
@@ -1042,6 +1270,8 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     assert!(f.runtime.poll_one(removal_time).unwrap());
     f.root.index_control_effects(64).unwrap();
     let retirement = f.root.take_control_effect(64).unwrap().unwrap();
+    let removed_owner_rejects_reused_actor =
+        removed_owner_rejects_reused_actor(&mut f, &host, establishment, removal_time);
     let lifecycle_with_own_batch_pending = host.retire_lifecycle().unwrap();
     let admission_paid_while_batch_pending = {
         let capacity = &host.resources_for_test().admission.capacity;
@@ -1077,6 +1307,16 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     f.finish();
 
     assert!(repeat_start_refused && repeat_start_owner_absent);
+    assert!(removed_owner_rejects_reused_actor);
+    assert!(foreign_pool_refused);
+    assert!(direct_completion_woke_original);
+    assert_eq!(before_foreign_pool, after_foreign_pool);
+    assert_eq!(calls_after_foreign_pool, 0);
+    assert_eq!(initial_progress.submitted, 1);
+    assert_eq!(initial_progress.returned, 0);
+    assert!(!initial_progress.callbacks_retired && !initial_progress.holder_retired);
+    assert_eq!(release_progress.submitted, 1);
+    assert_eq!(holder_progress.submitted, 1);
     assert!(m_still_blocked_during_r);
     assert!(factory_thread.is_some() && materialization_thread.is_some());
     assert!(release_thread.is_some() && holder_thread.is_some());
@@ -1129,6 +1369,7 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
         job,
         getters,
         drops,
+        ..
     } = MaterializationFixture::new(gate.clone(), calls.clone(), releases.clone());
     let scope = f.root.service().context(f.context).unwrap().scope().clone();
     let route = PublishedSnapshot::new(
@@ -1478,6 +1719,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
         job,
         getters,
         drops,
+        ..
     } = MaterializationFixture::with_factory(
         Gate::new(),
         Arc::new(AtomicUsize::new(0)),

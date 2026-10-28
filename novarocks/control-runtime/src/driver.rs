@@ -27,7 +27,8 @@ use novarocks_control_runtime_core::{
     effect::{EffectDescriptor, EffectError, EffectKind, EffectState},
     history::HistoryFact,
     identity::{
-        ActionId, ActorId, BatchId, Generation, InputId, ReservationId, SlotId, Tick, WorkId,
+        ActionId, ActorId, BatchId, Generation, InputId, ReservationId, ScopeId, SlotId, Tick,
+        WorkId,
     },
     mailbox::{InputClass, InputEnvelope, MailboxError, MailboxState},
     scheduler::{ReadyQueue, SchedulerError, TurnBudget},
@@ -104,6 +105,36 @@ impl std::fmt::Display for DriverError {
     }
 }
 impl std::error::Error for DriverError {}
+
+/// Read-only identity of one original actor registration. Cloning this witness
+/// grants no Work, publication or effect-ticket authority.
+#[derive(Clone)]
+pub struct ActorRegistration {
+    actor: ActorId,
+    attachment: SlotId,
+    scope: ScopeHandle,
+    origin: Arc<()>,
+}
+impl ActorRegistration {
+    pub fn actor(&self) -> ActorId {
+        self.actor
+    }
+    pub fn attachment(&self) -> SlotId {
+        self.attachment
+    }
+    pub fn scope_id(&self) -> ScopeId {
+        self.scope.id()
+    }
+}
+impl std::fmt::Debug for ActorRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorRegistration")
+            .field("actor", &self.actor)
+            .field("attachment", &self.attachment)
+            .field("scope", &self.scope.id())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Qualified state of one actor's original builtin timer source. Closing the
 /// source never consumes an already filled Tick or observes any Work exit.
@@ -899,6 +930,7 @@ impl<A: Actor> ActorRuntime<A> {
             config,
             ActorFailurePolicy::IsolateScope,
         )
+        .map(|registration| registration.attachment)
     }
     /// Bind the original failure-cleanup role outside the actor's mutable
     /// state. Its pure failure hook receives only the role identity, even if
@@ -934,6 +966,37 @@ impl<A: Actor> ActorRuntime<A> {
         failure_work: &crate::lease::WorkLease,
         failure_policy: ActorFailurePolicy,
     ) -> Result<SlotId, (DriverError, A)> {
+        self.register_supervised_inner(id, scope, actor, config, failure_work, failure_policy)
+            .map(|registration| registration.attachment)
+    }
+    /// Return the original registration witness in the same transaction that
+    /// installs the actor. No later lookup can bind this owner to a replacement.
+    pub fn register_supervised_bound(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        failure_work: &crate::lease::WorkLease,
+    ) -> Result<ActorRegistration, (DriverError, A)> {
+        self.register_supervised_inner(
+            id,
+            scope,
+            actor,
+            config,
+            failure_work,
+            ActorFailurePolicy::IsolateScope,
+        )
+    }
+    fn register_supervised_inner(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        failure_work: &crate::lease::WorkLease,
+        failure_policy: ActorFailurePolicy,
+    ) -> Result<ActorRegistration, (DriverError, A)> {
         if scope.id() != failure_work.scope().id()
             || !Arc::ptr_eq(&scope.runtime.shared, &failure_work.scope().runtime.shared)
         {
@@ -981,7 +1044,7 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
         failure_policy: ActorFailurePolicy,
-    ) -> Result<SlotId, (DriverError, A)> {
+    ) -> Result<ActorRegistration, (DriverError, A)> {
         let config = match config.validate() {
             Ok(c) => c,
             Err(_) => return Err((DriverError::InvalidConfig, actor)),
@@ -1030,10 +1093,16 @@ impl<A: Actor> ActorRuntime<A> {
                 .set(id, deadline)
                 .expect("one timer per registered actor");
         }
+        let registration = ActorRegistration {
+            actor: id,
+            attachment,
+            scope: scope.clone(),
+            origin: Arc::new(()),
+        };
         state.actors.insert(
             id,
             Arc::new(ActorCell {
-                origin: Arc::new(()),
+                origin: registration.origin.clone(),
                 id,
                 scope,
                 attachment,
@@ -1064,7 +1133,7 @@ impl<A: Actor> ActorRuntime<A> {
                 }),
             }),
         );
-        Ok(attachment)
+        Ok(registration)
     }
     /// Existing permits may still fill after external admission closes.
     pub fn reserve_input(
@@ -2242,6 +2311,23 @@ impl<A: Actor> ActorRuntime<A> {
         self.shared.changed.notify();
         Ok(())
     }
+    /// Complete a physical effect only for its original registered host owner.
+    /// Failure generations do not invalidate an observed physical completion.
+    /// Refusal preserves the exclusive original ticket for its actual owner.
+    pub fn effect_completed_for(
+        &self,
+        registration: &ActorRegistration,
+        ticket: EffectTicket<A::Effect>,
+    ) -> Result<(), EffectCompletionRefusal<A::Effect>> {
+        if registration.actor != ticket.actor || !Arc::ptr_eq(&registration.origin, &ticket.origin)
+        {
+            return Err(EffectCompletionRefusal {
+                error: DriverError::EffectTicketOriginMismatch,
+                ticket,
+            });
+        }
+        self.effect_completed(ticket)
+    }
     pub fn effect_completed(
         &self,
         ticket: EffectTicket<A::Effect>,
@@ -2795,6 +2881,10 @@ impl<A: Actor> Drop for PollerPool<A> {
         );
     }
 }
+
+#[cfg(all(test, not(loom)))]
+#[path = "driver/registration_tests.rs"]
+mod registration_tests;
 
 #[cfg(all(test, not(loom)))]
 mod effect_ticket_incarnation_tests {

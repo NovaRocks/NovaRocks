@@ -23,8 +23,15 @@
 
 use super::{
     actors::{WorkerAction, WorkerActor},
-    context_executors::{ContextExecutorStartError, ContextExecutorStartRefusal, ContextExecutors},
-    context_host::{ContextHostBinding, ContextHostError, ContextHostRecord, ContextHostRefusal},
+    context_executors::{
+        ContextExecutorHandles, ContextExecutorStartError, ContextExecutorStartRefusal,
+        ContextExecutors,
+    },
+    context_host::{
+        ContextHostBinding, ContextHostError, ContextHostProgress, ContextHostProgressError,
+        ContextHostRecord, ContextHostRefusal,
+    },
+    context_host_jobs::ContextHostJobError,
     context_ready::{ContextReady, ContextReadyError, ContextReadyNotice},
     host_executor::HostExecutorHandle,
     loading::TaskCreatePayload,
@@ -232,6 +239,18 @@ impl WorkerService {
         self.contexts
             .get_mut(&notice.context())
             .filter(|host| host.matches_ready(notice))
+    }
+    /// One already coalesced original address per bounded host turn. The
+    /// driver retains this inventory on error; it cannot turn a submission
+    /// failure into a parked retry without a corresponding capacity wake.
+    pub(crate) fn advance_context_host(
+        &mut self,
+        notice: &ContextReadyNotice,
+        handles: &ContextExecutorHandles,
+    ) -> Result<ContextHostProgress, ContextHostProgressError> {
+        self.ready_context(notice)
+            .ok_or(ContextHostJobError::WrongOwner)?
+            .advance_host_io(handles)
     }
     /// The real host job receives its fixed Loaded/LoaderExited authors before
     /// any request getter runs. An initializing/refused owner is retained for

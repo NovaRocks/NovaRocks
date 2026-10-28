@@ -19,6 +19,9 @@
 //! only transfers the existing guard and establishes finite metadata roles;
 //! it does not run materialization, publish Active, or infer any host exit.
 
+mod progress;
+pub(crate) use progress::{ContextHostProgress, ContextHostProgressError};
+
 use super::{
     actors::{ContextActor, WorkerAction, WorkerActor},
     context_host_jobs::{
@@ -42,7 +45,7 @@ use crate::{
     control_runtime_policy::{ControlRuntimePolicy, StorageNeed},
 };
 use novarocks_control_runtime::{
-    driver::{ActorRuntime, DriverError, EffectTicket},
+    driver::{ActorRegistration, ActorRuntime, DriverError, EffectTicket},
     lease::{CapacityBundle, WorkLease},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
@@ -121,9 +124,11 @@ pub(crate) struct ContextHostResources {
     pub scope: Option<ScopeHandle>,
     pub roles: Vec<ContextMetadataRole>,
     pub registered: bool,
+    registration: Option<ActorRegistration>,
     pub routes: BTreeMap<InputId, Arc<EstablishRouteCustody>>,
     pub io: Option<ContextIoInventory>,
     pub host_jobs: Option<ContextHostJobs>,
+    pending_host_jobs: progress::PendingHostJobs,
     pub lifecycle: Option<ContextLifecycle>,
     pub notice: Option<ContextReadyNotice>,
     io_attempted: bool,
@@ -287,9 +292,11 @@ impl ContextHostRecord {
             scope: None,
             roles: Vec::with_capacity(LOCAL_ROLES.len()),
             registered: false,
+            registration: None,
             routes: BTreeMap::new(),
             io: None,
             host_jobs: None,
+            pending_host_jobs: Default::default(),
             lifecycle: None,
             notice: None,
             io_attempted: false,
@@ -343,8 +350,8 @@ impl ContextHostRecord {
                 resources.roles[TIMER].work.id(),
                 resources.roles[LIFETIME].work.id(),
             );
-            runtime
-                .register_supervised_next(
+            let registration = runtime
+                .register_supervised_bound(
                     binding.actor,
                     scope,
                     WorkerActor::Context(Box::new(actor)),
@@ -352,6 +359,7 @@ impl ContextHostRecord {
                     &resources.roles[FAILURE].work,
                 )
                 .map_err(|(error, _pure_actor)| ContextHostError::Driver(error))?;
+            resources.registration = Some(registration);
             resources.registered = true;
             Ok(())
         })();
@@ -518,9 +526,9 @@ impl ContextHostRecord {
         if let Err(error) = jobs.request_release(&ticket) {
             return Err((error, ticket));
         }
-        self.control_runtime
-            .effect_completed(ticket)
-            .map_err(|refusal| (ContextHostJobError::Driver(refusal.error), refusal.ticket))
+        self.complete_host_effect(ticket)
+            .map_err(|refusal| (ContextHostJobError::Driver(refusal.error), refusal.ticket))?;
+        Ok(())
     }
     pub(crate) fn handoff_retention(
         &mut self,
@@ -536,8 +544,7 @@ impl ContextHostRecord {
             input: ticket.input,
             action: ticket.descriptor.id,
         };
-        self.control_runtime
-            .effect_completed(ticket)
+        self.complete_host_effect(ticket)
             .map_err(|refusal| (ContextHostJobError::Driver(refusal.error), refusal.ticket))?;
         if self.dispatch.completion_observed(reference).is_err() {
             std::process::abort();
@@ -583,8 +590,7 @@ impl ContextHostRecord {
             input: ticket.input,
             action: ticket.descriptor.id,
         };
-        self.control_runtime
-            .effect_completed(ticket)
+        self.complete_host_effect(ticket)
             .map_err(|r| (ContextHostJobError::Driver(r.error), r.ticket))?;
         if self.dispatch.completion_observed(reference).is_err() {
             std::process::abort();
@@ -647,8 +653,7 @@ impl ContextHostRecord {
             input: ticket.input,
             action: ticket.descriptor.id,
         };
-        self.control_runtime
-            .effect_completed(ticket)
+        self.complete_host_effect(ticket)
             .map_err(|refusal| (EstablishRouteError::Driver(refusal.error), refusal.ticket))?;
         // A completed ticket in this actor's original metadata lane cannot
         // lose its routing index. The original return leg remains retained.
