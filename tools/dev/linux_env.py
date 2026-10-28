@@ -589,7 +589,8 @@ class LinuxEnvironment:
         store = str(self.fixture_store)
         if prepare:
             args = [str(self.repo / "docker/fixture-inputs/provision.sh"), "--consumer", "iceberg-rest",
-                    "--platform", "linux/amd64", "--store", store]
+                    "--platform", "linux/amd64", "--store", store,
+                    "--docker-pull-timeout-seconds", str(self.timeout)]
             for logical, transport in sorted(self.profile.get("fixture_image_sources", {}).items()):
                 args += ["--image-source", f"{logical}={transport}"]
             self.run(args, account=True)

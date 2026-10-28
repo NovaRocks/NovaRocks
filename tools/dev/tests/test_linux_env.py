@@ -268,6 +268,15 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(self.installer.environment["RUSTUP_TOOLCHAIN"], "1.98.1")
         self.assertEqual(self.installer.check()["action"], "check")
 
+    def test_fixture_transfers_use_the_configured_download_deadline(self):
+        self.profile["download_timeout_seconds"] = 317
+        self.installer.timeout = 317
+        self.installer.fixture(prepare=True)
+        calls = [args for args, _ in self.commands.calls if args[0].endswith("provision.sh")]
+        self.assertEqual(len(calls), 1)
+        position = calls[0].index("--docker-pull-timeout-seconds")
+        self.assertEqual(calls[0][position + 1], "317")
+
     def test_partial_install_failure_can_be_prepared_again(self):
         self.commands.fail_install = True
         with self.assertRaisesRegex(linux.EnvironmentFailure, "command failed"):
