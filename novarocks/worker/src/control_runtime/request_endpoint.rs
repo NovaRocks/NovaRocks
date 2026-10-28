@@ -26,13 +26,14 @@ use std::sync::Arc;
 /// Constructed only by the original admission owner after its actual slot and
 /// role exist. The PublishedReply belongs to that caller's actual Scope; this
 /// shared mechanical spine does not choose a Root or Context owner for it.
-pub(super) struct RequestEndpoint<B> {
-    pub(super) request: RequestContext,
+/// H is the caller's frozen neutral header, not a factory for input identity.
+pub(super) struct RequestEndpoint<B, H: Copy = RequestContext> {
+    pub(super) request: H,
     pub(super) ready: ControlRequestReady,
     pub(super) reply: PublishedReply<B>,
     pub(super) external: RequestExternalLeg,
 }
-impl<B> RequestEndpoint<B> {
+impl<B, H: Copy> RequestEndpoint<B, H> {
     fn end_external(this: &Arc<Self>) {
         this.external.end();
     }
@@ -44,15 +45,15 @@ impl<B> RequestEndpoint<B> {
 /// This handle cannot be cloned. Cancellation ends only the external wait;
 /// the original custodian keeps its actual work, publication and exit duties.
 #[must_use = "Take the original reply or end only this external wait"]
-pub(crate) struct RequestHandle<B> {
-    pub(super) endpoint: Arc<RequestEndpoint<B>>,
+pub(crate) struct RequestHandle<B, H: Copy = RequestContext> {
+    pub(super) endpoint: Arc<RequestEndpoint<B, H>>,
     pub(super) active: bool,
 }
-impl<B> RequestHandle<B> {
-    pub(crate) fn request(&self) -> RequestContext {
+impl<B, H: Copy> RequestHandle<B, H> {
+    pub(crate) fn request(&self) -> H {
         self.endpoint.request
     }
-    pub(crate) fn try_take(&mut self) -> Option<RequestDelivery<B>> {
+    pub(crate) fn try_take(&mut self) -> Option<RequestDelivery<B, H>> {
         if !self.active {
             return None;
         }
@@ -64,7 +65,7 @@ impl<B> RequestHandle<B> {
         })
     }
 }
-impl<B> Drop for RequestHandle<B> {
+impl<B, H: Copy> Drop for RequestHandle<B, H> {
     fn drop(&mut self) {
         if self.active {
             RequestEndpoint::end_external(&self.endpoint);
@@ -75,19 +76,19 @@ impl<B> Drop for RequestHandle<B> {
 /// Taking the outbox moves the same endpoint's external exit obligation to
 /// this one delivery. It supplies no Core, source or physical Work exit fact.
 #[must_use = "The actual sender retains delivery custody until it really ends"]
-pub(crate) struct RequestDelivery<B> {
-    endpoint: Arc<RequestEndpoint<B>>,
+pub(crate) struct RequestDelivery<B, H: Copy = RequestContext> {
+    endpoint: Arc<RequestEndpoint<B, H>>,
     body: Option<Arc<B>>,
 }
-impl<B> RequestDelivery<B> {
-    pub(crate) fn request(&self) -> RequestContext {
+impl<B, H: Copy> RequestDelivery<B, H> {
+    pub(crate) fn request(&self) -> H {
         self.endpoint.request
     }
     pub(crate) fn body(&self) -> &B {
         self.body.as_deref().expect("live original reply delivery")
     }
 }
-impl<B> Drop for RequestDelivery<B> {
+impl<B, H: Copy> Drop for RequestDelivery<B, H> {
     fn drop(&mut self) {
         // A foreign body destructor runs outside all endpoint/phase locks. If
         // it panics, do not invent an Ended fact while unwinding that body.

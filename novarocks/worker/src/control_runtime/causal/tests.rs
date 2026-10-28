@@ -614,3 +614,5 @@ fn a_root_scope_work_with_the_same_numeric_id_cannot_author_a_context_request() 
 fn a_foreign_ledger_with_the_same_scope_and_work_numbers_cannot_author_a_context_request() {
     exercise_foreign_author(true);
 }
+
+mod rpc_author;

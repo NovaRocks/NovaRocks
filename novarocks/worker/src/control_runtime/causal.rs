@@ -25,6 +25,7 @@ use super::failure::ScopePublicationsDrained;
 use super::loading::LoaderCustody;
 use super::loading_events::LoadingAuthorReturn;
 use super::source_positions::{ReapedPosition, SourcePositionError};
+use crate::task_completion_roles::AdmittedCompletionRole;
 use crate::{
     settlement::RegistrationNotice,
     task_causal_input::CausalInputRole,
@@ -36,6 +37,10 @@ use crate::{
 };
 use novarocks_control_runtime::driver::{ActorRuntime, DriverError, InputPhase};
 use novarocks_control_runtime::lease::WorkLease;
+use novarocks_control_runtime::{
+    exit_role::{ExitAuthority, ExitRole, ExitRolePhase},
+    reported_work::{ReportedWork, ReportedWorkBindingError},
+};
 use novarocks_control_runtime_core::{
     completion::Consumption,
     identity::{ActorId, Generation, InputId, WorkId},
@@ -70,6 +75,7 @@ pub(crate) enum CausalError {
     Source(SourcePositionError),
     UnknownSource,
     InvalidRequestClass,
+    WrongAuthor,
 }
 impl From<CutError> for CausalError {
     fn from(error: CutError) -> Self {
@@ -187,6 +193,103 @@ impl TaskCausalSender {
         }
     }
 }
+/// One concrete observer of the same whole R author. It owns no second
+/// Work, authority or report; the validated original ExitRole retains them.
+struct RpcAuthorObserver {
+    binding: CausalAuthorBinding,
+    role: ExitRole,
+}
+#[must_use = "The original RPC sender must return or remain unresolved"]
+pub(crate) struct RpcCausalSender {
+    sender: TaskCausalSender,
+    original: Arc<RpcAuthorObserver>,
+}
+#[must_use = "Only this original sender return can acknowledge its captures"]
+pub(crate) struct RpcAuthorReturned {
+    original: Arc<RpcAuthorObserver>,
+}
+impl std::fmt::Debug for RpcAuthorReturned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcAuthorReturned")
+            .field("task", &self.original.binding.task)
+            .field("cut", &self.original.binding.cut)
+            .finish_non_exhaustive()
+    }
+}
+pub(crate) struct RpcInputRefusal {
+    pub input: ContextInput,
+    pub returned: RpcAuthorReturned,
+}
+impl std::fmt::Debug for RpcInputRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcInputRefusal")
+            .field("input", &self.input)
+            .finish_non_exhaustive()
+    }
+}
+impl RpcCausalSender {
+    /// This is only the real synchronous sender/capture return. The R author
+    /// authority, getter and external delivery remain with the original owner.
+    pub(crate) fn send_input(
+        self,
+        input: ContextInput,
+    ) -> Result<RpcAuthorReturned, RpcInputRefusal> {
+        let Self { sender, original } = self;
+        let returned = RpcAuthorReturned { original };
+        match sender.send_input(input) {
+            Ok(()) => Ok(returned),
+            Err(input) => Err(RpcInputRefusal { input, returned }),
+        }
+    }
+    pub(crate) fn withdraw(self) -> RpcAuthorReturned {
+        let Self { sender, original } = self;
+        sender.unused();
+        RpcAuthorReturned { original }
+    }
+}
+pub(crate) struct RpcAuthorAdmission {
+    pub cut: CutId,
+    pub role: ExitRole,
+    pub authority: ExitAuthority,
+    pub sender: RpcCausalSender,
+}
+#[derive(Debug)]
+pub(crate) enum RpcAuthorAdmissionError {
+    Binding(ReportedWorkBindingError),
+    Causal(CausalError),
+}
+/// Every refusal retains the same complete original Work/capacity/report.
+/// After cut admission, the Source2 already belongs to that actual cut.
+#[must_use = "Retain the original R and Source2 or its actually admitted partial cut"]
+pub(crate) enum RpcAuthorAdmissionRefusal {
+    BeforeCut {
+        error: RpcAuthorAdmissionError,
+        admitted: AdmittedCompletionRole,
+        admission: CutSourceAdmission,
+    },
+    BoundCut {
+        error: CausalError,
+        admitted: AdmittedCompletionRole,
+        cut: CutId,
+        sender: TaskCausalSender,
+    },
+}
+impl std::fmt::Debug for RpcAuthorAdmissionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeCut { error, .. } => f
+                .debug_struct("RpcAuthorBeforeCut")
+                .field("error", error)
+                .finish_non_exhaustive(),
+            Self::BoundCut { error, cut, .. } => f
+                .debug_struct("RpcAuthorBoundCut")
+                .field("error", error)
+                .field("cut", cut)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 impl RegistrationNotice for TaskCausalSender {
     fn bind_work(&mut self, work: WorkId) {
         let Some(ingress) = self.ingress() else {
@@ -246,6 +349,7 @@ struct Role {
     // Reference the original custodian, not a copied consumption flag. Its
     // report must finish before this role can discard the exact event receipt.
     input_author: Option<CausalInputCustody>,
+    rpc_author: Option<Arc<RpcAuthorObserver>>,
     loader_exit: Option<LoaderCustody>,
 }
 
@@ -309,7 +413,11 @@ impl TaskCausalInbox {
             return Err(CausalError::WrongTask);
         }
         let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.delivered.is_some() || role.input_author.is_some() || role.loader_exit.is_some() {
+        if role.delivered.is_some()
+            || role.input_author.is_some()
+            || role.rpc_author.is_some()
+            || role.loader_exit.is_some()
+        {
             return Err(CausalError::AlreadyAdmitted);
         }
         self.ingress.validate_input_author(cut, task, work)?;
@@ -454,6 +562,128 @@ impl TaskCausalInbox {
         sender.bind_work(request.author.id());
         Ok((cut, sender))
     }
+    /// One trusted whole-R entry: validate the original triple, borrow that
+    /// same Work for actual actor/scope admission, then consume the unchanged
+    /// carrier into ExitRole. Callers cannot swap a role after author checking.
+    pub(crate) fn admit_rpc_author(
+        &mut self,
+        admitted: AdmittedCompletionRole,
+        request: RequestMetadata,
+        class: InputClass,
+        consumers: u64,
+        pending: Arc<dyn TaskPendingNotice>,
+        admission: CutSourceAdmission,
+    ) -> Result<RpcAuthorAdmission, RpcAuthorAdmissionRefusal> {
+        let reported =
+            match ReportedWork::try_new(admitted.work, admitted.capacity, admitted.report) {
+                Ok(reported) => reported,
+                Err(refusal) => {
+                    return Err(RpcAuthorAdmissionRefusal::BeforeCut {
+                        error: RpcAuthorAdmissionError::Binding(refusal.error),
+                        admitted: AdmittedCompletionRole {
+                            work: refusal.work,
+                            capacity: refusal.capacity,
+                            report: refusal.report,
+                        },
+                        admission,
+                    });
+                }
+            };
+        let admitted = self.admit_request(
+            TaskCausalRequest {
+                author: reported.work(),
+                request,
+                class,
+            },
+            consumers,
+            pending,
+            admission,
+        );
+        let (cut, sender) = match admitted {
+            Ok(admitted) => admitted,
+            Err(refusal) => {
+                let (work, capacity, report) = reported.into_parts();
+                return Err(RpcAuthorAdmissionRefusal::BeforeCut {
+                    error: RpcAuthorAdmissionError::Causal(refusal.error),
+                    admitted: AdmittedCompletionRole {
+                        work,
+                        capacity,
+                        report,
+                    },
+                    admission: refusal.admission,
+                });
+            }
+        };
+        let binding = match self.author_binding(self.task, cut, reported.work().id(), &sender) {
+            Ok(binding) => binding,
+            Err(error) => {
+                let (work, capacity, report) = reported.into_parts();
+                return Err(RpcAuthorAdmissionRefusal::BoundCut {
+                    error,
+                    admitted: AdmittedCompletionRole {
+                        work,
+                        capacity,
+                        report,
+                    },
+                    cut,
+                    sender,
+                });
+            }
+        };
+        let (role, authority) = ExitRole::from_admitted(reported);
+        let original = Arc::new(RpcAuthorObserver {
+            binding,
+            role: role.clone(),
+        });
+        self.roles
+            .get_mut(&cut)
+            .expect("same admitted RPC cut")
+            .rpc_author = Some(original.clone());
+        Ok(RpcAuthorAdmission {
+            cut,
+            role,
+            authority,
+            sender: RpcCausalSender { sender, original },
+        })
+    }
+    /// A unique return from this exact bound sender observes only the cut's
+    /// capture leg. It neither fills/consumes the R report nor signs R exit.
+    pub(crate) fn observe_rpc_author_return(
+        &self,
+        returned: RpcAuthorReturned,
+    ) -> Result<(), (CausalError, RpcAuthorReturned)> {
+        let checked = (|| {
+            let original = &returned.original;
+            self.validate_author_binding(&original.binding)?;
+            if self
+                .roles
+                .get(&original.binding.cut)
+                .and_then(|role| role.rpc_author.as_ref())
+                .is_none_or(|bound| !Arc::ptr_eq(bound, original))
+            {
+                return Err(CausalError::WrongAuthor);
+            }
+            self.ingress
+                .observe_cut_exit(original.binding.cut, true, false)?;
+            Ok(())
+        })();
+        checked.map_err(|error| (error, returned))
+    }
+    /// Return only the exact fill receipt of this original RPC cut. Absence
+    /// means not fully delivered; it grants no token or consumption proof.
+    pub(crate) fn rpc_delivery(&self, cut: CutId) -> Result<Option<CausalDelivery>, CausalError> {
+        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
+        if role.rpc_author.is_none() {
+            return Err(CausalError::WrongAuthor);
+        }
+        Ok(role.delivered.as_ref().and_then(|delivered| {
+            delivered.event.map(|event| CausalDelivery {
+                cut,
+                prefix: delivered.prefix,
+                event,
+            })
+        }))
+    }
     fn admit(
         &mut self,
         kind: CausalEventKind,
@@ -508,6 +738,7 @@ impl TaskCausalInbox {
                         inputs,
                         delivered: None,
                         input_author: None,
+                        rpc_author: None,
                         loader_exit: None,
                     }
                 )
@@ -535,7 +766,11 @@ impl TaskCausalInbox {
             .roles
             .get_mut(&action.cut())
             .ok_or(CausalError::UnknownRole)?;
-        if role.input_author.is_some() || role.loader_exit.is_some() || role.delivered.is_some() {
+        if role.input_author.is_some()
+            || role.rpc_author.is_some()
+            || role.loader_exit.is_some()
+            || role.delivered.is_some()
+        {
             return Err(CausalError::AlreadyAdmitted);
         }
         role.input_author = Some(action);
@@ -555,7 +790,11 @@ impl TaskCausalInbox {
         self.ingress
             .validate_input_author(cut, self.task, loader.work_id())?;
         let role = self.roles.get_mut(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.input_author.is_some() || role.loader_exit.is_some() || role.delivered.is_some() {
+        if role.input_author.is_some()
+            || role.rpc_author.is_some()
+            || role.loader_exit.is_some()
+            || role.delivered.is_some()
+        {
             return Err(CausalError::AlreadyAdmitted);
         }
         role.loader_exit = Some(loader);
@@ -909,9 +1148,14 @@ impl TaskCausalInbox {
             let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
             if role.input_author.as_ref().is_some_and(|action| {
                 action.phase() != novarocks_control_runtime::exit_role::ExitRolePhase::Retired
-            }) || role.loader_exit.as_ref().is_some_and(|loader| {
-                loader.phase() != novarocks_control_runtime::exit_role::ExitRolePhase::Retired
-            }) || role.inputs.in_flight()?.iter().any(Option::is_some)
+            }) || role
+                .rpc_author
+                .as_ref()
+                .is_some_and(|author| author.role.phase() != ExitRolePhase::Retired)
+                || role.loader_exit.as_ref().is_some_and(|loader| {
+                    loader.phase() != novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+                })
+                || role.inputs.in_flight()?.iter().any(Option::is_some)
                 || role
                     .delivered
                     .as_ref()
