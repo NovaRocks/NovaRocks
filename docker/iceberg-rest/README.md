@@ -26,7 +26,7 @@ under the License.
 [ADR-0155](../../docs/adr/ADR-0155-fixture-provisioning-and-offline-verification.md) 继续拥有输入供给。只有显式 provision 可以下载、pull/build；verify、机器运行层、普通测试只消费本机已验证的 lock/BOM、derived 定义和实际 image ID。
 
 ```bash
-docker/fixture-inputs/provision.sh  # Only when acquisition/build is explicitly intended.
+docker/fixture-inputs/provision.sh --consumer iceberg-rest  # Explicit acquisition/build only.
 docker/fixture-inputs/verify.sh --consumer iceberg-rest
 docker/iceberg-rest/fixture-runtime.sh start  # Explicit machine maintenance.
 docker/iceberg-rest/up.sh                     # Attach this worktree only.
@@ -42,6 +42,7 @@ docker/iceberg-rest/up.sh                     # Attach this worktree only.
 
 ```bash
 docker/iceberg-rest/fixture-runtime.sh status
+docker/iceberg-rest/fixture-runtime.sh check  # Read-only: current source/BOM, exact version and health.
 docker/iceberg-rest/fixture-runtime.sh upgrade
 docker/iceberg-rest/fixture-runtime.sh --timeout 5 sweep
 ```
@@ -227,3 +228,5 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 `tests/iru13a-rest-interop-test.sh` 沿用固定 publication 和本地 BOM，执行 provider 内全部 14 个 ignored Java REST 用例。调用方先运行 `up.sh`，然后设置本 worktree 的 `CARGO_TARGET_DIR`（推荐当前 worktree 的 `target/`，使用 `dev` profile）与可选 `NR_IRU13A_INTEROP_ARTIFACT_DIR` 独占材料根；入口拒绝已存在目录，并为三个测试族建立独立 namespace/材料子目录。入口不启动或重绑 fixture、不下载缺失输入。
 
 材料保留 Cargo 实际报告的测试二进制路径/hash、源码 HEAD/diff、构建 profile、完整用例清单、构建/运行双流和真实退出。14 个 exact 名称必须全部通过；零用例、少例、额外用例或 ignored 均不算成功。Java 独立读回 UUID、metadata location、snapshot/ref/retention 与物理格式事实，prepared owner/journal 的 receipt、NoOp 和独立收尾失败也在既有用例中验证；这些不替代原生 1FE+3BE 的 FE 核查与 SQL 验收。变更发布、维护或 REST 协议时显式运行，普通 unit 仍保留 ignored 边界。失败材料由调用方持有，不随 fixture 自动删除。
+
+Linux 新开发节点的显式安装入口见 [Linux 环境准备](../../tools/dev/README.md)。它可联网安装和 provision；Codex 自动 setup 的 `--prepare-only` 仍只生成离线 unbound 入口。

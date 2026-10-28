@@ -634,6 +634,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 7.3 Local Test Environment (Iceberg REST + MinIO + Spark)
 
+新 Ubuntu 26.04 amd64 开发节点使用 [版本化准备入口](tools/dev/README.md)：
+`sudo tools/dev/linux-env.sh prepare --user <account> --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest`。
+prepare 才安装/联网供给；check/env 只观察/输出环境。显式账户和准确平台必须贯通 fixture schema 2，
+相同输入不无故重启服务；旧 BOM 明确重新 provision，现有机器版本变化沿原维护入口，不清卷。
+专用 profile 使用本机可用 CPU，通用构建默认不变。该节点不因此成为正式 CI 来源。
+
+
 The canonical local test fixture lives at `docker/iceberg-rest/` and is also
 the CI fixture for the `iceberg`, `iceberg-compatibility`, and `iceberg-rest`
 SQL suites. The Codex workspace manifest at
