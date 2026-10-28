@@ -16,6 +16,7 @@
 # under the License.
 
 explicit_only = true
+heavy = { reason = "fixture", detail = "Requires an explicitly prepared Iceberg REST object store fixture and native 1FE+3BE execution." }
 
 [impact]
 paths = ["novarocks/connector/iceberg/**", "novarocks/fs/**"]
