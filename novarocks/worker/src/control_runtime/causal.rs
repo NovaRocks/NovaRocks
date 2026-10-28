@@ -279,6 +279,9 @@ impl TaskCausalInbox {
             health,
         }
     }
+    pub(super) fn runtime(&self) -> &ActorRuntime<WorkerActor> {
+        &self.runtime
+    }
     /// The trusted host issuer checks the same original sender and event Work
     /// before it attaches the admitted lifecycle author's unique authority.
     pub(crate) fn check_input_author(

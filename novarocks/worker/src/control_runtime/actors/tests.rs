@@ -1095,6 +1095,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         completion,
         completion_action,
         lifecycle_inputs,
+        statistics,
         open_summary,
         mut causal,
     } = host.into_resources();
@@ -1118,6 +1119,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert!(completion.is_none());
     assert!(completion_action.is_none());
     assert!(lifecycle_inputs.is_empty());
+    assert!(statistics.is_none());
     assert!(open_summary.is_none());
     assert!(!lifetime.actual_exit_ready().unwrap());
 
@@ -2237,7 +2239,26 @@ fn exercise_fragment_roles_with_lifecycle(
             self.calls.fetch_add(2, Ordering::SeqCst);
         }
     }
-    if let Some(kind) = lifecycle_role {
+    if lifecycle_role == Some(TaskLifecycleRole::OperatorStatistics) {
+        let (producer, finalizer) = host.issue_statistics_producer().unwrap();
+        assert_eq!(producer.identity(), task);
+        assert_eq!(finalizer.identity(), task);
+        assert!(matches!(
+            host.issue_statistics_producer(),
+            Err(TaskHostError::LifecycleAlreadyIssued(
+                TaskLifecycleRole::OperatorStatistics
+            ))
+        ));
+        drop(producer);
+        assert_eq!(
+            host.statistics().unwrap().phase(),
+            novarocks_control_runtime::exit_role::ExitRolePhase::Admitted
+        );
+        assert!(finalizer.seal_for_terminal(None).is_none());
+        assert!(host.statistics().unwrap().advance().unwrap().retired);
+        f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
+        f.assert_storage_paid(policy.task_base);
+    } else if let Some(kind) = lifecycle_role {
         // Actual typed permits have no common public issuer or clone. This
         // test erases only their local destructor after recording identity.
         let (identity, permit): (_, Box<dyn Any>) = match kind {
@@ -2683,6 +2704,7 @@ fn exercise_fragment_roles_with_lifecycle(
         completion,
         completion_action,
         lifecycle_inputs,
+        statistics,
         open_summary,
         causal,
     } = host.into_resources();
@@ -2701,7 +2723,10 @@ fn exercise_fragment_roles_with_lifecycle(
         "this component issued no open-summary role"
     );
     assert!(causal.is_empty());
-    if let Some(kind) = lifecycle_role {
+    if lifecycle_role == Some(TaskLifecycleRole::OperatorStatistics) {
+        assert!(lifecycle_inputs.is_empty());
+        assert!(statistics.as_ref().unwrap().is_retired());
+    } else if let Some(kind) = lifecycle_role {
         assert_eq!(lifecycle_inputs.len(), 1);
         assert_eq!(
             lifecycle_inputs[&kind].phase(),
@@ -2709,8 +2734,10 @@ fn exercise_fragment_roles_with_lifecycle(
         );
     } else {
         assert!(lifecycle_inputs.is_empty());
+        assert!(statistics.is_none());
     }
     drop(lifecycle_inputs);
+    drop(statistics);
     drop(causal);
     drop(completion);
     drop(preparation);
@@ -2789,6 +2816,15 @@ fn an_accepted_terminal_issuer_withdraws_only_its_unbound_original_observation()
         false,
         SettlementScenario::Unused,
         Some(crate::control_runtime_policy::TaskLifecycleRole::TerminalObservation),
+    );
+}
+
+#[test]
+fn one_accepted_statistics_issuer_waits_for_the_original_producer_and_finalizer_to_exit() {
+    exercise_fragment_roles_with_lifecycle(
+        false,
+        SettlementScenario::Unused,
+        Some(crate::control_runtime_policy::TaskLifecycleRole::OperatorStatistics),
     );
 }
 

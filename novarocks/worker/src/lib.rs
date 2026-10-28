@@ -133,6 +133,9 @@ pub use catalog_manager::{
 };
 pub use catalog_manager_config::{CatalogManagerConfig, DEFAULT_MAX_RETAINED_CATALOGS};
 pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
+pub use control_runtime::operator_statistics::{
+    StatisticsSubmission, TaskStatisticsFinalizer, TaskStatisticsProducer,
+};
 pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };

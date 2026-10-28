@@ -163,6 +163,11 @@ impl SafeDetail {
                 actual: value.len(),
             });
         }
+        let value = if value.capacity() > SAFE_DETAIL_MAX_BYTES {
+            value.into_boxed_str().into_string()
+        } else {
+            value
+        };
         Ok(Self(value))
     }
 
@@ -1000,10 +1005,14 @@ impl OperatorStatistics {
 
     /// Records the operator's remaining named counters, truncating at the
     /// budget and saying so.
-    pub fn with_counters(mut self, counters: Vec<OperatorCounter>) -> Self {
+    pub fn with_counters(mut self, mut counters: Vec<OperatorCounter>) -> Self {
         self.counters_truncated = counters.len() > OPERATOR_COUNTER_BUDGET;
-        self.counters = counters;
-        self.counters.truncate(OPERATOR_COUNTER_BUDGET);
+        counters.truncate(OPERATOR_COUNTER_BUDGET);
+        self.counters = if counters.capacity() > OPERATOR_COUNTER_BUDGET {
+            counters.into_boxed_slice().into_vec()
+        } else {
+            counters
+        };
         self
     }
 
@@ -1167,8 +1176,9 @@ impl FinalTaskInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        SAFE_DETAIL_MAX_BYTES, SafeDetail, SafeFieldPath, TaskOutputFacts, TaskState, TaskStatus,
-        TaskStatusError, TaskStatusVersion,
+        OPERATOR_COUNTER_BUDGET, OperatorCounter, OperatorStatistics, SAFE_DETAIL_MAX_BYTES,
+        SafeDetail, SafeFieldPath, TaskOutputFacts, TaskState, TaskStatus, TaskStatusError,
+        TaskStatusVersion,
     };
     use crate::{
         TaskFailure, TaskFailureCategory, TaskFailurePhase, TaskIdentity, TerminationDetail,
@@ -1303,6 +1313,48 @@ mod tests {
         assert!(bounded.as_str().starts_with("prefix:"));
         assert_eq!(SafeDetail::truncating_display(17).as_str(), "17");
         assert!(SafeFieldPath::new("field").is_ok());
+    }
+
+    #[test]
+    fn short_safe_detail_does_not_retain_an_oversized_string_allocation() {
+        let mut value = String::with_capacity(100_000);
+        value.push_str("bounded detail");
+        assert!(value.capacity() > SAFE_DETAIL_MAX_BYTES);
+
+        let detail = SafeDetail::new(value).unwrap();
+
+        assert_eq!(detail.as_str(), "bounded detail");
+        assert!(detail.0.capacity() <= SAFE_DETAIL_MAX_BYTES);
+    }
+
+    #[test]
+    fn bounded_operator_counters_compact_backing_and_preserve_truncation() {
+        for count in [1, OPERATOR_COUNTER_BUDGET, OPERATOR_COUNTER_BUDGET + 1] {
+            let mut counters = Vec::with_capacity(100_000);
+            counters.extend(
+                (0..count).map(|index| {
+                    OperatorCounter::new(SafeDetail::new("rows").unwrap(), index as i64)
+                }),
+            );
+            assert!(counters.capacity() > OPERATOR_COUNTER_BUDGET);
+
+            let statistics = OperatorStatistics::new(7, SafeDetail::new("scan").unwrap())
+                .with_counters(counters);
+
+            assert_eq!(
+                statistics.counters().len(),
+                count.min(OPERATOR_COUNTER_BUDGET)
+            );
+            assert!(statistics.counters.capacity() <= OPERATOR_COUNTER_BUDGET);
+            assert_eq!(
+                statistics.counters_truncated(),
+                count > OPERATOR_COUNTER_BUDGET
+            );
+            for (index, counter) in statistics.counters().iter().enumerate() {
+                assert_eq!(counter.name().as_str(), "rows");
+                assert_eq!(counter.value(), index as i64);
+            }
+        }
     }
 
     #[test]

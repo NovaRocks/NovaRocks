@@ -370,14 +370,23 @@ impl ControlRuntimePolicy {
         if max_live_tasks == 0 {
             return Err(PolicyError::ZeroRunningPositions);
         }
+        // Periodic data uses one original input per live Task, independently
+        // of how many RPC positions happen to be busy. Move its already paid
+        // position between classes rather than adding another storage charge.
+        let task_ordinary = crate::control_runtime::operator_statistics::STATISTICS_INPUT_POSITIONS;
         let lifecycle = self
             .task_base
             .inputs
+            .checked_sub(task_ordinary)
+            .ok_or(PolicyError::InvalidStorageGeometry)?
             .checked_add(self.root_read_pool_per_root.inputs)
             .and_then(|n| n.checked_mul(max_live_tasks))
             .and_then(|n| n.checked_add(self.request_roles))
             .ok_or(PolicyError::Overflow)?;
-        let ordinary = self.request_roles;
+        let ordinary = task_ordinary
+            .checked_mul(max_live_tasks)
+            .and_then(|n| n.checked_add(self.request_roles))
+            .ok_or(PolicyError::Overflow)?;
         let control = self.request_roles;
         let inputs = lifecycle
             .checked_add(ordinary)
@@ -420,10 +429,90 @@ mod tests {
         let actor = policy.context_actor(9).unwrap();
         assert_eq!(
             actor.mailbox[0],
-            (policy.task_base.inputs + 4) * 9 + policy.request_roles
+            (policy.task_base.inputs + 4 - 1) * 9 + policy.request_roles
         );
         assert_eq!(actor.mailbox[1], policy.request_roles);
-        assert_eq!(actor.mailbox[2], policy.request_roles);
+        assert_eq!(actor.mailbox[2], policy.request_roles + 9);
+    }
+
+    #[test]
+    fn live_statistics_inputs_do_not_borrow_busy_request_positions() {
+        use novarocks_control_runtime::{
+            actor::{Actor, StepContext},
+            driver::{ActorRuntime, DriverError},
+            transaction::RuntimeLedger,
+        };
+        use novarocks_control_runtime_core::{
+            capacity::ResourceVector,
+            identity::{ActorId, Generation, ScopeId, Tick},
+            mailbox::{InputClass, InputEnvelope},
+        };
+        struct Idle;
+        impl Actor for Idle {
+            type Input = ();
+            type Effect = ();
+            fn timer_input(_: Tick) {}
+            fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut StepContext<'_, ()>) {}
+            fn next_deadline(&self) -> Option<Tick> {
+                None
+            }
+            fn owner_failed(
+                _: ScopeId,
+                _: Generation,
+                _: InputEnvelope,
+                _: &mut StepContext<'_, ()>,
+            ) {
+            }
+        }
+        let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
+            ordinary_running: 1,
+            ordinary_waiting: 0,
+            control_running: 1,
+            control_waiting: 0,
+            max_batch_items: 1,
+            root_read_holders: 1,
+        })
+        .unwrap();
+        let live_tasks = policy.request_roles + 1;
+        let config = policy.context_actor(live_tasks).unwrap();
+        let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap(), 1, 1);
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap(), 1, 1)
+            .unwrap();
+        let runtime = ActorRuntime::new(1);
+        let actor = ActorId::new(1).unwrap();
+        runtime
+            .register_next(actor, scope.clone(), Idle, config)
+            .unwrap_or_else(|(error, _)| panic!("actual mailbox registration: {error:?}"));
+        let mut permits = Vec::new();
+        // All request positions may already be busy when each live Task
+        // attaches its independently paid periodic data producer.
+        for _ in 0..policy.request_roles + live_tasks {
+            permits.push(
+                runtime
+                    .reserve_input(actor, actor, InputClass::Ordinary)
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            runtime.reserve_input(actor, actor, InputClass::Ordinary),
+            Err(DriverError::InputCapacity)
+        ));
+        // Moving between classes must not add another storage payment.
+        assert_eq!(
+            config.mailbox.iter().sum::<usize>(),
+            (policy.task_base.inputs + policy.root_read_pool_per_root.inputs) * live_tasks
+                + 3 * policy.request_roles
+                + 1
+        );
+        for permit in permits {
+            permit.revoke_unused().unwrap();
+        }
+        scope.close_external().unwrap();
+        runtime
+            .remove_actor(actor)
+            .unwrap_or_else(|error| panic!("retired mailbox: {error:?}"));
+        ledger.remove_scope(scope.id()).unwrap();
     }
 
     #[test]

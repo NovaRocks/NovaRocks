@@ -661,6 +661,7 @@ mod tests {
                 completion,
                 completion_action,
                 lifecycle_inputs,
+                statistics,
                 open_summary,
                 causal,
             } = self
@@ -669,6 +670,7 @@ mod tests {
                 .expect("one real elected lifetime")
                 .into_resources();
             assert!(lifecycle_inputs.is_empty());
+            assert!(statistics.is_none());
             assert!(
                 loader.is_none()
                     && loading_events.is_none()

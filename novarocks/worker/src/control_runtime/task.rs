@@ -34,6 +34,7 @@ use super::{
     },
     loading_host_job::LoadingHostJob,
     open_summary::TaskOpenSummaryInbox,
+    operator_statistics::{StatisticsBinding, StatisticsError, TaskStatisticsInbox},
     preparation::{
         PreparationAdoptionError, PreparationBinding, PreparationCustody, PreparationJob,
         PreparationOutcome, PreparationParent, QueuedPreparation, RunningPreparation,
@@ -87,6 +88,7 @@ pub(crate) enum TaskHostError {
     CompletionAlreadyIssued,
     OpenSummaryAlreadyIssued,
     LifecycleAlreadyIssued(TaskLifecycleRole),
+    Statistics(StatisticsError),
     Driver(DriverError),
     Runtime(RuntimeError),
     AdmissionBindInvariant(RuntimeError),
@@ -128,6 +130,9 @@ impl std::fmt::Display for TaskHostError {
                     f,
                     "the Task's original {role:?} lifecycle input was already issued"
                 )
+            }
+            Self::Statistics(error) => {
+                write!(f, "original Task statistics handoff failed: {error:?}")
             }
             Self::Driver(error) => write!(f, "Task host responsibility transfer failed: {error}"),
             Self::Runtime(error) => write!(f, "Task host work admission failed: {error}"),
@@ -217,6 +222,7 @@ pub(crate) struct TaskHostResources {
     pub completion: Option<Arc<TaskCompletionRoles>>,
     pub completion_action: Option<CompletionActionCustody>,
     pub lifecycle_inputs: BTreeMap<TaskLifecycleRole, CausalInputCustody>,
+    pub statistics: Option<TaskStatisticsInbox>,
     pub open_summary: Option<TaskOpenSummaryInbox>,
     pub causal: TaskCausalInbox,
 }
@@ -227,6 +233,10 @@ impl TaskHostResources {
     pub(crate) fn seal_read_observation(&self) -> Result<Arc<TaskReadSnapshot>, TaskReadError> {
         use novarocks_control_runtime::exit_role::ExitRolePhase;
         if !self.causal.is_empty()
+            || self
+                .statistics
+                .as_ref()
+                .is_some_and(|statistics| !statistics.is_retired())
             || self.pending_loading.is_some()
             || self
                 .open_summary
@@ -525,6 +535,7 @@ impl TaskHostRecord {
                 completion: None,
                 completion_action: None,
                 lifecycle_inputs: BTreeMap::new(),
+                statistics: None,
                 open_summary: None,
                 causal: TaskCausalInbox::new(
                     runtime.clone(),
@@ -982,6 +993,70 @@ impl TaskHostRecord {
         };
         self.resources.preparation_remainder = preparation.take_after_exit()?;
         Ok(self.resources.preparation_remainder.is_some())
+    }
+    /// One real repeated producer and one unique finalizer, both attached
+    /// before any statistics event sink captures them. Replays and Reporter
+    /// clones cannot reserve another input, Work or report.
+    pub(crate) fn issue_statistics_producer(
+        &mut self,
+    ) -> Result<
+        (
+            crate::TaskStatisticsProducer,
+            crate::TaskStatisticsFinalizer,
+        ),
+        TaskHostError,
+    > {
+        let kind = TaskLifecycleRole::OperatorStatistics;
+        if self.resources.preparation.is_none() {
+            return Err(TaskHostError::CompletionBeforeAccepted);
+        }
+        if std::mem::replace(&mut self.lifecycle_issued[kind as usize], true) {
+            return Err(TaskHostError::LifecycleAlreadyIssued(kind));
+        }
+        let role = reserve_reported_role(
+            &self.scope,
+            self.resources.active.id(),
+            WorkKind::Cleanup,
+            Some(self.core_generation),
+        )?;
+        let runtime = self.resources.causal.runtime().clone();
+        let permit = match runtime.reserve_input(
+            self.actor,
+            self.task_source,
+            novarocks_control_runtime_core::mailbox::InputClass::Ordinary,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                dispose_unused_completion(role);
+                return Err(TaskHostError::Driver(error));
+            }
+        };
+        let input = match permit.into_role() {
+            Ok(input) => input,
+            Err((error, permit)) => {
+                permit
+                    .revoke_unused()
+                    .expect("no statistics payload was attached");
+                dispose_unused_completion(role);
+                return Err(TaskHostError::Driver(error));
+            }
+        };
+        let (inbox, producer, finalizer) = TaskStatisticsInbox::from_admitted(
+            role,
+            input,
+            StatisticsBinding {
+                task: self.task,
+                runtime,
+                actor: self.actor,
+                pending: self.pending.clone(),
+                health: self.health.clone(),
+            },
+        );
+        self.resources.statistics = Some(inbox);
+        Ok((producer, finalizer))
+    }
+    pub(crate) fn statistics(&mut self) -> Option<&mut TaskStatisticsInbox> {
+        self.resources.statistics.as_mut()
     }
     /// Issue before the dormant runtime start captures this capability. Only
     /// this owner can consume the original Running role's paid inventory.

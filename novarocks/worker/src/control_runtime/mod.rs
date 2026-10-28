@@ -37,6 +37,7 @@ pub(crate) mod service;
 pub(crate) mod effect_dispatch;
 pub(crate) mod host_executor;
 pub(crate) mod open_summary;
+pub(crate) mod operator_statistics;
 
 pub(crate) mod preparation;
 pub(crate) mod preparation_refusal;
