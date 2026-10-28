@@ -21,6 +21,8 @@
 mod source_io;
 pub(crate) use source_io::{RequestIoError, RequestIoProgress};
 
+pub(crate) use super::request_ready::ControlRequestReady;
+use super::request_ready::{RequestExternalLeg, RequestReadySlot};
 use super::{
     actors::{ControlMessage, RequestMetadata, WorkerAction, WorkerActor, WorkerMessage},
     context_host::ContextHostRecord,
@@ -43,7 +45,6 @@ use novarocks_control_runtime::{
     },
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
     lease::{CapacityBundle, WorkLease, WorkRetirementObserver},
-    notify::Notify,
     owned_return::OwnedReturnReader,
     publication::PublishedReply,
     reported_work::{ReportedWork, ReportedWorkBindingError},
@@ -65,11 +66,7 @@ use novarocks_worker_protocol::{
     creation::{PayloadId, RequestContext},
     lease::MonotonicInstant,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::NonZeroUsize,
-    sync::{Arc, Mutex, Weak},
-};
+use std::sync::Arc;
 
 pub(crate) const CONTROL_REQUEST_STORAGE: StorageNeed = StorageNeed {
     inputs: 1,
@@ -203,165 +200,18 @@ impl std::fmt::Debug for ControlRequestPublishRefusal {
 
 pub(crate) use novarocks_worker_protocol::control::ControlReplyBody;
 
-struct ReadyState {
-    slots: BTreeMap<InputId, Weak<Endpoint>>,
-    ready: BTreeSet<InputId>,
-    cursor: Option<InputId>,
-}
-struct ReadyShared {
-    limit: NonZeroUsize,
-    state: Mutex<ReadyState>,
-    changed: Notify,
-    runtime: ActorRuntime<WorkerActor>,
-}
-/// Only bounded addresses and coalesced readiness, never another obligation
-/// table. R comes from actual ingress positions; registration grants no funds.
-#[derive(Clone)]
-pub(crate) struct ControlRequestReady {
-    shared: Arc<ReadyShared>,
-}
-impl ControlRequestReady {
-    pub(super) fn same_owner(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.shared, &other.shared)
-    }
-    pub(super) fn limit(&self) -> NonZeroUsize {
-        self.shared.limit
-    }
-    pub(crate) fn new(limit: NonZeroUsize, runtime: ActorRuntime<WorkerActor>) -> Self {
-        Self {
-            shared: Arc::new(ReadyShared {
-                limit,
-                state: Mutex::new(ReadyState {
-                    slots: BTreeMap::new(),
-                    ready: BTreeSet::new(),
-                    cursor: None,
-                }),
-                changed: Notify::default(),
-                runtime,
-            }),
-        }
-    }
-    fn register(&self, endpoint: &Arc<Endpoint>) -> Result<(), ControlRequestError> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("control request ready index");
-        if state.slots.contains_key(&endpoint.request.token) {
-            return Err(ControlRequestError::DuplicateReadySlot);
-        }
-        if state.slots.len() >= self.shared.limit.get() {
-            return Err(ControlRequestError::ReadyFull);
-        }
-        state
-            .slots
-            .insert(endpoint.request.token, Arc::downgrade(endpoint));
-        Ok(())
-    }
-    fn mark(&self, endpoint: &Arc<Endpoint>) {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("control request ready index");
-        let original = state
-            .slots
-            .get(&endpoint.request.token)
-            .is_some_and(|weak| Weak::ptr_eq(weak, &Arc::downgrade(endpoint)));
-        if original {
-            state.ready.insert(endpoint.request.token);
-        }
-        drop(state);
-        self.shared.changed.notify();
-        // External endpoint exits must also wake the host waiting on this
-        // original runtime. This is only a concrete metadata notification.
-        self.shared.runtime.notify_pollers();
-    }
-    fn unregister(&self, endpoint: &Arc<Endpoint>) -> Result<(), ControlRequestError> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("control request ready index");
-        if !state
-            .slots
-            .get(&endpoint.request.token)
-            .is_some_and(|weak| Weak::ptr_eq(weak, &Arc::downgrade(endpoint)))
-        {
-            return Err(ControlRequestError::UnknownReadySlot);
-        }
-        state.ready.remove(&endpoint.request.token);
-        state.slots.remove(&endpoint.request.token);
-        Ok(())
-    }
-    /// The driver samples version before taking ready metadata. It rechecks
-    /// this actual index after any wake; no callback or Waker executes here.
-    pub(crate) fn change_version(&self) -> u64 {
-        self.shared.changed.version()
-    }
-    pub(crate) fn next_ready(&self) -> Option<InputId> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("control request ready index");
-        let next = state
-            .cursor
-            .and_then(|cursor| {
-                state
-                    .ready
-                    .range((
-                        std::ops::Bound::Excluded(cursor),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next()
-                    .copied()
-            })
-            .or_else(|| state.ready.first().copied())?;
-        state.ready.remove(&next);
-        state.cursor = Some(next);
-        Some(next)
-    }
-    pub(crate) fn registered(&self) -> usize {
-        self.shared
-            .state
-            .lock()
-            .expect("control request ready index")
-            .slots
-            .len()
-    }
-}
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ExternalPhase {
-    Waiting,
-    Delivering,
-    Ended,
-}
 struct Endpoint {
     request: RequestContext,
     ready: ControlRequestReady,
     reply: PublishedReply<ControlReplyBody>,
-    external: Mutex<ExternalPhase>,
+    external: RequestExternalLeg,
 }
 impl Endpoint {
     fn end_external(this: &Arc<Self>) {
-        let mut phase = this
-            .external
-            .lock()
-            .expect("control request external custody");
-        let changed = *phase != ExternalPhase::Ended;
-        *phase = ExternalPhase::Ended;
-        drop(phase);
-        if changed {
-            this.ready.mark(this);
-        }
+        this.external.end();
     }
     fn external_ended(&self) -> bool {
-        *self
-            .external
-            .lock()
-            .expect("control request external custody")
-            == ExternalPhase::Ended
+        self.external.is_ended()
     }
 }
 /// This endpoint cannot be cloned. Cancellation ends only the external leg.
@@ -378,18 +228,8 @@ impl ControlRequestHandle {
         if !self.active {
             return None;
         }
-        let mut phase = self
-            .endpoint
-            .external
-            .lock()
-            .expect("control request external custody");
-        if *phase != ExternalPhase::Waiting {
-            return None;
-        }
-        let body = self.endpoint.reply.take_once()?;
-        *phase = ExternalPhase::Delivering;
+        let body = self.endpoint.external.try_take(&self.endpoint.reply)?;
         self.active = false;
-        drop(phase);
         Some(ControlRequestDelivery {
             endpoint: self.endpoint.clone(),
             body: Some(body),
@@ -398,13 +238,13 @@ impl ControlRequestHandle {
 }
 /// Concrete coalesced metadata wake; it executes no application callback.
 #[derive(Clone)]
-pub(super) struct ControlRequestNotice(Arc<Endpoint>);
+pub(super) struct ControlRequestNotice(Arc<RequestReadySlot>);
 impl ControlRequestNotice {
     pub(super) fn belongs_to(&self, ready: &ControlRequestReady) -> bool {
-        Arc::ptr_eq(&self.0.ready.shared, &ready.shared)
+        self.0.belongs_to(ready)
     }
     pub(super) fn notify(&self) {
-        self.0.ready.mark(&self.0);
+        self.0.notify();
     }
 }
 
@@ -670,25 +510,28 @@ impl ControlRequestCustody {
                 });
             }
         };
+        let slot = match root.request_ready().register_control(request.token) {
+            Ok(slot) => slot,
+            Err(error) => {
+                let (work, capacity, report) = reported.into_parts();
+                return Err(ControlRequestAdmissionRefusal {
+                    error,
+                    partial: Some(ControlRequestPartial {
+                        work,
+                        capacity,
+                        report: Some(report),
+                        permit: Some(permit),
+                        route_escrow,
+                    }),
+                });
+            }
+        };
         let endpoint = Arc::new(Endpoint {
             request,
             ready: root.request_ready().clone(),
             reply: PublishedReply::new(scope),
-            external: Mutex::new(ExternalPhase::Waiting),
+            external: RequestExternalLeg::new(slot),
         });
-        if let Err(error) = endpoint.ready.register(&endpoint) {
-            let (work, capacity, report) = reported.into_parts();
-            return Err(ControlRequestAdmissionRefusal {
-                error,
-                partial: Some(ControlRequestPartial {
-                    work,
-                    capacity,
-                    report: Some(report),
-                    permit: Some(permit),
-                    route_escrow,
-                }),
-            });
-        }
         let (role, authority) = ExitRole::from_admitted(reported);
         Ok((
             Self {
@@ -779,7 +622,7 @@ impl ControlRequestCustody {
             generation,
             &self.ledger,
             self.scope.id(),
-            ControlRequestNotice(self.endpoint.clone()),
+            ControlRequestNotice(self.endpoint.external.slot().clone()),
         ) {
             Ok(owner) => owner,
             Err(refusal) => {
@@ -1006,7 +849,7 @@ impl ControlRequestCustody {
             self.request(),
             self.work,
             author,
-            ControlRequestNotice(self.endpoint.clone()),
+            ControlRequestNotice(self.endpoint.external.slot().clone()),
         )
         .map_err(ControlRequestError::HostJob)?;
         Ok(())
@@ -1057,7 +900,7 @@ impl ControlRequestCustody {
             host.scope().clone(),
             seed.request,
             escrow,
-            ControlRequestNotice(self.endpoint.clone()),
+            ControlRequestNotice(self.endpoint.external.slot().clone()),
         );
         // Register both aliases before the first Context Work, input or
         // backchannel is constructed. Initialization refusal retains the same
@@ -1465,14 +1308,14 @@ impl ControlRequestCustody {
         match self.runtime.effect_completed(ticket) {
             Ok(()) => {
                 self.reply_completed = true;
-                self.endpoint.ready.mark(&self.endpoint);
+                self.endpoint.external.notify();
                 Ok(())
             }
             Err(refusal) => Err(ControlRequestPublishRefusal::Completion(refusal)),
         }
     }
     pub(crate) fn note_progress(&self) {
-        self.endpoint.ready.mark(&self.endpoint);
+        self.endpoint.external.notify();
     }
     /// Initial input retirement and final RPC completion are independent. A
     /// delayed Establish may retire its first step while its RPC still waits.
@@ -1512,7 +1355,9 @@ impl ControlRequestCustody {
             if !self.retire_original_role()? {
                 return Ok(false);
             }
-            self.endpoint.ready.unregister(&self.endpoint)?;
+            self.endpoint
+                .ready
+                .unregister(self.endpoint.external.slot())?;
             self.retired = true;
             return Ok(true);
         }
@@ -1567,7 +1412,9 @@ impl ControlRequestCustody {
         if !self.retire_original_role()? {
             return Ok(false);
         }
-        self.endpoint.ready.unregister(&self.endpoint)?;
+        self.endpoint
+            .ready
+            .unregister(self.endpoint.external.slot())?;
         self.retired = true;
         Ok(true)
     }
@@ -1598,7 +1445,7 @@ mod tests {
         QueryId,
     };
     use novarocks_worker_protocol::{admission::AdmissionTicketConfig, control::ControlConfig};
-    use std::time::Duration;
+    use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
     fn generation() -> Generation {
         Generation::new(1).unwrap()

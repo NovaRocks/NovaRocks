@@ -38,7 +38,7 @@ type RetainedSource = RetainedTaskSource<ExecutionFailure>;
 
 /// An address, never work/exit authority. One generation occupies this exact
 /// position until its original Work header is actually reaped.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SourcePositionId(usize);
 
 /// Addresses one original bank/position generation. Clones observe that same
@@ -60,6 +60,9 @@ pub(crate) struct SourcePositionObservation {
 impl SourcePositionKey {
     pub(crate) fn address(&self) -> SourcePositionId {
         self.position.id
+    }
+    pub(crate) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.position, &other.position)
     }
 }
 
@@ -126,6 +129,10 @@ impl Payload {
 struct PositionState {
     source: Option<SourceId>,
     payload: Payload,
+    // Old reap witnesses may outlive a later generation's removal. This
+    // original row can authorize a replacement only once, even when its
+    // numeric address is absent from the resident bank again.
+    replacement_issued: bool,
 }
 
 /// This is the original payload holder, not a second quota or work ledger.
@@ -158,6 +165,7 @@ impl Position {
             state: Mutex::new(PositionState {
                 source: None,
                 payload: Payload::Available(ManuallyDrop::new(permit)),
+                replacement_issued: false,
             }),
             retained: Mutex::new(None),
         });
@@ -217,12 +225,16 @@ impl Position {
     }
 }
 
-/// Only actual supplied roles add positions. `limit` bounds addresses; it
-/// issues no funding and does not preallocate a per-Task maximum-cut pool.
+/// Only actual supplied roles add positions. `limit` bounds resident rows,
+/// independently of monotonic fresh addresses. It issues no funding and
+/// does not preallocate a per-Task maximum-cut pool.
 #[must_use = "dispose original source/unused holders before retiring their inventory"]
 pub(crate) struct SourcePositions {
     identity: Arc<InventoryIdentity>,
-    positions: Vec<Arc<Position>>,
+    // Only current resident rows are retained here. A Task must not cache
+    // its historical peak of shared RPC positions after their true release.
+    positions: BTreeMap<SourcePositionId, Arc<Position>>,
+    next_position: usize,
     sources: BTreeMap<SourceId, SourcePositionId>,
     limit: usize,
     pending: Arc<dyn TaskPendingNotice>,
@@ -237,7 +249,8 @@ impl SourcePositions {
     ) -> Self {
         Self {
             identity: Arc::new(InventoryIdentity { task }),
-            positions: Vec::new(),
+            positions: BTreeMap::new(),
+            next_position: 0,
             sources: BTreeMap::new(),
             limit,
             pending,
@@ -254,7 +267,10 @@ impl SourcePositions {
         if self.positions.len() >= self.limit {
             return Err((SourcePositionError::Full, role));
         }
-        let id = SourcePositionId(self.positions.len());
+        let Some(next) = self.next_position.checked_add(1) else {
+            return Err((SourcePositionError::IdentityExhausted, role));
+        };
+        let id = SourcePositionId(self.next_position);
         let position = Position::from_admitted(
             self.identity.clone(),
             id,
@@ -263,7 +279,8 @@ impl SourcePositions {
             self.pending.clone(),
             self.health.clone(),
         );
-        self.positions.push(position.clone());
+        self.positions.insert(id, position.clone());
+        self.next_position = next;
         Ok(SourcePositionKey { position })
     }
     pub(crate) fn append_pair(
@@ -277,6 +294,9 @@ impl SourcePositions {
             .is_none_or(|n| n > self.limit)
         {
             return Err((SourcePositionError::Full, roles));
+        }
+        if self.next_position.checked_add(2).is_none() {
+            return Err((SourcePositionError::IdentityExhausted, roles));
         }
         let [first, second] = roles;
         // The complete pair was checked before moving either original role.
@@ -293,7 +313,7 @@ impl SourcePositions {
     }
     fn position(&self, id: SourcePositionId) -> Result<&Arc<Position>, SourcePositionError> {
         self.positions
-            .get(id.0)
+            .get(&id)
             .ok_or(SourcePositionError::UnknownPosition)
     }
     fn validate_key(&self, key: &SourcePositionKey) -> Result<&Arc<Position>, SourcePositionError> {
@@ -306,11 +326,39 @@ impl SourcePositions {
         }
         Ok(current)
     }
+    /// A released original may still have a real external observer or unique
+    /// pair owner. Inspecting that retired row does not recreate a resident
+    /// slot or grant access to any live replacement generation.
+    fn observe_original(
+        &self,
+        key: &SourcePositionKey,
+    ) -> Result<Arc<Position>, SourcePositionError> {
+        if !Arc::ptr_eq(&self.identity, &key.position.identity) {
+            return Err(SourcePositionError::ForeignInventory);
+        }
+        if let Some(current) = self.positions.get(&key.position.id) {
+            if !Arc::ptr_eq(current, &key.position) {
+                return Err(SourcePositionError::WrongGeneration);
+            }
+            return Ok(current.clone());
+        }
+        if !matches!(
+            key.position
+                .state
+                .lock()
+                .expect("original source position")
+                .payload,
+            Payload::Retired
+        ) {
+            return Err(SourcePositionError::UnknownPosition);
+        }
+        Ok(key.position.clone())
+    }
     pub(crate) fn inspect(
         &self,
         key: &SourcePositionKey,
     ) -> Result<SourcePositionObservation, SourcePositionError> {
-        let position = self.validate_key(key)?;
+        let position = self.observe_original(key)?;
         let state = position.state.lock().expect("original source position");
         Ok(SourcePositionObservation {
             key: key.clone(),
@@ -429,7 +477,7 @@ impl SourcePositions {
         if !Arc::ptr_eq(&self.identity, &bound.position.identity) {
             return Err((SourcePositionError::ForeignInventory, bound));
         }
-        let Some(position) = self.positions.get(bound.position.id.0) else {
+        let Some(position) = self.positions.get(&bound.position.id) else {
             return Err((SourcePositionError::UnknownPosition, bound));
         };
         if !Arc::ptr_eq(position, &bound.position) {
@@ -451,13 +499,13 @@ impl SourcePositions {
     }
     pub(crate) fn is_ready(&self, source: SourceId) -> bool {
         self.sources.get(&source).is_some_and(|id| {
-            let state = self.positions[id.0]
-                .state
-                .lock()
-                .expect("original source position");
+            let Some(position) = self.positions.get(id) else {
+                return false;
+            };
+            let state = position.state.lock().expect("original source position");
             state.source == Some(source)
                 && matches!(state.payload, Payload::Ready(_))
-                && self.positions[id.0].custody.retained_source_ready()
+                && position.custody.retained_source_ready()
         })
     }
     pub(crate) fn take_source(
@@ -469,13 +517,11 @@ impl SourcePositions {
             .get(&source)
             .copied()
             .ok_or(SourcePositionError::UnknownSource)?;
-        let mut state = self.positions[id.0]
-            .state
-            .lock()
-            .expect("original source position");
+        let position = self.position(id)?;
+        let mut state = position.state.lock().expect("original source position");
         match &mut state.payload {
             Payload::Ready(value) => {
-                if !self.positions[id.0].custody.retained_source_ready() {
+                if !position.custody.retained_source_ready() {
                     return Err(SourcePositionError::SourceUnresolved);
                 }
                 let source = unsafe { ManuallyDrop::take(value) };
@@ -538,26 +584,29 @@ impl SourcePositions {
             position: self.position(id)?.clone(),
         })
     }
+    pub(crate) fn retirement_probe_for(
+        &self,
+        key: &SourcePositionKey,
+    ) -> Result<RetirementProbe, SourcePositionError> {
+        Ok(RetirementProbe {
+            position: self.observe_original(key)?,
+        })
+    }
     fn validate_reaped(
         &self,
         reaped: &ReapedPosition,
-    ) -> Result<&Arc<Position>, SourcePositionError> {
-        if !Arc::ptr_eq(&self.identity, &reaped.position.identity) {
-            return Err(SourcePositionError::ForeignInventory);
-        }
-        let current = self.position(reaped.position.id)?;
-        if !Arc::ptr_eq(current, &reaped.position) {
+    ) -> Result<Arc<Position>, SourcePositionError> {
+        let current = self.observe_original(&SourcePositionKey {
+            position: reaped.position.clone(),
+        })?;
+        let state = current.state.lock().expect("original source position");
+        if state.replacement_issued {
             return Err(SourcePositionError::WrongGeneration);
         }
-        if !current
-            .state
-            .lock()
-            .expect("original source position")
-            .payload
-            .permits_retirement()
-        {
+        if !state.payload.permits_retirement() {
             return Err(SourcePositionError::SourceStillHeld);
         }
+        drop(state);
         Ok(current)
     }
     /// The witness was observed against this exact original role outside the
@@ -567,7 +616,7 @@ impl SourcePositions {
         reaped: ReapedPosition,
     ) -> Result<(), (SourcePositionError, ReapedPosition)> {
         let current = match self.validate_reaped(&reaped) {
-            Ok(current) => current.clone(),
+            Ok(current) => current,
             Err(error) => return Err((error, reaped)),
         };
         let source = {
@@ -578,6 +627,7 @@ impl SourcePositions {
         if let Some(source) = source {
             self.sources.remove(&source);
         }
+        self.positions.remove(&current.id);
         current.release_retention();
         Ok(())
     }
@@ -590,12 +640,15 @@ impl SourcePositions {
         role: AdmittedCompletionRole,
     ) -> Result<SourcePositionKey, (SourcePositionError, AdmittedCompletionRole)> {
         let old = match self.validate_reaped(&reaped) {
-            Ok(position) => position.clone(),
+            Ok(position) => position,
             Err(error) => return Err((error, role)),
         };
         let Some(generation) = old.generation.checked_add(1) else {
             return Err((SourcePositionError::IdentityExhausted, role));
         };
+        if !self.positions.contains_key(&old.id) && self.positions.len() >= self.limit {
+            return Err((SourcePositionError::Full, role));
+        }
         let replacement = Position::from_admitted(
             self.identity.clone(),
             old.id,
@@ -604,11 +657,16 @@ impl SourcePositions {
             self.pending.clone(),
             self.health.clone(),
         );
-        let source = old.state.lock().expect("original source position").source;
+        let source = {
+            let mut state = old.state.lock().expect("original source position");
+            state.replacement_issued = true;
+            state.payload = Payload::Retired;
+            state.source.take()
+        };
         if let Some(source) = source {
             self.sources.remove(&source);
         }
-        self.positions[old.id.0] = replacement.clone();
+        self.positions.insert(old.id, replacement.clone());
         old.release_retention();
         Ok(SourcePositionKey {
             position: replacement,
@@ -635,9 +693,22 @@ impl SourcePositions {
     > {
         let validation = (|| {
             self.validate_reaped_pair(&pair, &reaped)?;
+            let missing = pair
+                .positions
+                .iter()
+                .filter(|key| !self.positions.contains_key(&key.address()))
+                .count();
+            if self
+                .positions
+                .len()
+                .checked_add(missing)
+                .is_none_or(|n| n > self.limit)
+            {
+                return Err(SourcePositionError::Full);
+            }
             let mut generations = [0; 2];
             for (index, generation) in generations.iter_mut().enumerate() {
-                let current = self.validate_key(&pair.positions[index])?;
+                let current = &pair.positions[index].position;
                 *generation = current
                     .generation
                     .checked_add(1)
@@ -666,10 +737,16 @@ impl SourcePositions {
         });
         for (key, replacement) in pair.positions.iter().zip(&replacements) {
             let old = &key.position;
-            if let Some(source) = old.state.lock().expect("original source position").source {
+            let source = {
+                let mut state = old.state.lock().expect("original source position");
+                state.replacement_issued = true;
+                state.payload = Payload::Retired;
+                state.source.take()
+            };
+            if let Some(source) = source {
                 self.sources.remove(&source);
             }
-            self.positions[old.id.0] = replacement.clone();
+            self.positions.insert(old.id, replacement.clone());
         }
         for key in &pair.positions {
             key.position.release_retention();
@@ -695,9 +772,9 @@ impl SourcePositions {
             return Err(SourcePositionError::InvalidPair);
         }
         for (key, witness) in pair.positions.iter().zip(reaped) {
-            let current = self.validate_key(key)?;
+            let current = self.observe_original(key)?;
             let old = self.validate_reaped(witness)?;
-            if !Arc::ptr_eq(current, old) {
+            if !Arc::ptr_eq(&current, &old) {
                 return Err(SourcePositionError::WrongGeneration);
             }
         }
@@ -708,7 +785,7 @@ impl Drop for SourcePositions {
     fn drop(&mut self) {
         // Normal cleanup must explicitly move original holders out. A lost
         // inventory is an owner invariant failure, not a shutdown shortcut.
-        for position in &self.positions {
+        for position in self.positions.values() {
             if position.custody.phase() == ExitRolePhase::Retired {
                 position.release_retention();
             } else {
@@ -919,6 +996,7 @@ metadata_debug!(
 
 #[cfg(test)]
 mod tests {
+    mod residency;
     use super::*;
     use novarocks_control_runtime::{
         completion::ReportSlot,
@@ -1190,8 +1268,8 @@ mod tests {
             self.bank_mut().release_reaped(reaped).unwrap();
         }
         fn finish(mut self) {
-            for index in 0..self.bank().len() {
-                let id = SourcePositionId(index);
+            let resident = self.bank().positions.keys().copied().collect::<Vec<_>>();
+            for id in resident {
                 match self.bank().phase(id).unwrap() {
                     SourcePositionPhase::Available => self.take_unused(id).unwrap().exit(),
                     SourcePositionPhase::Taken
@@ -1667,9 +1745,9 @@ mod tests {
                 f.retire(key.address());
             }
             assert_eq!(f.scope.snapshot().unwrap().work, 5);
-            let witnesses = addresses.map(|id| {
+            let witnesses = pair.keys().map(|key| {
                 f.bank()
-                    .retirement_probe(id)
+                    .retirement_probe_for(key)
                     .unwrap()
                     .observe_reaped()
                     .unwrap()
@@ -1725,7 +1803,7 @@ mod tests {
         f.retire(addresses[0]);
         assert!(
             f.bank()
-                .retirement_probe(addresses[1])
+                .retirement_probe_for(pair.keys()[1])
                 .unwrap()
                 .observe_reaped()
                 .is_err()
@@ -1734,7 +1812,7 @@ mod tests {
         // Presenting it twice cannot authorize replacement of the live second.
         let witnesses = [0, 1].map(|_| {
             f.bank()
-                .retirement_probe(addresses[0])
+                .retirement_probe_for(pair.keys()[0])
                 .unwrap()
                 .observe_reaped()
                 .unwrap()
@@ -1747,12 +1825,13 @@ mod tests {
         assert_eq!(error, SourcePositionError::WrongGeneration);
         assert_eq!(returned.each_ref().map(|role| role.work.id()), ids);
         assert_eq!(f.scope.snapshot().unwrap(), before);
+        assert!(!f.bank().positions.contains_key(&addresses[0]));
+        assert_eq!(
+            f.bank().inspect(&keys[0]).unwrap().phase,
+            SourcePositionPhase::Retired
+        );
         assert!(Arc::ptr_eq(
-            &f.bank().positions[addresses[0].0],
-            &keys[0].position
-        ));
-        assert!(Arc::ptr_eq(
-            &f.bank().positions[addresses[1].0],
+            &f.bank().positions[&addresses[1]],
             &keys[1].position
         ));
         assert_eq!(
@@ -1764,7 +1843,7 @@ mod tests {
         let [first, _duplicate] = witnesses;
         let second = f
             .bank()
-            .retirement_probe(addresses[1])
+            .retirement_probe_for(pair.keys()[1])
             .unwrap()
             .observe_reaped()
             .unwrap();
@@ -1788,7 +1867,7 @@ mod tests {
         f.retire(id);
         let reaped = f
             .bank()
-            .retirement_probe(id)
+            .retirement_probe_for(&stale)
             .unwrap()
             .observe_reaped()
             .unwrap();
@@ -1869,7 +1948,7 @@ mod tests {
         f.retire(addresses[1]);
         assert!(
             f.bank()
-                .retirement_probe(addresses[0])
+                .retirement_probe_for(pair.keys()[0])
                 .unwrap()
                 .observe_reaped()
                 .is_err()
@@ -1883,7 +1962,7 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         assert!(
             f.bank()
-                .retirement_probe(addresses[0])
+                .retirement_probe_for(pair.keys()[0])
                 .unwrap()
                 .observe_reaped()
                 .is_err()
@@ -1896,15 +1975,15 @@ mod tests {
         assert!(custody.try_retire().unwrap());
         assert!(
             f.bank()
-                .retirement_probe(addresses[0])
+                .retirement_probe_for(pair.keys()[0])
                 .unwrap()
                 .observe_reaped()
                 .is_err()
         );
         assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
-        let witnesses = addresses.map(|id| {
+        let witnesses = pair.keys().map(|key| {
             f.bank()
-                .retirement_probe(id)
+                .retirement_probe_for(key)
                 .unwrap()
                 .observe_reaped()
                 .unwrap()
@@ -1935,16 +2014,16 @@ mod tests {
             f.bank_mut().take_unused(key).unwrap().exit();
             f.retire(key.address());
         }
-        let witnesses = addresses.map(|id| {
+        let witnesses = pair.keys().map(|key| {
             f.bank()
-                .retirement_probe(id)
+                .retirement_probe_for(key)
                 .unwrap()
                 .observe_reaped()
                 .unwrap()
         });
         let replacement_witness = f
             .bank()
-            .retirement_probe(addresses[0])
+            .retirement_probe_for(pair.keys()[0])
             .unwrap()
             .observe_reaped()
             .unwrap();
@@ -1966,7 +2045,7 @@ mod tests {
         assert_eq!(f.scope.snapshot().unwrap(), before);
         assert!(Arc::ptr_eq(
             &fresh.position,
-            &f.bank().positions[addresses[0].0]
+            &f.bank().positions[&addresses[0]]
         ));
         assert_eq!(
             f.bank().phase(addresses[0]).unwrap(),

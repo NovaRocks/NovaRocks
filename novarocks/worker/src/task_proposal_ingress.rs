@@ -92,6 +92,14 @@ pub(crate) struct SourceFunding {
     pub keys: [SourcePositionKey; 2],
     pub custody: [SourceCustody; 2],
 }
+impl SourceFunding {
+    pub(crate) fn matches_pair(&self, pair: &SourcePositionPair) -> bool {
+        self.keys
+            .iter()
+            .zip(pair.keys())
+            .all(|(original, current)| original.same_original(current))
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PairRoute {
     Open,
@@ -919,12 +927,8 @@ impl TaskProposalIngress {
         let state = self.state.lock().expect("task proposal handoff lock");
         let observations = state.observe_owned_pair(pair)?;
         Ok([
-            state
-                .sources
-                .retirement_probe(observations[0].key.address())?,
-            state
-                .sources
-                .retirement_probe(observations[1].key.address())?,
+            state.sources.retirement_probe_for(&observations[0].key)?,
+            state.sources.retirement_probe_for(&observations[1].key)?,
         ])
     }
     pub(crate) fn take_unused_owned_pair(
@@ -981,6 +985,65 @@ impl TaskProposalIngress {
             .funding
             .clone())
     }
+    /// A consumed cut returns the previous open pair, while its own paid pair
+    /// may now be the empty open or spare. Exchange the two original owners
+    /// before disposing either, so a lone RPC does not wait for another RPC
+    /// just to recover its never-claimed funding roles. Only these two fixed
+    /// locations are inspected; another live cut keeps its own unique pair.
+    ///
+    /// Both sides must still own their actual unused permits. Claimed,
+    /// abandoned or reaped positions cannot be substituted. This moves only
+    /// neutral ownership: it grants no source exit, Core consumption, report
+    /// acknowledgement, new role or refund. Refusal returns the same pair.
+    pub(crate) fn restore_retired_funding_pair(
+        &self,
+        mut retired: RetiredCut,
+    ) -> Result<RetiredCut, (IngressError, RetiredCut)> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        let checked = (|| {
+            let funding = &retired.funding;
+            state.sources.validate_unclaimed_pair(&retired.pair)?;
+            for (key, original) in funding.keys.iter().zip(&funding.custody) {
+                let observed = state.sources.inspect(key)?;
+                if !observed.custody.report().same_slot(original.report()) {
+                    return Err(IngressError::Source(SourcePositionError::ForeignInventory));
+                }
+            }
+            if funding.matches_pair(&retired.pair) {
+                return Ok(None);
+            }
+            let route = if state.open.as_ref().is_some_and(|p| funding.matches_pair(p)) {
+                PairRoute::Open
+            } else if !state.open_consuming
+                && state
+                    .spare
+                    .as_ref()
+                    .is_some_and(|p| funding.matches_pair(p))
+            {
+                PairRoute::ConsumingOpen
+            } else {
+                return Err(IngressError::Cut(CutError::NotReady));
+            };
+            state.sources.validate_unclaimed_pair(state.pair(route)?)?;
+            Ok(Some(route))
+        })();
+        let route = match checked {
+            Ok(route) => route,
+            Err(error) => return Err((error, retired)),
+        };
+        if let Some(route) = route {
+            let current = match route {
+                PairRoute::Open => state.open.as_mut(),
+                PairRoute::ConsumingOpen => state.spare.as_mut(),
+                PairRoute::Cut(_) => unreachable!("only two original fixed pair locations"),
+            }
+            .expect("the validated original pair");
+            current
+                .swap_with(&mut retired.pair)
+                .expect("same-lock validated original bank");
+        }
+        Ok(retired)
+    }
     pub(crate) fn prepare_pair_reap(
         &self,
         route: PairRoute,
@@ -988,12 +1051,8 @@ impl TaskProposalIngress {
         let state = self.state.lock().expect("task proposal handoff lock");
         let observations = state.observe_pair(route)?;
         Ok([
-            state
-                .sources
-                .retirement_probe(observations[0].key.address())?,
-            state
-                .sources
-                .retirement_probe(observations[1].key.address())?,
+            state.sources.retirement_probe_for(&observations[0].key)?,
+            state.sources.retirement_probe_for(&observations[1].key)?,
         ])
     }
     /// Only a closed prefix/spare or failed owner can retire unused holders.
@@ -1276,6 +1335,7 @@ impl TaskProposalIngress {
 
 #[cfg(test)]
 mod tests {
+    mod request_funding;
     use super::*;
     use novarocks_control_runtime::{
         completion::ReportSlot,
