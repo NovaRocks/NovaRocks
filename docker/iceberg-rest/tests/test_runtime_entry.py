@@ -107,10 +107,14 @@ class RendererTests(RendererCase):
         with mock.patch.object(machine, "endpoints", return_value=endpoints):
             entry.render_entry({"ready": True, "worktree": config["env_id"], "config": config, "machine": snapshot,
                 "publication_dir": str(output), "stable_runtime_dir": str(self.entry)}, output)
-        environment = self.environment(output / "env.sh", AWS_S3_ACCESS_KEY_ID="old", AWS_S3_SECRET_ACCESS_KEY="old", MINIO_ROOT_USER="old")
+        environment = self.environment(output / "env.sh", AWS_S3_ACCESS_KEY_ID="old", AWS_S3_SECRET_ACCESS_KEY="old", MINIO_ROOT_USER="old",
+            AWS_REQUEST_CHECKSUM_CALCULATION="WHEN_SUPPORTED", AWS_RESPONSE_CHECKSUM_VALIDATION="WHEN_SUPPORTED")
         for name in ("AWS_S3_ACCESS_KEY_ID", "AWS_S3_SECRET_ACCESS_KEY", "MINIO_ROOT_USER", "NOVA_ENV_MINIO_PORT"):
             self.assertNotIn(name, environment)
         self.assertEqual(environment["NOVA_ENV_OBJECT_STORE_CONFIG"], snapshot["object_store_config_file"])
+        for name in ("AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION"):
+            self.assertEqual("WHEN_REQUIRED", environment[name])
+            self.assertIn(name, entry.MANAGED)
         manifest = json.loads((output / "manifest.json").read_text())
         self.assertNotIn("minio", manifest)
         self.assertEqual(manifest["storage_owner"], snapshot["storage_owner"])
@@ -142,7 +146,10 @@ class RendererTests(RendererCase):
         self.assertNotIn('catalog', manifest['runtime'])
         self.assertNotIn('object_store', manifest['runtime'])
         self.assertEqual(manifest['runtime']['producer_receipt'], self.snapshot['producer_receipt'])
-        env = self.environment(directory / 'env.sh', REST_IMAGE='foreign')
+        env = self.environment(directory / 'env.sh', REST_IMAGE='foreign',
+            AWS_REQUEST_CHECKSUM_CALCULATION='WHEN_REQUIRED', AWS_RESPONSE_CHECKSUM_VALIDATION='WHEN_REQUIRED')
+        self.assertNotIn('AWS_REQUEST_CHECKSUM_CALCULATION', env)
+        self.assertNotIn('AWS_RESPONSE_CHECKSUM_VALIDATION', env)
         self.assertEqual(env['NOVA_ENV_REST_ENV_FILE'], str(directory / 'env.sh'))
         self.assertEqual(env['NOVAROCKS_STATE_STORE_PATH'], str(self.entry / 'frontend-state.sqlite'))
         self.assertEqual(env['NOVA_FIXTURE_MACHINE_GENERATION'], self.snapshot['generation'])

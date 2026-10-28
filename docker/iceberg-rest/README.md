@@ -69,6 +69,8 @@ docker/iceberg-rest/fixture-runtime.sh check --config "$machine_config"
 
 旧 ECS 释放后，在新 ECS 绑定同一 RAM 角色，取得相同源码、profile 和五字段配置，再执行同一 Linux prepare 命令。新机器重新取得本机 BOM、image ID、daemon 身份和 catalog generation，不复制旧 READY、SQLite 或运行定位信息。
 
+OSS 的 S3 兼容接口不接受 AWS SDK 的可选 checksum trailer 编码 `STREAMING-UNSIGNED-PAYLOAD-TRAILER`。cloud REST、REST-MV、Spark 及生成的 env 显式设置 `AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED`、`AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED`，只保留 API 要求的 checksum 行为；本地 MinIO 不强加这项配置。该设置沿用 SDK 的官方开关，不改变 SDK 版本或生产 Rust 签名逻辑。设置及必需校验边界见 [AWS Java SDK checksum 文档](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/s3-checksums.html)。
+
 普通建表、写入验证使用 REST catalog。Hadoop catalog 的生产 metadata 条件发布协议没有改变，而 OSS 的当前 S3 兼容接口不支持该条件写；不能将普通对象读写可用解释为 Hadoop catalog 提交可用。MinIO IAM/STS、vended 和 Paimon 专项在 OSS 模式下于副作用前明确拒绝，不能以 OSS 冒充这些前置。
 
 OSS 的普通启动不扫描并删除 TTL 遗留；显式 sweep 返回 `status=NOT_RUN`、`scope=cloud-ttl`、`cleanup_performed=false` 和保留原因。原运行清理独立核对 writer 实际退出、原 catalog 屏障及准确 run scope，再清其对象和 multipart；未知 writer、兄弟前缀、benchmark 和旧 generation 不因 TTL 或换机获得删除授权。

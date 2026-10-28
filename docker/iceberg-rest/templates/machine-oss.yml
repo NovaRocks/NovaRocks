@@ -25,6 +25,8 @@ x-service-labels: &service-labels
   novarocks.fixture.version: ${NOVA_FIXTURE_VERSION}
   novarocks.fixture.activation: ${NOVA_FIXTURE_GENERATION}
 x-cloud-environment: &cloud-environment
+  AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+  AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
   AWS_REGION: ${NOVA_OSS_REGION}
   NOVA_OSS_ROLE_NAME: ${NOVA_OSS_ROLE_NAME}
 x-rest-environment: &rest-environment

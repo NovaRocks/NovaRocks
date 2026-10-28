@@ -213,6 +213,10 @@ class CloudMachineTests(unittest.TestCase):
         self.assertNotIn("MINIO_", text)
         self.assertNotIn("AWS_ACCESS_KEY_ID", record["template"])
         self.assertIn("CATALOG_CLIENT_CREDENTIALS__PROVIDER_ROLE__NAME", record["template"])
+        for name in ("AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION"):
+            self.assertIn(name + ": WHEN_REQUIRED", record["template"])
+            self.assertNotIn(name, (runtime.SCRIPT_DIR / "templates/machine.yml").read_text())
+
         self.assertEqual(CLOUD, json.loads(Path(record["object_store_config_file"]).read_text()))
         self.assertEqual(0o600, Path(record["object_store_config_file"]).stat().st_mode & 0o777)
 
