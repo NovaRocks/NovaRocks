@@ -47,6 +47,9 @@ use novarocks_execution_contract::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+mod reply;
+pub use reply::{ContextReplyBody, ContextRequestSettlement};
+
 mod terminal;
 pub use terminal::{TerminalIntent, TerminalObservation, TerminalStatistics};
 
@@ -142,7 +145,7 @@ pub struct TaskShape {
 }
 #[derive(Debug)]
 struct PendingTaskUpdate {
-    request: TaskOperationId,
+    request: InputId,
     payload: PayloadId,
     transaction: crate::domain::TaskDomainTransaction,
     host_started: bool,
@@ -151,7 +154,7 @@ struct PendingTaskUpdate {
 }
 #[derive(Debug)]
 struct PendingContextUpdate {
-    request: TaskOperationId,
+    request: InputId,
     domains: QueryContextDomains,
     update: ContextDomainInput,
     progression: DomainProgression,
@@ -193,12 +196,73 @@ pub enum RootDrainVerdict {
     Illegal,
     VersionExhausted,
 }
+/// A neutral RPC body. Its original request token is supplied only by the
+/// actor consuming the admitted input; wire operation IDs never join RPCs.
+#[derive(Debug)]
+pub enum ContextCommand {
+    Cancel {
+        task: TaskIdentity,
+        reason: CancelReason,
+    },
+    UpdateTask {
+        task: TaskIdentity,
+        payload: PayloadId,
+        updates: Vec<TaskDomainInput>,
+    },
+    UpdateContext {
+        payload: PayloadId,
+        update: ContextDomainInput,
+    },
+    RootDrained {
+        task: TaskIdentity,
+    },
+    GetFinalInfo {
+        task: TaskIdentity,
+    },
+    GetDynamicFilters {
+        task: TaskIdentity,
+        acknowledged: Option<DomainVersion>,
+    },
+    Subscribe {
+        generation: u64,
+        position: CoveredSubscriptionRequest,
+    },
+    Create {
+        task: TaskIdentity,
+        payload: PayloadId,
+    },
+    Renew {
+        sequence: LeaseSequence,
+        valid_for: LeaseValidFor,
+    },
+    Quiesce,
+    Abort {
+        cause: AbortCause,
+    },
+    Release,
+}
+impl ContextCommand {
+    pub fn task(&self) -> Option<TaskIdentity> {
+        match self {
+            Self::Create { task, .. }
+            | Self::Cancel { task, .. }
+            | Self::UpdateTask { task, .. }
+            | Self::RootDrained { task }
+            | Self::GetFinalInfo { task }
+            | Self::GetDynamicFilters { task, .. } => Some(*task),
+            _ => None,
+        }
+    }
+}
 #[expect(
     clippy::large_enum_variant,
     reason = "The finite preparation failure cut carries two neutral bounded projections of one source; neither owns a callback or confidential resource."
 )]
 #[derive(Debug)]
 pub enum ContextInput {
+    /// Transport-only neutral body. `handle_request` binds its original token;
+    /// the lifecycle-only `handle` entry rejects this wrapper.
+    Request(ContextCommand),
     /// The driver has consumed this Task's already-admitted summary/cut
     /// predecessors. Source/capture actual exit is a separate obligation.
     ApplyTaskClose {
@@ -209,10 +273,10 @@ pub enum ContextInput {
         task: TaskIdentity,
     },
     ContinueRequestReplies {
-        operation: TaskOperationId,
+        operation: InputId,
     },
     RequestCompleted {
-        operation: TaskOperationId,
+        operation: InputId,
         outcome: OperationOutcome,
     },
     PreparationBodyFailure {
@@ -259,34 +323,14 @@ pub enum ContextInput {
         task: TaskIdentity,
         shape: TaskShape,
     },
-    Cancel {
-        request: TaskOperationId,
-        task: TaskIdentity,
-        reason: CancelReason,
-    },
-    UpdateTask {
-        request: TaskOperationId,
-        task: TaskIdentity,
-        payload: PayloadId,
-        updates: Vec<TaskDomainInput>,
-    },
     TaskUpdateApplied {
-        request: TaskOperationId,
+        request: InputId,
         task: TaskIdentity,
         result: Result<Vec<Option<u64>>, DomainRefusal>,
     },
-    UpdateContext {
-        request: TaskOperationId,
-        payload: PayloadId,
-        update: ContextDomainInput,
-    },
     ContextUpdateApplied {
-        request: TaskOperationId,
+        request: InputId,
         result: Result<(), DomainRefusal>,
-    },
-    RootDrained {
-        request: TaskOperationId,
-        task: TaskIdentity,
     },
     DynamicFilterPublished {
         task: TaskIdentity,
@@ -304,20 +348,6 @@ pub enum ContextInput {
         facts: TaskResourceFacts,
         writer: Option<TaskWriterFacts>,
     },
-    GetFinalInfo {
-        request: TaskOperationId,
-        task: TaskIdentity,
-    },
-    GetDynamicFilters {
-        request: TaskOperationId,
-        task: TaskIdentity,
-        acknowledged: Option<DomainVersion>,
-    },
-    Subscribe {
-        request: TaskOperationId,
-        generation: u64,
-        position: CoveredSubscriptionRequest,
-    },
     MaterializationFinished {
         result: Result<ContextMaterialized, AdmissionRefusal>,
     },
@@ -330,11 +360,6 @@ pub enum ContextInput {
         context: QueryContextRef,
         request: EstablishReplayRequest,
         comparison: Option<EstablishCredentialComparison>,
-    },
-    Create {
-        request: TaskOperationId,
-        task: TaskIdentity,
-        payload: PayloadId,
     },
     Loaded {
         task: TaskIdentity,
@@ -379,21 +404,6 @@ pub enum ContextInput {
         task: TaskIdentity,
         fact: PhysicalFact,
     },
-    Renew {
-        request: TaskOperationId,
-        sequence: LeaseSequence,
-        valid_for: LeaseValidFor,
-    },
-    Quiesce {
-        request: TaskOperationId,
-    },
-    Abort {
-        request: TaskOperationId,
-        cause: AbortCause,
-    },
-    Release {
-        request: TaskOperationId,
-    },
     HostReleased,
     ContinueClose,
     Tick,
@@ -429,15 +439,15 @@ pub enum ContextEffect {
         task: TaskIdentity,
     },
     ContinueRequestReplies {
-        operation: TaskOperationId,
+        operation: InputId,
     },
     ContinueQuiesce,
     WaitQuiesce {
-        request: TaskOperationId,
+        request: InputId,
     },
     WakeQuiesce,
     QuiesceReply {
-        request: TaskOperationId,
+        request: InputId,
         outcome: OperationOutcome,
         receipt: Arc<novarocks_execution_contract::QuiesceQueryContextReceipt>,
     },
@@ -453,22 +463,22 @@ pub enum ContextEffect {
         snapshot: crate::convergence::TaskConvergenceSnapshot,
     },
     ApplyTaskDomains {
-        request: TaskOperationId,
+        request: InputId,
         task: TaskIdentity,
         payload: PayloadId,
         progressions: Arc<Vec<DomainProgression>>,
     },
     TaskDomainReply {
-        request: TaskOperationId,
+        request: InputId,
         outcome: OperationOutcome,
-        receipts: Vec<TaskDomainReceipt>,
+        receipts: Arc<Vec<TaskDomainReceipt>>,
     },
     DomainFailureReply {
-        request: TaskOperationId,
+        request: InputId,
         refusal: DomainRefusal,
     },
     WaitTaskDomain {
-        request: TaskOperationId,
+        request: InputId,
         task: TaskIdentity,
         payload: PayloadId,
         updates: Vec<TaskDomainInput>,
@@ -477,32 +487,33 @@ pub enum ContextEffect {
         task: TaskIdentity,
     },
     ApplyContextDomain {
-        request: TaskOperationId,
+        request: InputId,
         payload: PayloadId,
         progression: DomainProgression,
     },
     ContextDomainReply {
-        request: TaskOperationId,
+        request: InputId,
         outcome: OperationOutcome,
         receipt: QueryContextDomainReceipt,
     },
     WaitContextDomain {
-        request: TaskOperationId,
+        request: InputId,
         payload: PayloadId,
         update: ContextDomainInput,
     },
     WakeContextDomains,
     RootDrainReply {
-        request: TaskOperationId,
+        request: InputId,
         result: RootDrainVerdict,
     },
     ReadPayload {
-        request: TaskOperationId,
+        request: InputId,
+        version: DomainVersion,
         payload: PayloadId,
         outcome: OperationOutcome,
     },
     Subscribe {
-        request: TaskOperationId,
+        request: InputId,
         generation: u64,
         position: Arc<CoveredSubscriptionRequest>,
     },
@@ -514,7 +525,7 @@ pub enum ContextEffect {
         snapshot: TaskStatus,
     },
     FinalInfoReply {
-        request: TaskOperationId,
+        request: InputId,
         info: Arc<FinalTaskInfo>,
     },
     LoadInput {
@@ -562,7 +573,7 @@ pub enum ContextEffect {
         generation: Generation,
     },
     Reply {
-        request: TaskOperationId,
+        request: InputId,
         outcome: OperationOutcome,
     },
     ContinueClose {
@@ -588,7 +599,7 @@ pub enum ContextEffect {
 #[derive(Debug, Default)]
 pub struct ContextStep {
     pub effects: Vec<ContextEffect>,
-    pub requests: Vec<RequestSettlement>,
+    pub requests: Vec<ContextRequestSettlement>,
     /// Distinct protocol records visited by this slice. Fixed-size summary
     /// fields and ordered map lookups are local O(1)/O(log N) decisions.
     pub records_visited: usize,
@@ -620,22 +631,27 @@ pub struct ContextEstablishmentDecision {
     pub state: QueryContextState,
     pub outcome: Result<OperationOutcome, DomainRefusal>,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PendingReply {
-    outcome: OperationOutcome,
+    body: Arc<ContextReplyBody>,
     settled_at: MonotonicInstant,
 }
 #[derive(Debug)]
 struct PendingQuiesce {
-    request: TaskOperationId,
+    request: InputId,
     cursor: Option<TaskIdentity>,
     accepted: Vec<TaskIdentity>,
+}
+#[derive(Debug)]
+struct QuiesceDecision {
+    receipt: Arc<novarocks_execution_contract::QuiesceQueryContextReceipt>,
+    decided_at: MonotonicInstant,
 }
 #[derive(Clone, Copy, Debug)]
 struct Closing {
     cursor: Option<TaskIdentity>,
     cause: AbortCause,
-    request: Option<TaskOperationId>,
+    request: Option<InputId>,
     scan_finished: bool,
 }
 #[derive(Debug)]
@@ -654,9 +670,9 @@ pub struct ContextCore {
     closing: Option<Closing>,
     close_applied: bool,
     scheduled_closes: usize,
-    abort_waiters: BTreeSet<TaskOperationId>,
+    abort_waiters: BTreeSet<InputId>,
     host_releasing: bool,
-    release_request: Option<TaskOperationId>,
+    release_request: Option<InputId>,
     task_domains: BTreeMap<TaskIdentity, TaskDomains>,
     pending_task_updates: BTreeMap<TaskIdentity, PendingTaskUpdate>,
     context_domains: QueryContextDomains,
@@ -667,12 +683,12 @@ pub struct ContextCore {
     metric_deadlines: BTreeSet<(MonotonicInstant, TaskIdentity)>,
     metric_due: BTreeMap<TaskIdentity, MonotonicInstant>,
     pending_quiesce: Option<PendingQuiesce>,
-    quiesce_completed: bool,
+    quiesce_waiters: BTreeSet<InputId>,
+    quiesce_decision: Option<QuiesceDecision>,
     requests: BTreeMap<InputId, RequestContext>,
-    request_operations: BTreeMap<TaskOperationId, BTreeSet<InputId>>,
-    creation_reply_owners: BTreeMap<TaskOperationId, TaskIdentity>,
+    request_tasks: BTreeMap<InputId, TaskIdentity>,
     request_deadlines: BTreeSet<(MonotonicInstant, InputId)>,
-    pending_replies: BTreeMap<TaskOperationId, PendingReply>,
+    pending_replies: BTreeMap<InputId, PendingReply>,
 }
 impl ContextCore {
     /// One slice visits at most one task/domain member/request/catch-up member.
@@ -734,10 +750,10 @@ impl ContextCore {
             metric_deadlines: BTreeSet::new(),
             metric_due: BTreeMap::new(),
             pending_quiesce: None,
-            quiesce_completed: false,
+            quiesce_waiters: BTreeSet::new(),
+            quiesce_decision: None,
             requests: BTreeMap::new(),
-            request_operations: BTreeMap::new(),
-            creation_reply_owners: BTreeMap::new(),
+            request_tasks: BTreeMap::new(),
             request_deadlines: BTreeSet::new(),
             pending_replies: BTreeMap::new(),
         })
@@ -787,14 +803,13 @@ impl ContextCore {
         .chain(self.request_deadlines.first().map(|(at, _)| *at))
         .min()
     }
-    /// RPC entry used by the driver after it reserved this exact reply role.
-    /// It shares one actor claim/step with the command, with no mailbox roundtrip.
-    /// Joining an in-flight exact operation does not issue its host work twice.
+    /// RPC entry used by the actor consuming this exact admitted input.
+    /// Entity/domain rules decide replay; operation IDs never join reply roles.
     pub fn handle_request(
         &mut self,
         now: MonotonicInstant,
         request: RequestContext,
-        input: ContextInput,
+        command: ContextCommand,
         capacity: &mut impl AdmissionPort,
     ) -> Result<ContextStep, CoreError> {
         if now < self.now {
@@ -803,129 +818,80 @@ impl ContextCore {
         if self.requests.contains_key(&request.token) {
             return Err(CoreError::WrongIdentity);
         }
-        if Self::request_operation(&input) != Some(request.operation) {
-            return Err(CoreError::WrongIdentity);
-        }
         self.now = now;
+        let task = command.task();
         if now.has_reached(request.deadline) {
-            let mut step = ContextStep {
-                effects: Vec::new(),
-                records_visited: 1,
-                requests: vec![RequestSettlement {
-                    request,
-                    result: self.late_request_result(&input, request.operation),
-                }],
+            let body = match &command {
+                ContextCommand::Create { task, .. } => match self.tasks.get(task) {
+                    Some(record) => match &record.creation_refusal {
+                        Some(AdmissionRefusal::Domain(outcome, failure)) => {
+                            ContextReplyBody::Domain(DomainRefusal {
+                                outcome: *outcome,
+                                failure: failure.clone(),
+                            })
+                        }
+                        _ => ContextReplyBody::Verdict(match record.pending_reply_outcome {
+                            Some(OperationOutcome::Accepted) => {
+                                RequestResult::Outcome(OperationOutcome::Idempotent)
+                            }
+                            Some(outcome) => RequestResult::Outcome(outcome),
+                            None => RequestResult::TimeoutWhileAccepted,
+                        }),
+                    },
+                    None => ContextReplyBody::Verdict(RequestResult::Outcome(
+                        OperationOutcome::OperationTimedOut,
+                    )),
+                },
+                _ => ContextReplyBody::Verdict(RequestResult::Outcome(
+                    OperationOutcome::OperationTimedOut,
+                )),
             };
-            if let ContextInput::Create { task, .. } = &input
-                && let Some(refusal) = self
-                    .tasks
-                    .get(task)
-                    .and_then(|record| record.creation_refusal.clone())
-            {
-                Self::refusal_reply(request.operation, refusal, &mut step);
-            }
-            return Ok(step);
+            return Ok(ContextStep {
+                records_visited: 1,
+                requests: vec![ContextRequestSettlement::new(request, task, Arc::new(body))],
+                ..ContextStep::default()
+            });
         }
         if self.requests.len() >= self.config.max_pending_requests {
             return Ok(ContextStep {
-                effects: Vec::new(),
                 records_visited: 0,
-                requests: vec![RequestSettlement {
+                requests: vec![ContextRequestSettlement::verdict(
                     request,
-                    result: RequestResult::Outcome(OperationOutcome::ResourceExhausted),
-                }],
+                    task,
+                    RequestResult::Outcome(OperationOutcome::ResourceExhausted),
+                )],
+                ..ContextStep::default()
             });
         }
-        let joined = self.request_operations.contains_key(&request.operation);
-        if !joined && let ContextInput::Create { task, .. } = &input {
-            self.creation_reply_owners.insert(request.operation, *task);
+        if let Some(task) = task {
+            self.request_tasks.insert(request.token, task);
         }
         self.requests.insert(request.token, request);
-        self.request_operations
-            .entry(request.operation)
-            .or_default()
-            .insert(request.token);
         self.request_deadlines
             .insert((request.deadline, request.token));
-        if joined {
-            self.now = now;
-            let mut step = ContextStep {
-                records_visited: 1,
-                ..ContextStep::default()
-            };
-            if self.pending_replies.contains_key(&request.operation) {
-                self.flush_request_replies(request.operation, &mut step);
-            }
-            return Ok(step);
-        }
-        self.handle(now, input, capacity)
-    }
-    fn late_request_result(
-        &self,
-        input: &ContextInput,
-        operation: TaskOperationId,
-    ) -> RequestResult {
-        if let Some(reply) = self.pending_replies.get(&operation) {
-            return RequestResult::Outcome(reply.outcome);
-        }
-        if self.request_operations.contains_key(&operation)
-            || self
-                .pending_context_update
-                .as_ref()
-                .is_some_and(|p| p.request == operation)
-            || self.release_request == Some(operation)
-            || self
-                .pending_quiesce
-                .as_ref()
-                .is_some_and(|p| p.request == operation)
-            || self.closing.is_some_and(|p| p.request == Some(operation))
-            || self.abort_waiters.contains(&operation)
-        {
-            return RequestResult::TimeoutWhileAccepted;
-        }
-        match input {
-            ContextInput::Create { task, .. } => self.tasks.get(task).map_or(
-                RequestResult::Outcome(OperationOutcome::OperationTimedOut),
-                |record| match record.pending_reply_outcome {
-                    Some(OperationOutcome::Accepted) => {
-                        RequestResult::Outcome(OperationOutcome::Idempotent)
-                    }
-                    Some(outcome) => RequestResult::Outcome(outcome),
-                    None => RequestResult::TimeoutWhileAccepted,
-                },
-            ),
-            ContextInput::UpdateTask { task, .. }
-                if self
-                    .pending_task_updates
-                    .get(task)
-                    .is_some_and(|p| p.request == operation) =>
-            {
-                RequestResult::TimeoutWhileAccepted
-            }
-            _ => RequestResult::Outcome(OperationOutcome::OperationTimedOut),
-        }
-    }
-    fn request_operation(input: &ContextInput) -> Option<TaskOperationId> {
-        match input {
-            ContextInput::Create { request, .. }
-            | ContextInput::Cancel { request, .. }
-            | ContextInput::UpdateTask { request, .. }
-            | ContextInput::UpdateContext { request, .. }
-            | ContextInput::RootDrained { request, .. }
-            | ContextInput::GetFinalInfo { request, .. }
-            | ContextInput::GetDynamicFilters { request, .. }
-            | ContextInput::Subscribe { request, .. }
-            | ContextInput::Renew { request, .. }
-            | ContextInput::Quiesce { request, .. }
-            | ContextInput::Abort { request, .. }
-            | ContextInput::Release { request, .. } => Some(*request),
-            _ => None,
-        }
+        self.handle_bound(
+            now,
+            ContextInput::Request(command),
+            Some(request.token),
+            capacity,
+        )
     }
     pub fn handle(
         &mut self,
         now: MonotonicInstant,
         input: ContextInput,
+        capacity: &mut impl AdmissionPort,
+    ) -> Result<ContextStep, CoreError> {
+        if matches!(input, ContextInput::Request(_)) {
+            return Err(CoreError::WrongIdentity);
+        }
+        self.handle_bound(now, input, None, capacity)
+    }
+    fn handle_bound(
+        &mut self,
+        now: MonotonicInstant,
+        input: ContextInput,
+        request_token: Option<InputId>,
         capacity: &mut impl AdmissionPort,
     ) -> Result<ContextStep, CoreError> {
         if now < self.now {
@@ -960,6 +926,13 @@ impl ContextCore {
             self.begin_abort(None, AbortCause::LeaseExpired, &mut step)?;
         }
         match input {
+            ContextInput::Request(command) => self.handle_command(
+                now,
+                request_token.ok_or(CoreError::WrongIdentity)?,
+                command,
+                capacity,
+                &mut step,
+            )?,
             ContextInput::ApplyTaskClose { task, generation } => {
                 if generation != self.generation {
                     return Err(CoreError::WrongIdentity);
@@ -977,7 +950,11 @@ impl ContextCore {
                 self.advance_task_domain(task, &mut step)?
             }
             ContextInput::RequestCompleted { operation, outcome } => {
-                self.complete_request(operation, outcome, &mut step);
+                self.complete_request(
+                    operation,
+                    Arc::new(ContextReplyBody::Verdict(RequestResult::Outcome(outcome))),
+                    &mut step,
+                );
             }
             ContextInput::ContinueRequestReplies { operation } => {
                 self.flush_request_replies(operation, &mut step)
@@ -1117,47 +1094,11 @@ impl ContextCore {
                     ),
                 );
             }
-            ContextInput::Cancel {
-                request,
-                task,
-                reason,
-            } => {
-                if self.task_request_cut(request, task, &mut step)? {
-                    let record = self.tasks.get_mut(&task).expect("cut located task");
-                    if !record.state.is_terminal() {
-                        record.proposals.push(Proposal {
-                            conclusion: TaskConclusion::Terminated(TerminationDetail::Canceled(
-                                reason,
-                            )),
-                            evidence: None,
-                            source: None,
-                            diagnostic: None,
-                        });
-                        self.flush(task, &mut step)?;
-                        self.try_finish_completion_intent(task, &mut step)?;
-                    }
-                    step.effects.push(ContextEffect::Reply {
-                        request,
-                        outcome: OperationOutcome::Accepted,
-                    });
-                }
-            }
-            ContextInput::UpdateTask {
-                request,
-                task,
-                payload,
-                updates,
-            } => self.update_task(request, task, payload, updates, &mut step)?,
             ContextInput::TaskUpdateApplied {
                 request,
                 task,
                 result,
             } => self.task_update_applied(request, task, result, &mut step)?,
-            ContextInput::UpdateContext {
-                request,
-                payload,
-                update,
-            } => self.update_context(request, payload, update, &mut step)?,
             ContextInput::ContextUpdateApplied { request, result } => {
                 let pending = self
                     .pending_context_update
@@ -1188,9 +1129,6 @@ impl ContextCore {
                     }),
                 }
                 step.effects.push(ContextEffect::WakeContextDomains);
-            }
-            ContextInput::RootDrained { request, task } => {
-                self.root_drained(request, task, &mut step)?
             }
             ContextInput::DynamicFilterPublished {
                 task,
@@ -1267,80 +1205,6 @@ impl ContextCore {
                     }
                 }
                 self.try_finish_completion_intent(task, &mut step)?;
-            }
-            ContextInput::GetFinalInfo { request, task } => {
-                if self.task_request_cut(request, task, &mut step)? {
-                    self.try_finish_completion_intent(task, &mut step)?;
-                    if !self.tasks[&task].state.is_terminal() {
-                        step.effects.push(ContextEffect::Reply {
-                            request,
-                            outcome: OperationOutcome::InvalidStateOrRequest,
-                        });
-                    } else if let Some(info) = self.final_info.get(&task) {
-                        step.effects.push(ContextEffect::FinalInfoReply {
-                            request,
-                            info: info.clone(),
-                        });
-                    } else {
-                        step.effects.push(ContextEffect::Reply {
-                            request,
-                            outcome: OperationOutcome::Idempotent,
-                        });
-                    }
-                }
-            }
-            ContextInput::GetDynamicFilters {
-                request,
-                task,
-                acknowledged,
-            } => {
-                if self.task_request_cut(request, task, &mut step)? {
-                    self.try_finish_completion_intent(task, &mut step)?;
-                    if let Some((version, payload)) = self
-                        .dynamic_filters
-                        .get(&task)
-                        .filter(|_| self.tasks[&task].phase != CreationPhase::Retained)
-                    {
-                        step.effects.push(ContextEffect::ReadPayload {
-                            request,
-                            payload: *payload,
-                            outcome: if acknowledged.is_none_or(|ack| ack < *version) {
-                                OperationOutcome::Accepted
-                            } else {
-                                OperationOutcome::Idempotent
-                            },
-                        });
-                    } else {
-                        step.effects.push(ContextEffect::Reply {
-                            request,
-                            outcome: OperationOutcome::Idempotent,
-                        });
-                    }
-                }
-            }
-            ContextInput::Subscribe {
-                request,
-                generation,
-                position,
-            } => {
-                // Per-target validation belongs to ObservationSource's bounded
-                // initial-cut cursor, before it may publish CatchUpComplete.
-                if generation == 0
-                    || position.status.len() > self.config.max_tasks
-                    || position.convergence.len() > self.config.max_tasks
-                    || position.required.len() > self.config.max_tasks
-                {
-                    step.effects.push(ContextEffect::Reply {
-                        request,
-                        outcome: OperationOutcome::InvalidStateOrRequest,
-                    });
-                } else {
-                    step.effects.push(ContextEffect::Subscribe {
-                        request,
-                        generation,
-                        position: Arc::new(position),
-                    });
-                }
             }
             ContextInput::MaterializationWithdrawn => {
                 if !matches!(
@@ -1431,11 +1295,6 @@ impl ContextCore {
                     decided_at: now,
                 });
             }
-            ContextInput::Create {
-                request,
-                task,
-                payload,
-            } => self.create(request, task, payload, capacity, &mut step)?,
             ContextInput::Loaded { task, result } => {
                 self.loaded(task, result, capacity, &mut step)?
             }
@@ -1558,100 +1417,6 @@ impl ContextCore {
                 self.try_finish_completion_intent(task, &mut step)?;
                 self.retire_if_ready(task, &mut step)?;
             }
-            ContextInput::Renew {
-                request,
-                sequence,
-                valid_for,
-            } => {
-                let outcome = if !matches!(
-                    self.state,
-                    QueryContextState::Active | QueryContextState::Quiescing
-                ) {
-                    self.closed_outcome()
-                } else {
-                    match self.lease.classify_renewal(sequence, valid_for) {
-                        LeaseProgression::Apply { .. } => {
-                            self.lease = self.lease.renew(
-                                sequence,
-                                valid_for,
-                                self.config.lease_bounds,
-                                now,
-                            );
-                            OperationOutcome::Accepted
-                        }
-                        LeaseProgression::Idempotent { .. } | LeaseProgression::Stale { .. } => {
-                            OperationOutcome::Idempotent
-                        }
-                        LeaseProgression::Conflict { .. } | LeaseProgression::Gap { .. } => {
-                            OperationOutcome::DomainConflict
-                        }
-                    }
-                };
-                step.effects.push(ContextEffect::Reply { request, outcome });
-            }
-            ContextInput::Quiesce { request } => {
-                if self.pending_quiesce.is_some() {
-                    step.effects.push(ContextEffect::WaitQuiesce { request });
-                } else if matches!(
-                    self.state,
-                    QueryContextState::Establishing
-                        | QueryContextState::Active
-                        | QueryContextState::Quiescing
-                ) {
-                    if matches!(
-                        self.state,
-                        QueryContextState::Establishing | QueryContextState::Active
-                    ) {
-                        self.state = QueryContextState::Quiescing;
-                        step.effects.push(ContextEffect::CloseExternalAdmission {
-                            context: self.identity,
-                            generation: self.generation,
-                        });
-                    }
-                    self.pending_quiesce = Some(PendingQuiesce {
-                        request,
-                        cursor: None,
-                        accepted: Vec::new(),
-                    });
-                    step.effects.push(ContextEffect::ContinueQuiesce);
-                } else {
-                    step.effects.push(ContextEffect::Reply {
-                        request,
-                        outcome: self.closed_outcome(),
-                    });
-                }
-            }
-            ContextInput::Abort { request, cause } => {
-                self.begin_abort(Some(request), cause, &mut step)?
-            }
-            ContextInput::Release { request } => {
-                if self.state == QueryContextState::TerminalRetained {
-                    step.effects.push(ContextEffect::Reply {
-                        request,
-                        outcome: OperationOutcome::ContextTerminalReceipt,
-                    });
-                } else if self.state != QueryContextState::Quiescing
-                    || self.closing.is_some()
-                    || !self.quiesce_completed
-                    || self.pending_quiesce.is_some()
-                    || self.unretired_tasks != 0
-                    || !self.pending_task_updates.is_empty()
-                    || self.pending_context_update.is_some()
-                {
-                    step.effects.push(ContextEffect::Reply {
-                        request,
-                        outcome: OperationOutcome::ReleaseNotReady,
-                    });
-                } else {
-                    self.state = QueryContextState::Releasing;
-                    self.release_request = Some(request);
-                    self.host_releasing = true;
-                    step.effects.push(ContextEffect::ReleaseHost {
-                        context: self.identity,
-                        generation: self.generation,
-                    });
-                }
-            }
             ContextInput::HostReleased => {
                 if !self.host_releasing {
                     return Err(CoreError::IllegalFact);
@@ -1724,6 +1489,222 @@ impl ContextCore {
         step.records_visited = 1 + usize::from(!step.requests.is_empty());
         Ok(step)
     }
+    fn handle_command(
+        &mut self,
+        now: MonotonicInstant,
+        request: InputId,
+        command: ContextCommand,
+        capacity: &mut impl AdmissionPort,
+        step: &mut ContextStep,
+    ) -> Result<(), CoreError> {
+        match command {
+            ContextCommand::Cancel { task, reason } => {
+                if self.task_request_cut(request, task, step)? {
+                    let record = self.tasks.get_mut(&task).expect("cut located task");
+                    if !record.state.is_terminal() {
+                        record.proposals.push(Proposal {
+                            conclusion: TaskConclusion::Terminated(TerminationDetail::Canceled(
+                                reason,
+                            )),
+                            evidence: None,
+                            source: None,
+                            diagnostic: None,
+                        });
+                        self.flush(task, step)?;
+                        self.try_finish_completion_intent(task, step)?;
+                    }
+                    step.effects.push(ContextEffect::Reply {
+                        request,
+                        outcome: OperationOutcome::Accepted,
+                    });
+                }
+            }
+            ContextCommand::UpdateTask {
+                task,
+                payload,
+                updates,
+            } => self.update_task(request, task, payload, updates, step)?,
+            ContextCommand::UpdateContext { payload, update } => {
+                self.update_context(request, payload, update, step)?
+            }
+            ContextCommand::RootDrained { task } => self.root_drained(request, task, step)?,
+            ContextCommand::GetFinalInfo { task } => {
+                if self.task_request_cut(request, task, step)? {
+                    self.try_finish_completion_intent(task, step)?;
+                    if !self.tasks[&task].state.is_terminal() {
+                        step.effects.push(ContextEffect::Reply {
+                            request,
+                            outcome: OperationOutcome::InvalidStateOrRequest,
+                        });
+                    } else if let Some(info) = self.final_info.get(&task) {
+                        step.effects.push(ContextEffect::FinalInfoReply {
+                            request,
+                            info: info.clone(),
+                        });
+                    } else {
+                        step.effects.push(ContextEffect::Reply {
+                            request,
+                            outcome: OperationOutcome::Idempotent,
+                        });
+                    }
+                }
+            }
+            ContextCommand::GetDynamicFilters { task, acknowledged } => {
+                if self.task_request_cut(request, task, step)? {
+                    self.try_finish_completion_intent(task, step)?;
+                    if let Some((version, payload)) = self
+                        .dynamic_filters
+                        .get(&task)
+                        .filter(|_| self.tasks[&task].phase != CreationPhase::Retained)
+                    {
+                        step.effects.push(ContextEffect::ReadPayload {
+                            request,
+                            version: *version,
+                            payload: *payload,
+                            outcome: if acknowledged.is_none_or(|ack| ack < *version) {
+                                OperationOutcome::Accepted
+                            } else {
+                                OperationOutcome::Idempotent
+                            },
+                        });
+                    } else {
+                        step.effects.push(ContextEffect::Reply {
+                            request,
+                            outcome: OperationOutcome::Idempotent,
+                        });
+                    }
+                }
+            }
+            ContextCommand::Subscribe {
+                generation,
+                position,
+            } => {
+                // Per-target validation belongs to ObservationSource's bounded
+                // initial-cut cursor, before it may publish CatchUpComplete.
+                if generation == 0
+                    || position.status.len() > self.config.max_tasks
+                    || position.convergence.len() > self.config.max_tasks
+                    || position.required.len() > self.config.max_tasks
+                {
+                    step.effects.push(ContextEffect::Reply {
+                        request,
+                        outcome: OperationOutcome::InvalidStateOrRequest,
+                    });
+                } else {
+                    step.effects.push(ContextEffect::Subscribe {
+                        request,
+                        generation,
+                        position: Arc::new(position),
+                    });
+                }
+            }
+            ContextCommand::Create { task, payload } => {
+                self.create(request, task, payload, capacity, step)?
+            }
+            ContextCommand::Renew {
+                sequence,
+                valid_for,
+            } => {
+                let outcome = if !matches!(
+                    self.state,
+                    QueryContextState::Active | QueryContextState::Quiescing
+                ) {
+                    self.closed_outcome()
+                } else {
+                    match self.lease.classify_renewal(sequence, valid_for) {
+                        LeaseProgression::Apply { .. } => {
+                            self.lease = self.lease.renew(
+                                sequence,
+                                valid_for,
+                                self.config.lease_bounds,
+                                now,
+                            );
+                            OperationOutcome::Accepted
+                        }
+                        LeaseProgression::Idempotent { .. } | LeaseProgression::Stale { .. } => {
+                            OperationOutcome::Idempotent
+                        }
+                        LeaseProgression::Conflict { .. } | LeaseProgression::Gap { .. } => {
+                            OperationOutcome::DomainConflict
+                        }
+                    }
+                };
+                step.effects.push(ContextEffect::Reply { request, outcome });
+            }
+            ContextCommand::Quiesce => {
+                if !matches!(
+                    self.state,
+                    QueryContextState::Establishing
+                        | QueryContextState::Active
+                        | QueryContextState::Quiescing
+                ) {
+                    step.effects.push(ContextEffect::Reply {
+                        request,
+                        outcome: self.closed_outcome(),
+                    });
+                } else if self.pending_quiesce.is_some() {
+                    // Only the entity owns this membership scan. Each original
+                    // RPC retains a separate bounded reply position.
+                    self.quiesce_waiters.insert(request);
+                } else if self.state == QueryContextState::Quiescing
+                    && let Some(decision) = self.quiesce_decision.as_ref()
+                {
+                    step.effects.push(ContextEffect::QuiesceReply {
+                        request,
+                        outcome: OperationOutcome::Idempotent,
+                        receipt: decision.receipt.clone(),
+                    });
+                } else {
+                    if matches!(
+                        self.state,
+                        QueryContextState::Establishing | QueryContextState::Active
+                    ) {
+                        self.state = QueryContextState::Quiescing;
+                        step.effects.push(ContextEffect::CloseExternalAdmission {
+                            context: self.identity,
+                            generation: self.generation,
+                        });
+                    }
+                    self.pending_quiesce = Some(PendingQuiesce {
+                        request,
+                        cursor: None,
+                        accepted: Vec::new(),
+                    });
+                    step.effects.push(ContextEffect::ContinueQuiesce);
+                }
+            }
+            ContextCommand::Abort { cause } => self.begin_abort(Some(request), cause, step)?,
+            ContextCommand::Release => {
+                if self.state == QueryContextState::TerminalRetained {
+                    step.effects.push(ContextEffect::Reply {
+                        request,
+                        outcome: OperationOutcome::ContextTerminalReceipt,
+                    });
+                } else if self.state != QueryContextState::Quiescing
+                    || self.closing.is_some()
+                    || self.quiesce_decision.is_none()
+                    || self.pending_quiesce.is_some()
+                    || self.unretired_tasks != 0
+                    || !self.pending_task_updates.is_empty()
+                    || self.pending_context_update.is_some()
+                {
+                    step.effects.push(ContextEffect::Reply {
+                        request,
+                        outcome: OperationOutcome::ReleaseNotReady,
+                    });
+                } else {
+                    self.state = QueryContextState::Releasing;
+                    self.release_request = Some(request);
+                    self.host_releasing = true;
+                    step.effects.push(ContextEffect::ReleaseHost {
+                        context: self.identity,
+                        generation: self.generation,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
     fn compose(task: &TaskRecord) -> Result<TaskStatus, CoreError> {
         let termination = match task.conclusion.accepted.as_ref() {
             Some(TaskConclusion::Terminated(detail)) => Some(detail.clone()),
@@ -1775,7 +1756,7 @@ impl ContextCore {
     }
     fn create(
         &mut self,
-        request: TaskOperationId,
+        request: InputId,
         task: TaskIdentity,
         payload: PayloadId,
         capacity: &mut impl AdmissionPort,
@@ -1934,6 +1915,7 @@ impl ContextCore {
             }
         };
         t.pending_reply_outcome = Some(outcome);
+        t.creation_decided_at = Some(self.now);
         if outcome == OperationOutcome::Accepted {
             Self::publish(t, step)?;
             // The runtime must bind this action's started dependency to the
@@ -1950,7 +1932,7 @@ impl ContextCore {
         self.retire_if_ready(task, step)?;
         Ok(())
     }
-    fn refusal_reply(request: TaskOperationId, refusal: AdmissionRefusal, step: &mut ContextStep) {
+    fn refusal_reply(request: InputId, refusal: AdmissionRefusal, step: &mut ContextStep) {
         match refusal {
             AdmissionRefusal::Verdict(outcome) => {
                 step.effects.push(ContextEffect::Reply { request, outcome })
@@ -1970,16 +1952,41 @@ impl ContextCore {
     ) -> Result<(), CoreError> {
         let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
         let outcome = t.pending_reply_outcome.ok_or(CoreError::IllegalFact)?;
-        if let Some(request) = t.waiting_replies.pop_first() {
+        let decided_at = t.creation_decided_at.ok_or(CoreError::IllegalFact)?;
+        let reply = t.waiting_replies.pop_first().map(|request| {
+            let body = Self::creation_reply_body(t);
+            (request, body)
+        });
+        if let Some((request, _)) = &reply {
             match &t.creation_refusal {
-                Some(refusal) => Self::refusal_reply(request, refusal.clone(), step),
-                None => step.effects.push(ContextEffect::Reply { request, outcome }),
+                Some(refusal) => Self::refusal_reply(*request, refusal.clone(), step),
+                None => step.effects.push(ContextEffect::Reply {
+                    request: *request,
+                    outcome,
+                }),
             }
         }
         if !t.waiting_replies.is_empty() {
             step.effects.push(ContextEffect::ContinueReplies { task });
         }
+        if let Some((request, body)) = reply {
+            self.complete_request_at(request, Arc::new(body), decided_at, step);
+        }
         Ok(())
+    }
+    fn creation_reply_body(task: &TaskRecord) -> ContextReplyBody {
+        match &task.creation_refusal {
+            Some(AdmissionRefusal::Domain(outcome, failure)) => {
+                ContextReplyBody::Domain(DomainRefusal {
+                    outcome: *outcome,
+                    failure: failure.clone(),
+                })
+            }
+            _ => ContextReplyBody::Verdict(RequestResult::Outcome(
+                task.pending_reply_outcome
+                    .expect("creation reply has an entity decision"),
+            )),
+        }
     }
     fn retire_if_ready(
         &mut self,
@@ -2143,7 +2150,7 @@ impl ContextCore {
     }
     fn begin_abort(
         &mut self,
-        request: Option<TaskOperationId>,
+        request: Option<InputId>,
         cause: AbortCause,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
@@ -2328,7 +2335,7 @@ impl ContextCore {
     }
     fn task_request_cut(
         &mut self,
-        request: TaskOperationId,
+        request: InputId,
         task: TaskIdentity,
         step: &mut ContextStep,
     ) -> Result<bool, CoreError> {
@@ -2355,7 +2362,7 @@ impl ContextCore {
     }
     fn update_task(
         &mut self,
-        request: TaskOperationId,
+        request: InputId,
         task: TaskIdentity,
         payload: PayloadId,
         updates: Vec<TaskDomainInput>,
@@ -2415,7 +2422,7 @@ impl ContextCore {
     }
     fn task_update_applied(
         &mut self,
-        request: TaskOperationId,
+        request: InputId,
         task: TaskIdentity,
         result: Result<Vec<Option<u64>>, DomainRefusal>,
         step: &mut ContextStep,
@@ -2502,7 +2509,7 @@ impl ContextCore {
                     } else {
                         OperationOutcome::Idempotent
                     },
-                    receipts,
+                    receipts: Arc::new(receipts),
                 });
                 step.effects.push(ContextEffect::WakeTaskDomains { task });
             }
@@ -2560,7 +2567,7 @@ impl ContextCore {
     }
     fn update_context(
         &mut self,
-        request: TaskOperationId,
+        request: InputId,
         payload: PayloadId,
         update: ContextDomainInput,
         step: &mut ContextStep,
@@ -2609,7 +2616,7 @@ impl ContextCore {
     }
     fn root_drained(
         &mut self,
-        request: TaskOperationId,
+        request: InputId,
         task: TaskIdentity,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
@@ -2679,6 +2686,31 @@ impl ContextCore {
     fn advance_quiesce(&mut self, step: &mut ContextStep) -> Result<(), CoreError> {
         use std::ops::Bound::{Excluded, Unbounded};
         let Some(mut pending) = self.pending_quiesce.take() else {
+            if let Some(request) = self.quiesce_waiters.pop_first() {
+                let decision = self
+                    .quiesce_decision
+                    .as_ref()
+                    .ok_or(CoreError::IllegalFact)?;
+                let receipt = decision.receipt.clone();
+                let decided_at = decision.decided_at;
+                step.effects.push(ContextEffect::QuiesceReply {
+                    request,
+                    outcome: OperationOutcome::Idempotent,
+                    receipt: receipt.clone(),
+                });
+                self.complete_request_at(
+                    request,
+                    Arc::new(ContextReplyBody::Quiesce {
+                        outcome: OperationOutcome::Idempotent,
+                        receipt,
+                    }),
+                    decided_at,
+                    step,
+                );
+                if !self.quiesce_waiters.is_empty() {
+                    step.effects.push(ContextEffect::ContinueQuiesce);
+                }
+            }
             return Ok(());
         };
         let records = match pending.cursor {
@@ -2701,163 +2733,169 @@ impl ContextCore {
             self.pending_quiesce = Some(pending);
             step.effects.push(ContextEffect::ContinueQuiesce);
         } else {
-            let outcome = if self.quiesce_completed {
+            let outcome = if self.quiesce_decision.is_some() {
                 OperationOutcome::Idempotent
             } else {
                 OperationOutcome::Accepted
             };
-            self.quiesce_completed = true;
+            let receipt = Arc::new(
+                novarocks_execution_contract::QuiesceQueryContextReceipt::new(
+                    self.identity,
+                    1,
+                    pending.accepted,
+                    self.state,
+                ),
+            );
+            self.quiesce_decision = Some(QuiesceDecision {
+                receipt: receipt.clone(),
+                decided_at: self.now,
+            });
             step.effects.push(ContextEffect::QuiesceReply {
                 request: pending.request,
                 outcome,
-                receipt: Arc::new(
-                    novarocks_execution_contract::QuiesceQueryContextReceipt::new(
-                        self.identity,
-                        1,
-                        pending.accepted,
-                        self.state,
-                    ),
-                ),
+                receipt: receipt.clone(),
             });
-            step.effects.push(ContextEffect::WakeQuiesce);
+            self.complete_request_at(
+                pending.request,
+                Arc::new(ContextReplyBody::Quiesce { outcome, receipt }),
+                self.now,
+                step,
+            );
+            if !self.quiesce_waiters.is_empty() {
+                step.effects.push(ContextEffect::ContinueQuiesce);
+            }
         }
         Ok(())
     }
     fn complete_request(
         &mut self,
-        operation: TaskOperationId,
-        outcome: OperationOutcome,
+        token: InputId,
+        body: Arc<ContextReplyBody>,
         step: &mut ContextStep,
     ) {
-        if !self.request_operations.contains_key(&operation) {
+        self.complete_request_at(token, body, self.now, step);
+    }
+    fn complete_request_at(
+        &mut self,
+        token: InputId,
+        body: Arc<ContextReplyBody>,
+        settled_at: MonotonicInstant,
+        step: &mut ContextStep,
+    ) {
+        if !self.requests.contains_key(&token) {
             return;
         }
         self.pending_replies
-            .entry(operation)
-            .or_insert(PendingReply {
-                outcome,
-                settled_at: self.now,
-            });
-        self.flush_request_replies(operation, step);
+            .entry(token)
+            .or_insert(PendingReply { body, settled_at });
+        self.flush_request_replies(token, step);
     }
-    fn flush_request_replies(&mut self, operation: TaskOperationId, step: &mut ContextStep) {
-        let Some(reply) = self.pending_replies.get(&operation).copied() else {
+    fn flush_request_replies(&mut self, token: InputId, step: &mut ContextStep) {
+        if !step.requests.is_empty() {
+            return;
+        }
+        let Some(reply) = self.pending_replies.remove(&token) else {
             return;
         };
-        let count = 1usize.saturating_sub(step.requests.len());
-        let tokens: Vec<_> = self
-            .request_operations
-            .get(&operation)
-            .into_iter()
-            .flat_map(|tokens| tokens.iter())
-            .take(count)
-            .copied()
-            .collect();
-        for token in tokens {
-            let request = self.remove_request(token).expect("indexed request exists");
-            step.requests.push(RequestSettlement {
-                request,
-                result: if reply.settled_at.has_reached(request.deadline) {
-                    RequestResult::TimeoutWhileAccepted
-                } else {
-                    RequestResult::Outcome(reply.outcome)
-                },
+        let task = self.request_tasks.get(&token).copied();
+        let request = self
+            .remove_request(token)
+            .expect("pending reply has its original request");
+        step.requests
+            .push(if reply.settled_at.has_reached(request.deadline) {
+                ContextRequestSettlement::verdict(
+                    request,
+                    task,
+                    RequestResult::TimeoutWhileAccepted,
+                )
+            } else {
+                ContextRequestSettlement::new(request, task, reply.body)
             });
-        }
-        if self.request_operations.contains_key(&operation) {
-            step.effects
-                .push(ContextEffect::ContinueRequestReplies { operation });
-        } else {
-            self.pending_replies.remove(&operation);
-        }
     }
     fn remove_request(&mut self, token: InputId) -> Option<RequestContext> {
         let request = self.requests.remove(&token)?;
         self.request_deadlines.remove(&(request.deadline, token));
-        if let Some(tokens) = self.request_operations.get_mut(&request.operation) {
-            tokens.remove(&token);
-            if tokens.is_empty() {
-                self.request_operations.remove(&request.operation);
-                self.pending_replies.remove(&request.operation);
-                self.abort_waiters.remove(&request.operation);
-                if let Some(task) = self.creation_reply_owners.remove(&request.operation)
-                    && let Some(record) = self.tasks.get_mut(&task)
-                {
-                    // This removes only an unanswered RPC wait position. The
-                    // Creating owner, loader and capacity remain unchanged.
-                    record.waiting_replies.remove(&request.operation);
-                }
-            }
+        self.pending_replies.remove(&token);
+        self.abort_waiters.remove(&token);
+        self.quiesce_waiters.remove(&token);
+        if let Some(task) = self.request_tasks.remove(&token)
+            && let Some(record) = self.tasks.get_mut(&task)
+        {
+            // Remove only this RPC waiter, never the entity's admitted work.
+            record.waiting_replies.remove(&token);
         }
         Some(request)
     }
     fn expire_requests(&mut self, step: &mut ContextStep) {
-        for _ in 0..1 {
-            let Some((at, token)) = self.request_deadlines.first().copied() else {
-                break;
-            };
-            if self.now < at {
-                break;
-            }
-            self.request_deadlines.pop_first();
-            let request = self
-                .requests
-                .get(&token)
-                .copied()
-                .expect("deadline has a request");
-            // A reply decided before the deadline remains that decided fact even
-            // when bounded reply fanout reaches this waiter on a later turn.
-            if self
-                .pending_replies
-                .get(&request.operation)
-                .is_some_and(|reply| reply.settled_at < at)
-            {
-                continue;
-            }
-            self.remove_request(token);
-            step.requests.push(RequestSettlement {
-                request,
-                result: RequestResult::TimeoutWhileAccepted,
-            });
+        let Some((at, token)) = self.request_deadlines.first().copied() else {
+            return;
+        };
+        if self.now < at {
+            return;
         }
+        // A complete body decided before the deadline remains its original
+        // fact even if bounded delivery reaches this token on a later turn.
+        if self
+            .pending_replies
+            .get(&token)
+            .is_some_and(|reply| reply.settled_at < at)
+        {
+            self.flush_request_replies(token, step);
+            return;
+        }
+        // The entity may have decided all its original waiters while bounded
+        // fanout has not yet selected this one. Membership, not same Task or
+        // operation identity, grants access to that original decision time.
+        let creation = self.request_tasks.get(&token).and_then(|task| {
+            let record = self.tasks.get(task)?;
+            if !record.waiting_replies.contains(&token) {
+                return None;
+            }
+            let decided_at = record.creation_decided_at.filter(|decided| *decided < at)?;
+            Some((Self::creation_reply_body(record), decided_at))
+        });
+        let quiesce = || {
+            if !self.quiesce_waiters.contains(&token) {
+                return None;
+            }
+            let decision = self
+                .quiesce_decision
+                .as_ref()
+                .filter(|decision| decision.decided_at < at)?;
+            Some((
+                ContextReplyBody::Quiesce {
+                    outcome: OperationOutcome::Idempotent,
+                    receipt: decision.receipt.clone(),
+                },
+                decision.decided_at,
+            ))
+        };
+        if let Some((body, decided_at)) = creation.or_else(quiesce) {
+            self.complete_request_at(token, Arc::new(body), decided_at, step);
+            return;
+        }
+        let task = self.request_tasks.get(&token).copied();
+        let request = self
+            .remove_request(token)
+            .expect("deadline has its original request");
+        step.requests.push(ContextRequestSettlement::verdict(
+            request,
+            task,
+            RequestResult::TimeoutWhileAccepted,
+        ));
     }
     fn settle_effect_requests(&mut self, step: &mut ContextStep) {
-        let ready: Vec<_> =
+        let ready: Vec<_> = step
+            .effects
+            .iter()
+            .filter_map(ContextReplyBody::from_effect)
+            .collect();
+        for (token, body) in ready {
+            self.complete_request(token, Arc::new(body), step);
+        }
+        if let Some((&operation, _)) = self.pending_replies.first_key_value() {
             step.effects
-                .iter()
-                .filter_map(|effect| match effect {
-                    ContextEffect::Reply { request, outcome }
-                    | ContextEffect::TaskDomainReply {
-                        request, outcome, ..
-                    }
-                    | ContextEffect::ContextDomainReply {
-                        request, outcome, ..
-                    }
-                    | ContextEffect::ReadPayload {
-                        request, outcome, ..
-                    }
-                    | ContextEffect::QuiesceReply {
-                        request, outcome, ..
-                    } => Some((*request, *outcome)),
-                    ContextEffect::DomainFailureReply { request, refusal } => {
-                        Some((*request, refusal.outcome.outcome()))
-                    }
-                    ContextEffect::FinalInfoReply { request, .. } => {
-                        Some((*request, OperationOutcome::Accepted))
-                    }
-                    ContextEffect::RootDrainReply { request, result } => Some((
-                        *request,
-                        match result {
-                            RootDrainVerdict::Published(_)
-                            | RootDrainVerdict::AlreadyTerminal(_) => OperationOutcome::Accepted,
-                            _ => OperationOutcome::InvalidStateOrRequest,
-                        },
-                    )),
-                    _ => None,
-                })
-                .collect();
-        for (operation, outcome) in ready {
-            self.complete_request(operation, outcome, step);
+                .push(ContextEffect::ContinueRequestReplies { operation });
         }
     }
 }

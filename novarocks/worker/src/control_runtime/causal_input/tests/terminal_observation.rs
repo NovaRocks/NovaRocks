@@ -22,6 +22,7 @@ use super::*;
 use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution_contract::{OperatorStatistics, SafeDetail, TaskOutputFacts, TaskState};
 use novarocks_types::UniqueId;
+use novarocks_worker_protocol::context::ContextCommand;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn observation() -> crate::TaskTerminalObservation {
@@ -104,16 +105,18 @@ fn a_bound_terminal_action_hands_off_one_observation_after_its_cancel_prefix() {
         .expect("the independent positive output fact follows");
     assert!(terminal < output);
     let final_effects = f.runtime.run(
-        ContextInput::GetFinalInfo {
-            request: operation(20),
-            task,
-        },
+        ContextInput::Request(ContextCommand::GetFinalInfo { task }),
         Some(operation(20)),
     );
     let info = final_effects
         .iter()
         .find_map(|effect| match effect {
-            WorkerAction::Context(ContextEffect::FinalInfoReply { info, .. }) => Some(info),
+            WorkerAction::Reply(reply) => match reply.body.as_ref() {
+                novarocks_worker_protocol::context::ContextReplyBody::FinalInfo(info) => {
+                    Some(info.clone())
+                }
+                _ => None,
+            },
             _ => None,
         })
         .expect("the same actor froze the final statistics");

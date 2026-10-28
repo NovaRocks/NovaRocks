@@ -21,13 +21,11 @@ use crate::{
     creation::{AdmissionRefusal, PayloadId},
     proposal_summary::{ConclusionState, Diagnostics, ProposalSummary},
 };
-use novarocks_control_runtime_core::identity::{Generation, ReservationId};
+use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
 use novarocks_execution_contract::{
     DynamicFilterAdvertisement, OperatorStatistics, TaskResourceFacts, TaskStatus, TaskWriterFacts,
 };
-use novarocks_execution_contract::{
-    OperationOutcome, TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState,
-};
+use novarocks_execution_contract::{OperationOutcome, TaskIdentity, TaskOutputFacts, TaskState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CreationPhase {
@@ -43,8 +41,10 @@ pub struct TaskRecord {
     pub payload: PayloadId,
     pub active_reservation: ReservationId,
     pub preparation_reservation: Option<ReservationId>,
-    pub waiting_replies: std::collections::BTreeSet<TaskOperationId>,
+    pub waiting_replies: std::collections::BTreeSet<InputId>,
     pub pending_reply_outcome: Option<OperationOutcome>,
+    /// Original entity decision time, shared only by its actual Create waiters.
+    pub creation_decided_at: Option<crate::lease::MonotonicInstant>,
     pub creation_refusal: Option<AdmissionRefusal>,
     pub state: TaskState,
     pub version: u64,
@@ -90,7 +90,7 @@ impl TaskRecord {
         identity: TaskIdentity,
         payload: PayloadId,
         reservation: ReservationId,
-        request: TaskOperationId,
+        request: InputId,
         generation: Generation,
     ) -> Self {
         Self {
@@ -101,6 +101,7 @@ impl TaskRecord {
             preparation_reservation: None,
             waiting_replies: [request].into_iter().collect(),
             pending_reply_outcome: None,
+            creation_decided_at: None,
             creation_refusal: None,
             state: TaskState::Planned,
             version: 1,

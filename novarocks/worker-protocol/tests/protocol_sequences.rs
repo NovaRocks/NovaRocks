@@ -35,7 +35,7 @@ use novarocks_worker_protocol::{
         AdmissionCore, AdmissionTicketConfig, AdmissionTicketObservation, AdmissionTicketRedemption,
     },
     context::{
-        ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
+        ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
         ContextEstablishmentDecision, ContextInput, ContextMaterialized, ContextStep, PhysicalFact,
         RequestResult,
     },
@@ -126,6 +126,8 @@ struct Port {
     next: u64,
     reject: Option<OperationOutcome>,
     typed_reject: Option<AdmissionRefusal>,
+    next_context_input: u64,
+    context_tokens: std::collections::BTreeMap<TaskOperationId, InputId>,
 }
 impl AdmissionPort for Port {
     fn try_reserve(&mut self, need: AdmissionNeed) -> Result<ReservationId, AdmissionRefusal> {
@@ -140,6 +142,65 @@ impl AdmissionPort for Port {
         Ok(ReservationId::new(self.next).unwrap())
     }
 }
+
+#[derive(Debug)]
+enum FixtureInput {
+    Fact(Box<ContextInput>),
+    Rpc(TaskOperationId, Box<ContextCommand>),
+}
+impl From<ContextInput> for FixtureInput {
+    fn from(input: ContextInput) -> Self {
+        Self::Fact(Box::new(input))
+    }
+}
+fn rpc(operation: TaskOperationId, command: ContextCommand) -> FixtureInput {
+    FixtureInput::Rpc(operation, Box::new(command))
+}
+impl Port {
+    fn request_token(&self, operation: TaskOperationId) -> InputId {
+        *self
+            .context_tokens
+            .get(&operation)
+            .expect("the fixture issued this actual request")
+    }
+}
+trait FixtureContext {
+    fn apply_fixture(
+        &mut self,
+        now: MonotonicInstant,
+        input: impl Into<FixtureInput>,
+        port: &mut Port,
+    ) -> Result<ContextStep, novarocks_worker_protocol::context::CoreError>;
+}
+impl FixtureContext for ContextCore {
+    fn apply_fixture(
+        &mut self,
+        now: MonotonicInstant,
+        input: impl Into<FixtureInput>,
+        port: &mut Port,
+    ) -> Result<ContextStep, novarocks_worker_protocol::context::CoreError> {
+        match input.into() {
+            FixtureInput::Fact(input) => self.handle(now, *input, port),
+            FixtureInput::Rpc(operation, command) => {
+                // The external fixture issues every token, even for the same wire operation.
+                port.next_context_input += 1;
+                let token = InputId::new(1_000_000 + port.next_context_input).unwrap();
+                port.context_tokens.insert(operation, token);
+                self.handle_request(
+                    now,
+                    RequestContext {
+                        token,
+                        operation,
+                        deadline: at(10_000),
+                    },
+                    *command,
+                    port,
+                )
+            }
+        }
+    }
+}
+
 fn cost() -> CreationCost {
     CreationCost {
         input_retained_bytes: 3,
@@ -162,13 +223,15 @@ fn activate(core: &mut ContextCore, port: &mut Port) {
     .unwrap();
 }
 fn create(core: &mut ContextCore, port: &mut Port, n: u8) {
-    core.handle(
+    core.apply_fixture(
         at(0),
-        ContextInput::Create {
-            request: operation(n),
-            task: task(n.into()),
-            payload: PayloadId(n.into()),
-        },
+        rpc(
+            operation(n),
+            ContextCommand::Create {
+                task: task(n.into()),
+                payload: PayloadId(n.into()),
+            },
+        ),
         port,
     )
     .unwrap();
@@ -292,13 +355,15 @@ fn exact_create_replays_share_one_loader_and_reserve_the_complete_preparation_co
     let mut port = Port::default();
     activate(&mut core, &mut port);
     create(&mut core, &mut port, 1);
-    core.handle(
+    core.apply_fixture(
         at(0),
-        ContextInput::Create {
-            request: operation(2),
-            task: task(1),
-            payload: PayloadId(999),
-        },
+        rpc(
+            operation(2),
+            ContextCommand::Create {
+                task: task(1),
+                payload: PayloadId(999),
+            },
+        ),
         &mut port,
     )
     .unwrap();
@@ -357,12 +422,14 @@ fn abort_predecessor_is_applied_before_a_late_loader_result() {
     let mut port = Port::default();
     activate(&mut core, &mut port);
     create(&mut core, &mut port, 1);
-    core.handle(
+    core.apply_fixture(
         at(0),
-        ContextInput::Abort {
-            request: operation(4),
-            cause: AbortCause::QueryFailed,
-        },
+        rpc(
+            operation(4),
+            ContextCommand::Abort {
+                cause: AbortCause::QueryFailed,
+            },
+        ),
         &mut port,
     )
     .unwrap();
@@ -502,24 +569,12 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     }
     core.handle(at(0), ContextInput::Finish { task: task(1) }, &mut port)
         .unwrap();
-    core.handle(
-        at(0),
-        ContextInput::Quiesce {
-            request: operation(6),
-        },
-        &mut port,
-    )
-    .unwrap();
+    core.apply_fixture(at(0), rpc(operation(6), ContextCommand::Quiesce), &mut port)
+        .unwrap();
     core.handle(at(0), ContextInput::ContinueQuiesce, &mut port)
         .unwrap();
     let refused = core
-        .handle(
-            at(0),
-            ContextInput::Release {
-                request: operation(7),
-            },
-            &mut port,
-        )
+        .apply_fixture(at(0), rpc(operation(7), ContextCommand::Release), &mut port)
         .unwrap();
     assert!(refused.effects.iter().any(|e| matches!(
         e,
@@ -545,13 +600,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
             .any(|e| matches!(e, ContextEffect::RetireTask { .. }))
     );
     let releasing = core
-        .handle(
-            at(0),
-            ContextInput::Release {
-                request: operation(7),
-            },
-            &mut port,
-        )
+        .apply_fixture(at(0), rpc(operation(7), ContextCommand::Release), &mut port)
         .unwrap();
     assert!(
         releasing
@@ -570,7 +619,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         .handle(at(0), ContextInput::HostReleased, &mut port)
         .unwrap();
     assert_eq!(core.state(), QueryContextState::TerminalRetained);
-    assert!(released.effects.iter().any(|e|matches!(e,ContextEffect::Reply{request,outcome:OperationOutcome::Accepted} if *request==operation(7))));
+    assert!(released.effects.iter().any(|e|matches!(e,ContextEffect::Reply{request,outcome:OperationOutcome::Accepted} if *request == port.request_token(operation(7)))));
 }
 #[test]
 fn current_input_time_expires_a_lease_before_a_delayed_timer_arrives() {
@@ -578,13 +627,15 @@ fn current_input_time_expires_a_lease_before_a_delayed_timer_arrives() {
     let mut port = Port::default();
     activate(&mut core, &mut port);
     let step = core
-        .handle(
+        .apply_fixture(
             at(30),
-            ContextInput::Renew {
-                request: operation(7),
-                sequence: LeaseSequence::new(1),
-                valid_for: LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
-            },
+            rpc(
+                operation(7),
+                ContextCommand::Renew {
+                    sequence: LeaseSequence::new(1),
+                    valid_for: LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+                },
+            ),
             &mut port,
         )
         .unwrap();
@@ -815,8 +866,7 @@ fn absolute_request_deadline_settles_only_reply_and_keeps_accepted_loader_owned(
         .handle_request(
             at(0),
             request,
-            ContextInput::Create {
-                request: operation(1),
+            ContextCommand::Create {
                 task: task(1),
                 payload: PayloadId(1),
             },
@@ -861,12 +911,11 @@ fn absolute_request_deadline_settles_only_reply_and_keeps_accepted_loader_owned(
     );
 }
 #[test]
-fn a_late_request_never_starts_work_and_an_exact_pending_replay_does_not_duplicate_loader() {
+fn a_late_request_never_starts_work_and_same_operation_tokens_share_only_the_created_entity() {
     let mut core = core(8, 2);
     let mut port = Port::default();
     activate(&mut core, &mut port);
-    let command = || ContextInput::Create {
-        request: operation(1),
+    let command = || ContextCommand::Create {
         task: task(1),
         payload: PayloadId(1),
     };
@@ -914,15 +963,26 @@ fn a_late_request_never_starts_work_and_an_exact_pending_replay_does_not_duplica
     let more = core
         .handle(
             at(2),
-            ContextInput::ContinueRequestReplies {
-                operation: operation(1),
-            },
+            ContextInput::ContinueReplies { task: task(1) },
             &mut port,
         )
         .unwrap();
     let mut replies = ready.requests;
     replies.extend(more.requests);
     assert_eq!(replies.len(), 2);
+    assert_eq!(
+        replies
+            .iter()
+            .map(|reply| reply.request.token)
+            .collect::<Vec<_>>(),
+        vec![InputId::new(2).unwrap(), InputId::new(3).unwrap()],
+        "the same wire operation settles each actual request separately"
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|reply| reply.request.operation == operation(1))
+    );
     assert!(
         replies
             .iter()
@@ -1194,13 +1254,12 @@ fn expired_create_replay_checks_the_entity_before_claiming_nothing_was_created()
         operation: operation(operation_id),
         deadline: at(1),
     };
-    let command = |operation_id| ContextInput::Create {
-        request: operation(operation_id),
+    let command = || ContextCommand::Create {
         task: task(1),
         payload: PayloadId(99),
     };
     let creating = core
-        .handle_request(at(1), request(1, 2), command(2), &mut port)
+        .handle_request(at(1), request(1, 2), command(), &mut port)
         .unwrap();
     assert_eq!(
         creating.requests[0].result,
@@ -1216,7 +1275,7 @@ fn expired_create_replay_checks_the_entity_before_claiming_nothing_was_created()
     )
     .unwrap();
     let accepted = core
-        .handle_request(at(1), request(2, 3), command(3), &mut port)
+        .handle_request(at(1), request(2, 3), command(), &mut port)
         .unwrap();
     assert_eq!(
         accepted.requests[0].result,
@@ -1285,10 +1344,15 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
         )
         .unwrap();
     }
-    core.handle(
+    let request = RequestContext {
+        token: InputId::new(77).unwrap(),
+        operation: operation(8),
+        deadline: at(5),
+    };
+    core.handle_request(
         at(0),
-        ContextInput::Abort {
-            request: operation(8),
+        request,
+        ContextCommand::Abort {
             cause: AbortCause::QueryFailed,
         },
         &mut port,
@@ -1297,12 +1361,17 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
     let scheduled = core
         .handle(at(0), ContextInput::ContinueClose, &mut port)
         .unwrap();
-    assert!(
-        scheduled
-            .effects
-            .iter()
-            .any(|e| matches!(e, ContextEffect::ApplyTaskClose { .. }))
-    );
+    let close_generation = scheduled
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::ApplyTaskClose {
+                task: target,
+                generation,
+            } if *target == task(1) => Some(*generation),
+            _ => None,
+        })
+        .expect("the original close cut is scheduled but has not been consumed");
     let due = MonotonicInstant::from_origin(Duration::from_millis(100));
     assert_eq!(core.next_deadline(), Some(due));
     let tick = core.handle(due, ContextInput::Tick, &mut port).unwrap();
@@ -1311,11 +1380,36 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
             .iter()
             .any(|e| matches!(e, ContextEffect::PublishMetrics { .. }))
     );
-    assert!(core.next_deadline().is_none());
+    assert_eq!(
+        core.next_deadline(),
+        Some(request.deadline),
+        "the handled metric timer is gone; only the actual unfinished Abort reply remains"
+    );
     assert_eq!(
         core.task(task(1)).unwrap().applied_close_generation,
         Generation::new(1).unwrap()
     );
+    let applied = core
+        .handle(
+            due,
+            ContextInput::ApplyTaskClose {
+                task: task(1),
+                generation: close_generation,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(applied.requests.len(), 1);
+    assert_eq!(applied.requests[0].request, request);
+    assert_eq!(
+        applied.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    assert_eq!(
+        core.task(task(1)).unwrap().applied_close_generation,
+        close_generation
+    );
+    assert!(core.next_deadline().is_none());
 }
 #[test]
 fn final_info_freezes_the_real_status_writer_and_operator_facts() {
@@ -1350,25 +1444,24 @@ fn final_info_freezes_the_real_status_writer_and_operator_facts() {
         &mut port,
     )
     .unwrap();
-    core.handle(
+    core.apply_fixture(
         at(0),
-        ContextInput::Cancel {
-            request: operation(2),
-            task: task(1),
-            reason: CancelReason::UpstreamNoLongerNeeded,
-        },
+        rpc(
+            operation(2),
+            ContextCommand::Cancel {
+                task: task(1),
+                reason: CancelReason::UpstreamNoLongerNeeded,
+            },
+        ),
         &mut port,
     )
     .unwrap();
     core.handle(at(0), ContextInput::Finish { task: task(1) }, &mut port)
         .unwrap();
     let final_step = core
-        .handle(
+        .apply_fixture(
             at(0),
-            ContextInput::GetFinalInfo {
-                request: operation(3),
-                task: task(1),
-            },
+            rpc(operation(3), ContextCommand::GetFinalInfo { task: task(1) }),
             &mut port,
         )
         .unwrap();
@@ -2426,12 +2519,14 @@ fn an_abort_before_establishment_keeps_its_original_closed_outcome() {
     let mut context_core = core(1, 1);
     let mut port = Port::default();
     let aborted = context_core
-        .handle(
+        .apply_fixture(
             at(1),
-            ContextInput::Abort {
-                request: operation(2),
-                cause: AbortCause::QueryFailed,
-            },
+            rpc(
+                operation(2),
+                ContextCommand::Abort {
+                    cause: AbortCause::QueryFailed,
+                },
+            ),
             &mut port,
         )
         .unwrap();
@@ -2463,18 +2558,13 @@ fn an_abort_before_establishment_keeps_its_original_closed_outcome() {
 }
 
 #[test]
-fn quiesce_during_materialization_fences_late_establishment_without_inventing_host_exit() {
+fn quiesce_during_materialization_fences_late_establishment_and_settles_each_actual_token() {
     let mut context_core = core(1, 1);
     let mut port = Port::default();
     let quiesce = context_core
-        .handle(
-            at(1),
-            ContextInput::Quiesce {
-                request: operation(2),
-            },
-            &mut port,
-        )
+        .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
         .unwrap();
+    let first_token = port.request_token(operation(2));
     assert!(quiesce.charged_work() <= ContextCore::MAX_STEP_WORK);
     assert_eq!(context_core.state(), QueryContextState::Quiescing);
     assert!(
@@ -2489,26 +2579,20 @@ fn quiesce_during_materialization_fences_late_establishment_without_inventing_ho
             .iter()
             .any(|effect| matches!(effect, ContextEffect::ContinueQuiesce))
     );
-    assert!(!quiesce.effects.iter().any(|effect| matches!(
-        effect,
-        ContextEffect::Reply { .. }
-            | ContextEffect::QuiesceReply { .. }
-            | ContextEffect::ReleaseHost { .. }
-    )));
+    assert!(quiesce.requests.is_empty());
     let waiting = context_core
-        .handle(
-            at(1),
-            ContextInput::Quiesce {
-                request: operation(3),
-            },
-            &mut port,
-        )
+        .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
         .unwrap();
+    let second_token = port.request_token(operation(2));
+    assert_ne!(first_token, second_token);
     assert!(waiting.charged_work() <= ContextCore::MAX_STEP_WORK);
-    assert!(waiting.effects.iter().any(|effect| matches!(
-        effect,
-        ContextEffect::WaitQuiesce { request } if *request == operation(3)
-    )));
+    assert!(waiting.requests.is_empty());
+    assert!(
+        !waiting
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ContextEffect::QuiesceReply { .. }))
+    );
     for now in [at(1), at(2)] {
         let late = context_core
             .handle(
@@ -2531,7 +2615,6 @@ fn quiesce_during_materialization_fences_late_establishment_without_inventing_ho
                 )
             )
         );
-        assert_eq!(context_core.state(), QueryContextState::Quiescing);
         assert!(
             !late
                 .effects
@@ -2539,37 +2622,52 @@ fn quiesce_during_materialization_fences_late_establishment_without_inventing_ho
                 .any(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
         );
     }
-    // Only the existing bounded quiesce continuation may publish its fence
-    // receipt. It is not a materialization rollback or physical host release.
+    // One entity scan runs once; each continuation settles at most one actual request.
     let completed = context_core
         .handle(at(2), ContextInput::ContinueQuiesce, &mut port)
         .unwrap();
     assert!(completed.charged_work() <= ContextCore::MAX_STEP_WORK);
-    assert!(completed.effects.iter().any(|effect| matches!(
-        effect,
-        ContextEffect::QuiesceReply { request, outcome: OperationOutcome::Accepted, receipt }
-            if *request == operation(2) && receipt.state() == QueryContextState::Quiescing
-    )));
-    let repeated = context_core
-        .handle(
-            at(2),
-            ContextInput::Quiesce {
-                request: operation(3),
-            },
-            &mut port,
-        )
-        .unwrap();
-    assert!(repeated.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert_eq!(completed.requests.len(), 1);
+    assert_eq!(completed.requests[0].request.token, first_token);
+    assert_eq!(
+        completed.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    let first_receipt = completed
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::QuiesceReply {
+                request, receipt, ..
+            } if *request == first_token => Some(receipt.clone()),
+            _ => None,
+        })
+        .expect("the first request retains its complete neutral fence receipt");
     let idempotent = context_core
         .handle(at(2), ContextInput::ContinueQuiesce, &mut port)
         .unwrap();
     assert!(idempotent.charged_work() <= ContextCore::MAX_STEP_WORK);
-    assert!(idempotent.effects.iter().any(|effect| matches!(
-        effect,
-        ContextEffect::QuiesceReply { request, outcome: OperationOutcome::Idempotent, receipt }
-            if *request == operation(3) && receipt.state() == QueryContextState::Quiescing
-    )));
-    for step in [&completed, &repeated, &idempotent] {
+    assert_eq!(idempotent.requests.len(), 1);
+    assert_eq!(idempotent.requests[0].request.token, second_token);
+    assert_eq!(
+        idempotent.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Idempotent)
+    );
+    let second_receipt = idempotent
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::QuiesceReply {
+                request, receipt, ..
+            } if *request == second_token => Some(receipt.clone()),
+            _ => None,
+        })
+        .expect("a pending second token needs no host RPC replay");
+    assert!(std::sync::Arc::ptr_eq(&first_receipt, &second_receipt));
+    assert_eq!(first_receipt.state(), QueryContextState::Quiescing);
+    assert_eq!(completed.requests[0].request.operation, operation(2));
+    assert_eq!(idempotent.requests[0].request.operation, operation(2));
+    for step in [&quiesce, &waiting, &completed, &idempotent] {
         assert!(
             !step
                 .effects
@@ -2616,12 +2714,18 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
             .handle(at(1), ControlInput::ContinueFence, &mut port)
             .unwrap();
         assert!(fence.charged_work() <= control.max_step_work());
-        let close = || ContextInput::Abort {
-            request: operation(3),
-            cause: AbortCause::QueryFailed,
+        let close = || {
+            rpc(
+                operation(3),
+                ContextCommand::Abort {
+                    cause: AbortCause::QueryFailed,
+                },
+            )
         };
         if close_first {
-            context_core.handle(at(1), close(), &mut port).unwrap();
+            context_core
+                .apply_fixture(at(1), close(), &mut port)
+                .unwrap();
         }
         let decided = context_core
             .handle(
@@ -2647,7 +2751,9 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
             }
         );
         if !close_first {
-            context_core.handle(at(1), close(), &mut port).unwrap();
+            context_core
+                .apply_fixture(at(1), close(), &mut port)
+                .unwrap();
         }
 
         let returned = control
@@ -2941,16 +3047,18 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
         // A's preceding segment was already admitted by its driver, but has
         // not reached the core yet. The context close only schedules its cut.
         let begin = core
-            .handle(
+            .apply_fixture(
                 at(0),
-                ContextInput::Abort {
-                    request: operation(5),
-                    cause: AbortCause::QueryFailed,
-                },
+                rpc(
+                    operation(5),
+                    ContextCommand::Abort {
+                        cause: AbortCause::QueryFailed,
+                    },
+                ),
                 &mut port,
             )
             .unwrap();
-        assert!(!begin.effects.iter().any(|effect| matches!(effect, ContextEffect::Reply { request, .. } if *request == operation(5))));
+        assert!(!begin.effects.iter().any(|effect| matches!(effect, ContextEffect::Reply { request, .. } if *request == port.request_token(operation(5)))));
         let a = core
             .handle(at(0), ContextInput::ContinueClose, &mut port)
             .unwrap();
@@ -2968,12 +3076,14 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             generation: Generation::new(2).unwrap()
         }));
         let another_abort = core
-            .handle(
+            .apply_fixture(
                 at(0),
-                ContextInput::Abort {
-                    request: operation(6),
-                    cause: AbortCause::QueryFailed,
-                },
+                rpc(
+                    operation(6),
+                    ContextCommand::Abort {
+                        cause: AbortCause::QueryFailed,
+                    },
+                ),
                 &mut port,
             )
             .unwrap();
@@ -3042,7 +3152,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             .unwrap();
         assert_eq!(core.task(task(1)).unwrap().conclusion.accepted, Some(first));
         assert!(a_applied.effects.contains(&ContextEffect::Reply {
-            request: operation(5),
+            request: port.request_token(operation(5)),
             outcome: OperationOutcome::Accepted
         }));
         assert!(!core.task(task(1)).unwrap().loader_exited);
@@ -3051,7 +3161,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             .handle(at(0), ContextInput::ContinueClose, &mut port)
             .unwrap();
         assert!(replay.effects.contains(&ContextEffect::Reply {
-            request: operation(6),
+            request: port.request_token(operation(6)),
             outcome: OperationOutcome::Idempotent
         }));
         let failure = TaskFailure::new(
@@ -3119,12 +3229,14 @@ fn a_preparation_failure_before_its_ordered_close_is_not_preempted_by_context_ab
         source: Some(SourceId(12)),
         diagnostic: None,
     };
-    core.handle(
+    core.apply_fixture(
         at(0),
-        ContextInput::Abort {
-            request: operation(5),
-            cause: AbortCause::QueryFailed,
-        },
+        rpc(
+            operation(5),
+            ContextCommand::Abort {
+                cause: AbortCause::QueryFailed,
+            },
+        ),
         &mut port,
     )
     .unwrap();
@@ -3183,12 +3295,14 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
         source: Some(SourceId(17)),
         diagnostic: None,
     });
-    core.handle(
+    core.apply_fixture(
         at(0),
-        ContextInput::Abort {
-            request: operation(5),
-            cause: AbortCause::QueryFailed,
-        },
+        rpc(
+            operation(5),
+            ContextCommand::Abort {
+                cause: AbortCause::QueryFailed,
+            },
+        ),
         &mut port,
     )
     .unwrap();
@@ -3224,7 +3338,7 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
         source: SourceId(17)
     }));
     assert!(closed.effects.contains(&ContextEffect::Reply {
-        request: operation(5),
+        request: port.request_token(operation(5)),
         outcome: OperationOutcome::Accepted
     }));
     assert!(!core.task(task(1)).unwrap().actual_stopped);
@@ -3244,8 +3358,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
             operation: operation(4),
             deadline: at(1000),
         },
-        ContextInput::Abort {
-            request: operation(4),
+        ContextCommand::Abort {
             cause: AbortCause::QueryFailed,
         },
         &mut port,
@@ -3265,8 +3378,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
                     operation: op,
                     deadline: at(now + 1),
                 },
-                ContextInput::Abort {
-                    request: op,
+                ContextCommand::Abort {
                     cause: AbortCause::QueryFailed,
                 },
                 &mut port,
@@ -3304,8 +3416,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
                 operation: operation(200),
                 deadline: at(1000),
             },
-            ContextInput::Abort {
-                request: operation(200),
+            ContextCommand::Abort {
                 cause: AbortCause::QueryFailed,
             },
             &mut port,
@@ -3357,8 +3468,7 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
             operation: operation(1),
             deadline: at(1),
         },
-        ContextInput::Create {
-            request: operation(1),
+        ContextCommand::Create {
             task: task(1),
             payload: PayloadId(1),
         },
@@ -3377,8 +3487,7 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
                     operation: op,
                     deadline: at(now + 1),
                 },
-                ContextInput::Create {
-                    request: op,
+                ContextCommand::Create {
                     task: task(1),
                     payload: PayloadId(99),
                 },
@@ -3398,8 +3507,7 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
             operation: operation(50),
             deadline: at(25),
         },
-        ContextInput::Create {
-            request: operation(50),
+        ContextCommand::Create {
             task: task(1),
             payload: PayloadId(99),
         },
@@ -3524,8 +3632,7 @@ fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
                 operation: operation(1),
                 deadline: at(deadline),
             },
-            ContextInput::Create {
-                request: operation(1),
+            ContextCommand::Create {
                 task: task(1),
                 payload: PayloadId(1),
             },
@@ -3539,7 +3646,7 @@ fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
         core.task(task(1))
             .unwrap()
             .waiting_replies
-            .contains(&operation(1))
+            .contains(&InputId::new(2).unwrap())
     );
     let ready = core
         .handle(
@@ -3609,8 +3716,7 @@ fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay(
             operation: operation(1),
             deadline: at(100),
         },
-        ContextInput::Create {
-            request: operation(1),
+        ContextCommand::Create {
             task: task(1),
             payload: PayloadId(1),
         },
@@ -3632,7 +3738,7 @@ fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay(
         rejected
             .effects
             .contains(&ContextEffect::DomainFailureReply {
-                request: operation(1),
+                request: InputId::new(1).unwrap(),
                 refusal: expected.clone()
             })
     );
@@ -3687,18 +3793,33 @@ fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay(
                     operation: operation(op),
                     deadline: at(deadline),
                 },
-                ContextInput::Create {
-                    request: operation(op),
+                ContextCommand::Create {
                     task: task(1),
                     payload: PayloadId(99),
                 },
                 &mut port,
             )
             .unwrap();
-        assert!(replay.effects.contains(&ContextEffect::DomainFailureReply {
-            request: operation(op),
-            refusal: expected.clone()
-        }));
+        assert_eq!(replay.requests.len(), 1);
+        assert_eq!(
+            replay.requests[0].request.token,
+            InputId::new(token).unwrap()
+        );
+        assert_eq!(replay.requests[0].request.operation, operation(op));
+        assert_eq!(replay.requests[0].task, Some(task(1)));
+        assert!(matches!(replay.requests[0].body.as_ref(),
+            novarocks_worker_protocol::context::ContextReplyBody::Domain(actual) if actual == &expected));
+        if deadline <= 3 {
+            assert!(
+                replay.effects.is_empty(),
+                "an expired unadmitted request publishes no host effect"
+            );
+        } else {
+            assert!(replay.effects.contains(&ContextEffect::DomainFailureReply {
+                request: InputId::new(token).unwrap(),
+                refusal: expected.clone()
+            }));
+        }
         assert_eq!(
             replay.requests[0].result,
             RequestResult::Outcome(outcome.outcome())
@@ -3718,13 +3839,15 @@ fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_b
     activate(&mut core, &mut port);
     port.typed_reject = Some(refusal.clone());
     let first = core
-        .handle(
+        .apply_fixture(
             at(0),
-            ContextInput::Create {
-                request: operation(1),
-                task: task(1),
-                payload: PayloadId(1),
-            },
+            rpc(
+                operation(1),
+                ContextCommand::Create {
+                    task: task(1),
+                    payload: PayloadId(1),
+                },
+            ),
             &mut port,
         )
         .unwrap();
@@ -3905,13 +4028,13 @@ fn a_single_task_byte_refusal_keeps_precedence_over_a_full_preparation_position(
         )
         .unwrap();
     assert!(rejected.effects.contains(&ContextEffect::Reply {
-        request: operation(2),
+        request: port.request_token(operation(2)),
         outcome: OperationOutcome::ResourceExhausted
     }));
     create(&mut core, &mut port, 3);
     let full = loaded(&mut core, &mut port, 3);
     assert!(full.contains(&ContextEffect::Reply {
-        request: operation(3),
+        request: port.request_token(operation(3)),
         outcome: OperationOutcome::PreparationBusy
     }));
 }
@@ -3973,7 +4096,7 @@ fn aggregate_preparation_capacity_refusal_remains_preparation_busy() {
         )
         .unwrap();
     assert!(step.effects.contains(&ContextEffect::Reply {
-        request: operation(1),
+        request: port.request_token(operation(1)),
         outcome: OperationOutcome::PreparationBusy
     }));
     assert!(!step.effects.iter().any(|effect| matches!(
@@ -4000,8 +4123,7 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
                     operation: operation(op),
                     deadline: at(100),
                 },
-                ContextInput::Create {
-                    request: operation(op),
+                ContextCommand::Create {
                     task: task(number),
                     payload: PayloadId(u64::from(number)),
                 },
@@ -4018,8 +4140,7 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
                 operation: operation(3),
                 deadline: at(100),
             },
-            ContextInput::Create {
-                request: operation(3),
+            ContextCommand::Create {
                 task: task(3),
                 payload: PayloadId(3),
             },
@@ -4027,7 +4148,7 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
         )
         .unwrap_err();
     assert_eq!(duplicate, CoreError::WrongIdentity);
-    let mismatched = core
+    let independent = core
         .handle_request(
             at(0),
             RequestContext {
@@ -4035,23 +4156,22 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
                 operation: operation(4),
                 deadline: at(100),
             },
-            ContextInput::Create {
-                request: operation(5),
+            ContextCommand::Create {
                 task: task(3),
                 payload: PayloadId(3),
             },
             &mut port,
         )
-        .unwrap_err();
-    assert_eq!(mismatched, CoreError::WrongIdentity);
-    assert!(core.task(task(3)).is_none());
+        .unwrap();
+    assert!(independent.requests.is_empty());
+    assert!(core.task(task(3)).is_some());
     assert_eq!(
         port.calls.len(),
-        2,
-        "invalid tokens cannot start another loader"
+        3,
+        "a new actual token may create another entity; only the duplicate was refused"
     );
     let mut replies = Vec::new();
-    for number in [1, 2] {
+    for number in [1, 2, 3] {
         replies.extend(
             core.handle(
                 at(0),
@@ -4065,12 +4185,20 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
             .requests,
         );
     }
-    assert_eq!(replies.len(), 2);
+    assert_eq!(replies.len(), 3);
     assert_eq!(replies[0].request.token, InputId::new(20).unwrap());
     assert_eq!(replies[1].request.token, InputId::new(10).unwrap());
+    assert_eq!(replies[2].request.token, InputId::new(30).unwrap());
+    assert_eq!(replies[2].request.operation, operation(4));
+    assert_eq!(
+        replies[2].result,
+        RequestResult::Outcome(OperationOutcome::PreparationBusy),
+        "the independent third loader reaches the original two-position preparation limit"
+    );
     assert!(
         replies
             .iter()
+            .take(2)
             .all(|reply| reply.result == RequestResult::Outcome(OperationOutcome::Accepted))
     );
     assert!(
@@ -4427,10 +4555,11 @@ fn completion_fixture() -> (ContextCore, Port) {
 fn completion_step(
     core: &mut ContextCore,
     port: &mut Port,
-    input: ContextInput,
+    input: impl Into<FixtureInput>,
 ) -> novarocks_worker_protocol::context::ContextStep {
+    let input = input.into();
     let label = format!("{input:?}");
-    let step = core.handle(at(0), input, port).unwrap();
+    let step = core.apply_fixture(at(0), input, port).unwrap();
     assert!(
         step.charged_work() <= ContextCore::MAX_STEP_WORK,
         "{label}: actual charged work {} exceeds {}: {:?}",
@@ -4679,10 +4808,7 @@ fn successful_root_production_waits_for_output_and_drain_reply_follows_the_termi
     let drained = completion_step(
         &mut core,
         &mut port,
-        ContextInput::RootDrained {
-            request: operation(10),
-            task: task(1),
-        },
+        rpc(operation(10), ContextCommand::RootDrained { task: task(1) }),
     );
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Finished);
@@ -4712,11 +4838,13 @@ fn a_cancellation_between_success_intent_and_exit_keeps_its_conclusion_and_indep
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Cancel {
-            request: operation(10),
-            task: task(1),
-            reason: CancelReason::UpstreamNoLongerNeeded,
-        },
+        rpc(
+            operation(10),
+            ContextCommand::Cancel {
+                task: task(1),
+                reason: CancelReason::UpstreamNoLongerNeeded,
+            },
+        ),
     );
     assert_eq!(core.task(task(1)).unwrap().state, TaskState::Canceling);
     completion_step(
@@ -4750,11 +4878,13 @@ fn a_stopped_root_success_intent_is_completed_as_the_later_cancellation_without_
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Cancel {
-            request: operation(10),
-            task: task(1),
-            reason: CancelReason::UpstreamNoLongerNeeded,
-        },
+        rpc(
+            operation(10),
+            ContextCommand::Cancel {
+                task: task(1),
+                reason: CancelReason::UpstreamNoLongerNeeded,
+            },
+        ),
     );
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Canceled);
@@ -4904,11 +5034,13 @@ fn finishing_a_prior_termination_clears_the_waiting_intent_and_late_success_neve
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Cancel {
-            request: operation(10),
-            task: task(1),
-            reason: CancelReason::UpstreamNoLongerNeeded,
-        },
+        rpc(
+            operation(10),
+            ContextCommand::Cancel {
+                task: task(1),
+                reason: CancelReason::UpstreamNoLongerNeeded,
+            },
+        ),
     );
     completion_step(&mut core, &mut port, ContextInput::Finish { task: task(1) });
     assert_eq!(core.task(task(1)).unwrap().state, TaskState::Canceled);
@@ -5114,10 +5246,12 @@ fn task_close_retries_a_stopped_pending_success_as_the_existing_abort() {
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Abort {
-            request: operation(10),
-            cause: AbortCause::PeerTaskFailed,
-        },
+        rpc(
+            operation(10),
+            ContextCommand::Abort {
+                cause: AbortCause::PeerTaskFailed,
+            },
+        ),
     );
     completion_step(&mut core, &mut port, ContextInput::ContinueClose);
     let closed = completion_step(
@@ -5171,10 +5305,7 @@ fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abo
     let drained = completion_step(
         &mut core,
         &mut port,
-        ContextInput::RootDrained {
-            task: task(1),
-            request: operation(10),
-        },
+        rpc(operation(10), ContextCommand::RootDrained { task: task(1) }),
     );
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Aborted);
@@ -5466,10 +5597,10 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
     let read = completion_step(
         &mut core,
         &mut port,
-        ContextInput::GetFinalInfo {
-            request: operation(11),
-            task: task(1),
-        },
+        rpc(
+            operation(11),
+            ContextCommand::GetFinalInfo { task: task(1) },
+        ),
     );
     let info = read
         .effects
@@ -5501,10 +5632,10 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
     let reread = completion_step(
         &mut core,
         &mut port,
-        ContextInput::GetFinalInfo {
-            request: operation(12),
-            task: task(1),
-        },
+        rpc(
+            operation(12),
+            ContextCommand::GetFinalInfo { task: task(1) },
+        ),
     );
     let later = reread
         .effects
@@ -6032,13 +6163,7 @@ fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_
                 let mut context_core = core(1, 1);
                 let mut port = Port::default();
                 context_core
-                    .handle(
-                        at(1),
-                        ContextInput::Quiesce {
-                            request: operation(2),
-                        },
-                        &mut port,
-                    )
+                    .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
                     .unwrap();
                 if tick_first {
                     context_core
@@ -6122,12 +6247,14 @@ fn materialization_host_error_preserves_domain_facts_without_replacing_the_first
         let now = if expired { 30 } else { 1 };
         if !expired {
             context_core
-                .handle(
+                .apply_fixture(
                     at(now),
-                    ContextInput::Abort {
-                        request: operation(2),
-                        cause: AbortCause::QueryFailed,
-                    },
+                    rpc(
+                        operation(2),
+                        ContextCommand::Abort {
+                            cause: AbortCause::QueryFailed,
+                        },
+                    ),
                     &mut port,
                 )
                 .unwrap();
@@ -6247,24 +6374,12 @@ fn root_fence_blocks_late_active_without_erasing_typed_failure_or_lease_expiry()
 }
 
 fn release_while_materialization_is_outstanding(core: &mut ContextCore, port: &mut Port) {
-    core.handle(
-        at(0),
-        ContextInput::Quiesce {
-            request: operation(70),
-        },
-        port,
-    )
-    .unwrap();
+    core.apply_fixture(at(0), rpc(operation(70), ContextCommand::Quiesce), port)
+        .unwrap();
     core.handle(at(0), ContextInput::ContinueQuiesce, port)
         .unwrap();
     let releasing = core
-        .handle(
-            at(0),
-            ContextInput::Release {
-                request: operation(71),
-            },
-            port,
-        )
+        .apply_fixture(at(0), rpc(operation(71), ContextCommand::Release), port)
         .unwrap();
     assert_eq!(core.state(), QueryContextState::Releasing);
     assert!(
@@ -6586,13 +6701,7 @@ fn a_quiesced_context_does_not_accept_a_success_disguised_as_host_refusal() {
         let mut context_core = core(1, 1);
         let mut port = Port::default();
         context_core
-            .handle(
-                at(1),
-                ContextInput::Quiesce {
-                    request: operation(2),
-                },
-                &mut port,
-            )
+            .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
             .unwrap();
         assert_eq!(
             context_core
@@ -7395,4 +7504,127 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
         original.requests[0].result,
         RequestResult::Outcome(OperationOutcome::Accepted)
     );
+}
+
+#[test]
+fn an_rpc_transport_wrapper_cannot_bypass_the_actual_request_envelope() {
+    use novarocks_worker_protocol::context::CoreError;
+    let mut core = core(4, 1);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    let command = || ContextCommand::Create {
+        task: task(1),
+        payload: PayloadId(1),
+    };
+    let refused = core.handle(at(0), ContextInput::Request(command()), &mut port);
+    assert_eq!(refused.unwrap_err(), CoreError::WrongIdentity);
+    assert!(port.calls.is_empty());
+    assert!(core.task(task(1)).is_none());
+    let request = RequestContext {
+        token: InputId::new(71).unwrap(),
+        operation: operation(9),
+        deadline: at(100),
+    };
+    let admitted = core
+        .handle_request(at(0), request, command(), &mut port)
+        .unwrap();
+    assert!(admitted.requests.is_empty());
+    assert_eq!(port.calls.len(), 1);
+    let loaded = core
+        .handle(
+            at(0),
+            ContextInput::Loaded {
+                task: task(1),
+                result: Ok(cost()),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(loaded.requests.len(), 1);
+    assert_eq!(loaded.requests[0].request, request);
+    assert_eq!(loaded.requests[0].task, Some(task(1)));
+    assert!(loaded.requests[0].body.matches(loaded.requests[0].result));
+}
+
+#[test]
+fn the_same_wire_operation_does_not_join_distinct_tasks_or_replace_a_settled_body() {
+    let mut core = core(4, 2);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    let requests = [
+        RequestContext {
+            token: InputId::new(81).unwrap(),
+            operation: operation(9),
+            deadline: at(100),
+        },
+        RequestContext {
+            token: InputId::new(82).unwrap(),
+            operation: operation(9),
+            deadline: at(100),
+        },
+    ];
+    for (index, request) in requests.into_iter().enumerate() {
+        let n = index as u32 + 1;
+        core.handle_request(
+            at(0),
+            request,
+            ContextCommand::Create {
+                task: task(n),
+                payload: PayloadId(u64::from(n)),
+            },
+            &mut port,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        port.calls.len(),
+        2,
+        "each distinct entity owns its original loader"
+    );
+    let first = core
+        .handle(
+            at(0),
+            ContextInput::Loaded {
+                task: task(1),
+                result: Ok(cost()),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(first.requests.len(), 1);
+    assert_eq!(first.requests[0].request, requests[0]);
+    assert_eq!(first.requests[0].task, Some(task(1)));
+    let original_body = first.requests[0].body.clone();
+    let second = core
+        .handle(
+            at(0),
+            ContextInput::Loaded {
+                task: task(2),
+                result: Err(OperationOutcome::ResourceExhausted.into()),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(second.requests.len(), 1);
+    assert_eq!(second.requests[0].request, requests[1]);
+    assert_eq!(second.requests[0].task, Some(task(2)));
+    assert_eq!(
+        first.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    assert_eq!(
+        second.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::ResourceExhausted)
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &original_body,
+        &first.requests[0].body
+    ));
+    assert!(!std::sync::Arc::ptr_eq(
+        &original_body,
+        &second.requests[0].body
+    ));
+    for reply in [&first.requests[0], &second.requests[0]] {
+        assert!(reply.body.matches(reply.result));
+    }
 }

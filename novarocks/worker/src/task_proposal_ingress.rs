@@ -39,7 +39,7 @@ use novarocks_execution_contract::{
     RetainedTaskSource, TaskConclusionProposal, TaskFailurePhase, TaskIdentity, TaskOperationId,
 };
 use novarocks_worker_protocol::{
-    context::ContextInput,
+    context::{ContextCommand, ContextInput},
     lease::MonotonicInstant,
     proposal_summary::{CausalSegments, CutError, CutId, Diagnostic, ProposalSummary, SourceId},
 };
@@ -601,13 +601,15 @@ impl TaskProposalIngress {
         };
         let input_task = match (event.kind, &input) {
             (
-                CausalEventKind::Request(metadata),
-                ContextInput::Cancel { request, task, .. }
-                | ContextInput::UpdateTask { request, task, .. }
-                | ContextInput::RootDrained { request, task }
-                | ContextInput::GetFinalInfo { request, task }
-                | ContextInput::GetDynamicFilters { request, task, .. },
-            ) if *request == metadata.operation => Some(*task),
+                CausalEventKind::Request(_),
+                ContextInput::Request(
+                    ContextCommand::Cancel { task, .. }
+                    | ContextCommand::UpdateTask { task, .. }
+                    | ContextCommand::RootDrained { task }
+                    | ContextCommand::GetFinalInfo { task }
+                    | ContextCommand::GetDynamicFilters { task, .. },
+                ),
+            ) => Some(*task),
             (
                 CausalEventKind::Input,
                 ContextInput::Loaded { task, .. }

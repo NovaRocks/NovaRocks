@@ -36,6 +36,7 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::{OperatorStatistics, SafeDetail, TaskOutputFacts};
+use novarocks_worker_protocol::context::ContextCommand;
 use novarocks_worker_protocol::{
     context::{ContextEffect, TerminalIntent, TerminalObservation},
     creation::{CreationCost, PayloadId},
@@ -65,6 +66,20 @@ fn command(f: &mut Fixture, input: ContextInput) -> Vec<WorkerAction> {
     f.runtime.poll_one(Tick(1)).unwrap();
     f.drain(input)
 }
+fn request(
+    f: &mut Fixture,
+    command: ContextCommand,
+    operation: novarocks_execution_contract::TaskOperationId,
+) -> Vec<WorkerAction> {
+    let input = f.send(
+        ContextInput::Request(command),
+        Some(operation),
+        InputClass::Ordinary,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    f.drain(input)
+}
 fn fixture() -> (
     Fixture,
     TaskStatisticsInbox,
@@ -73,13 +88,13 @@ fn fixture() -> (
 ) {
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
-    command(
+    request(
         &mut f,
-        ContextInput::Create {
-            request: operation(3),
+        ContextCommand::Create {
             task: identity,
             payload: PayloadId(3),
         },
+        operation(3),
     );
     let mut loaded = command(
         &mut f,
@@ -186,16 +201,19 @@ fn final_info_with_snapshot(
         },
     );
     command(f, ContextInput::CompletionExited { task: identity });
-    command(
+    request(
         f,
-        ContextInput::GetFinalInfo {
-            request: operation(20),
-            task: identity,
-        },
+        ContextCommand::GetFinalInfo { task: identity },
+        operation(20),
     )
     .into_iter()
     .find_map(|effect| match effect {
-        WorkerAction::Context(ContextEffect::FinalInfoReply { info, .. }) => Some(info),
+        WorkerAction::Reply(reply) => match reply.body.as_ref() {
+            novarocks_worker_protocol::context::ContextReplyBody::FinalInfo(info) => {
+                Some(info.clone())
+            }
+            _ => None,
+        },
         _ => None,
     })
     .unwrap()

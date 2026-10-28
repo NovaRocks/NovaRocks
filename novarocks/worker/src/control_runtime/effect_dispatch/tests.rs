@@ -110,3 +110,184 @@ fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_t
     assert!(second_completed.is_ok());
     assert!(empty);
 }
+
+#[test]
+fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() {
+    use crate::control_runtime::actors::tests::task;
+    use novarocks_control_runtime::publication::PublishedSnapshot;
+    use novarocks_control_runtime_core::effect::EffectState;
+    use novarocks_execution_contract::TaskStatus;
+    use novarocks_worker_protocol::{
+        context::ContextCommand,
+        creation::{CreationCost, PayloadId},
+    };
+    use std::sync::Arc;
+
+    // The fixture runs the actual actor, ledger, inputs and effect tickets.
+    // Installed is a pure protocol model fact, not a Native physical-exit proof.
+    let mut f = Fixture::new();
+    let task = task(f.identity, 1);
+    let create = f.send(
+        ContextInput::Request(ContextCommand::Create {
+            task,
+            payload: PayloadId(71),
+        }),
+        Some(operation(71)),
+        InputClass::Ordinary,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    f.drain(create);
+    let loaded = f.send(
+        ContextInput::Loaded {
+            task,
+            result: Ok(CreationCost {
+                input_retained_bytes: 1,
+                ingress_retained_bytes: 1,
+                structural_bytes: 1,
+                inbound_records: 0,
+                inbound_bytes: 0,
+            }),
+        },
+        None,
+        InputClass::Lifecycle,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    f.drain(loaded);
+
+    let publishing = f.send(
+        ContextInput::Installed { task },
+        None,
+        InputClass::Lifecycle,
+        2,
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
+    let request = f.send(
+        ContextInput::Request(ContextCommand::GetDynamicFilters {
+            task,
+            acknowledged: None,
+        }),
+        Some(operation(72)),
+        InputClass::Ordinary,
+        2,
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
+    let mut dispatch =
+        EffectDispatch::context(f.runtime.clone(), actor(), ContextCore::MAX_STEP_WORK * 4);
+    dispatch.index_committed(&f.runtime, 64).unwrap();
+    let publication = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
+    let snapshot = match &publication.effect {
+        WorkerAction::Context(ContextEffect::PublishTask {
+            task: actual,
+            snapshot,
+            ..
+        }) if *actual == task => snapshot.clone(),
+        _ => panic!("the earlier installed Task has an original status publication"),
+    };
+    let mut held_replies = Vec::new();
+    let mut premature = false;
+    let mut body_exits_proven = true;
+    // Body completion is a separate actual predecessor of the reply. The
+    // dispatch lane alone does not acknowledge that original dependency.
+    let complete_body = |ticket: EffectTicket<WorkerAction>| {
+        let input = ticket.input;
+        let predecessor = ticket.descriptor.id;
+        f.runtime.effect_completed(ticket).unwrap();
+        let inventory = f
+            .runtime
+            .effect_inventory(actor(), input, None, ContextCore::MAX_STEP_WORK)
+            .unwrap();
+        let exited = inventory.iter().any(|(descriptor, state)| {
+            descriptor.id == predecessor && *state == EffectState::Completed
+        });
+        if exited {
+            for (descriptor, state) in inventory {
+                if state == EffectState::Pending && descriptor.dependencies.contains(&predecessor) {
+                    f.runtime
+                        .acknowledge_dependency(actor(), input, descriptor.id, predecessor)
+                        .unwrap();
+                }
+            }
+        }
+        exited
+    };
+    while let Some(ticket) = dispatch.take_ready(&f.runtime, 16).unwrap() {
+        if matches!(&ticket.effect, WorkerAction::Reply(reply) if reply.request.token == request) {
+            premature = true;
+            held_replies.push(ticket);
+        } else {
+            body_exits_proven &= complete_body(ticket);
+        }
+    }
+    let target = PublishedSnapshot::new(&f.scope, Arc::new(TaskStatus::created(task)));
+    drop(
+        f.runtime
+            .commit_snapshot(&publication, &target, Arc::new(snapshot))
+            .unwrap(),
+    );
+    dispatch
+        .publication_committed(&f.runtime, &publication)
+        .unwrap();
+    while let Some(ticket) = dispatch.take_ready(&f.runtime, 16).unwrap() {
+        if matches!(&ticket.effect, WorkerAction::Reply(reply) if reply.request.token == request) {
+            held_replies.push(ticket);
+        } else {
+            body_exits_proven &= complete_body(ticket);
+        }
+    }
+    let reply_requests: Vec<_> = held_replies
+        .iter()
+        .filter_map(|ticket| match &ticket.effect {
+            WorkerAction::Reply(reply) => Some(reply.request),
+            _ => None,
+        })
+        .collect();
+    let publication_still_held = f
+        .runtime
+        .effect_inventory(actor(), publishing, None, ContextCore::MAX_STEP_WORK)
+        .unwrap()
+        .iter()
+        .any(|(descriptor, state)| {
+            descriptor.id == publication.descriptor.id && *state == EffectState::Published
+        });
+    // Reply ordering releases at real start. The original ticket and body are
+    // still held here; a slow external sender must not keep the Task lane.
+    let ordering_drained = dispatch.is_empty();
+    f.runtime.effect_completed(publication).unwrap();
+    for reply in held_replies {
+        f.runtime.effect_completed(reply).unwrap();
+    }
+    // Preserve the ordering observations above before a strict final drain.
+    // A regression may leave an original pending effect; finish its actual
+    // dependency/capture sequence before reporting the failed oracle instead
+    // of making driver Drop hide it with a second panic.
+    let mut cleanup_outputs = f.drain(publishing);
+    cleanup_outputs.extend(f.drain(request));
+    drop(target);
+    f.finish();
+
+    assert!(
+        !premature,
+        "a later reply cannot precede actual Task publication"
+    );
+    assert!(
+        body_exits_proven,
+        "only actual Completed body facts release dependencies"
+    );
+    assert!(
+        cleanup_outputs.is_empty(),
+        "the ordering exercise must itself finish every original effect"
+    );
+    assert_eq!(reply_requests.len(), 1);
+    assert_eq!(reply_requests[0].token, request);
+    assert_eq!(reply_requests[0].operation, operation(72));
+    assert!(
+        publication_still_held,
+        "publication ordering is independent of capture exit"
+    );
+    assert!(
+        ordering_drained,
+        "the started reply cannot retain the Task ordering lane"
+    );
+}

@@ -26,10 +26,11 @@ use uuid::Uuid;
 
 /// Identity of one protocol operation.
 ///
-/// Every mutation and observation read carries an operation id so that an
-/// unknown transport outcome can be resolved by replaying the exact same
-/// immutable request. Replaying a different content under the same id is a
-/// conflict, never an update.
+/// A sender resolving an unknown transport outcome must replay its original
+/// immutable request and retain this identity for receipt correlation.
+/// Receiver replay decisions follow each entity, domain and lease contract;
+/// this identity alone promises no request-content check or result cache.
+/// Observation RPCs without a wire operation id use a local correlation id.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TaskOperationId(Uuid);
 

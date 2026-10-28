@@ -42,6 +42,7 @@ use novarocks_execution_contract::{
 use novarocks_types::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
+use novarocks_worker_protocol::context::ContextCommand;
 use novarocks_worker_protocol::{
     context::{ContextConfig, PhysicalFact, RequestResult},
     creation::{CreationCost, PayloadId},
@@ -146,11 +147,10 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
         inbound_bytes: 9,
     };
     let loading = f.run(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
     );
     let source_parent = loading
@@ -645,11 +645,10 @@ impl Fixture {
     ) -> crate::control_runtime::task::TaskHostRecord {
         use crate::control_runtime::task::{TaskHostBinding, TaskHostRecord};
         let create = self.send(
-            ContextInput::Create {
-                request: operation(1),
+            ContextInput::Request(ContextCommand::Create {
                 task,
                 payload: PayloadId(1),
-            },
+            }),
             Some(operation(1)),
             InputClass::Ordinary,
             2,
@@ -826,11 +825,10 @@ fn source_bootstrap_slot_refusal_returns_the_original_paid_unpublished_task_unti
     assert_eq!(original.unresolved, 0);
     f.assert_storage_paid(StorageNeed::default());
     let create = f.send(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
         InputClass::Ordinary,
         2,
@@ -1240,21 +1238,19 @@ fn actual_fair_delivery_uses_each_envelope_token_even_when_issuance_order_differ
     let first_task = task(f.identity, 1);
     let second_task = task(f.identity, 2);
     let first = f.send(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task: first_task,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
         InputClass::Ordinary,
         2,
     );
     let second = f.send(
-        ContextInput::Create {
-            request: operation(2),
+        ContextInput::Request(ContextCommand::Create {
             task: second_task,
             payload: PayloadId(2),
-        },
+        }),
         Some(operation(2)),
         InputClass::Control,
         3,
@@ -1317,11 +1313,10 @@ fn accepted_preparation_keeps_its_original_bundle_after_the_body_fact() {
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task: identity,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
     );
     let outputs = f.run(
@@ -1365,11 +1360,10 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     let earlier = f.send(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task: identity,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
         InputClass::Ordinary,
         2,
@@ -1456,11 +1450,10 @@ fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generati
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task: identity,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
     );
     f.run(
@@ -1477,10 +1470,9 @@ fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generati
         None,
     );
     let aborted = f.run(
-        ContextInput::Abort {
-            request: operation(2),
+        ContextInput::Request(ContextCommand::Abort {
             cause: novarocks_execution_contract::AbortCause::QueryFailed,
-        },
+        }),
         Some(operation(2)),
     );
     let close = aborted
@@ -1530,11 +1522,10 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task: identity,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
     );
     f.run(
@@ -1773,11 +1764,10 @@ fn host_publications_follow_core_order_without_waiting_for_old_body_capture_reti
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task: identity,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
     );
     f.run(
@@ -1875,11 +1865,10 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task: identity,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
     );
     f.run(
@@ -1896,11 +1885,10 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
         None,
     );
     let input = f.send(
-        ContextInput::Cancel {
-            request: operation(2),
+        ContextInput::Request(ContextCommand::Cancel {
             task: identity,
             reason: CancelReason::UpstreamNoLongerNeeded,
-        },
+        }),
         Some(operation(2)),
         InputClass::Control,
         2,
@@ -2156,11 +2144,10 @@ fn exercise_fragment_roles_with_preparation(
     f.assert_storage_paid(StorageNeed::default());
     let task = task(f.identity, 1);
     let create = f.send(
-        ContextInput::Create {
-            request: operation(1),
+        ContextInput::Request(ContextCommand::Create {
             task,
             payload: PayloadId(1),
-        },
+        }),
         Some(operation(1)),
         InputClass::Ordinary,
         2,
@@ -2521,11 +2508,10 @@ fn exercise_fragment_roles_with_preparation(
     assert!(loader.try_retire().unwrap());
     if task_stopped {
         let canceled = f.send(
-            ContextInput::Cancel {
-                request: operation(3),
+            ContextInput::Request(ContextCommand::Cancel {
                 task,
                 reason: novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
-            },
+            }),
             Some(operation(3)),
             InputClass::Control,
             2,
@@ -3131,11 +3117,10 @@ impl CausalHarness {
         let mut fixture = Fixture::new();
         let task = task(fixture.identity, 1);
         let loading = fixture.run(
-            ContextInput::Create {
-                request: operation(1),
+            ContextInput::Request(ContextCommand::Create {
                 task,
                 payload: PayloadId(1),
-            },
+            }),
             Some(operation(1)),
         );
         let source_parent = loading
@@ -3412,10 +3397,9 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
     let settlement_work = h.work();
     let settlement_admission = h.admission();
     let mut closing = h.fixture.run(
-        ContextInput::Abort {
-            request: operation(2),
+        ContextInput::Request(ContextCommand::Abort {
             cause: AbortCause::PeerTaskFailed,
-        },
+        }),
         Some(operation(2)),
     );
     assert!(closing.iter().any(|effect| matches!(

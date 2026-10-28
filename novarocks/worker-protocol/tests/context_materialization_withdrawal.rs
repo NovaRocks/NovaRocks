@@ -18,7 +18,7 @@
 //! Pure Context owner decisions after an admitted M returns without invoking
 //! materialization I/O. Host exit itself remains an explicit world fact.
 
-use novarocks_control_runtime_core::identity::{Generation, ReservationId};
+use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
 use novarocks_execution_contract::{
     AdmissionTicketId, ContentFingerprint, CredentialEpoch, CredentialLeaseId, LeaseValidFor,
     OperationOutcome, QueryContextRef, QueryContextState, TaskOperationId,
@@ -28,11 +28,11 @@ use novarocks_types::identity::{
 };
 use novarocks_worker_protocol::{
     context::{
-        ContextConfig, ContextCore, ContextEffect, ContextEstablishment, ContextInput,
-        ContextMaterialized, ContextStep, CoreError,
+        ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
+        ContextInput, ContextMaterialized, ContextStep, CoreError,
     },
     control::EstablishSemanticFacts,
-    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId},
+    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId, RequestContext},
     domain::CredentialState,
     lease::{LeaseBounds, MonotonicInstant},
 };
@@ -86,6 +86,30 @@ fn core() -> ContextCore {
     )
     .unwrap()
 }
+
+fn command_step(
+    core: &mut ContextCore,
+    now: u64,
+    token: u64,
+    operation: TaskOperationId,
+    command: ContextCommand,
+) -> ContextStep {
+    let step = core
+        .handle_request(
+            at(now),
+            RequestContext {
+                token: InputId::new(token).unwrap(),
+                operation,
+                deadline: at(10_000),
+            },
+            command,
+            &mut NoAdmission,
+        )
+        .unwrap();
+    assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+    step
+}
+
 struct NoAdmission;
 impl AdmissionPort for NoAdmission {
     fn try_reserve(&mut self, _: AdmissionNeed) -> Result<ReservationId, AdmissionRefusal> {
@@ -147,23 +171,11 @@ fn a_quiesce_won_withdrawal_keeps_normal_closure_after_the_lease_deadline_unless
  {
     for phase in 0..3 {
         let mut core = core();
-        step(
-            &mut core,
-            1,
-            ContextInput::Quiesce {
-                request: operation(60),
-            },
-        );
+        command_step(&mut core, 1, 10001, operation(60), ContextCommand::Quiesce);
         assert_eq!(core.state(), QueryContextState::Quiescing);
         if phase >= 1 {
             step(&mut core, 1, ContextInput::ContinueQuiesce);
-            let release = step(
-                &mut core,
-                1,
-                ContextInput::Release {
-                    request: operation(61),
-                },
-            );
+            let release = command_step(&mut core, 1, 10002, operation(61), ContextCommand::Release);
             assert_eq!(core.state(), QueryContextState::Releasing);
             assert!(
                 release
@@ -182,12 +194,12 @@ fn a_quiesce_won_withdrawal_keeps_normal_closure_after_the_lease_deadline_unless
     }
 
     let mut upgraded = core();
-    step(
+    command_step(
         &mut upgraded,
         1,
-        ContextInput::Quiesce {
-            request: operation(62),
-        },
+        10003,
+        operation(62),
+        ContextCommand::Quiesce,
     );
     step(&mut upgraded, 30, ContextInput::Tick);
     assert_eq!(upgraded.state(), QueryContextState::Aborting);

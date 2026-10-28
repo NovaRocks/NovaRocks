@@ -310,6 +310,7 @@ impl Drop for InputAuthor {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_worker_protocol::context::ContextCommand;
     mod generic_negative;
     mod terminal_observation;
     use super::*;
@@ -695,11 +696,10 @@ mod tests {
         let mut runtime = RuntimeFixture::new();
         let task = task(runtime.identity, 1);
         let created = runtime.run(
-            ContextInput::Create {
-                request: operation(1),
+            ContextInput::Request(ContextCommand::Create {
                 task,
                 payload: PayloadId(1),
-            },
+            }),
             Some(operation(1)),
         );
         let parent = created

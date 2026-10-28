@@ -38,6 +38,7 @@ use novarocks_execution_contract::{
     AbortCause, CancelReason, OperationOutcome, TaskConclusion, TaskConclusionProposal,
     TerminationDetail,
 };
+use novarocks_worker_protocol::context::ContextCommand;
 use novarocks_worker_protocol::{
     context::{ContextEffect, RequestResult},
     creation::{CreationCost, PayloadId},
@@ -101,11 +102,10 @@ impl Harness {
         let mut fixture = Fixture::new();
         let task = task(fixture.identity, 1);
         let create = fixture.send(
-            ContextInput::Create {
-                request: operation(1),
+            ContextInput::Request(ContextCommand::Create {
                 task,
                 payload: PayloadId(1),
-            },
+            }),
             Some(operation(1)),
             InputClass::Ordinary,
             2,
@@ -330,11 +330,10 @@ fn control_request_waits_for_its_actual_prefix_and_replies_to_its_event_token() 
         .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
     assert!(handoff.transferred && handoff.discarded.is_none() && handoff.error.is_none());
     sender
-        .send_input(ContextInput::Cancel {
-            request: request.operation,
+        .send_input(ContextInput::Request(ContextCommand::Cancel {
             task: h.task,
             reason: CancelReason::UpstreamNoLongerNeeded,
-        })
+        }))
         .unwrap();
     let delivery = h.inbox.lock().unwrap().deliver_next().unwrap().unwrap();
     assert!(delivery.prefix.is_some());
@@ -387,10 +386,9 @@ fn ordinary_request_uses_its_frozen_deadline_and_actual_event_token() {
     };
     let (_, sender) = h.admit(request, InputClass::Ordinary);
     sender
-        .send_input(ContextInput::GetFinalInfo {
-            request: request.operation,
+        .send_input(ContextInput::Request(ContextCommand::GetFinalInfo {
             task: h.task,
-        })
+        }))
         .unwrap();
     let delivery = h.inbox.lock().unwrap().deliver_next().unwrap().unwrap();
     assert!(delivery.prefix.is_none());
@@ -511,64 +509,30 @@ fn mismatched_request_bodies_return_the_original_input_without_sealing_the_cut()
         let (cut, sender) = h.admit(request, InputClass::Control);
         let actor_before = h.fixture.runtime.snapshot(actor()).unwrap();
         let wrong_task = task(h.fixture.identity, 2);
-        let wrong_operation = operation(65);
         let input = match mismatch {
-            0 => ContextInput::Cancel {
-                request: request.operation,
+            0 => ContextInput::Request(ContextCommand::Cancel {
                 task: wrong_task,
                 reason: CancelReason::UpstreamNoLongerNeeded,
-            },
-            1 => ContextInput::Cancel {
-                request: wrong_operation,
-                task: h.task,
-                reason: CancelReason::UpstreamNoLongerNeeded,
-            },
+            }),
+            1 => ContextInput::Request(ContextCommand::Release),
             2 => ContextInput::Running { task: h.task },
             3 => ContextInput::Tick,
-            4 => ContextInput::Create {
-                request: request.operation,
+            4 => ContextInput::Request(ContextCommand::Create {
                 task: h.task,
                 payload: PayloadId(777),
-            },
+            }),
             _ => unreachable!(),
         };
         let returned = sender.send_input(input).unwrap_err();
         match (mismatch, returned) {
-            (
-                0,
-                ContextInput::Cancel {
-                    request: op,
-                    task: id,
-                    reason,
-                },
-            ) => {
-                assert_eq!(op, request.operation);
+            (0, ContextInput::Request(ContextCommand::Cancel { task: id, reason })) => {
                 assert_eq!(id, wrong_task);
                 assert_eq!(reason, CancelReason::UpstreamNoLongerNeeded);
             }
-            (
-                1,
-                ContextInput::Cancel {
-                    request: op,
-                    task: id,
-                    reason,
-                },
-            ) => {
-                assert_eq!(op, wrong_operation);
-                assert_eq!(id, h.task);
-                assert_eq!(reason, CancelReason::UpstreamNoLongerNeeded);
-            }
+            (1, ContextInput::Request(ContextCommand::Release)) => {}
             (2, ContextInput::Running { task: id }) => assert_eq!(id, h.task),
             (3, ContextInput::Tick) => {}
-            (
-                4,
-                ContextInput::Create {
-                    request: op,
-                    task: id,
-                    payload,
-                },
-            ) => {
-                assert_eq!(op, request.operation);
+            (4, ContextInput::Request(ContextCommand::Create { task: id, payload })) => {
                 assert_eq!(id, h.task);
                 assert_eq!(payload, PayloadId(777));
             }

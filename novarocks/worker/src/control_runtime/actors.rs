@@ -25,12 +25,12 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     effect::{EffectDescriptor, EffectKind},
-    identity::{ActionId, Generation, ScopeId, Tick, WorkId},
+    identity::{ActionId, Generation, InputId, ScopeId, Tick, WorkId},
     mailbox::InputEnvelope,
 };
-use novarocks_execution_contract::{QueryContextState, TaskIdentity, TaskOperationId};
+use novarocks_execution_contract::{QueryContextState, TaskIdentity};
 use novarocks_worker_protocol::{
-    context::{ContextCore, ContextEffect, ContextInput, RequestSettlement},
+    context::{ContextCore, ContextEffect, ContextInput, ContextRequestSettlement},
     creation::RequestContext,
     lease::MonotonicInstant,
 };
@@ -65,7 +65,7 @@ pub(crate) enum WorkerAction {
         /// host I/O effect of their own, so their body adopts it here.
         admitted: Option<novarocks_control_runtime_core::identity::ReservationId>,
     },
-    Reply(RequestSettlement),
+    Reply(ContextRequestSettlement),
     ControlReply(novarocks_worker_protocol::control::ControlRequestSettlement),
     OwnerFailed {
         scope: ScopeId,
@@ -132,16 +132,21 @@ impl Actor for ContextActor {
         )
         .with_parent(self.lifetime_work);
         let result = match request {
-            Some(request) => self.core.handle_request(
-                now,
-                RequestContext {
-                    token: envelope.input,
-                    operation: request.operation,
-                    deadline: request.deadline,
-                },
-                command,
-                &mut admission,
-            ),
+            Some(request) => {
+                let ContextInput::Request(command) = command else {
+                    panic!("an admitted Context request carries its original command");
+                };
+                self.core.handle_request(
+                    now,
+                    RequestContext {
+                        token: envelope.input,
+                        operation: request.operation,
+                        deadline: request.deadline,
+                    },
+                    command,
+                    &mut admission,
+                )
+            }
             None => self.core.handle(now, command, &mut admission),
         }
         .expect("context protocol input preserves its frozen invariants");
@@ -172,7 +177,7 @@ impl Actor for ContextActor {
         }
         let mut next = 0u64;
         let mut publications = BTreeMap::<TaskIdentity, ActionId>::new();
-        let mut reply_bodies = BTreeMap::<TaskOperationId, Vec<ActionId>>::new();
+        let mut reply_bodies = BTreeMap::<InputId, Vec<ActionId>>::new();
         for effect in result.effects {
             let mut dependencies = Vec::new();
             let mut effect_work = work;
@@ -253,12 +258,12 @@ impl Actor for ContextActor {
                 | ContextEffect::Subscribe { request, .. } => Some(*request),
                 _ => None,
             };
-            if let Some(operation) = reply {
+            if let Some(token) = reply {
                 // A reply body or covered read cannot run ahead of the
                 // snapshots this same Core step promised to make visible.
                 // Opaque source disposal is deliberately not a predecessor.
                 dependencies.extend(publications.values().copied());
-                reply_bodies.entry(operation).or_default().push(id);
+                reply_bodies.entry(token).or_default().push(id);
             }
             step.effect(
                 EffectDescriptor {
@@ -274,7 +279,7 @@ impl Actor for ContextActor {
         for reply in result.requests {
             next += 1;
             let dependencies = reply_bodies
-                .get(&reply.request.operation)
+                .get(&reply.request.token)
                 .cloned()
                 .unwrap_or_default();
             step.effect(

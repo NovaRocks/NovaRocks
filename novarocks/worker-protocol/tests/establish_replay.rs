@@ -28,8 +28,8 @@ use novarocks_types::identity::{
 };
 use novarocks_worker_protocol::{
     context::{
-        ContextConfig, ContextCore, ContextEffect, ContextEstablishment, ContextInput,
-        ContextMaterialized, ContextStep, CoreError, EstablishCredentialComparison,
+        ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
+        ContextInput, ContextMaterialized, ContextStep, CoreError, EstablishCredentialComparison,
         EstablishReplayRequest, EstablishReplayResult,
     },
     control::EstablishSemanticFacts,
@@ -92,6 +92,30 @@ fn core() -> ContextCore {
     )
     .unwrap()
 }
+
+fn command_step(
+    core: &mut ContextCore,
+    now: u64,
+    token: u64,
+    operation: TaskOperationId,
+    command: ContextCommand,
+) -> ContextStep {
+    let step = core
+        .handle_request(
+            at(now),
+            RequestContext {
+                token: InputId::new(token).unwrap(),
+                operation,
+                deadline: at(10_000),
+            },
+            command,
+            &mut NoAdmission,
+        )
+        .unwrap();
+    assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+    step
+}
+
 struct NoAdmission;
 impl AdmissionPort for NoAdmission {
     fn try_reserve(&mut self, _: AdmissionNeed) -> Result<ReservationId, AdmissionRefusal> {
@@ -183,12 +207,18 @@ fn comparison(
         same_material,
     })
 }
-fn update(core: &mut ContextCore, input: ContextDomainInput, now: u64) -> DomainProgression {
-    let initiated = step(
+fn update(
+    core: &mut ContextCore,
+    input: ContextDomainInput,
+    now: u64,
+    token: u64,
+) -> DomainProgression {
+    let initiated = command_step(
         core,
         now,
-        ContextInput::UpdateContext {
-            request: operation(50),
+        token,
+        operation(50),
+        ContextCommand::UpdateContext {
             payload: PayloadId(901),
             update: input,
         },
@@ -202,7 +232,7 @@ fn update(core: &mut ContextCore, input: ContextDomainInput, now: u64) -> Domain
         core,
         now,
         ContextInput::ContextUpdateApplied {
-            request: operation(50),
+            request: InputId::new(token).unwrap(),
             result: Ok(()),
         },
     );
@@ -224,7 +254,7 @@ fn materialization_installs_the_initial_domains_only_after_real_success() {
         EstablishReplayResult::CompareCredential { expected: initial }
     );
     let facts = original().semantics;
-    for input in [
+    for (token, input) in [
         ContextDomainInput::Catalog {
             version: DomainVersion::FIRST,
             fingerprint: facts.catalog,
@@ -233,8 +263,14 @@ fn materialization_installs_the_initial_domains_only_after_real_success() {
             version: DomainVersion::FIRST,
             fingerprint: facts.shared_filter,
         },
-    ] {
-        assert_eq!(update(&mut core, input, 1), DomainProgression::Idempotent);
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            update(&mut core, input, 1, 20_000 + token as u64),
+            DomainProgression::Idempotent
+        );
     }
     // This explicit symbolic fact says the canonical owner compared the
     // candidate material against precisely resource 700 at epoch FIRST.
@@ -322,6 +358,7 @@ fn credential_rotation_requires_a_current_comparison_and_repeated_materializatio
                 same_material: false,
             }),
             1,
+            30_000,
         ),
         DomainProgression::Apply
     );
@@ -379,13 +416,7 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
     mismatched.semantics.catalog = ContentFingerprint::from_bytes([99; 16]);
     for started in [false, true] {
         let mut core = if started { active(700) } else { core() };
-        step(
-            &mut core,
-            1,
-            ContextInput::Quiesce {
-                request: operation(60),
-            },
-        );
+        command_step(&mut core, 1, 10002, operation(60), ContextCommand::Quiesce);
         materialize(&mut core, 999, 1);
         assert_eq!(core.state(), QueryContextState::Quiescing);
         assert_eq!(
@@ -394,11 +425,12 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
         );
     }
     let mut unmaterialized = core();
-    step(
+    command_step(
         &mut unmaterialized,
         1,
-        ContextInput::Abort {
-            request: operation(62),
+        10003,
+        operation(62),
+        ContextCommand::Abort {
             cause: AbortCause::QueryFailed,
         },
     );
@@ -417,21 +449,9 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
     // Normal release reaches Releasing through the actual Quiesce protocol,
     // independently of the Aborting state above.
     let mut core = active(700);
-    step(
-        &mut core,
-        1,
-        ContextInput::Quiesce {
-            request: operation(60),
-        },
-    );
+    command_step(&mut core, 1, 10004, operation(60), ContextCommand::Quiesce);
     step(&mut core, 1, ContextInput::ContinueQuiesce);
-    step(
-        &mut core,
-        1,
-        ContextInput::Release {
-            request: operation(61),
-        },
-    );
+    command_step(&mut core, 1, 10005, operation(61), ContextCommand::Release);
     assert_eq!(core.state(), QueryContextState::Releasing);
     assert_eq!(
         probe(&mut core, 1, mismatched, None),

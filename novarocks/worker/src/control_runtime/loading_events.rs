@@ -606,7 +606,7 @@ mod tests {
     use crate::task_proposal_ingress::RetiredCut;
     use novarocks_control_runtime::driver::{DriverError, InputPhase};
     use novarocks_control_runtime_core::{
-        identity::{ActorId, Tick},
+        identity::{ActorId, InputId, Tick},
         mailbox::InputClass,
     };
     use novarocks_execution_contract::{
@@ -614,6 +614,7 @@ mod tests {
         TaskDescriptor,
     };
     use novarocks_types::UniqueId;
+    use novarocks_worker_protocol::context::ContextCommand;
     use novarocks_worker_protocol::{context::ContextEffect, creation::PayloadId};
     use std::{any::Any, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
@@ -692,6 +693,9 @@ mod tests {
     }
     fn world(f: &mut Fixture, command: ContextInput) -> Vec<WorkerAction> {
         let input = f.send(command, None, InputClass::Lifecycle, 2);
+        committed_world_input(f, input)
+    }
+    fn committed_world_input(f: &mut Fixture, input: InputId) -> Vec<WorkerAction> {
         f.runtime.poll_one(Tick(2)).unwrap();
         assert_eq!(
             f.runtime
@@ -787,13 +791,15 @@ mod tests {
         f.finish();
     }
     fn cancel_from_core(f: &mut Fixture, host: &TaskHostRecord) {
-        let outputs = world(
-            f,
-            ContextInput::Abort {
-                request: operation(7),
+        let input = f.send(
+            ContextInput::Request(ContextCommand::Abort {
                 cause: AbortCause::LeaseExpired,
-            },
+            }),
+            Some(operation(7)),
+            InputClass::Control,
+            2,
         );
+        let outputs = committed_world_input(f, input);
         assert!(outputs.iter().any(|effect| matches!(
             effect,
             WorkerAction::Context(ContextEffect::ContinueClose { .. })

@@ -171,6 +171,7 @@ impl TaskLifetime {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_worker_protocol::context::ContextCommand;
     mod reporter;
     use super::super::actors::{WorkerAction, WorkerActor};
     use super::super::task_publication::commit_task_projection;
@@ -365,11 +366,10 @@ mod tests {
                     None,
                 ),
                 (
-                    ContextInput::Create {
-                        request: operation(1),
+                    ContextInput::Request(ContextCommand::Create {
                         task,
                         payload: PayloadId(1),
-                    },
+                    }),
                     Some(operation(1)),
                 ),
                 (

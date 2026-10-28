@@ -18,7 +18,7 @@
 //! Pure protocol sequences supply explicit model facts. They do not prove
 //! physical host/capture exit, native transfer, or real failure-owner cleanup.
 
-use novarocks_control_runtime_core::identity::{Generation, ReservationId};
+use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
 use novarocks_execution_contract::{
     AbortCause, AdmissionTicketId, CancelReason, ContentFingerprint, CredentialEpoch,
     CredentialLeaseId, FinalTaskInfo, LeaseValidFor, OperatorStatistics, QueryContextRef,
@@ -31,12 +31,14 @@ use novarocks_types::identity::{
 };
 use novarocks_worker_protocol::{
     context::{
-        ContextConfig, ContextCore, ContextEffect, ContextEstablishment, ContextInput,
-        ContextMaterialized, ContextStep, CoreError, PhysicalFact, TerminalIntent,
+        ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
+        ContextInput, ContextMaterialized, ContextStep, CoreError, PhysicalFact, TerminalIntent,
         TerminalObservation, TerminalStatistics,
     },
     control::EstablishSemanticFacts,
-    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId},
+    creation::{
+        AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestContext,
+    },
     lease::{LeaseBounds, MonotonicInstant},
     proposal_summary::{Proposal, SourceId},
 };
@@ -84,6 +86,7 @@ struct Model {
     core: ContextCore,
     port: Port,
     now: MonotonicInstant,
+    next_request: u64,
 }
 impl Model {
     fn new() -> Self {
@@ -121,17 +124,20 @@ impl Model {
             core,
             port: Port::default(),
             now: at(0),
+            next_request: 1,
         };
         model.apply(ContextInput::MaterializationFinished {
             result: Ok(ContextMaterialized {
                 initial_credential_resource: 101,
             }),
         });
-        model.apply(ContextInput::Create {
-            request: operation(3),
-            task: task(),
-            payload: PayloadId(3),
-        });
+        model.request(
+            operation(3),
+            ContextCommand::Create {
+                task: task(),
+                payload: PayloadId(3),
+            },
+        );
         let mut loaded = model.apply(ContextInput::Loaded {
             task: task(),
             result: Ok(CreationCost {
@@ -152,6 +158,25 @@ impl Model {
         model.apply(ContextInput::Installed { task: task() });
         model.apply(ContextInput::Running { task: task() });
         model
+    }
+    fn request(&mut self, operation: TaskOperationId, command: ContextCommand) -> ContextStep {
+        let token = InputId::new(self.next_request).unwrap();
+        self.next_request += 1;
+        let step = self
+            .core
+            .handle_request(
+                self.now,
+                RequestContext {
+                    token,
+                    operation,
+                    deadline: at(10_000),
+                },
+                command,
+                &mut self.port,
+            )
+            .unwrap();
+        assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+        step
     }
     fn apply(&mut self, input: ContextInput) -> ContextStep {
         let label = format!("{input:?}");
@@ -174,10 +199,10 @@ impl Model {
         self.apply(ContextInput::Physical { task: task(), fact })
     }
     fn final_info(&mut self, request: u8) -> Arc<FinalTaskInfo> {
-        self.apply(ContextInput::GetFinalInfo {
-            request: operation(request),
-            task: task(),
-        })
+        self.request(
+            operation(request),
+            ContextCommand::GetFinalInfo { task: task() },
+        )
         .effects
         .into_iter()
         .find_map(|effect| match effect {
@@ -499,10 +524,12 @@ fn lease_expiry_and_two_failure_candidates_remain_inside_the_actual_step_budget(
 #[test]
 fn the_last_retirement_requests_host_release_without_inventing_exit_in_the_group() {
     let mut model = Model::new();
-    let close = model.apply(ContextInput::Abort {
-        request: operation(30),
-        cause: AbortCause::PeerTaskFailed,
-    });
+    let close = model.request(
+        operation(30),
+        ContextCommand::Abort {
+            cause: AbortCause::PeerTaskFailed,
+        },
+    );
     assert!(
         !close
             .effects

@@ -202,6 +202,7 @@ mod tests {
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+    use novarocks_worker_protocol::context::ContextCommand;
     use novarocks_worker_protocol::{
         context::{ContextConfig, ContextCore, ContextInput},
         creation::{CreationCost, PayloadId},
@@ -355,11 +356,10 @@ mod tests {
                     None,
                 ),
                 (
-                    ContextInput::Create {
-                        request: operation(1),
+                    ContextInput::Request(ContextCommand::Create {
                         task,
                         payload: PayloadId(1),
-                    },
+                    }),
                     Some(operation(1)),
                 ),
                 (
@@ -686,11 +686,10 @@ mod tests {
         let mut f = Fixture::new();
         let task = f.port().identity();
         let canceled = f.send(
-            ContextInput::Cancel {
-                request: operation(2),
+            ContextInput::Request(ContextCommand::Cancel {
                 task,
                 reason: CancelReason::UpstreamNoLongerNeeded,
-            },
+            }),
             Some(operation(2)),
         );
         f.drain();

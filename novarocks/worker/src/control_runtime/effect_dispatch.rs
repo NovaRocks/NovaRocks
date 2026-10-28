@@ -199,6 +199,12 @@ impl EffectDispatch {
             WorkerAction::Context(ContextEffect::StopTask { task, .. }) => {
                 Some((LaneKey::Task(*task), Release::Started))
             }
+            // A later RPC reply observes the same Task publication order.
+            // Starting its original delivery releases only this ordering
+            // position; the actual reply body and wire holder exit separately.
+            WorkerAction::Reply(reply) => reply
+                .task
+                .map(|task| (LaneKey::Task(task), Release::Started)),
             WorkerAction::Control {
                 effect: ControlEffect::Route { context, .. },
                 ..
