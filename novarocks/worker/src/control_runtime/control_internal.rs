@@ -24,7 +24,10 @@ use super::{
 };
 use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
-    driver::{ActorRuntime, DriverError, EffectTicket, InputPermit, InputRole, TimerSourceState},
+    driver::{
+        ActorRegistration, ActorRuntime, DriverError, EffectTicket, InputPermit, InputRole,
+        TimerSourceState,
+    },
     lease::{CapacityBundle, WorkLease},
     transaction::RuntimeError,
 };
@@ -91,6 +94,7 @@ pub(crate) enum InternalAdvance {
 #[must_use = "Drain the internal source before sealing its actor"]
 pub(crate) struct ControlInternal {
     runtime: ActorRuntime<WorkerActor>,
+    registration: ActorRegistration,
     actor: ActorId,
     work: WorkLease,
     capacity: CapacityBundle,
@@ -165,6 +169,7 @@ impl ControlInternal {
         }
         Ok(Self {
             runtime: root.runtime().clone(),
+            registration: root.registration().clone(),
             actor: root.actor(),
             work: partial.work,
             capacity: partial.capacity,
@@ -201,7 +206,9 @@ impl ControlInternal {
             return Err(ControlInternalError::WrongEffect);
         }
         self.pending = true;
-        self.runtime.notify_pollers();
+        self.runtime
+            .notify_host_actor(&self.registration)
+            .map_err(ControlInternalError::Driver)?;
         Ok(())
     }
 

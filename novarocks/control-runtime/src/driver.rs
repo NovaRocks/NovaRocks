@@ -125,6 +125,14 @@ impl ActorRegistration {
     pub fn scope_id(&self) -> ScopeId {
         self.scope.id()
     }
+    /// Equal public numbers do not identify the same registration. This is a
+    /// read-only origin comparison and grants no scheduling or Work authority.
+    pub fn same_registration(&self, other: &Self) -> bool {
+        self.actor == other.actor
+            && self.attachment == other.attachment
+            && self.scope.same_scope(&other.scope)
+            && Arc::ptr_eq(&self.origin, &other.origin)
+    }
     /// Original scope identity only; this grants no Work or publication right.
     pub fn matches_scope(&self, scope: &ScopeHandle) -> bool {
         self.scope.same_scope(scope)
@@ -1043,8 +1051,15 @@ impl<A: Actor> ActorRuntime<A> {
         failure_work: &crate::lease::WorkLease,
         failure_policy: ActorFailurePolicy,
     ) -> Result<SlotId, (DriverError, A)> {
-        self.register_supervised_inner(id, scope, actor, config, failure_work, failure_policy)
-            .map(|registration| registration.attachment)
+        self.register_supervised_bound_with_policy(
+            id,
+            scope,
+            actor,
+            config,
+            failure_work,
+            failure_policy,
+        )
+        .map(|registration| registration.attachment)
     }
     /// Return the original registration witness in the same transaction that
     /// installs the actor. No later lookup can bind this owner to a replacement.
@@ -1056,7 +1071,7 @@ impl<A: Actor> ActorRuntime<A> {
         config: ActorConfig,
         failure_work: &crate::lease::WorkLease,
     ) -> Result<ActorRegistration, (DriverError, A)> {
-        self.register_supervised_inner(
+        self.register_supervised_bound_with_policy(
             id,
             scope,
             actor,
@@ -1064,6 +1079,19 @@ impl<A: Actor> ActorRuntime<A> {
             failure_work,
             ActorFailurePolicy::IsolateScope,
         )
+    }
+    /// Return the original witness without changing the supervisor's immutable
+    /// failure policy. Process owners retain ProcessFailStop through this path.
+    pub fn register_supervised_bound_with_policy(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        failure_work: &crate::lease::WorkLease,
+        failure_policy: ActorFailurePolicy,
+    ) -> Result<ActorRegistration, (DriverError, A)> {
+        self.register_supervised_inner(id, scope, actor, config, failure_work, failure_policy)
     }
     fn register_supervised_inner(
         &self,

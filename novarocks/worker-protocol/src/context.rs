@@ -263,6 +263,9 @@ pub enum ContextInput {
     /// Transport-only neutral body. `handle_request` binds its original token;
     /// the lifecycle-only `handle` entry rejects this wrapper.
     Request(ContextCommand),
+    /// The owning frontend process was fenced. The original lifecycle role
+    /// binds the target Context; no RPC token or directory epoch is supplied.
+    OwnerFenced,
     /// The driver has consumed this Task's already-admitted summary/cut
     /// predecessors. Source/capture actual exit is a separate obligation.
     ApplyTaskClose {
@@ -910,6 +913,9 @@ impl ContextCore {
                 capacity,
                 &mut step,
             )?,
+            ContextInput::OwnerFenced => {
+                self.begin_abort(None, AbortCause::QueryFailed, &mut step)?;
+            }
             ContextInput::ApplyTaskClose { task, generation } => {
                 if generation != self.generation {
                     return Err(CoreError::WrongIdentity);

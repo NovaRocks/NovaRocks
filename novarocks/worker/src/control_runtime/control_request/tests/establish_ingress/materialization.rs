@@ -451,10 +451,11 @@ fn dispose_context_metadata(f: &mut Fixture) {
         original_host_turn.release(false).unwrap();
     }
     runtime.close_actor_admission(context_actor()).unwrap();
-    runtime.seal_actor(context_actor()).unwrap();
     let host_address = f.root.service().context(context).unwrap();
     let mut host = host_address.lock().unwrap();
     let resources = host.resources_for_test();
+    assert!(resources.owner_control.close_for_teardown().unwrap());
+    runtime.seal_actor(context_actor()).unwrap();
     let scope = resources.scope.as_ref().unwrap().clone();
     for role in resources.roles.iter_mut().rev() {
         role.work.body_exited().unwrap();
@@ -1254,6 +1255,15 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     let timer = root_handoff(&mut f, ControlInput::Tick, removal_time);
     let removal = f.root.take_control_effect(64).unwrap().unwrap();
     let removal_source_input = timer.input;
+    let idle_owner_source_is_still_live = !f
+        .root
+        .service()
+        .context(context)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retire_owner_control()
+        .unwrap();
     f.root.handoff_context_removal(removal).unwrap();
     // This is the independently paid HostInput used for this test's Tick,
     // not evidence about the production builtin Root timer slot.
@@ -1282,6 +1292,7 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
         .advance_context_host(&holder_notice, pools.handles.as_ref().unwrap())
         .unwrap();
     let callbacks_retired = holder_progress.callbacks_retired;
+    let owner_control_retired_by_original_removal = holder_progress.owner_control_retired;
     let h_callbacks = wait_host_returns(&mut f).expect("H returns on the original cleanup worker");
     let holder_retired = jobs.retire_holder().unwrap();
     let before_child_move = f
@@ -1382,6 +1393,7 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     assert!(source_after_final_handoff);
     assert!(callbacks_retired && holder_retired);
     assert!(holder_waited_for_final_callbacks);
+    assert!(idle_owner_source_is_still_live && owner_control_retired_by_original_removal);
     assert!(!before_holder_publication && !before_child_removal_publication);
     assert!(original_owner_before_holder && original_owner_before_child_removal);
     assert!(removal_source_retired && original_owner_removed_after_exit);

@@ -53,6 +53,7 @@ fn an_original_context_binds_and_withdraws_its_prepaid_io_bank_without_new_charg
         .scope()
         .clone();
     let baseline = scope.snapshot().unwrap();
+    let original_callbacks = fixture.runtime.snapshot(context_actor()).unwrap();
     let paid = bank_charges(&fixture);
     fixture
         .service
@@ -111,14 +112,17 @@ fn an_original_context_binds_and_withdraws_its_prepaid_io_bank_without_new_charg
 
     assert_eq!(admitted.work, baseline.work + CONTEXT_IO_ROLES);
     assert_eq!(admitted.storage, baseline.storage + CONTEXT_IO_ROLES);
-    assert_eq!(callbacks.roles, CONTEXT_IO_CALLBACKS);
+    assert_eq!(
+        callbacks.roles,
+        original_callbacks.roles + CONTEXT_IO_CALLBACKS
+    );
     assert_eq!(callbacks.inputs, 0);
     assert!(unchanged_charge_on_admit);
     assert!(duplicate_refused);
     assert!(duplicate_unchanged);
     assert_eq!(withdrawn.work, admitted.work);
     assert_eq!(withdrawn.storage, baseline.storage);
-    assert_eq!(callbacks_after_withdrawal.roles, 0);
+    assert_eq!(callbacks_after_withdrawal.roles, original_callbacks.roles);
     assert_eq!(callbacks_after_withdrawal.inputs, 0);
     assert!(withdrawn_bank_cannot_rebind);
     assert!(withdrawal_retry_unchanged);
@@ -145,6 +149,20 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
         .runtime
         .close_actor_admission(context_actor())
         .unwrap();
+    // This stopped component driver withdraws its one original unused parent
+    // source before sealing; an empty input queue alone cannot revoke it.
+    assert!(
+        fixture
+            .service
+            .context(fixture.identity)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .resources
+            .owner_control
+            .close_for_teardown()
+            .unwrap()
+    );
     fixture.runtime.seal_actor(context_actor()).unwrap();
     let callback_refused = matches!(
         fixture
@@ -232,6 +250,7 @@ fn an_actual_holder_cleanup_retires_with_only_its_host_observer_and_no_core_call
         .scope()
         .clone();
     let baseline = scope.snapshot().unwrap();
+    let original_callbacks = fixture.runtime.snapshot(context_actor()).unwrap();
     let paid = bank_charges(&fixture);
     fixture
         .service
@@ -322,7 +341,7 @@ fn an_actual_holder_cleanup_retires_with_only_its_host_observer_and_no_core_call
     assert_eq!(reaped, CONTEXT_IO_ROLES);
     assert_eq!(restored.work, baseline.work);
     assert_eq!(restored.storage, baseline.storage);
-    assert_eq!(callbacks.roles, 0);
+    assert_eq!(callbacks.roles, original_callbacks.roles);
     assert_eq!(callbacks.inputs, 0);
     assert!(bank_still_paid);
 }

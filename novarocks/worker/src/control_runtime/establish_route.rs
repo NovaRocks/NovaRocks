@@ -27,7 +27,10 @@ use super::{
 use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError, EffectTicket, InputPermit, InputRole, InputRoleId},
+    driver::{
+        ActorRegistration, ActorRuntime, DriverError, EffectTicket, InputPermit, InputRole,
+        InputRoleId,
+    },
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
     lease::{CapacityBundle, WorkLease, WorkRetirementObserver},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
@@ -154,6 +157,7 @@ pub(crate) struct EstablishRouteCustody {
     root_work: WorkId,
     context: QueryContextRef,
     actor: ActorId,
+    registration: ActorRegistration,
     request: EstablishReplayRequest,
     notice: ControlRequestNotice,
     context_leg: Mutex<ContextLeg>,
@@ -167,12 +171,20 @@ impl EstablishRouteCustody {
         root: ActorId,
         root_work: WorkId,
         context: QueryContextRef,
-        actor: ActorId,
+        registration: ActorRegistration,
         scope: ScopeHandle,
         request: EstablishReplayRequest,
         escrow: CapacityBundle,
         notice: ControlRequestNotice,
     ) -> Arc<Self> {
+        assert!(
+            registration.matches_scope(&scope),
+            "original route Context scope"
+        );
+        runtime
+            .validate_registration(&registration)
+            .expect("original route Context registration");
+        let actor = registration.actor();
         Arc::new(Self {
             runtime,
             ledger,
@@ -180,6 +192,7 @@ impl EstablishRouteCustody {
             root_work,
             context,
             actor,
+            registration,
             request,
             notice,
             context_leg: Mutex::new(ContextLeg {
@@ -443,7 +456,10 @@ impl EstablishRouteCustody {
             .lock()
             .expect("original Context route")
             .cancelled = true;
-        self.runtime.notify_pollers();
+        match self.runtime.notify_host_actor(&self.registration) {
+            Ok(()) | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {}
+            Err(_) => std::process::abort(),
+        }
     }
     fn retire_context_input(&self, leg: &mut ContextLeg) -> Result<bool, EstablishRouteError> {
         if let Some(input) = &leg.input

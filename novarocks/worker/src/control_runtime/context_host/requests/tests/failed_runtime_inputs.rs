@@ -31,14 +31,6 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
  {
     let f = original_context(1, StorageNeed::default());
     let ready = ready(&f, 1);
-    let scope = f
-        .service
-        .context(f.identity)
-        .unwrap()
-        .lock()
-        .unwrap()
-        .scope()
-        .id();
     let fault_work = f
         .service
         .context(f.identity)
@@ -148,10 +140,10 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
     // real inventory; an empty ready queue proves only that this wake was used.
     let mut old_notices = 0;
     for _ in 0..4 {
-        let Some((actual_scope, actual_work)) = ready.next_context_ready() else {
+        let Some(actual_work) = ready.next_context_ready(&ready_owner(&f)) else {
             break;
         };
-        assert_eq!((actual_scope, actual_work), (scope, work));
+        assert_eq!(actual_work, work);
         assert!(
             !f.service
                 .context(f.identity)
@@ -164,7 +156,7 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
         old_notices += 1;
     }
     assert!(old_notices > 0);
-    assert!(ready.next_context_ready().is_none());
+    assert!(ready.next_context_ready(&ready_owner(&f)).is_none());
     assert!(
         f.runtime
             .input_custody(context_actor(), request.token)
@@ -188,7 +180,7 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
             .unwrap()
             .is_some_and(|input| input.phase == InputPhase::Filled)
     );
-    assert!(ready.next_context_ready().is_none());
+    assert!(ready.next_context_ready(&ready_owner(&f)).is_none());
 
     let mut took_original = false;
     for _ in 0..8 {
@@ -215,9 +207,9 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
     assert!(took_original);
     assert_eq!(f.ledger.used(Dimension::Requests.id()), 1);
     let awakened = ready
-        .next_context_ready()
+        .next_context_ready(&ready_owner(&f))
         .expect("taking this exact queued R input must notify its original address again");
-    assert_eq!(awakened, (scope, work));
+    assert_eq!(awakened, work);
     assert!(
         !f.service
             .context(f.identity)
@@ -234,15 +226,15 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
     let mut retired = false;
     for _ in 0..8 {
         let original = ready
-            .next_context_ready()
+            .next_context_ready(&ready_owner(&f))
             .expect("the actual external delivery end wakes the same original R");
-        assert_eq!(original, (scope, work));
+        assert_eq!(original, work);
         if f.service
             .context(f.identity)
             .unwrap()
             .lock()
             .unwrap()
-            .advance_request(original.1)
+            .advance_request(original)
             .unwrap()
         {
             retired = true;
@@ -283,6 +275,6 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
         .unwrap();
     assert!(final_observation.empty);
     assert_eq!((final_observation.units, final_observation.taken), (0, 0));
-    assert!(ready.next_context_ready().is_none());
+    assert!(ready.next_context_ready(&ready_owner(&f)).is_none());
     finish(f);
 }

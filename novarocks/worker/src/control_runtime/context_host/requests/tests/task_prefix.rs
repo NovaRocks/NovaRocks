@@ -149,19 +149,9 @@ fn task_rpc_consumes_its_actual_proposal_prefix_before_its_control_event() {
 
     let mut retired = false;
     for _ in 0..8 {
-        let (scope, actual_work) = ready
-            .next_context_ready()
+        let actual_work = ready
+            .next_context_ready(&ready_owner(&f))
             .expect("the same original Task request remains ready to retire");
-        assert_eq!(
-            scope,
-            f.service
-                .context(f.identity)
-                .unwrap()
-                .lock()
-                .unwrap()
-                .scope()
-                .id()
-        );
         assert_eq!(actual_work, work);
         if f.service
             .context(f.identity)

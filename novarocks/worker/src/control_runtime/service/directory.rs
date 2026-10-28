@@ -17,10 +17,12 @@
 
 //! The shared directory stores addresses; each original Context owns its own lock.
 
-use super::{ContextHostRecord, WorkerActor};
-use novarocks_control_runtime::driver::{ActorHostTurn, ActorRegistration};
+use super::{ContextHostError, ContextHostRecord, WorkerAction, WorkerActor};
+use crate::control_runtime::context_host::OwnerFenceDelivery;
+use novarocks_control_runtime::driver::{ActorHostTurn, ActorRegistration, EffectTicket};
 use novarocks_control_runtime_core::identity::ActorId;
 use novarocks_execution_contract::QueryContextRef;
+use novarocks_worker_protocol::control::ControlEffect;
 use std::{
     collections::BTreeMap,
     ops::{Deref, DerefMut},
@@ -95,6 +97,26 @@ impl ContextDirectory {
     }
     pub(crate) fn context(&self, context: QueryContextRef) -> Option<ContextHostAddress> {
         self.state().contexts.get(&context).cloned()
+    }
+    /// The Root dispatcher can release its own inventory lock before this
+    /// target handoff. The caller retains its original effect ticket, and a
+    /// missing target is a refusal rather than a fabricated fence receipt.
+    pub(crate) fn handoff_owner_fence(
+        &self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<OwnerFenceDelivery, ContextHostError> {
+        let WorkerAction::Control {
+            effect: ControlEffect::AbortContext { context, .. },
+            ..
+        } = &ticket.effect
+        else {
+            return Err(ContextHostError::WrongEffect);
+        };
+        let address = self
+            .context(*context)
+            .ok_or(ContextHostError::WrongContext)?;
+        let mut host = address.lock().ok_or(ContextHostError::WrongContext)?;
+        host.handoff_owner_fence(ticket)
     }
     pub(crate) fn host_turn(
         &self,

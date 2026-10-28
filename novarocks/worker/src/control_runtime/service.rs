@@ -24,6 +24,9 @@
 mod directory;
 pub(crate) use directory::{ContextDirectory, ContextHostAddress};
 
+#[cfg(test)]
+use super::context_ready::ContextReadyError;
+
 use super::{
     actors::{WorkerAction, WorkerActor},
     context_executors::{
@@ -35,7 +38,7 @@ use super::{
         ContextHostRecord, ContextHostRefusal,
     },
     context_host_jobs::ContextHostJobError,
-    context_ready::{ContextReady, ContextReadyError, ContextReadyNotice},
+    context_ready::ContextReadyNotice,
     host_executor::HostExecutorHandle,
     loading::TaskCreatePayload,
     loading_events::{LoadingEventOutcome, LoadingJobReturned},
@@ -93,7 +96,6 @@ pub(crate) struct WorkerService {
     directory: ContextDirectory,
     max_contexts: NonZeroUsize,
     request_positions: usize,
-    context_ready: ContextReady,
     context_executors_started: bool,
 }
 impl WorkerService {
@@ -120,7 +122,6 @@ impl WorkerService {
         request_positions: usize,
     ) -> Self {
         Self {
-            context_ready: ContextReady::new(runtime.clone(), max_contexts),
             context_executors_started: false,
             runtime,
             ledger,
@@ -193,7 +194,7 @@ impl WorkerService {
             self.request_positions,
         )
         .map_err(ServiceHostError::Context)?;
-        if let Err(error) = host.register_ready(&self.context_ready) {
+        if let Err(error) = host.register_ready() {
             let (resources, tasks) = host.into_resources();
             assert!(tasks.is_empty(), "a bootstrap has not captured Task work");
             return Err(ServiceHostError::Context(ContextHostRefusal {
@@ -248,8 +249,38 @@ impl WorkerService {
     pub(crate) fn context(&self, context: QueryContextRef) -> Option<ContextHostAddress> {
         self.directory.context(context)
     }
+    /// Manual component fixtures consume the real Common ready marks. Root
+    /// turns are driven explicitly by those fixtures; this is not a production
+    /// dispatcher or evidence of a host claim held across a later callback.
+    #[cfg(test)]
     pub(crate) fn next_host_ready(&self) -> Result<Option<ContextReadyNotice>, ContextReadyError> {
-        self.context_ready.next_ready()
+        let mut other_turns = Vec::new();
+        let result = loop {
+            let Some(turn) = self.runtime.claim_host_actor() else {
+                break Ok(None);
+            };
+            let Some(address) = self.directory.host_turn(&turn) else {
+                other_turns.push(turn);
+                continue;
+            };
+            let notice = address
+                .lock()
+                .ok_or(ContextReadyError::Driver(DriverError::UnknownActor))?
+                .ready_notice()
+                .clone();
+            turn.release(false).map_err(|(error, original)| {
+                drop(original);
+                ContextReadyError::Driver(error)
+            })?;
+            break Ok(Some(notice));
+        };
+        for turn in other_turns {
+            turn.release(false).map_err(|(error, original)| {
+                drop(original);
+                ContextReadyError::Driver(error)
+            })?;
+        }
+        result
     }
     pub(crate) fn ready_context(&self, notice: &ContextReadyNotice) -> Option<ContextHostAddress> {
         let address = self.context(notice.context())?;

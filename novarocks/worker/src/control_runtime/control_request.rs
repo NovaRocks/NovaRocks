@@ -440,7 +440,10 @@ impl ControlRequestCustody {
                 });
             }
         };
-        let slot = match root.request_ready().register_control(request.token) {
+        let slot = match root
+            .request_ready()
+            .register_control(request.token, root.registration())
+        {
             Ok(slot) => slot,
             Err(error) => {
                 let (work, capacity, report) = reported.into_parts();
@@ -826,7 +829,7 @@ impl ControlRequestCustody {
             self.actor,
             self.work,
             seed.context,
-            host.actor(),
+            host.registration().clone(),
             host.scope().clone(),
             seed.request,
             escrow,

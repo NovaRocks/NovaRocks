@@ -54,6 +54,15 @@ fn original_context(requests: usize, extra: StorageNeed) -> Harness {
     f.complete_materialize_handoff(materialize);
     f
 }
+fn ready_owner(f: &Harness) -> novarocks_control_runtime::driver::ActorRegistration {
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .registration()
+        .clone()
+}
 fn ready(f: &Harness, count: usize) -> ControlRequestReady {
     ControlRequestReady::new(NonZeroUsize::new(count).unwrap(), f.runtime.clone())
 }
@@ -1377,19 +1386,9 @@ fn actual_task_r_repeats_at_r_one_and_retains_the_original_delivery_and_real_del
         // retry emitted when a bounded reaper first visits another sibling.
         let mut retired = false;
         for _ in 0..8 {
-            let (scope, actual) = ready
-                .next_context_ready()
+            let actual = ready
+                .next_context_ready(&ready_owner(&f))
                 .expect("same original R must remain ready");
-            assert_eq!(
-                scope,
-                f.service
-                    .context(f.identity)
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .scope()
-                    .id()
-            );
             assert_eq!(actual, work);
             if f.service
                 .context(f.identity)
@@ -1608,20 +1607,10 @@ fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_pr
     drop((handle, delivered));
     let mut retired = false;
     for _ in 0..8 {
-        let (scope, actual) = ready
-            .next_context_ready()
+        let actual = ready
+            .next_context_ready(&ready_owner(&f))
             .expect("actual R ready or bounded-reaper retry");
         assert_eq!(actual, work);
-        assert_eq!(
-            scope,
-            f.service
-                .context(f.identity)
-                .unwrap()
-                .lock()
-                .unwrap()
-                .scope()
-                .id()
-        );
         if f.service
             .context(f.identity)
             .unwrap()

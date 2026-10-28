@@ -46,7 +46,10 @@ use super::{
 use crate::{control_admission::AdmissionStorage, control_runtime_policy::StorageNeed};
 use novarocks_control_runtime::{
     actor::{ActorConfig, ActorFailurePolicy},
-    driver::{ActorRuntime, DriverError, EffectCompletionRefusal, EffectTicket, InputRoleId},
+    driver::{
+        ActorRegistration, ActorRuntime, DriverError, EffectCompletionRefusal, EffectTicket,
+        InputRoleId,
+    },
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -202,6 +205,7 @@ impl std::fmt::Debug for ProcessBootstrapRefusal {
 #[must_use = "The actual process owner must drain before its resources can retire"]
 pub(crate) struct ProcessControlOwner {
     actor: ActorId,
+    registration: ActorRegistration,
     service: WorkerService,
     resources: ProcessControlResources,
     source_executors_started: bool,
@@ -279,7 +283,7 @@ impl ProcessControlOwner {
             next_route_order: 0,
             return_routes: BTreeMap::new(),
         };
-        let admitted = (|| -> Result<(), ProcessBootstrapError> {
+        let admitted = (|| -> Result<ActorRegistration, ProcessBootstrapError> {
             let root = scope
                 .reserve_next(
                     binding.generation,
@@ -324,8 +328,8 @@ impl ProcessControlOwner {
                 binding.admission_storage,
                 resources.roles[TIMER].work.id(),
             );
-            runtime
-                .register_supervised_next_with_policy(
+            let registration = runtime
+                .register_supervised_bound_with_policy(
                     binding.actor,
                     scope.clone(),
                     WorkerActor::Control(Box::new(actor)),
@@ -335,16 +339,20 @@ impl ProcessControlOwner {
                 )
                 .map_err(|(error, _pure_actor)| ProcessBootstrapError::Driver(error))?;
             resources.registered = true;
-            Ok(())
+            Ok(registration)
         })();
-        if let Err(error) = admitted {
-            return Err(ProcessBootstrapRefusal {
-                error,
-                resources: Some(resources),
-            });
-        }
+        let registration = match admitted {
+            Ok(registration) => registration,
+            Err(error) => {
+                return Err(ProcessBootstrapRefusal {
+                    error,
+                    resources: Some(resources),
+                });
+            }
+        };
         Ok(Self {
             actor: binding.actor,
+            registration,
             service: WorkerService::from_registered_control(RegisteredControl {
                 runtime: runtime.clone(),
                 ledger: ledger.clone(),
@@ -355,6 +363,9 @@ impl ProcessControlOwner {
             resources,
             source_executors_started: false,
         })
+    }
+    pub(crate) fn registration(&self) -> &ActorRegistration {
+        &self.registration
     }
     pub(crate) fn actor(&self) -> ActorId {
         self.actor
@@ -767,7 +778,9 @@ impl ProcessControlOwner {
         self.service.adopt_context(ticket, binding)?;
         if self.resources.route_waiters.contains_key(&context) {
             self.resources.ready_routes.insert(context);
-            self.runtime().notify_pollers();
+            self.runtime()
+                .notify_host_actor(&self.registration)
+                .unwrap_or_else(|_| std::process::abort());
         }
         Ok(())
     }
@@ -793,9 +806,14 @@ impl ProcessControlOwner {
         let mut host = address.as_ref().and_then(|address| address.lock());
         let result = host
             .as_mut()
-            .and_then(|host| host.host_jobs())
             .ok_or(ContextHostJobError::WrongOwner)
-            .and_then(|jobs| jobs.request_holder_disposal(&ticket));
+            .and_then(|host| {
+                host.authorize_owner_control_removal(&ticket)
+                    .map_err(ContextHostJobError::Driver)?;
+                host.host_jobs()
+                    .ok_or(ContextHostJobError::WrongOwner)?
+                    .request_holder_disposal(&ticket)
+            });
         if let Err(error) = result {
             return Err(ControlContextHandoffRefusal::Rejected { error, ticket });
         }

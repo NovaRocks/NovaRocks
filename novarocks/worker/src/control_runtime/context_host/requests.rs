@@ -370,7 +370,7 @@ impl ContextRequestCustody {
             deadline,
         };
         partial.permit = Some(permit);
-        let slot = match ready.register_context(scope.id(), partial.work.id()) {
+        let slot = match ready.register_context(scope, partial.work.id(), host.registration()) {
             Ok(slot) => slot,
             Err(error) => return Err((ContextRequestError::Ready(error), Some(partial))),
         };

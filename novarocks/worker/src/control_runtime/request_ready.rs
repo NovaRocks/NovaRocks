@@ -20,9 +20,12 @@
 
 use super::{actors::WorkerActor, control_request::ControlRequestError};
 use novarocks_control_runtime::{
-    driver::ActorRuntime, notify::Notify, publication::PublishedReply,
+    driver::{ActorRegistration, ActorRuntime, DriverError},
+    notify::Notify,
+    publication::PublishedReply,
+    transaction::ScopeHandle,
 };
-use novarocks_control_runtime_core::identity::{InputId, ScopeId, WorkId};
+use novarocks_control_runtime_core::identity::{ActorId, InputId, WorkId};
 use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
@@ -32,18 +35,20 @@ use std::{
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum Address {
     Control(InputId),
-    // Context Work IDs are local to their actual scope. This compound
-    // address routes a notification and grants no Work or access authority.
-    Context { scope: ScopeId, work: WorkId },
+    // A Context's actual registration owns its scope-local Work addresses.
+    // The registered actor ID selects its FIFO; the stored original witness
+    // qualifies every fill/pop. Neither numeric field grants Work or access.
+    Context { actor: ActorId, work: WorkId },
 }
 struct RegisteredSlot {
     original: Weak<RequestReadySlot>,
+    owner: ActorRegistration,
     queued: Option<u64>,
 }
 struct ReadyState {
     slots: BTreeMap<Address, RegisteredSlot>,
     control_ready: BTreeMap<u64, InputId>,
-    context_ready: BTreeMap<u64, (ScopeId, WorkId)>,
+    context_ready: BTreeMap<ActorId, BTreeMap<u64, WorkId>>,
     next_ready: u64,
 }
 struct ReadyShared {
@@ -86,17 +91,40 @@ impl ControlRequestReady {
     pub(crate) fn register_control(
         &self,
         input: InputId,
+        owner: &ActorRegistration,
     ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
-        self.register(Address::Control(input))
+        self.register(Address::Control(input), owner)
     }
     pub(crate) fn register_context(
         &self,
-        scope: ScopeId,
+        scope: &ScopeHandle,
         work: WorkId,
+        owner: &ActorRegistration,
     ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
-        self.register(Address::Context { scope, work })
+        if !owner.matches_scope(scope) {
+            return Err(ControlRequestError::Driver(
+                DriverError::EffectTicketOriginMismatch,
+            ));
+        }
+        self.register(
+            Address::Context {
+                actor: owner.actor(),
+                work,
+            },
+            owner,
+        )
     }
-    fn register(&self, address: Address) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
+    fn register(
+        &self,
+        address: Address,
+        owner: &ActorRegistration,
+    ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
+        // The real request's admitted Work/input keeps this actor resident.
+        // This validation grants no additional Work or lifecycle position.
+        self.shared
+            .runtime
+            .validate_registration(owner)
+            .map_err(ControlRequestError::Driver)?;
         let mut state = self.shared.state.lock().expect("request ready index");
         if state.slots.contains_key(&address) {
             return Err(ControlRequestError::DuplicateReadySlot);
@@ -112,6 +140,7 @@ impl ControlRequestReady {
             address,
             RegisteredSlot {
                 original: Arc::downgrade(&slot),
+                owner: owner.clone(),
                 queued: None,
             },
         );
@@ -138,8 +167,15 @@ impl ControlRequestReady {
                 Address::Control(_) => {
                     state.control_ready.remove(&ordinal);
                 }
-                Address::Context { .. } => {
-                    state.context_ready.remove(&ordinal);
+                Address::Context { actor, .. } => {
+                    let entries = state
+                        .context_ready
+                        .get_mut(&actor)
+                        .expect("original Context ready FIFO");
+                    entries.remove(&ordinal);
+                    if entries.is_empty() {
+                        state.context_ready.remove(&actor);
+                    }
                 }
             }
         }
@@ -165,22 +201,38 @@ impl ControlRequestReady {
         registered.queued = None;
         Some(input)
     }
-    /// Consume at most one Context scope/Work address in actual ready-enqueue
-    /// order, without visiting or consuming the other domain's queue.
-    pub(crate) fn next_context_ready(&self) -> Option<(ScopeId, WorkId)> {
+    /// Consume only this original Context's next Work address. Actor fairness
+    /// belongs to the Common host queue; one Context cannot steal a sibling's
+    /// pending return or mistake an old registration for its successor.
+    pub(crate) fn next_context_ready(&self, owner: &ActorRegistration) -> Option<WorkId> {
         let mut state = self.shared.state.lock().expect("request ready index");
-        let (ordinal, (scope, work)) = state.context_ready.pop_first()?;
+        let (&ordinal, &work) = state.context_ready.get(&owner.actor())?.first_key_value()?;
+        let address = Address::Context {
+            actor: owner.actor(),
+            work,
+        };
         let registered = state
             .slots
-            .get_mut(&Address::Context { scope, work })
-            .expect("original queued context slot");
+            .get_mut(&address)
+            .expect("original queued Context slot");
+        if !registered.owner.same_registration(owner) {
+            return None;
+        }
         assert_eq!(
             registered.queued,
             Some(ordinal),
             "one original queued ready mark"
         );
         registered.queued = None;
-        Some((scope, work))
+        let entries = state
+            .context_ready
+            .get_mut(&owner.actor())
+            .expect("original Context ready FIFO");
+        entries.remove(&ordinal);
+        if entries.is_empty() {
+            state.context_ready.remove(&owner.actor());
+        }
+        Some(work)
     }
     pub(crate) fn registered(&self) -> usize {
         self.shared
@@ -213,6 +265,7 @@ impl RequestReadySlot {
         if !Weak::ptr_eq(&registered.original, &Arc::downgrade(self)) {
             return;
         }
+        let owner = registered.owner.clone();
         if registered.queued.is_none() {
             // This is only bounded ready ordering, never a business identity,
             // Work author or resource credit. Exhaustion cannot wrap silently.
@@ -230,15 +283,22 @@ impl RequestReadySlot {
                 Address::Control(input) => {
                     state.control_ready.insert(ordinal, input);
                 }
-                Address::Context { scope, work } => {
-                    state.context_ready.insert(ordinal, (scope, work));
+                Address::Context { actor, work } => {
+                    state
+                        .context_ready
+                        .entry(actor)
+                        .or_default()
+                        .insert(ordinal, work);
                 }
             }
         }
         drop(state);
         // No application callback or asynchronous Waker runs under the index.
         shared.changed.notify();
-        shared.runtime.notify_pollers();
+        match shared.runtime.notify_host_actor(&owner) {
+            Ok(()) | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {}
+            Err(_) => std::process::abort(),
+        }
     }
 }
 

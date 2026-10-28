@@ -535,6 +535,7 @@ impl RouteFixture {
         for original_host_turn in other_claims {
             original_host_turn.release(true).unwrap();
         }
+        assert!(resources.owner_control.close_for_teardown().unwrap());
         runtime.seal_actor(context_actor()).unwrap();
         let scope = resources.scope.take().unwrap();
         scope.close_external().unwrap();

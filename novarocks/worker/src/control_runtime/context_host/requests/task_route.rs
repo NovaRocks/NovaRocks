@@ -456,7 +456,7 @@ impl ContextHostRecord {
         let work = funding.author.work.id();
         let work_retirement = funding.author.work.retirement_observer();
         let report = funding.author.report.clone();
-        let slot = match ready.register_context(self.scope().id(), work) {
+        let slot = match ready.register_context(self.scope(), work, self.registration()) {
             Ok(slot) => slot,
             Err(error) => {
                 let partial =

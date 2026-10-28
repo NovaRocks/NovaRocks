@@ -20,7 +20,9 @@
 //! it does not run materialization, publish Active, or infer any host exit.
 
 pub(super) mod failure;
+mod owner_control;
 mod progress;
+pub(crate) use owner_control::OwnerFenceDelivery;
 pub(crate) use progress::{ContextHostProgress, ContextHostProgressError};
 
 use super::{
@@ -34,7 +36,7 @@ use super::{
         ContextIoInventory,
     },
     context_lifecycle::{CONTEXT_LIFECYCLE_STORAGE, ContextLifecycle},
-    context_ready::{ContextReady, ContextReadyError, ContextReadyNotice},
+    context_ready::{ContextReadyError, ContextReadyNotice},
     control_request::ValidatedEstablishRoute,
     effect_dispatch::{EffectDispatch, EffectRef},
     establish_ingress::ValidatedMaterializationSource,
@@ -72,11 +74,18 @@ const FAILURE: usize = 2;
 /// roles and both callbacks before capture; shared-domain U is still separate.
 pub(crate) const CONTEXT_BOOTSTRAP_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
-    inputs: 1 + CONTEXT_IO_STORAGE.inputs + CONTEXT_LIFECYCLE_STORAGE.inputs,
-    batches: 1 + CONTEXT_IO_STORAGE.batches + CONTEXT_LIFECYCLE_STORAGE.batches,
+    inputs: 1
+        + CONTEXT_IO_STORAGE.inputs
+        + CONTEXT_LIFECYCLE_STORAGE.inputs
+        + owner_control::OWNER_CONTROL_STORAGE.inputs,
+    batches: 1
+        + CONTEXT_IO_STORAGE.batches
+        + CONTEXT_LIFECYCLE_STORAGE.batches
+        + owner_control::OWNER_CONTROL_STORAGE.batches,
     effects: ContextCore::MAX_STEP_WORK
         + CONTEXT_IO_STORAGE.effects
-        + CONTEXT_LIFECYCLE_STORAGE.effects,
+        + CONTEXT_LIFECYCLE_STORAGE.effects
+        + owner_control::OWNER_CONTROL_STORAGE.effects,
     cuts: 0,
     replies: 0,
     completions: CONTEXT_IO_STORAGE.completions,
@@ -131,6 +140,7 @@ pub(crate) struct ContextHostResources {
     pub registered: bool,
     registration: Option<ActorRegistration>,
     pub routes: BTreeMap<InputId, Arc<EstablishRouteCustody>>,
+    pub owner_control: owner_control::OwnerControl,
     pub io: Option<ContextIoInventory>,
     pub host_jobs: Option<ContextHostJobs>,
     pending_host_jobs: progress::PendingHostJobs,
@@ -247,11 +257,13 @@ impl ContextHostRecord {
             [InputClass::Control.index()]
         .checked_add(max_routes)
         .and_then(|n| n.checked_add(CONTEXT_IO_CALLBACKS))
+        .and_then(|n| n.checked_add(owner_control::OWNER_CONTROL_STORAGE.inputs))
         .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
         actor_config.max_batches = actor_config
             .max_batches
             .checked_add(max_routes)
             .and_then(|n| n.checked_add(CONTEXT_IO_CALLBACKS))
+            .and_then(|n| n.checked_add(owner_control::OWNER_CONTROL_STORAGE.batches))
             .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
         let task_work = binding
             .policy
@@ -315,6 +327,7 @@ impl ContextHostRecord {
             registered: false,
             registration: None,
             routes: BTreeMap::new(),
+            owner_control: owner_control::OwnerControl::default(),
             io: None,
             host_jobs: None,
             pending_host_jobs: Default::default(),
@@ -384,6 +397,19 @@ impl ContextHostRecord {
                 .map_err(|(error, _pure_actor)| ContextHostError::Driver(error))?;
             resources.registration = Some(registration);
             resources.registered = true;
+            resources
+                .owner_control
+                .admit(
+                    runtime,
+                    resources
+                        .registration
+                        .as_ref()
+                        .expect("original Context registration"),
+                    ticket.actor,
+                    context,
+                    &resources.roles[TIMER].work,
+                )
+                .map_err(ContextHostError::Driver)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -434,15 +460,23 @@ impl ContextHostRecord {
     pub(crate) fn admission(&self) -> ReservationId {
         self.resources.admission.capacity.id()
     }
-    pub(super) fn register_ready(&mut self, index: &ContextReady) -> Result<(), ContextReadyError> {
-        if !index.same_runtime(&self.control_runtime) {
-            return Err(ContextReadyError::WrongRuntime);
-        }
+    pub(super) fn register_ready(&mut self) -> Result<(), ContextReadyError> {
         if self.resources.notice.is_some() {
             return Err(ContextReadyError::Duplicate);
         }
-        self.resources.notice = Some(index.register(self.identity, self.scope().clone())?);
+        self.resources.notice = Some(ContextReadyNotice::for_registered(
+            &self.control_runtime,
+            self.identity,
+            self.scope(),
+            self.registration(),
+        )?);
         Ok(())
+    }
+    pub(super) fn ready_notice(&self) -> &ContextReadyNotice {
+        self.resources
+            .notice
+            .as_ref()
+            .expect("published original Context host notice")
     }
     pub(crate) fn matches_ready(&self, notice: &ContextReadyNotice) -> bool {
         self.resources
@@ -881,6 +915,7 @@ pub(crate) use requests::{
 
 #[cfg(test)]
 mod tests {
+    mod host_wakes;
     mod io_bank;
     mod lifecycle_bank;
     mod owner_cells;
@@ -1461,6 +1496,7 @@ mod tests {
             resources: &mut ContextHostResources,
             actor: ActorId,
         ) {
+            assert!(resources.owner_control.close_for_teardown().unwrap());
             Self::release_drained_effect_claims(runtime);
             if resources.registered {
                 runtime.close_actor_admission(actor).unwrap();

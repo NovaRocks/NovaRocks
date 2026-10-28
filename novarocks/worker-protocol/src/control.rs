@@ -1036,11 +1036,12 @@ impl ControlCore {
                     .insert(context, now.saturating_add(self.config.retention), 0)
                     .map_err(|_| CoreError::IllegalFact)?;
                 self.owners.remove(&context.query_execution_id());
-                if let Some(members) = self
-                    .frontend_members
-                    .get_mut(&context.frontend_process_id())
-                {
+                let frontend = context.frontend_process_id();
+                if let Some(members) = self.frontend_members.get_mut(&frontend) {
                     members.remove(&context);
+                    if members.is_empty() {
+                        self.frontend_members.remove(&frontend);
+                    }
                 }
                 step.effects
                     .push(ControlEffect::RetireReservation(record.reservation));
@@ -1407,3 +1408,7 @@ impl ControlCore {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "control/frontend_members_tests.rs"]
+mod frontend_members_tests;

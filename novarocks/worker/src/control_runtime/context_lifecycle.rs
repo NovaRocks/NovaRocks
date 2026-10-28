@@ -182,8 +182,9 @@ impl ContextLifecycle {
             Ok(_) => return Ok(false),
             Err(error) => return Err(error.into()),
         }
-        // Remove this physical host address before Root can consume the
-        // removal and reuse its logical directory position for another owner.
+        // Validate this notice's actual Scope removal before Root consumes
+        // HostRemoved. Service separately removes the same original directory
+        // cell; a scheduling notice itself never proves that removal.
         notice
             .unregister_removed()
             .map_err(ContextHostJobError::Ready)?;

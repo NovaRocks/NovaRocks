@@ -506,3 +506,242 @@ fn a_foreign_same_number_failure_ticket_cannot_start_the_local_work_and_returns_
     assert!(same_numeric_identity && rejected_origin && returned_original);
     assert!(local_drained && foreign_drained && local_alive && foreign_alive);
 }
+
+#[test]
+fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its_queued_input() {
+    use crate::control_runtime::context_host::owner_control::OwnerFenceDelivery;
+    use novarocks_control_runtime::driver::InputPhase;
+
+    let mut f = original_context(1, StorageNeed::default());
+    let root_fence_input = f
+        .input
+        .fill(WorkerMessage::Control(ControlMessage::Command {
+            work: f.roles[2].work.id(),
+            request: None,
+            command: ControlInput::FenceFrontend {
+                frontend: f.identity.frontend_process_id(),
+            },
+        }))
+        .unwrap();
+    f.runtime.poll_one(Tick(2)).unwrap();
+    let wake_actions = f
+        .runtime
+        .ready_effects(
+            control_actor(),
+            root_fence_input,
+            ControlCore::MAX_STEP_WORK,
+        )
+        .unwrap();
+    assert_eq!(
+        wake_actions.len(),
+        1,
+        "the real fence schedules its own continuation"
+    );
+    let wake = f
+        .runtime
+        .take_effect(control_actor(), root_fence_input, wake_actions[0])
+        .unwrap();
+    assert!(matches!(
+        &wake.effect,
+        WorkerAction::Control {
+            effect: ControlEffect::WakeInternal,
+            ..
+        }
+    ));
+    // Consume this actual neutral wake before reusing the fixture's original
+    // serial Control input role for Core-selected internal work. No new role,
+    // synthetic token, or guessed ContinueFence operation is introduced.
+    f.runtime.effect_completed(wake).unwrap();
+    f.runtime
+        .retire_input(control_actor(), root_fence_input)
+        .unwrap();
+    let root_input = f
+        .input
+        .fill(WorkerMessage::Control(ControlMessage::Command {
+            work: f.roles[2].work.id(),
+            request: None,
+            command: ControlInput::NextInternal,
+        }))
+        .unwrap();
+    f.runtime.poll_one(Tick(3)).unwrap();
+    let actions = f
+        .runtime
+        .ready_effects(control_actor(), root_input, ControlCore::MAX_STEP_WORK)
+        .unwrap();
+    let mut abort = None;
+    let mut route_published = false;
+    for action in actions {
+        let ticket = f
+            .runtime
+            .take_effect(control_actor(), root_input, action)
+            .unwrap();
+        match &ticket.effect {
+            WorkerAction::Control {
+                effect: ControlEffect::Route { context, state, .. },
+                ..
+            } => {
+                assert_eq!(*context, f.identity);
+                assert_eq!(*state, QueryContextState::Aborting);
+                drop(
+                    f.runtime
+                        .commit_snapshot(&ticket, &f.route, Arc::new(*state))
+                        .unwrap(),
+                );
+                f.runtime.effect_completed(ticket).unwrap();
+                route_published = true;
+            }
+            WorkerAction::Control {
+                effect: ControlEffect::AbortContext { context, .. },
+                ..
+            } => {
+                assert_eq!(*context, f.identity);
+                assert!(abort.replace(ticket).is_none());
+            }
+            other => {
+                panic!("unexpected real Root fence effect requires its actual owner: {other:?}")
+            }
+        }
+    }
+    let abort = abort.expect("the real fenced Context has one original AbortContext effect");
+    let directory = f.service.directory();
+    let address = directory.context(f.identity).unwrap();
+    let scope = address.lock().unwrap().scope().clone();
+    let before_scope = scope.snapshot().unwrap();
+    let before_actor = f.runtime.snapshot(context_actor()).unwrap();
+    let before_roles = f.runtime.role_inventory(context_actor(), None, 16).unwrap();
+    let paid = [
+        Dimension::Inputs,
+        Dimension::Batches,
+        Dimension::Effects,
+        Dimension::Work,
+        Dimension::Completions,
+        Dimension::Captures,
+        Dimension::Requests,
+    ]
+    .map(|dimension| f.ledger.used(dimension.id()));
+    let original_parent_role = before_roles
+        .iter()
+        .find(|role| role.source == control_actor() && role.class == InputClass::Control)
+        .expect("bootstrap already admitted the original parent-control role")
+        .role;
+    let unused_is_not_retired = !address.lock().unwrap().retire_owner_control().unwrap();
+    let delivered = directory.handoff_owner_fence(&abort).unwrap();
+    let after_first = f.runtime.snapshot(context_actor()).unwrap();
+    let duplicate = directory.handoff_owner_fence(&abort).unwrap();
+    let after_duplicate = f.runtime.snapshot(context_actor()).unwrap();
+    let input = f
+        .runtime
+        .role_inventory(context_actor(), None, 16)
+        .unwrap()
+        .into_iter()
+        .find(|role| role.role == original_parent_role)
+        .unwrap()
+        .in_flight
+        .expect("the same original parent role holds its one actual input");
+    let original_queued = f
+        .runtime
+        .input_custody(context_actor(), input)
+        .unwrap()
+        .is_some_and(|original| {
+            original.role == Some(original_parent_role)
+                && original.source == control_actor()
+                && original.class == InputClass::Control
+                && original.phase == InputPhase::Filled
+        });
+    let queued_cannot_retire = !address.lock().unwrap().retire_owner_control().unwrap();
+    let one_original_position = after_first.inputs == before_actor.inputs + 1
+        && after_first.roles == before_actor.roles
+        && after_first.batches == before_actor.batches
+        && after_duplicate == after_first;
+    let no_new_work_or_funding = scope.snapshot().unwrap() == before_scope
+        && paid
+            == [
+                Dimension::Inputs,
+                Dimension::Batches,
+                Dimension::Effects,
+                Dimension::Work,
+                Dimension::Completions,
+                Dimension::Captures,
+                Dimension::Requests,
+            ]
+            .map(|dimension| f.ledger.used(dimension.id()));
+    let no_rpc_capture = {
+        let host = address.lock().unwrap();
+        host.resources.requests.is_empty()
+            && host.resources.request_partials.is_empty()
+            && f.ledger.used(Dimension::Requests.id()) == 0
+    };
+
+    // Lifecycle input from another actual source wins class priority over
+    // queued parent Control. The real Core panics on an unknown Task; it has
+    // never run OwnerFenced's unassembled foreign close/stop host actions.
+    let failure = actual_failure(&mut f);
+    let failure_input = failure.input;
+    let parent_still_queued = f
+        .runtime
+        .input_custody(context_actor(), input)
+        .unwrap()
+        .is_some_and(|original| original.phase == InputPhase::Filled);
+    let failed_delivery = directory.handoff_owner_fence(&abort).unwrap();
+    let no_refill_after_failure = f
+        .runtime
+        .input_custody(context_actor(), input)
+        .unwrap()
+        .is_some_and(|original| original.phase == InputPhase::Filled);
+    let original_root_ticket_still_valid = f.runtime.validate_effect_ticket(&abort).is_ok();
+    address
+        .lock()
+        .unwrap()
+        .begin_failure_publications(failure)
+        .unwrap();
+    let (drained, failure_alive) = drain_one_unit_turns(&mut f, failure_input);
+    let still_not_consumed_by_publication = f
+        .runtime
+        .input_custody(context_actor(), input)
+        .unwrap()
+        .is_some_and(|original| original.phase == InputPhase::Filled);
+    let mut abandoned = false;
+    for _ in 0..8 {
+        let progress = address
+            .lock()
+            .unwrap()
+            .advance_failed_runtime_inputs(1)
+            .unwrap();
+        assert!(progress.units <= 1 && progress.taken <= progress.units);
+        if f.runtime
+            .input_custody(context_actor(), input)
+            .unwrap()
+            .is_some_and(|original| original.phase == InputPhase::AbandonedByOwnerFailure)
+        {
+            abandoned = true;
+            break;
+        }
+    }
+    let retired_after_abandon = address.lock().unwrap().retire_owner_control().unwrap();
+    let original_input_removed = f
+        .runtime
+        .input_custody(context_actor(), input)
+        .unwrap()
+        .is_none();
+    let no_parent_role_after_retirement = !f
+        .runtime
+        .role_inventory(context_actor(), None, 16)
+        .unwrap()
+        .iter()
+        .any(|role| role.role == original_parent_role);
+    f.runtime.effect_completed(abort).unwrap();
+    f.runtime.retire_input(control_actor(), root_input).unwrap();
+    // Existing metadata-only teardown finishes the genuine failure session,
+    // then the original Root refusal/retention/removal. It is not Native exit.
+    finish(f);
+
+    assert!(route_published && original_root_ticket_still_valid);
+    assert_eq!(delivered, OwnerFenceDelivery::Delivered);
+    assert_eq!(duplicate, OwnerFenceDelivery::AlreadyDelivered);
+    assert!(unused_is_not_retired && original_queued && queued_cannot_retire);
+    assert!(one_original_position && no_new_work_or_funding && no_rpc_capture);
+    assert_eq!(failed_delivery, OwnerFenceDelivery::FailedOwner);
+    assert!(parent_still_queued && no_refill_after_failure && still_not_consumed_by_publication);
+    assert!(drained && failure_alive && abandoned);
+    assert!(retired_after_abandon && original_input_removed && no_parent_role_after_retirement);
+}

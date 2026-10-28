@@ -54,6 +54,7 @@ pub(crate) struct ContextHostProgress {
     pub submitted: usize,
     pub callbacks_retired: bool,
     pub holder_retired: bool,
+    pub owner_control_retired: bool,
 }
 
 impl ContextHostRecord {
@@ -105,7 +106,7 @@ impl ContextHostRecord {
         }
     }
 
-    /// Called by the serial Service owner after an original ready notice or
+    /// Called by this Context's host owner after an original ready notice or
     /// Context effect completion. No foreign getter, destructor or host call
     /// runs here. A failure retains all original pending jobs in this owner.
     /// This turn does not remove an actor/Scope or assert whole Context exit.
@@ -133,6 +134,11 @@ impl ContextHostRecord {
         }
         progress.callbacks_retired = jobs.retire_callbacks()?;
         progress.holder_retired = jobs.retire_holder()?;
+        progress.owner_control_retired = self
+            .resources
+            .owner_control
+            .close()
+            .map_err(ContextHostJobError::Driver)?;
 
         let stopped = jobs.scope_stopped().map_err(ContextHostJobError::Runtime)?;
         let pending = &mut self.resources.pending_host_jobs;
