@@ -22,6 +22,11 @@
 //! ready guard before the cut guard, so a successful bind or abandoned claim
 //! reaches the live custodian after unlocking; this container never wakes one.
 
+mod storage;
+pub(crate) use storage::{
+    SOURCE_SLOT_STORAGE, SourceSlotAdmission, SourceSlotAdmissionRefusal, SourceSlotStorageError,
+};
+
 use super::source_custody::{SourceCustody, SourcePermit};
 use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
 use novarocks_control_runtime::exit_role::ExitRolePhase;

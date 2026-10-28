@@ -62,6 +62,7 @@ struct State {
     body_report_retired: bool,
     exit_report_retired: bool,
     transferred: bool,
+    task_source_storage_transferred: bool,
     unresolved: bool,
     // One original body and one independent input-disposal boundary. Panic
     // graphs are retained without invoking their destructor a second time.
@@ -148,6 +149,15 @@ impl std::fmt::Display for PreparationAdoptionError {
     }
 }
 impl std::error::Error for PreparationAdoptionError {}
+
+/// Refusal leaves the original preparation inventory and split opportunity intact.
+#[derive(Debug)]
+pub(crate) enum PreparationStorageSplitError {
+    InvalidResources,
+    AlreadyTransferred,
+    Unavailable,
+    Runtime(RuntimeError),
+}
 
 pub(crate) const PREPARATION_CORE_CONSUMER: ConsumerId = ConsumerId::new(1).unwrap();
 pub(crate) const PREPARATION_OBSERVER_CONSUMER: ConsumerId = ConsumerId::new(2).unwrap();
@@ -280,6 +290,7 @@ impl PreparationCustody {
                 body_report_retired: false,
                 exit_report_retired: false,
                 transferred: false,
+                task_source_storage_transferred: false,
                 unresolved: false,
                 panics: [None, None],
             }),
@@ -298,6 +309,41 @@ impl PreparationCustody {
             active: true,
         };
         (owner, job)
+    }
+    /// Transfer already paid Task source storage once. Preparation and inbound
+    /// fees, the actual job/input and independent reports stay with this owner.
+    pub(crate) fn take_task_source_storage(
+        &self,
+        resources: &ResourceVector,
+    ) -> Result<CapacityBundle, PreparationStorageSplitError> {
+        let units = resources.get(Dimension::Work.id());
+        if units == 0
+            || resources.get(Dimension::Completions.id()) != units
+            || resources.get(Dimension::Captures.id()) != units
+            || resources.iter().any(|(dimension, _)| {
+                dimension != Dimension::Work.id()
+                    && dimension != Dimension::Completions.id()
+                    && dimension != Dimension::Captures.id()
+            })
+        {
+            return Err(PreparationStorageSplitError::InvalidResources);
+        }
+        let mut state = self.0.state.lock().expect("preparation custody lock");
+        if state.task_source_storage_transferred {
+            return Err(PreparationStorageSplitError::AlreadyTransferred);
+        }
+        if state.transferred || state.unresolved || state.exit_published {
+            return Err(PreparationStorageSplitError::Unavailable);
+        }
+        let capacity = state
+            .capacity
+            .as_mut()
+            .ok_or(PreparationStorageSplitError::Unavailable)?;
+        let storage = capacity
+            .split_next(resources)
+            .map_err(PreparationStorageSplitError::Runtime)?;
+        state.task_source_storage_transferred = true;
+        Ok(storage)
     }
     fn key(&self) -> Key {
         (self.0.parent.scope.id(), self.0.parent.work)

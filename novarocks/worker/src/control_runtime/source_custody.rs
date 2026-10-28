@@ -26,6 +26,7 @@ use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
     lease::WorkRetirementObserver,
+    reported_work::ReportedWork,
 };
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
@@ -93,13 +94,28 @@ impl SourceCustody {
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
     ) -> (Self, SourcePermit) {
-        let report = admitted.report.clone();
-        let retirement = admitted.work.retirement_observer();
-        let (role, authority) = ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
-            admitted.work,
-            admitted.capacity,
-            admitted.report,
-        ));
+        Self::from_reported(
+            task,
+            super::admitted_role::adopt_reported_work(
+                admitted.work,
+                admitted.capacity,
+                admitted.report,
+            ),
+            pending,
+            health,
+        )
+    }
+    /// Moves an already validated original into custody without revalidating
+    /// its binding or acquiring the shared admission ledger lock.
+    pub(crate) fn from_reported(
+        task: TaskIdentity,
+        reported: ReportedWork,
+        pending: Arc<dyn TaskPendingNotice>,
+        health: Arc<ExecutionHealth>,
+    ) -> (Self, SourcePermit) {
+        let report = reported.report().clone();
+        let retirement = reported.work().retirement_observer();
+        let (role, authority) = ExitRole::from_admitted(reported);
         let shared = Arc::new(Custody {
             task,
             role,
