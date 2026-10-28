@@ -46,11 +46,14 @@ use novarocks_spi::connector::{
     ConnectorPayloadRetentionGuard, ConnectorProviderId, ConnectorRequestContext,
     ConnectorStopOwner, CredentialConsumerRole, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, NodeLocalCredentialReference, SharedDependency,
+    StorageCredentialScopePrefix,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const PAYLOAD: &[u8] = b"NovaRocks real ECS -> OSS known bytes\n\x00\x01\x7f\x80\xfe\xff";
+const MULTIPART_COMPLETE: &str = "multipart-complete.bin";
+const MULTIPART_ABORT: &str = "multipart-abort.bin";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -362,8 +365,179 @@ async fn probe(
     work
 }
 
+// OpenDAL 0.58.1 S3 advertises a 5 MiB multipart minimum. With an
+// explicit exact chunk, WriteGenerator keeps its current chunk buffered and
+// MultipartWriter keeps one previous chunk. Two full writes + close therefore
+// initiate, upload two parts, and complete. A third nonempty write flushes the
+// second chunk into MultipartWriter and awaits initiate + first part before
+// abort. concurrent(1) executes each part inline, with no detached part task.
+// See opendal-core types/context/write.rs and raw/oio/write/multipart_write.rs;
+// opendal-service-s3 writer.rs requires HTTP 204 from abort_part.
+async fn multipart_probe(
+    operator: &opendal::Operator,
+    access: &FsAccessHandle,
+    directory: &str,
+    io: &ProbeIoCell,
+    cancellation: &FileCancellation,
+    work_deadline: Instant,
+    deadline: Instant,
+    abort: bool,
+) -> Result<(), String> {
+    const PART: usize = 5 * 1024 * 1024;
+    let uri = format!(
+        "{directory}{}",
+        if abort {
+            MULTIPART_ABORT
+        } else {
+            MULTIPART_COMPLETE
+        }
+    );
+    let file = access
+        .bind_location(&uri, FileIdentity::new(&uri, (2 * PART) as u64, None))
+        .map_err(|_| "bind the exact multipart probe")?;
+    let key = file.operator_relative_path();
+    let mut writer: Option<opendal::Writer> = None;
+    let mut attempted = false;
+    let mut completed = false;
+    let mut aborted = false;
+    eprintln!("Real ECS/OSS multipart probe URI: {uri}");
+    let work = async {
+        match file.stat(cancellation).await {
+            Err(error) if error.kind() == FileErrorKind::NotFound => {}
+            Err(error) => return Err(format!("multipart preflight failed ({:?})", error.kind())),
+            Ok(_) => return Err("multipart nonce already exists; refusing to write".into()),
+        }
+        let before = io.requests.load(Ordering::Relaxed);
+        writer = Some(
+            operator
+                .writer_with(key)
+                .chunk(PART)
+                .concurrent(1)
+                .await
+                .map_err(|error| format!("create multipart writer failed ({:?})", error.kind()))?,
+        );
+        let writer = writer.as_mut().expect("writer just installed");
+        attempted = true;
+        writer
+            .write(bytes::Bytes::from(vec![0x36; PART]))
+            .await
+            .map_err(|error| format!("write first multipart chunk failed ({:?})", error.kind()))?;
+        writer
+            .write(bytes::Bytes::from(vec![0xa9; PART]))
+            .await
+            .map_err(|error| format!("write second multipart chunk failed ({:?})", error.kind()))?;
+        if abort {
+            writer
+                .write(bytes::Bytes::from_static(b"pending-tail-never-committed"))
+                .await
+                .map_err(|error| format!("trigger multipart part failed ({:?})", error.kind()))?;
+            let uploaded = io.requests.load(Ordering::Relaxed);
+            if uploaded.saturating_sub(before) < 2 {
+                return Err("multipart initiate and first uploaded part were not observed".into());
+            }
+            writer
+                .abort()
+                .await
+                .map_err(|error| format!("real multipart abort failed ({:?})", error.kind()))?;
+            if io.requests.load(Ordering::Relaxed) <= uploaded {
+                return Err("multipart abort performed no HTTP request".into());
+            }
+            aborted = true;
+            match file.stat(cancellation).await {
+                Err(error) if error.kind() == FileErrorKind::NotFound => {}
+                _ => return Err("aborted multipart object was not confirmed absent".into()),
+            }
+            eprintln!(
+                "Real multipart abort confirmed: initiate + uploaded part + abort HTTP; {uri}"
+            );
+        } else {
+            writer
+                .close()
+                .await
+                .map_err(|error| format!("complete multipart write failed ({:?})", error.kind()))?;
+            completed = true;
+            if io.requests.load(Ordering::Relaxed).saturating_sub(before) < 4 {
+                return Err(
+                    "multipart initiate, two uploaded parts and complete were not observed".into(),
+                );
+            }
+            let actual = file
+                .read(FileReadRange::WholeFile, cancellation)
+                .await
+                .map_err(|error| format!("read completed multipart failed ({:?})", error.kind()))?;
+            if actual.len() != 2 * PART
+                || actual[..PART].iter().any(|byte| *byte != 0x36)
+                || actual[PART..].iter().any(|byte| *byte != 0xa9)
+            {
+                return Err(
+                    "completed multipart differs from the independent two-part byte oracle".into(),
+                );
+            }
+            if file
+                .stat(cancellation)
+                .await
+                .map_err(|_| "stat completed multipart")?
+                != (2 * PART) as u64
+            {
+                return Err("completed multipart size differs from its fixed oracle".into());
+            }
+            eprintln!(
+                "Real multipart completion confirmed: two distinct 5 MiB parts, exact byte oracle; {uri}"
+            );
+        }
+        Ok::<(), String>(())
+    };
+    let work = tokio::time::timeout_at(tokio::time::Instant::from_std(work_deadline), work)
+        .await
+        .unwrap_or_else(|_| Err("multipart work deadline elapsed".into()));
+    let cleanup = async {
+        if completed {
+            // Only a successful complete ACK grants this exact object's delete.
+            operator.delete(key).await.map_err(|error| {
+                format!("delete completed multipart failed ({:?})", error.kind())
+            })?;
+            match file.stat(cancellation).await {
+                Err(error) if error.kind() == FileErrorKind::NotFound => {}
+                _ => return Err("completed multipart delete was not confirmed absent".into()),
+            }
+        } else if attempted && !aborted {
+            // Keep the original writer/upload identity through cleanup, even
+            // after timeout. Unknown initiate/complete outcomes stay failures.
+            let before = io.requests.load(Ordering::Relaxed);
+            writer
+                .as_mut()
+                .expect("attempted writer remains owned")
+                .abort()
+                .await
+                .map_err(|error| format!("settle failed multipart abort ({:?})", error.kind()))?;
+            if io.requests.load(Ordering::Relaxed) <= before {
+                return Err("failed multipart had no confirmed upload identity to abort".into());
+            }
+            match file.stat(cancellation).await {
+                Err(error) if error.kind() == FileErrorKind::NotFound => {}
+                _ => return Err("failed multipart object remains or is unobserved".into()),
+            }
+        }
+        Ok::<(), String>(())
+    };
+    let cleanup = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), cleanup)
+        .await
+        .unwrap_or_else(|_| Err("multipart cleanup deadline elapsed".into()));
+    match (work, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (work, cleanup) => Err(format!(
+            "{}; {}; exact multipart probe URI retained for diagnosis: {uri}",
+            work.err()
+                .unwrap_or_else(|| "multipart oracle passed".into()),
+            cleanup
+                .err()
+                .unwrap_or_else(|| "owned multipart cleanup confirmed".into())
+        )),
+    }
+}
+
 #[test]
-#[ignore = "requires an ECS RAM role and explicit NOVA_OSS_TEST_CONFIG; writes only one nonce probe"]
+#[ignore = "requires an ECS RAM role and explicit NOVA_OSS_TEST_CONFIG; uses only exact nonce probe objects"]
 fn real_ecs_authority_signs_oss_fileio_roundtrip() -> Result<(), String> {
     let config = configuration()?;
     let root = format!("s3://{}/{}", config.bucket, config.root_prefix);
@@ -375,9 +549,17 @@ fn real_ecs_authority_signs_oss_fileio_roundtrip() -> Result<(), String> {
         .as_nanos();
     let directory = format!("{root}g19-rust-ecs-oss/{}-{stamp}/", std::process::id());
     let uri = format!("{directory}oracle.bin");
-    let scope = provider
-        .scope_for_locations(std::slice::from_ref(&uri))
-        .map_err(|_| "nonce probe leaves the explicit configured scope")?;
+    provider
+        .scope_for_locations(&[
+            uri.clone(),
+            format!("{directory}{MULTIPART_COMPLETE}"),
+            format!("{directory}{MULTIPART_ABORT}"),
+        ])
+        .map_err(|_| "a nonce probe leaves the explicit configured scope")?;
+    // The deployment definition is validated for all three exact targets, but
+    // this test authority can sign only inside its own nonce directory.
+    let scope = StorageCredentialScopePrefix::try_from_normalized(&directory)
+        .map_err(|_| "invalid exact nonce directory scope")?;
     let endpoint = format!("https://s3.oss-{}-internal.aliyuncs.com", config.region);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -489,14 +671,41 @@ fn real_ecs_authority_signs_oss_fileio_roundtrip() -> Result<(), String> {
         .with_request_context(request);
     eprintln!("Real ECS/OSS probe URI: {uri}");
     let result = runtime.block_on(async {
-        let operation = Box::pin(probe(
-            &access,
-            &uri,
-            &directory,
-            &cancellation,
-            deadline - Duration::from_secs(20),
-            deadline,
-        ));
+        let operator = access.operator();
+        let operation = Box::pin(async {
+            let work_deadline = deadline - Duration::from_secs(20);
+            probe(
+                &access,
+                &uri,
+                &directory,
+                &cancellation,
+                work_deadline,
+                deadline,
+            )
+            .await?;
+            multipart_probe(
+                &operator,
+                &access,
+                &directory,
+                &io,
+                &cancellation,
+                work_deadline,
+                deadline,
+                false,
+            )
+            .await?;
+            multipart_probe(
+                &operator,
+                &access,
+                &directory,
+                &io,
+                &cancellation,
+                work_deadline,
+                deadline,
+                true,
+            )
+            .await
+        });
         match futures::future::select(operation, Box::pin(io.drive())).await {
             futures::future::Either::Left((result, _)) => result,
             futures::future::Either::Right(_) => {
