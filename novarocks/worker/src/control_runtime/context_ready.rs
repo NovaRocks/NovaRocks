@@ -26,7 +26,7 @@ use novarocks_control_runtime::{
 use novarocks_control_runtime_core::identity::ScopeId;
 use novarocks_execution_contract::QueryContextRef;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     num::NonZeroUsize,
     sync::{Arc, Mutex, Weak},
 };
@@ -39,10 +39,14 @@ pub(crate) enum ContextReadyError {
     OwnerLost,
     Runtime(RuntimeError),
 }
+struct Registered {
+    original: Weak<Endpoint>,
+    queued: Option<u64>,
+}
 struct State {
-    slots: BTreeMap<ScopeId, Weak<Endpoint>>,
-    ready: BTreeSet<ScopeId>,
-    cursor: Option<ScopeId>,
+    slots: BTreeMap<ScopeId, Registered>,
+    ready: BTreeMap<u64, ScopeId>,
+    next_ready: u64,
 }
 struct Shared {
     runtime: ActorRuntime<WorkerActor>,
@@ -73,8 +77,8 @@ impl ContextReady {
                 limit,
                 state: Mutex::new(State {
                     slots: BTreeMap::new(),
-                    ready: BTreeSet::new(),
-                    cursor: None,
+                    ready: BTreeMap::new(),
+                    next_ready: 0,
                 }),
             }),
         }
@@ -97,37 +101,42 @@ impl ContextReady {
         if state.slots.len() >= self.shared.limit.get() {
             return Err(ContextReadyError::Full);
         }
-        state
-            .slots
-            .insert(endpoint.scope.id(), Arc::downgrade(&endpoint));
+        state.slots.insert(
+            endpoint.scope.id(),
+            Registered {
+                original: Arc::downgrade(&endpoint),
+                queued: None,
+            },
+        );
         Ok(ContextReadyNotice(endpoint))
     }
-    /// One bounded address per call, fair across repeated coalesced marks.
+    /// One bounded address per call, in actual ready-enqueue FIFO order.
     /// The driver samples its actual runtime version before draining this
     /// index, then uses the runtime's versioned wait; no request scans owners.
     pub(crate) fn next_ready(&self) -> Result<Option<ContextReadyNotice>, ContextReadyError> {
-        use std::ops::Bound::{Excluded, Unbounded};
         let mut state = self.shared.state.lock().expect("Context host ready index");
-        let key = state
-            .cursor
-            .and_then(|cursor| {
-                state
-                    .ready
-                    .range((Excluded(cursor), Unbounded))
-                    .next()
-                    .copied()
-            })
-            .or_else(|| state.ready.first().copied());
-        let Some(key) = key else {
+        let Some((&ordinal, &key)) = state.ready.first_key_value() else {
             return Ok(None);
         };
-        let endpoint = state
-            .slots
-            .get(&key)
-            .and_then(Weak::upgrade)
+        let registered = state.slots.get(&key).ok_or(ContextReadyError::OwnerLost)?;
+        assert_eq!(
+            registered.queued,
+            Some(ordinal),
+            "one original queued Context mark"
+        );
+        // A lost live owner remains queued and consumes its bounded slot. Do
+        // not turn an Unknown owner into implicit removal or an empty queue.
+        let endpoint = registered
+            .original
+            .upgrade()
             .ok_or(ContextReadyError::OwnerLost)?;
-        state.ready.remove(&key);
-        state.cursor = Some(key);
+        state.ready.remove(&ordinal);
+        state
+            .slots
+            .get_mut(&key)
+            .expect("original registered Context")
+            .queued = None;
+        drop(state);
         Ok(Some(ContextReadyNotice(endpoint)))
     }
 }
@@ -149,10 +158,15 @@ impl Drop for Endpoint {
         if state
             .slots
             .get(&self.scope.id())
-            .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
+            .is_some_and(|entry| std::ptr::eq(entry.original.as_ptr(), self))
         {
-            state.slots.remove(&self.scope.id());
-            state.ready.remove(&self.scope.id());
+            let entry = state
+                .slots
+                .remove(&self.scope.id())
+                .expect("original removed Context");
+            if let Some(ordinal) = entry.queued {
+                state.ready.remove(&ordinal);
+            }
         }
     }
 }
@@ -169,17 +183,29 @@ impl ContextReadyNotice {
     pub(super) fn notify(&self) {
         let shared = &self.0.index.shared;
         let mut state = shared.state.lock().expect("Context host ready index");
-        let original = state
-            .slots
-            .get(&self.scope())
-            .is_some_and(|entry| Weak::ptr_eq(entry, &Arc::downgrade(&self.0)));
-        if original {
-            state.ready.insert(self.scope());
+        let Some(registered) = state.slots.get(&self.scope()) else {
+            return;
+        };
+        if !Weak::ptr_eq(&registered.original, &Arc::downgrade(&self.0)) {
+            return;
+        }
+        if registered.queued.is_none() {
+            // This monotonic value orders bounded readiness only. It grants
+            // no business identity, Work, resource access or retirement proof.
+            let ordinal = state
+                .next_ready
+                .checked_add(1)
+                .expect("Context ready ordering exhausted");
+            state.next_ready = ordinal;
+            state
+                .slots
+                .get_mut(&self.scope())
+                .expect("original registered Context")
+                .queued = Some(ordinal);
+            state.ready.insert(ordinal, self.scope());
         }
         drop(state);
-        if original {
-            shared.runtime.notify_pollers();
-        }
+        shared.runtime.notify_pollers();
     }
     /// Physical child-scope removal precedes Root HostRemoved publication.
     /// At that point M/R/H and their reports are gone, so old aliases can no
@@ -196,11 +222,16 @@ impl ContextReadyNotice {
         let Some(entry) = state.slots.get(&self.scope()) else {
             return Ok(());
         };
-        if !Weak::ptr_eq(entry, &Arc::downgrade(&self.0)) {
+        if !Weak::ptr_eq(&entry.original, &Arc::downgrade(&self.0)) {
             return Err(ContextReadyError::Duplicate);
         }
-        state.slots.remove(&self.scope());
-        state.ready.remove(&self.scope());
+        let entry = state
+            .slots
+            .remove(&self.scope())
+            .expect("original removed Context");
+        if let Some(ordinal) = entry.queued {
+            state.ready.remove(&ordinal);
+        }
         Ok(())
     }
 }

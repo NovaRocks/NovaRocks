@@ -138,27 +138,31 @@ fn continuously_remarking_the_smaller_scope_cannot_starve_the_larger_scope() {
     first.notify();
     let initial = index.next_ready().unwrap().unwrap();
     let initial_is_first = initial.scope() == first.scope();
+    first.notify();
+    second.notify();
     let mut both_progress = true;
     for _ in 0..16 {
-        first.notify();
+        let selected = index.next_ready().unwrap().unwrap();
+        both_progress &= selected.same_origin(&first);
+        first.notify(); // Requeue behind the already waiting second owner.
+        let selected = index.next_ready().unwrap().unwrap();
+        both_progress &= selected.same_origin(&second);
         second.notify();
-        let selected = index.next_ready().unwrap().unwrap();
-        both_progress &= selected.scope() == second.scope();
-        first.notify();
-        let selected = index.next_ready().unwrap().unwrap();
-        both_progress &= selected.scope() == first.scope();
     }
+    let tail_first = index.next_ready().unwrap().unwrap();
+    let tail_second = index.next_ready().unwrap().unwrap();
+    let tail_order = tail_first.same_origin(&first) && tail_second.same_origin(&second);
     let drained = index.next_ready().unwrap().is_none();
     smaller.finish();
     larger.finish();
     first.unregister_removed().unwrap();
     second.unregister_removed().unwrap();
-    drop((initial, first, second));
+    drop((initial, tail_first, tail_second, first, second));
     assert!(ledger.is_empty());
     assert!(runtime.is_empty());
     assert!(ascending);
     assert!(initial_is_first);
-    assert!(both_progress);
+    assert!(both_progress && tail_order);
     assert!(drained);
 }
 
@@ -275,4 +279,58 @@ fn losing_a_live_notice_keeps_the_bounded_address_instead_of_reclassifying_its_w
     assert!(still_funded);
     assert!(still_live);
     assert!(no_implicit_recovery);
+}
+
+#[test]
+fn an_older_scope_becoming_ready_late_cannot_be_starved_by_real_fresh_scope_churn() {
+    let (runtime, ledger, index) = fixture(2, 2);
+    let older = ScopeOwner::new(&ledger);
+    let old_notice = index.register(context(201), older.scope.clone()).unwrap();
+    let first_fresh = ScopeOwner::new(&ledger);
+    let fresh_notice = index
+        .register(context(202), first_fresh.scope.clone())
+        .unwrap();
+    fresh_notice.notify();
+    let passed_old_address = index.next_ready().unwrap().unwrap();
+    let first_fresh_served = passed_old_address.same_origin(&fresh_notice);
+    old_notice.notify();
+    first_fresh.finish();
+    fresh_notice.unregister_removed().unwrap();
+    drop((passed_old_address, fresh_notice));
+
+    let mut old_always_first = true;
+    let mut fresh_always_second = true;
+    let mut increasing_scopes = true;
+    let mut previous = older.scope.id();
+    for seed in 203..211 {
+        // The shared index has only two actual positions. Every new scope
+        // is genuinely admitted, exited, removed and unregistered before
+        // another fresh owner is constructed; no fake retirement is used.
+        let fresh = ScopeOwner::new(&ledger);
+        let notice = index.register(context(seed), fresh.scope.clone()).unwrap();
+        increasing_scopes &= notice.scope() > previous;
+        previous = notice.scope();
+        notice.notify();
+        let selected_old = index.next_ready().unwrap().unwrap();
+        old_always_first &= selected_old.same_origin(&old_notice);
+        old_notice.notify();
+        let selected_fresh = index.next_ready().unwrap().unwrap();
+        fresh_always_second &= selected_fresh.same_origin(&notice);
+        fresh.finish();
+        notice.unregister_removed().unwrap();
+        drop((selected_old, selected_fresh, notice));
+    }
+    let final_old = index.next_ready().unwrap();
+    let old_remark_retained = final_old
+        .as_ref()
+        .is_some_and(|notice| notice.same_origin(&old_notice));
+    older.finish();
+    old_notice.unregister_removed().unwrap();
+    drop((final_old, old_notice));
+    let drained = index.next_ready().unwrap().is_none();
+    assert!(ledger.is_empty());
+    assert!(runtime.is_empty());
+    assert!(first_fresh_served && increasing_scopes);
+    assert!(old_always_first && fresh_always_second && old_remark_retained);
+    assert!(drained);
 }
