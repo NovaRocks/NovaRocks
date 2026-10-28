@@ -125,6 +125,7 @@ pub(crate) enum ControlRequestError {
     IngressNotEnabled,
     IngressPending,
     IngressUnresolved,
+    SourceUnresolved { input: InputId },
     Route(EstablishRouteError),
     HostJob(ContextHostJobError),
 }
@@ -216,6 +217,9 @@ pub(crate) struct ControlRequestReady {
     shared: Arc<ReadyShared>,
 }
 impl ControlRequestReady {
+    pub(super) fn limit(&self) -> NonZeroUsize {
+        self.shared.limit
+    }
     pub(crate) fn new(limit: NonZeroUsize, runtime: ActorRuntime<WorkerActor>) -> Self {
         Self {
             shared: Arc::new(ReadyShared {
@@ -373,6 +377,9 @@ impl ControlRequestHandle {
 #[derive(Clone)]
 pub(super) struct ControlRequestNotice(Arc<Endpoint>);
 impl ControlRequestNotice {
+    pub(super) fn belongs_to(&self, ready: &ControlRequestReady) -> bool {
+        Arc::ptr_eq(&self.0.ready.shared, &ready.shared)
+    }
     pub(super) fn notify(&self) {
         self.0.ready.mark(&self.0);
     }
@@ -1154,6 +1161,11 @@ impl ControlRequestCustody {
             .ingress_owner
             .as_ref()
             .and_then(EstablishIngressOwner::take_disposal))
+    }
+    pub(super) fn ingress_source_phase(&self) -> Option<ExitRolePhase> {
+        self.ingress_owner
+            .as_ref()
+            .map(EstablishIngressOwner::phase)
     }
     fn close_ingress(&mut self) -> Result<bool, ControlRequestError> {
         if let Some(partial) = self.ingress_partial.take()

@@ -19,6 +19,9 @@
 //! A physical body return, queue drain or thread join supplies no Task, Source,
 //! capture or report exit. Those facts belong to each original job's custody.
 
+mod pair;
+pub(crate) use pair::{HostExecutorPair, HostPairShutdownError};
+
 use super::preparation::{
     HostFairnessGroup, PreparationQueue, QueuedPreparation, RunningPreparation,
 };

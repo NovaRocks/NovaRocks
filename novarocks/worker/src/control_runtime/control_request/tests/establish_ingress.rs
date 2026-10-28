@@ -21,6 +21,7 @@
 mod materialization;
 mod owner_failure;
 mod source_loan;
+mod source_pools;
 
 use super::*;
 use crate::control_runtime::{
@@ -417,30 +418,35 @@ fn a_physical_queue_refusal_returns_the_same_unstarted_job_and_can_revoke_the_or
 #[test]
 fn independent_raw_field_panics_never_unwind_through_another_field_or_return_rpc_capacity() {
     let mut f = fixture(2);
+    let mut pools = source_pools::SourcePoolGuard::start(&mut f);
     let (raw, getters, drops) = request(&f, None, None, true);
     let (input, external) = admit(&mut f);
     let job = f
         .root
         .begin_establish_ingress(input, raw, PayloadId(1))
         .unwrap();
-    host(job);
+    pools.getter(job);
     let projected = matches!(
-        f.root.take_establish_ingress(input).unwrap(),
-        Some(EstablishIngressOutcome::Projected(_))
+        source_pools::wait_ingress(&mut f, input),
+        EstablishIngressOutcome::Projected(_)
     );
     drop(external);
     let cleanup = f.root.begin_unsubmitted_withdrawal(input).unwrap().unwrap();
-    let exited = thread::spawn(move || cleanup.run()).join().unwrap();
-    let retired = f.root.reap_ready_requests(8).unwrap();
+    pools.disposal(cleanup);
+    let disposition = source_pools::wait_disposal(&f, input);
+    let retired = f.root.reap_ready_requests(8);
     let held = f.ledger.used(Dimension::Replies.id());
+    pools.finish();
     // This exact bounded Unknown is intentionally retained; it is not a green
     // cleanup result or proof that the missing S8 failure owner is complete.
     std::mem::forget(f);
     assert!(projected);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
-    assert!(!exited);
-    assert_eq!(retired, 0);
+    assert_eq!(disposition, ExitRolePhase::Unresolved);
+    assert!(
+        matches!(retired, Err(ControlRequestError::SourceUnresolved { input: failed }) if failed == input)
+    );
     assert_eq!(held, 1);
 }
 

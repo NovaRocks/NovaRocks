@@ -23,7 +23,8 @@ use super::{
     actors::WorkerActor,
     context_host_jobs::{ContextHostJob, ContextHostJobs},
     host_executor::{
-        HostExecutor, HostExecutorHandle, HostExecutorLimits, HostShutdownError, HostSubmitError,
+        HostExecutorHandle, HostExecutorLimits, HostExecutorPair, HostPairShutdownError,
+        HostShutdownError, HostSubmitError,
     },
     preparation::{HostFairnessGroup, QueuedPreparation},
 };
@@ -43,7 +44,6 @@ impl QueuedPreparation for Queued {
 fn run(original: Queued) {
     original.0.run_on_host();
 }
-type Pool = HostExecutor<Queued, fn(Queued)>;
 
 #[derive(Debug)]
 pub(crate) enum ContextExecutorStartError {
@@ -108,9 +108,7 @@ fn limits(
 pub(crate) struct ContextExecutors {
     runtime: ActorRuntime<WorkerActor>,
     control: ActorId,
-    materialization: Option<Pool>,
-    cleanup: Option<Pool>,
-    startup_complete: bool,
+    pools: HostExecutorPair<Queued>,
 }
 impl ContextExecutors {
     /// Called by the registered Service before publishing a request facade.
@@ -131,72 +129,59 @@ impl ContextExecutors {
                 owner: None,
             });
         };
-        let mut owner = Self {
-            runtime,
-            control,
-            materialization: None,
-            cleanup: None,
-            startup_complete: false,
-        };
-        match HostExecutor::start(m, run as fn(Queued)) {
-            Ok(pool) => owner.materialization = Some(pool),
-            Err((error, pool)) => {
-                owner.materialization = Some(pool);
-                return Err(ContextExecutorStartRefusal {
-                    error: ContextExecutorStartError::Spawn(error),
-                    owner: Some(Box::new(owner)),
-                });
-            }
+        match HostExecutorPair::start(m, c, run) {
+            Ok(pools) => Ok(Self {
+                runtime,
+                control,
+                pools,
+            }),
+            Err((error, pools)) => Err(ContextExecutorStartRefusal {
+                error: ContextExecutorStartError::Spawn(error),
+                owner: Some(Box::new(Self {
+                    runtime,
+                    control,
+                    pools,
+                })),
+            }),
         }
-        match HostExecutor::start(c, run as fn(Queued)) {
-            Ok(pool) => owner.cleanup = Some(pool),
-            Err((error, pool)) => {
-                owner.cleanup = Some(pool);
-                return Err(ContextExecutorStartRefusal {
-                    error: ContextExecutorStartError::Spawn(error),
-                    owner: Some(Box::new(owner)),
-                });
-            }
-        }
-        owner.startup_complete = true;
-        Ok(owner)
     }
     /// A partially started owner never yields an operational pair of handles.
     pub(crate) fn handles(&self) -> Option<ContextExecutorHandles> {
-        if !self.startup_complete {
-            return None;
-        }
+        let (materialization, cleanup) = self.pools.handles()?;
         Some(ContextExecutorHandles {
             runtime: self.runtime.clone(),
             control: self.control,
-            materialization: self.materialization.as_ref()?.handle(),
-            cleanup: self.cleanup.as_ref()?.handle(),
+            materialization,
+            cleanup,
         })
     }
     /// Caller has first drained the real Context scopes and producer leases.
     /// Cleanup stays open while the original materialization pool joins. A
     /// failed join returns every remaining physical owner rather than Drop.
-    pub(crate) fn shutdown(mut self) -> Result<(), (ContextExecutorShutdownError, Self)> {
-        self.startup_complete = false;
-        if let Some(pool) = self.materialization.take() {
-            match pool.shutdown() {
-                Ok(runner) => drop(runner),
-                Err((error, pool)) => {
-                    self.materialization = Some(pool);
-                    return Err((ContextExecutorShutdownError::Materialization(error), self));
+    pub(crate) fn shutdown(self) -> Result<(), (ContextExecutorShutdownError, Self)> {
+        let Self {
+            runtime,
+            control,
+            pools,
+        } = self;
+        pools.shutdown().map_err(|(error, pools)| {
+            let error = match error {
+                HostPairShutdownError::Ordinary(error) => {
+                    ContextExecutorShutdownError::Materialization(error)
                 }
-            }
-        }
-        if let Some(pool) = self.cleanup.take() {
-            match pool.shutdown() {
-                Ok(runner) => drop(runner),
-                Err((error, pool)) => {
-                    self.cleanup = Some(pool);
-                    return Err((ContextExecutorShutdownError::Cleanup(error), self));
+                HostPairShutdownError::Cleanup(error) => {
+                    ContextExecutorShutdownError::Cleanup(error)
                 }
-            }
-        }
-        Ok(())
+            };
+            (
+                error,
+                Self {
+                    runtime,
+                    control,
+                    pools,
+                },
+            )
+        })
     }
 }
 #[derive(Clone)]

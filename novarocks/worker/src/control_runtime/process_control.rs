@@ -35,6 +35,9 @@ use super::{
     },
     control_ticket::{ControlTicketError, ControlTicketInventory},
     effect_dispatch::{DispatchError, EffectDispatch, EffectRef, IndexedBatches},
+    establish_executors::{
+        EstablishExecutorStartError, EstablishExecutorStartRefusal, EstablishExecutors,
+    },
     service::{ServiceHostError, WorkerService},
 };
 use crate::{control_admission::AdmissionStorage, control_runtime_policy::StorageNeed};
@@ -197,6 +200,7 @@ pub(crate) struct ProcessControlOwner {
     actor: ActorId,
     service: WorkerService,
     resources: ProcessControlResources,
+    source_executors_started: bool,
 }
 impl ProcessControlOwner {
     pub(crate) fn bootstrap(
@@ -345,10 +349,41 @@ impl ProcessControlOwner {
                 requests: binding.request_positions,
             }),
             resources,
+            source_executors_started: false,
         })
     }
     pub(crate) fn actor(&self) -> ActorId {
         self.actor
+    }
+    pub(crate) fn start_establish_executors(
+        &mut self,
+        getter_workers: NonZeroUsize,
+        cleanup_workers: NonZeroUsize,
+    ) -> Result<EstablishExecutors, EstablishExecutorStartRefusal> {
+        if std::mem::replace(&mut self.source_executors_started, true) {
+            return Err(EstablishExecutorStartRefusal {
+                error: EstablishExecutorStartError::AlreadyStarted,
+                owner: None,
+            });
+        }
+        EstablishExecutors::start(
+            self.resources.request_ready.clone(),
+            getter_workers,
+            cleanup_workers,
+        )
+    }
+    /// Mechanical projection of the same original source role. In particular,
+    /// physical executor drain cannot turn Unresolved into observed raw exit.
+    pub(crate) fn establish_source_phase(
+        &self,
+        input: InputId,
+    ) -> Result<Option<novarocks_control_runtime::exit_role::ExitRolePhase>, ControlRequestError>
+    {
+        self.resources
+            .requests
+            .get(&input)
+            .map(ControlRequestCustody::ingress_source_phase)
+            .ok_or(ControlRequestError::WrongRequest)
     }
     pub(super) fn runtime(&self) -> &ActorRuntime<WorkerActor> {
         self.service.runtime()
@@ -839,6 +874,14 @@ impl ProcessControlOwner {
             let Some(custody) = self.resources.requests.get_mut(&input) else {
                 std::process::abort();
             };
+            if custody.ingress_source_phase()
+                == Some(novarocks_control_runtime::exit_role::ExitRolePhase::Unresolved)
+            {
+                // The caller must route this exact original R to its failure
+                // owner. Keep all source/R custody; do not park a silent wait
+                // or invent a completed reply, child exit or quota release.
+                return Err(ControlRequestError::SourceUnresolved { input });
+            }
             if custody.try_retire()? {
                 if let Some(role) = custody.route_return_role() {
                     assert_eq!(self.resources.return_routes.remove(&role), Some(input));

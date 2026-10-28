@@ -18,6 +18,7 @@
 //! Actual original M/R calls on a symbolic host instance. These tests do not
 //! claim Native materialization, and only Core decides the establishment reply.
 
+use super::source_pools::SourcePoolGuard;
 use super::*;
 use crate::{
     HostRejection, QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence,
@@ -125,6 +126,7 @@ struct MaterializationFixture {
     getters: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
     establishment: ContextEstablishment,
+    source_pools: SourcePoolGuard,
 }
 impl MaterializationFixture {
     fn new(materializing: Arc<Gate>, calls: Arc<AtomicUsize>, releases: Arc<AtomicUsize>) -> Self {
@@ -174,6 +176,7 @@ impl MaterializationFixture {
             ticket: ticket_storage.resources().unwrap(),
         };
         let mut f = Fixture::with_geometry_records(2, 2, 16, storage.clone(), additional, 3, 2, 32);
+        let mut source_pools = SourcePoolGuard::start(&mut f);
         let factory: Arc<dyn QueryContextHostFactory> = factory.unwrap_or_else(|| {
             Arc::new(SymbolicFactory {
                 instance: Arc::new(SymbolicInstance {
@@ -231,13 +234,13 @@ impl MaterializationFixture {
                 MonotonicInstant::from_origin(Duration::from_secs(100)),
             )
             .unwrap();
-        host(
+        source_pools.getter(
             f.root
                 .begin_establish_ingress(input, raw, PayloadId(1))
                 .unwrap(),
         );
         let EstablishIngressOutcome::Projected(projection) =
-            f.root.take_establish_ingress(input).unwrap().unwrap()
+            source_pools::wait_ingress(&mut f, input)
         else {
             panic!("the original getter returns the actual projection")
         };
@@ -313,6 +316,7 @@ impl MaterializationFixture {
             getters,
             drops,
             establishment,
+            source_pools,
         }
     }
 }
@@ -898,6 +902,7 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
         getters,
         drops,
         establishment,
+        mut source_pools,
     } = MaterializationFixture::with_factory(
         Gate::new(),
         calls.clone(),
@@ -1206,7 +1211,8 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     }
     let raw_disposal =
         disposal.expect("the actual non-success reply permits original raw disposal");
-    assert!(thread::spawn(move || raw_disposal.run()).join().unwrap());
+    source_pools.disposal(raw_disposal);
+    let raw_disposed = source_pools::wait_disposal(&f, input);
     let delivered = external.try_take().unwrap();
     drop(delivered);
     drop(external);
@@ -1304,9 +1310,14 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     let materialization_thread = *threads.materialization.lock().unwrap();
     let release_thread = *threads.release.lock().unwrap();
     let holder_thread = *threads.factory_drop.lock().unwrap();
+    source_pools.finish();
     f.finish();
 
     assert!(repeat_start_refused && repeat_start_owner_absent);
+    assert!(matches!(
+        raw_disposed,
+        ExitRolePhase::Exited | ExitRolePhase::Retired
+    ));
     assert!(removed_owner_rejects_reused_actor);
     assert!(foreign_pool_refused);
     assert!(direct_completion_woke_original);
@@ -1369,6 +1380,7 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
         job,
         getters,
         drops,
+        mut source_pools,
         ..
     } = MaterializationFixture::new(gate.clone(), calls.clone(), releases.clone());
     let scope = f.root.service().context(f.context).unwrap().scope().clone();
@@ -1438,7 +1450,11 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
         .take_consumed_creator_disposal(input)
         .unwrap()
         .expect("the actual original M has returned its borrowed source");
-    let disposed_source = thread::spawn(move || raw.run()).join().unwrap();
+    source_pools.disposal(raw);
+    let disposed_source = matches!(
+        source_pools::wait_disposal(&f, input),
+        ExitRolePhase::Exited | ExitRolePhase::Retired
+    );
     let delivery = external.try_take().unwrap();
     let delivered_accepted = delivery.body()
         == &ControlReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::Accepted));
@@ -1645,6 +1661,7 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
         .unwrap();
     drop(resources);
     drop(jobs);
+    source_pools.finish();
     f.finish();
 
     assert_eq!(m_callbacks, 1);
@@ -1719,6 +1736,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
         job,
         getters,
         drops,
+        mut source_pools,
         ..
     } = MaterializationFixture::with_factory(
         Gate::new(),
@@ -1839,7 +1857,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     // stop fence, before this host has executed any ReleaseHost effect.
     pools.submit_stopped(job);
     let m_notice =
-        wait_host_notice(&mut f).expect("the stopped M produced its real completion notice");
+        wait_host_notice(&mut f).expect("the original host has a coalesced ready notice");
     let original_notice_before_consumption = f.root.service().ready_context(&m_notice).is_some();
     let source_before_notice_consumption = jobs.source_consumed().unwrap();
     for effect in pending_release_effects {
@@ -1859,11 +1877,14 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     bridge_capacity
         .release(&bridge_capacity.resources().unwrap())
         .unwrap();
-    // The actual stopped-M completion notice is held but has not been
-    // consumed. No cell-state getter is inferred from that notification.
+    // The coalesced host notice is held, but it may also have been marked by
+    // an earlier Direct effect completion. It proves no cell return or exit.
     let release_before_m_taken = jobs.take_release_job().unwrap();
     let no_cleanup_worker_occupied = release_before_m_taken.is_none();
-    let m_callbacks = poll_noticed_host_returns(&mut f, &m_notice);
+    let m_callbacks = match poll_noticed_host_returns(&mut f, &m_notice) {
+        0 => wait_host_returns(&mut f).expect("the original stopped-M return becomes consumable"),
+        actual => actual,
+    };
     let source_after_m = jobs.source_consumed().unwrap();
     assert!(f.runtime.poll_one(closed_at).unwrap());
     let mut actual_decision = None;
@@ -1916,7 +1937,11 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
         .take_consumed_creator_disposal(input)
         .unwrap()
         .expect("withdrawn M returned the original source loan and observed its actual exit");
-    let raw_disposed = thread::spawn(move || raw.run()).join().unwrap();
+    source_pools.disposal(raw);
+    let raw_disposed = matches!(
+        source_pools::wait_disposal(&f, input),
+        ExitRolePhase::Exited | ExitRolePhase::Retired
+    );
     let delivery = external.try_take().unwrap();
     let delivered_lease = delivery.body()
         == &ControlReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::LeaseExpired));
@@ -2051,6 +2076,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     drop(jobs);
     drop(m_notice);
     pools.finish();
+    source_pools.finish();
     f.finish();
 
     assert_eq!(prestop_refusal, ContextSubmitError::StopRequired);

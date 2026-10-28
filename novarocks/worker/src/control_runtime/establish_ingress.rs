@@ -301,6 +301,9 @@ impl Drop for EstablishMaterializationLoan {
 }
 
 impl EstablishIngressOwner {
+    pub(super) fn phase(&self) -> ExitRolePhase {
+        self.0.role.phase()
+    }
     /// No request has been captured yet. Parent-link/root/report headers are
     /// drawn only from the original RPC's prepaid, fixed child inventory.
     pub(super) fn bootstrap(
@@ -492,6 +495,9 @@ impl QueuedPreparation for EstablishDisposalJob {
     }
 }
 impl EstablishIngressJob {
+    pub(super) fn belongs_to(&self, ready: &super::control_request::ControlRequestReady) -> bool {
+        self.owner.0.notice.belongs_to(ready)
+    }
     pub(crate) fn cancel_before_start(mut self) {
         self.owner
             .0
@@ -577,6 +583,9 @@ impl Drop for EstablishIngressJob {
     }
 }
 impl EstablishDisposalJob {
+    pub(super) fn belongs_to(&self, ready: &super::control_request::ControlRequestReady) -> bool {
+        self.owner.0.notice.belongs_to(ready)
+    }
     pub(crate) fn run(mut self) -> bool {
         let mut authority = self
             .owner
