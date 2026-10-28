@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "support": {
+    "os_id": "ubuntu",
+    "version_id": "26.04",
+    "platform": "linux/amd64"
+  },
+  "docker_registry_mirrors": [
+    "https://docker.m.daocloud.io"
+  ],
+  "rustup_dist_server": "https://rsproxy.cn",
+  "rustup_update_root": "https://rsproxy.cn/rustup",
+  "download_timeout_seconds": 600,
+  "locale": "zh_CN.UTF-8",
+  "cargo_build_jobs": "available",
+  "fixture_image_sources": {},
+  "tool_download_urls": {
+    "rustup": "https://rsproxy.cn/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init"
+  }
+}
