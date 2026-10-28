@@ -50,7 +50,7 @@ NodeLocal 定义使用独立类型，进入 canonical identity、持久化与 pr
 3. **原 authority 拥有 Rust 续期。** SDK 适配器返回单次完整材料与寿命；operator 继续通过原 StorageAuthority 加载，不在创建时快照材料、不旁建 runtime 或刷新任务。
 4. **每个对象请求核对 scope。** 来源定义限制实际签名和预签名请求，包括 list prefix、批量删除、copy source 与 multipart；非规范路径拒绝，不靠字符串公共前缀推导权利。
 5. **引用隔离不等于云端降权。** metadata/data 使用各自的角色本地引用和 purpose。它们可以取得同一部署 RAM 角色的权限；进程内 scope 不能冒充独立 RAM policy，换机器或本地代际不能声称旧临时凭证已撤销。ADR-0151 的不同 principal 要求对原 Vended 路径继续有效。
-6. **能力与部署验证分开。** OSS 使用现有 S3 I/O 与正确区域、虚拟主机端点；不支持的生产条件发布仍明确失败。benchmark 完成标记沿 ADR-0200 普通发布，不能据此删除 Hadoop metadata 的生产并发保证。
+6. **能力与部署验证分开。** OSS 使用现有 S3 I/O 与正确区域、虚拟主机端点；不支持的生产条件发布仍明确失败。benchmark 完成标记沿 ADR-0202 普通发布，不能据此删除 Hadoop metadata 的生产并发保证。
 
 ## 接受的妥协（诚实记录）
 

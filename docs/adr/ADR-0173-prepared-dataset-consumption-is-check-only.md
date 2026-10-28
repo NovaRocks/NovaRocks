@@ -6,9 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0200
+  - id: ADR-0202
     scope: "Remove conditional READY publication and in-place rebuild; check-only consumption, exact input validation and shared-data retention remain effective"
-    link: "ADR-0200-benchmark-ready-after-complete-data.md"
+    link: "ADR-0202-benchmark-ready-after-complete-data.md"
 partially-supersedes: [ADR-0165]
 date: 2026-10-13
 provenance:

@@ -794,7 +794,7 @@ handle_owner_signal() {
 }
 
 publish_ready() {
-  # Design: ADR-0200 (docs/adr/ADR-0200-benchmark-ready-after-complete-data.md).
+  # Design: ADR-0202 (docs/adr/ADR-0202-benchmark-ready-after-complete-data.md).
   local candidate="$1" status
   status="$(fixture_publication_put "$ready_uri" "$candidate")" || return 1
   [[ "$status" == 200 || "$status" == 201 ]]

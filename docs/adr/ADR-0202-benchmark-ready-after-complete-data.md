@@ -1,5 +1,5 @@
 ---
-id: ADR-0200
+id: ADR-0202
 title: "Benchmark READY is a completion marker without conditional replacement"
 domain: [test-fixtures]
 status: active
