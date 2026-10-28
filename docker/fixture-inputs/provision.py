@@ -47,7 +47,7 @@ def download(url: str, output: Path) -> None:
         with urllib.request.urlopen(request, timeout=90) as response, output.open("wb") as destination:
             shutil.copyfileobj(response, destination)
     except OSError as error:
-        raise FixtureInputError(f"fixture artifact download failed: {url}") from error
+        raise FixtureInputError(f"fixture artifact download failed: {url}: {error}") from error
 
 
 def parse_image_sources(specs: list[str], image_names: set[str]) -> dict[str, str]:
@@ -114,8 +114,48 @@ def prepare_artifacts(lock: dict[str, Any], staging: Path) -> dict[str, dict[str
     receipts: dict[str, dict[str, Any]] = {}
     for name, item in lock["artifacts"].items():
         output = artifacts_dir / name
-        download(item["url"], output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # A failed provision keeps its own staging. Reuse a previous transfer
+        # only after validating its bytes against this exact selected input.
+        # The cache is optional and grants no BOM/READY authority.
+        cache = staging.parent / "downloads" if staging.name.startswith(".staging-") else None
+        if cache is not None:
+            algorithm = "sha256" if "sha256" in item else "sha1"
+            key = f"{algorithm}-{item[algorithm]}-{item['bytes']}"
+            cached = cache / key
+            if cached.is_file():
+                try:
+                    validate_artifact(cached, item)
+                except FixtureInputError:
+                    pass
+                else:
+                    shutil.copy2(cached, output)
+                    receipts[name] = validate_artifact(output, item)
+                    continue
+            # Earlier versions retained failed staging without a download cache.
+            # Those files are candidates only, never receipts or trusted names.
+            for candidate in sorted(staging.parent.glob(".staging-*/artifacts/" + name)):
+                if candidate == output:
+                    continue
+                try:
+                    validate_artifact(candidate, item)
+                except FixtureInputError:
+                    continue
+                shutil.copy2(candidate, output)
+                break
+            else:
+                download(item["url"], output)
+        else:
+            download(item["url"], output)
         receipts[name] = validate_artifact(output, item)
+        if cache is not None:
+            cache.mkdir(exist_ok=True)
+            algorithm = "sha256" if "sha256" in item else "sha1"
+            destination = cache / f"{algorithm}-{item[algorithm]}-{item['bytes']}"
+            temporary = cache / (".download-" + uuid.uuid4().hex)
+            shutil.copy2(output, temporary)
+            validate_artifact(temporary, item)
+            temporary.replace(destination)
     return receipts
 
 

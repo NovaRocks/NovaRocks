@@ -330,7 +330,7 @@ class ConsumerClosureTests(unittest.TestCase):
     def test_actual_iceberg_consumer_closure_is_exact(self):
         lock, _ = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/amd64")
         images, artifacts, derived = fixture_inputs.required_input_names(lock, "iceberg-rest")
-        self.assertEqual(images, {"minio-runtime", "minio-go-builder", "iceberg-rest", "iceberg-spark-base", "gradle-builder"})
+        self.assertEqual(images, {"minio-runtime", "iceberg-rest", "iceberg-spark-base", "gradle-builder"})
         self.assertEqual(derived, {"iceberg-spark", "rest-mv", "minio", "minio-mc"})
         self.assertEqual(artifacts, set().union(*(lock["derived_images"][name]["artifacts"] for name in derived)))
         self.assertNotIn("paimon-writer", derived)
@@ -452,13 +452,44 @@ class MinioSupplyTests(unittest.TestCase):
         for architecture in ("amd64", "arm64"):
             lock, identity = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/" + architecture,
                                                       consumer="object-store")
-            self.assertEqual(set(lock["images"]), {"minio-go-builder", "minio-runtime"})
+            self.assertEqual(set(lock["images"]), {"minio-runtime"})
             self.assertEqual(set(lock["derived_images"]), {"minio", "minio-mc"})
-            self.assertIn("mc-linux-" + architecture, lock["artifacts"])
+            self.assertIn("mc-source.tar.gz", lock["artifacts"])
+            self.assertIn("go-linux-" + architecture + ".tar.gz", lock["artifacts"])
             other = "arm64" if architecture == "amd64" else "amd64"
-            self.assertNotIn("mc-linux-" + other, lock["artifacts"])
+            self.assertNotIn("go-linux-" + other + ".tar.gz", lock["artifacts"])
             self.assertEqual(identity, fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/" + architecture,
                                                                consumer="iceberg-rest")[1])
+
+    def test_failed_provision_reuses_only_revalidated_artifact_transfers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary)
+            data = b"upstream content"
+            item = {"url": "https://example.invalid/input", "bytes": len(data),
+                    "sha1": hashlib.sha1(data).hexdigest(), "sha256": hashlib.sha256(data).hexdigest()}
+            lock = {"artifacts": {"input": item}}
+            first = store / ".staging-first"
+            first.mkdir()
+            with mock.patch.object(provision_module, "download", side_effect=lambda _, p: p.write_bytes(data)) as download:
+                provision_module.prepare_artifacts(lock, first)
+                self.assertEqual(download.call_count, 1)
+            second = store / ".staging-second"
+            second.mkdir()
+            with mock.patch.object(provision_module, "download") as download:
+                provision_module.prepare_artifacts(lock, second)
+                download.assert_not_called()
+            self.assertEqual((second / "artifacts/input").read_bytes(), data)
+            for path in store.glob(".staging-*/artifacts/input"):
+                path.write_bytes(b"invalid")
+            for path in (store / "downloads").iterdir():
+                path.write_bytes(b"invalid")
+            third = store / ".staging-third"
+            third.mkdir()
+            with mock.patch.object(provision_module, "download", side_effect=lambda _, p: p.write_bytes(data)) as download:
+                provision_module.prepare_artifacts(lock, third)
+                self.assertEqual(download.call_count, 1)
+            self.assertEqual((third / "artifacts/input").read_bytes(), data)
+            self.assertFalse((store / "READY").exists())
 
     def test_declared_sha256_is_required_even_when_size_and_sha1_match(self):
         with tempfile.TemporaryDirectory() as temporary:

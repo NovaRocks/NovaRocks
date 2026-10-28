@@ -15,18 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG GO_BASE
 ARG RUNTIME_BASE
-FROM ${GO_BASE} AS build
+FROM ${RUNTIME_BASE} AS build
 ARG TARGETARCH
 ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local \
-    GOPROXY=${GOPROXY}
+    GOPATH=/go \
+    GOPROXY=${GOPROXY} \
+    PATH=/usr/local/go/bin:${PATH}
 WORKDIR /src
+COPY artifacts/go-linux-${TARGETARCH}.tar.gz /tmp/go-toolchain.tar.gz
 COPY artifacts/minio-source.tar.gz /tmp/minio-source.tar.gz
-RUN tar -xzf /tmp/minio-source.tar.gz --strip-components=1 -C /src && \
-    rm /tmp/minio-source.tar.gz && \
+RUN tar -xzf /tmp/go-toolchain.tar.gz -C /usr/local && \
+    tar -xzf /tmp/minio-source.tar.gz --strip-components=1 -C /src && \
+    rm /tmp/go-toolchain.tar.gz /tmp/minio-source.tar.gz && \
     test "$(go env GOVERSION)" = go1.24.8
 
 # These are the upstream gen-ldflags.go fields for the verified source commit.
@@ -49,4 +52,5 @@ FROM ${RUNTIME_BASE}
 COPY --from=build --chmod=755 /out/minio /usr/bin/minio
 COPY --from=build /src/LICENSE /licenses/LICENSE
 COPY --from=build /src/CREDITS /licenses/CREDITS
+COPY --from=build /usr/local/go/LICENSE /licenses/go-LICENSE
 ENTRYPOINT ["/usr/bin/minio"]

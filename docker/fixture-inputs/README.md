@@ -40,7 +40,7 @@ BOM schema 2 记录 platform、锁身份、镜像/派生定义和 artifact 证�
 
 ## MinIO 官方源码与发布物
 
-MinIO公开镜像已无法可靠取得，服务端采用官方 `RELEASE.2025-10-15T17-29-55Z` 的未修改源码构建；mc使用官方GitHub `RELEASE.2025-08-13T08-35-41Z` 的静态二进制。实际URL/完整源码commit/工具链manifest/长度和hash在唯一源锁中维护，版本允许更新。MinIO与mc属于derived_images；运行层消费准确image_id/定义回执，不依赖旧公开镜像或机器缓存。新增源码/客户端资产同时按声明SHA256核验，Go保留原go.mod/go.sum与校验，不下载另一个工具链或修改依赖。
+MinIO公开镜像已无法可靠取得，服务端采用官方 `RELEASE.2025-10-15T17-29-55Z` 的未修改源码构建；mc使用官方GitHub `RELEASE.2025-08-13T08-35-41Z` 的未修改源码构建。实际URL/完整源码commit/工具链manifest/长度和hash在唯一源锁中维护，版本允许更新。MinIO与mc属于derived_images；运行层消费准确image_id/定义回执，不依赖旧公开镜像或机器缓存。新增源码/客户端资产同时按声明SHA256核验，Go保留原go.mod/go.sum与校验，不下载另一个工具链或修改依赖。
 
 ```bash
 docker/fixture-inputs/provision.sh --consumer object-store --platform linux/amd64 \
@@ -48,6 +48,10 @@ docker/fixture-inputs/provision.sh --consumer object-store --platform linux/amd6
 docker/fixture-inputs/verify.sh --consumer object-store --platform linux/amd64
 ```
 
-这只准备MinIO/mc及必要的Go/Alpine闭包；`verify --consumer iceberg-rest`仍要求完整REST/Spark输入，单独object-store BOM不能代表整栈ready。正式Linux准备入口仍显式选择iceberg-rest。旧 `--image-source minio=...` / `minio-mc=...` 不再适用；传输覆盖应对新的 `minio-go-builder` 或 `minio-runtime` 基础镜像，源码与客户端通过锁内官方URL取得。Go模块代理由构建recipe的GOPROXY设置选择，内容由原go.sum验证。
+这只准备MinIO/mc及必要的Go工具链归档/Alpine闭包；`verify --consumer iceberg-rest`仍要求完整REST/Spark输入，单独object-store BOM不能代表整栈ready。正式Linux准备入口仍显式选择iceberg-rest。旧 `--image-source minio=...` / `minio-mc=...` 不再适用；传输覆盖应对`minio-runtime` 基础镜像，两个源码归档通过锁内官方URL取得。Go模块代理由构建recipe的GOPROXY设置选择，内容由原go.sum验证。
 
-更新官方版本时一并核对源归档、客户端/许可证、Go基础镜像及recipe自报元数据，并实际构建、读写和验证权限。已有共享fixture须按原显式upgrade切换；不自动认领或删除旧卷/旧输入。研究和原生运行材料按任务约定在库外保留。
+更新官方版本时一并核对源归档、客户端源码/许可证、Go工具链归档及recipe自报元数据，并实际构建、读写和验证权限。已有共享fixture须按原显式upgrade切换；不自动认领或删除旧卷/旧输入。研究和原生运行材料按任务约定在库外保留。
+
+Go工具链通过阿里云镜像取得官方1.24.8归档，并核对Go官方SHA256；完整amd64/arm64归档均已核验。它在Alpine构建阶段使用，避免额外大型Go镜像的冷拉取依赖；GOTOOLCHAIN=local禁止构建时自动切换编译器。
+
+失败后的重入会逐字节重新核验已下载artifact；匹配当前声明的缓存或保留staging可复用，校验不符重新下载。缓存不授予BOM/READY。mc及其LICENSE/CREDITS从同一官方commit源码归档构建/提取，减少分散raw下载地址依赖。

@@ -56,21 +56,6 @@
         }
       }
     },
-    "minio-go-builder": {
-      "source": "golang",
-      "variants": {
-        "linux/amd64": {
-          "platform": "linux/amd64",
-          "manifest_digest": "sha256:e89daba6691cee7e338c17467e3d8777ff18d80ee62ff544808971fd51189282",
-          "alias": "novarocks/fixture-minio-go:amd64-e89daba6691c"
-        },
-        "linux/arm64": {
-          "platform": "linux/arm64",
-          "manifest_digest": "sha256:b3696ba11202489e0a20ab1b14727ce23c5a50b88e099fe8ada2abcf2bdb8b26",
-          "alias": "novarocks/fixture-minio-go:arm64-b3696ba11202"
-        }
-      }
-    },
     "minio-runtime": {
       "source": "alpine",
       "variants": {
@@ -129,29 +114,23 @@
       "sha1": "e0da54ffbde3a52844e594aab2bcf81f5a591982",
       "sha256": "45521908307306e925c98d629e1c17d78c8b72b6ee242b1bfb1409f7d8ee5841"
     },
-    "mc-linux-amd64": {
-      "url": "https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z",
-      "bytes": 30535864,
-      "sha1": "f287887779ebb2b069bdd76cab11b56f5c605f6b",
-      "sha256": "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891"
+    "go-linux-amd64.tar.gz": {
+      "url": "https://mirrors.aliyun.com/golang/go1.24.8.linux-amd64.tar.gz",
+      "bytes": 78694215,
+      "sha1": "9071e95ff130fd0e5b00a62d68044b48af574985",
+      "sha256": "6842c516ca66c89d648a7f1dbe28e28c47b61b59f8f06633eb2ceb1188e9251d"
     },
-    "mc-linux-arm64": {
-      "url": "https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-arm64.RELEASE.2025-08-13T08-35-41Z",
-      "bytes": 28704952,
-      "sha1": "f2a12e87ac27c21449f5e46c87788708ec4eba69",
-      "sha256": "14c8c9616cfce4636add161304353244e8de383b2e2752c0e9dad01d4c27c12c"
+    "go-linux-arm64.tar.gz": {
+      "url": "https://mirrors.aliyun.com/golang/go1.24.8.linux-arm64.tar.gz",
+      "bytes": 74938272,
+      "sha1": "3c131b2fa3530442b4441b8576650afafb686513",
+      "sha256": "38ac33b4cfa41e8a32132de7a87c6db49277ab5c0de1412512484db1ed77637e"
     },
-    "mc-LICENSE": {
-      "url": "https://raw.githubusercontent.com/minio/mc/7394ce0dd2a80935aded936b09fa12cbb3cb8096/LICENSE",
-      "bytes": 34523,
-      "sha1": "4c665f87b5dc2e7d26279c4b48968d085e1ace32",
-      "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
-    },
-    "mc-CREDITS": {
-      "url": "https://raw.githubusercontent.com/minio/mc/7394ce0dd2a80935aded936b09fa12cbb3cb8096/CREDITS",
-      "bytes": 668850,
-      "sha1": "1268f3db6fcd914ffea4cbc80096c03b14772905",
-      "sha256": "4ead58181c478e2f449d5778165684f4fceb1e7b8b3ee150051c8e7adfe4f337"
+    "mc-source.tar.gz": {
+      "url": "https://codeload.github.com/minio/mc/tar.gz/7394ce0dd2a80935aded936b09fa12cbb3cb8096",
+      "bytes": 564228,
+      "sha1": "c485fd0b0692dea74ff0440f92f30eaf4e19f9d5",
+      "sha256": "95cd293c7119f16921a6dc515a1fb74a2227f19fd994b9c8b770a154e802ac44"
     }
   },
   "derived_images": {
@@ -231,24 +210,28 @@
     },
     "minio": {
       "bases": {
-        "GO_BASE": "minio-go-builder",
         "RUNTIME_BASE": "minio-runtime"
       },
       "dockerfile": "docker/fixture-inputs/minio/Dockerfile",
       "definition_files": [
         "docker/fixture-inputs/minio/Dockerfile"
       ],
-      "artifacts": [
-        "minio-source.tar.gz"
-      ],
       "variants": {
         "linux/amd64": {
           "platform": "linux/amd64",
-          "alias": "novarocks/fixture-minio:20251015-amd64"
+          "alias": "novarocks/fixture-minio:20251015-amd64",
+          "artifacts": [
+            "minio-source.tar.gz",
+            "go-linux-amd64.tar.gz"
+          ]
         },
         "linux/arm64": {
           "platform": "linux/arm64",
-          "alias": "novarocks/fixture-minio:20251015-arm64"
+          "alias": "novarocks/fixture-minio:20251015-arm64",
+          "artifacts": [
+            "minio-source.tar.gz",
+            "go-linux-arm64.tar.gz"
+          ]
         }
       }
     },
@@ -265,18 +248,16 @@
           "platform": "linux/amd64",
           "alias": "novarocks/fixture-minio-mc:20250813-amd64",
           "artifacts": [
-            "mc-linux-amd64",
-            "mc-LICENSE",
-            "mc-CREDITS"
+            "mc-source.tar.gz",
+            "go-linux-amd64.tar.gz"
           ]
         },
         "linux/arm64": {
           "platform": "linux/arm64",
           "alias": "novarocks/fixture-minio-mc:20250813-arm64",
           "artifacts": [
-            "mc-linux-arm64",
-            "mc-LICENSE",
-            "mc-CREDITS"
+            "mc-source.tar.gz",
+            "go-linux-arm64.tar.gz"
           ]
         }
       }

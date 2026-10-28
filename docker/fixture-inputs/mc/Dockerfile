@@ -16,9 +16,39 @@
 # under the License.
 
 ARG RUNTIME_BASE
-FROM ${RUNTIME_BASE}
+FROM ${RUNTIME_BASE} AS build
 ARG TARGETARCH
-COPY --chmod=755 artifacts/mc-linux-${TARGETARCH} /usr/bin/mc
-COPY artifacts/mc-LICENSE /licenses/LICENSE
-COPY artifacts/mc-CREDITS /licenses/CREDITS
+ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org
+ENV CGO_ENABLED=0 \
+    GOTOOLCHAIN=local \
+    GOPATH=/go \
+    GOPROXY=${GOPROXY} \
+    PATH=/usr/local/go/bin:${PATH}
+WORKDIR /src
+COPY artifacts/go-linux-${TARGETARCH}.tar.gz /tmp/go-toolchain.tar.gz
+COPY artifacts/mc-source.tar.gz /tmp/mc-source.tar.gz
+RUN tar -xzf /tmp/go-toolchain.tar.gz -C /usr/local && \
+    tar -xzf /tmp/mc-source.tar.gz --strip-components=1 -C /src && \
+    rm /tmp/go-toolchain.tar.gz /tmp/mc-source.tar.gz && \
+    test "$(go env GOVERSION)" = go1.24.8
+
+# These are the upstream gen-ldflags.go fields for the verified source commit.
+# The source archive has no .git; pass its frozen facts without modifying it.
+RUN --mount=type=cache,target=/go/pkg/mod,id=novarocks-minio-go1.24.8-mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,id=novarocks-minio-go1.24.8-build-${TARGETARCH},sharing=locked \
+    mkdir -p /out && \
+    go build -mod=readonly -trimpath -buildvcs=false \
+      -ldflags="-s -w \
+        -X github.com/minio/mc/cmd.Version=2025-08-13T08:35:41Z \
+        -X github.com/minio/mc/cmd.CopyrightYear=2025 \
+        -X github.com/minio/mc/cmd.ReleaseTag=RELEASE.2025-08-13T08-35-41Z \
+        -X github.com/minio/mc/cmd.CommitID=7394ce0dd2a80935aded936b09fa12cbb3cb8096 \
+        -X github.com/minio/mc/cmd.ShortCommitID=7394ce0dd2a8" \
+      -o /out/mc .
+
+FROM ${RUNTIME_BASE}
+COPY --from=build --chmod=755 /out/mc /usr/bin/mc
+COPY --from=build /src/LICENSE /licenses/LICENSE
+COPY --from=build /src/CREDITS /licenses/CREDITS
+COPY --from=build /usr/local/go/LICENSE /licenses/go-LICENSE
 ENTRYPOINT ["/usr/bin/mc"]
