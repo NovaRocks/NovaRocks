@@ -1,0 +1,76 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import groovy.json.JsonSlurper
+import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+
+// Transport selection changes repository locations, never dependency versions,
+// verification metadata, repository ordering or the number of repositories.
+def prefixes = new JsonSlurper().parseText(System.getenv('NOVA_FIXTURE_URL_PREFIXES') ?: '{}')
+if (!(prefixes instanceof Map)) {
+  throw new GradleException('Fixture artifact URL prefixes must be a JSON object')
+}
+prefixes.each { original, transport ->
+  [original, transport].each { value ->
+    def valid = value instanceof String
+    if (valid) {
+      try {
+        def uri = new URI(value)
+        valid = value.startsWith('https://') && value.endsWith('/') && uri.host != null &&
+            uri.userInfo == null && uri.rawQuery == null && uri.rawFragment == null &&
+            (uri.port == -1 || (uri.port > 0 && uri.port <= 65535)) &&
+            !value.any { Character.isWhitespace((char) it) || (int) ((char) it) < 32 || (int) ((char) it) == 127 } &&
+            !value.contains('\\')
+      } catch (URISyntaxException ignored) {
+        valid = false
+      }
+    }
+    if (!valid) {
+      throw new GradleException('Fixture artifact URL prefixes require closed HTTPS directory URLs')
+    }
+  }
+}
+def originals = prefixes.keySet().toList()
+originals.eachWithIndex { original, index ->
+  if (originals.take(index).any { original.startsWith(it) || it.startsWith(original) }) {
+    throw new GradleException('Fixture artifact URL prefixes must not overlap')
+  }
+}
+
+def rewriteRepository = { MavenArtifactRepository repository ->
+  def original = repository.url.toString()
+  // Gradle repository factories use both spellings of a directory base URL.
+  def directory = original.endsWith('/') ? original : original + '/'
+  def entry = prefixes.find { prefix, transport -> directory.startsWith(prefix) }
+  if (entry != null) {
+    repository.setUrl(entry.value + directory.substring(entry.key.length()))
+  }
+}
+def observeRepositories = { repositories ->
+  repositories.withType(MavenArtifactRepository).all(rewriteRepository)
+}
+
+gradle.beforeSettings { settings ->
+  observeRepositories(settings.pluginManagement.repositories)
+  observeRepositories(settings.dependencyResolutionManagement.repositories)
+}
+gradle.beforeProject { project ->
+  observeRepositories(project.buildscript.repositories)
+  observeRepositories(project.repositories)
+}

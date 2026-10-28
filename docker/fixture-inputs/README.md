@@ -41,12 +41,24 @@ artifact 下载可显式使用可重复的 `--artifact-url-prefix ORIGINAL=TRANS
 ```bash
 docker/fixture-inputs/provision.sh --consumer iceberg-rest-oss --platform linux/amd64 \
   --artifact-url-prefix https://repo.maven.apache.org/maven2/=https://maven.aliyun.com/repository/public/ \
-  --artifact-url-prefix https://files.pythonhosted.org/packages/=https://mirrors.aliyun.com/pypi/packages/
+  --artifact-url-prefix https://files.pythonhosted.org/packages/=https://mirrors.aliyun.com/pypi/packages/ \
+  --artifact-url-prefix https://plugins.gradle.org/m2/=https://maven.aliyun.com/repository/gradle-plugin/
 ```
 
 两侧必须是 HTTPS 目录 URL，以 `/` 结尾，不带 userinfo、query 或 fragment；原始前缀重复或互相包含时拒绝。只匹配原锁 URL 一次，不递归改写。选择的镜像不可达或内容不符直接失败，不自动回退来源。原锁中的 URL、bytes、SHA1/SHA256、lock identity 与内容缓存键均不变；镜像返回同名文件也须通过原始校验。相同内容缓存可跨传输地址复用，但每次仍核验字节。
 
-Linux profile 的 `fixture_artifact_url_prefixes` 使用原始前缀到传输前缀的 JSON 映射；阿里云 profile 显式配置上述 Maven、PyPI 映射。installer 仅在 prepare 时将每条映射传给 provision，context-only 同样接受显式 CLI 参数；check 和 verify 不新增网络访问或下载修复。
+Linux profile 的 `fixture_artifact_url_prefixes` 使用原始前缀到传输前缀的 JSON 映射；阿里云 profile 显式配置上述 Maven、PyPI 和 Gradle plugin 映射。installer 仅在 prepare 时将每条映射传给 provision，context-only 同样接受显式 CLI 参数；check 和 verify 不新增网络访问或下载修复。
+
+派生 recipe 可通过可选字段 `artifact_url_prefix_build_arg` 声明一个独占的大写 Docker ARG 名称，例如 `NOVA_FIXTURE_URL_PREFIXES`。provision 只向声明该字段的构建传入同一已验证映射的 JSON；普通 artifact 下载与 Gradle 内部下载复用同一显式来源选择。ARG 名不能与 bases、derived_bases 或固定 build_args 冲突，未声明的 recipe 不接收参数。
+
+REST-MV 的 `transport.init.gradle` 在 Gradle settings、project 和 buildscript 的 Maven 仓库注册时改写匹配的目录 URL，兼容仓库 URL 有无尾 `/`；未匹配的仓库、顺序和数量保持原样，不新增 fallback。Gradle plugin portal 和 Maven Central 分别按自己的显式前缀改写，避免只处理宿主机下载而遗漏容器内部解析。依赖版本及 `verification-metadata.xml` 的严格校验不变，缺项或 hash 不符仍失败；metadata 维护目标也使用同一 init。传输映射不写入源锁或 runtime 镜像环境，recipe 脚本变更仍计入定义 hash。
+
+本地存在准确 Gradle 8.14.3 时，可显式运行无依赖、无网络的仓库生命周期合约；普通单元入口不要求安装 host Gradle：
+
+```bash
+NOVA_FIXTURE_TEST_GRADLE=/absolute/path/gradle-8.14.3/bin/gradle \
+  python3 -m unittest discover -s docker/fixture-inputs/tests -p test_gradle_transport.py
+```
 
 镜像或平台变更由 fixture 维护者更新唯一源锁，保留上游 index、平台 manifest 和 config 的原始证据，再执行 provision 和实际消费者验证。仅修改 JSON 不能证明平台运行可用。单测入口：`bash docker/fixture-inputs/tests/run.sh`；machine、Paimon 和 benchmark reader 回归由各自原测试入口维护。
 

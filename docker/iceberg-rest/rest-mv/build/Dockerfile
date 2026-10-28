@@ -18,10 +18,13 @@
 ARG BUILDER
 ARG REST_BASE
 FROM ${BUILDER} AS prep
+ARG NOVA_FIXTURE_URL_PREFIXES={}
 USER root
 WORKDIR /build
 ENV CI=true \
-    REST_MV_GRADLE_ARGS="--no-daemon --console=plain --max-workers=2 -Dorg.gradle.jvmargs=-Xmx1536m -DsparkVersions= -DflinkVersions= -DkafkaVersions= :iceberg-core:test --tests org.apache.iceberg.view.TestViewVersionParser --tests org.apache.iceberg.view.TestViewMetadata --tests org.apache.iceberg.rest.TestRESTCatalogServlet :iceberg-open-api:shadowJar"
+    NOVA_FIXTURE_URL_PREFIXES=${NOVA_FIXTURE_URL_PREFIXES} \
+    REST_MV_GRADLE_ARGS="--init-script /build/transport.init.gradle --no-daemon --console=plain --max-workers=2 -Dorg.gradle.jvmargs=-Xmx1536m -DsparkVersions= -DflinkVersions= -DkafkaVersions= :iceberg-core:test --tests org.apache.iceberg.view.TestViewVersionParser --tests org.apache.iceberg.view.TestViewMetadata --tests org.apache.iceberg.rest.TestRESTCatalogServlet :iceberg-open-api:shadowJar"
+COPY transport.init.gradle /build/transport.init.gradle
 COPY artifacts/apache-iceberg-1.10.1.tar.gz /build/source.tar.gz
 RUN tar -xzf source.tar.gz && rm source.tar.gz && \
     test "$(sed -n 's/^git.commit.id=//p' apache-iceberg-1.10.1/iceberg-build.properties)" = "ccb8bc435062171e64bc8b7e5f56e6aed9c5b934"

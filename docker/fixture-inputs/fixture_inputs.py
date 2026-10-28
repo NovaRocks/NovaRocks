@@ -118,6 +118,11 @@ def read_source_lock(path: Path) -> dict[str, Any]:
                     or any(not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
                            or not isinstance(value, str) for key, value in build_args.items())):
                 raise FixtureInputError(f"invalid fixture scalar build arguments: {name}")
+            transport_arg = item.get("artifact_url_prefix_build_arg")
+            if "artifact_url_prefix_build_arg" in item and (
+                    not isinstance(transport_arg, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", transport_arg)
+                    or transport_arg in set(bases) | set(derived_bases) | set(build_args)):
+                raise FixtureInputError(f"invalid fixture artifact transport build argument: {name}")
             for argument, base in bases.items():
                 if not isinstance(argument, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argument):
                     raise FixtureInputError(f"invalid fixture base build argument: {name}/{argument}")

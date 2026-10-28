@@ -498,6 +498,7 @@
         "docker/iceberg-rest/rest-mv/build/patches/0001-backport-storage-table.patch",
         "docker/iceberg-rest/rest-mv/build/patches/0002-storage-table-version-equivalence.patch",
         "docker/iceberg-rest/rest-mv/build/patches/0003-null-storage-table.patch",
+        "docker/iceberg-rest/rest-mv/build/transport.init.gradle",
         "docker/iceberg-rest/rest-mv/build/verification-metadata.xml"
       ],
       "artifacts": [
@@ -512,7 +513,8 @@
           "platform": "linux/amd64",
           "alias": "novarocks/fixture-iceberg-rest-mv:amd64"
         }
-      }
+      },
+      "artifact_url_prefix_build_arg": "NOVA_FIXTURE_URL_PREFIXES"
     },
     "minio": {
       "bases": {

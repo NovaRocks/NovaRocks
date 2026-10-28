@@ -772,6 +772,80 @@ class DerivedImageBuildTests(unittest.TestCase):
                 with self.assertRaises(fixture_inputs.FixtureInputError):
                     fixture_inputs.load_lock(self.lock_path)
 
+    def test_recipe_transport_argument_requires_one_closed_unshared_name(self):
+        item = self.lock["derived_images"]["rest-mv"]
+        for argument in (None, "", "lowercase", "BAD=ARG", "NOVA-FIXTURE", "REST_BASE", "BUILDER"):
+            with self.subTest(argument=argument):
+                item["artifact_url_prefix_build_arg"] = argument
+                self.write_lock()
+                with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "artifact transport build argument"):
+                    fixture_inputs.load_lock(self.lock_path)
+        item["build_args"] = {"NOVA_FIXTURE_URL_PREFIXES": "fixed"}
+        item["artifact_url_prefix_build_arg"] = "NOVA_FIXTURE_URL_PREFIXES"
+        self.write_lock()
+        with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "artifact transport build argument"):
+            fixture_inputs.load_lock(self.lock_path)
+        del item["build_args"]
+        self.write_lock()
+        fixture_inputs.load_lock(self.lock_path)
+
+    def test_only_declared_recipe_receives_transport_without_source_identity_change(self):
+        prefixes = {"https://upstream.invalid/maven2/": "https://mirror.invalid/public/"}
+        item = self.lock["derived_images"]["rest-mv"]
+        item["artifact_url_prefix_build_arg"] = "NOVA_FIXTURE_URL_PREFIXES"
+        self.write_lock()
+        original = self.lock_path.read_bytes()
+        definition = fixture_inputs.definition_sha256(self.repo, item["definition_files"])
+        with mock.patch.object(provision_module, "run", side_effect=self.build_command) as run, \
+                mock.patch.object(provision_module, "inspect_image", side_effect=self.image_info):
+            receipt = provision_module.build_derived_images(self.lock, self.repo, self.staging, "lock-sha", url_prefixes=prefixes)
+        command = run.call_args.args[0]
+        payload = next(value.split("=", 1)[1] for value in command if value.startswith("NOVA_FIXTURE_URL_PREFIXES="))
+        self.assertEqual(prefixes, json.loads(payload))
+        self.assertEqual(original, self.lock_path.read_bytes())
+        self.assertEqual(definition, receipt["rest-mv"]["definition_sha256"])
+        self.assertNotIn("url_prefixes", receipt["rest-mv"])
+        self.assertEqual([], provision_module.artifact_url_prefix_build_args({}, prefixes))
+        self.assertEqual(["--build-arg", "NOVA_FIXTURE_URL_PREFIXES={}"],
+            provision_module.artifact_url_prefix_build_args(item, None))
+
+    def test_provision_forwards_verified_transport_to_original_builder(self):
+        self.lock["derived_images"]["rest-mv"]["artifact_url_prefix_build_arg"] = "NOVA_FIXTURE_URL_PREFIXES"
+        self.write_lock()
+        prefixes = {"https://upstream.invalid/maven2/": "https://mirror.invalid/public/"}
+        with mock.patch.object(provision_module, "prepare_images", return_value={}), \
+                mock.patch.object(provision_module, "download", side_effect=lambda _, path: path.write_bytes(
+                    b"source" if path.name == "source.tar.gz" else b"other")), \
+                mock.patch.object(provision_module, "run", side_effect=self.build_command), \
+                mock.patch.object(provision_module, "inspect_image", side_effect=self.image_info), \
+                mock.patch.object(provision_module, "build_derived_images", wraps=provision_module.build_derived_images) as build:
+            provision_module.provision(self.root / "store", self.repo, self.lock_path, [], 30,
+                artifact_url_prefix_specs=[f"{original}={transport}" for original, transport in prefixes.items()])
+        self.assertEqual(prefixes, build.call_args.kwargs["url_prefixes"])
+
+    def test_metadata_maintenance_uses_the_same_declared_transport_argument(self):
+        self.lock["derived_images"]["rest-mv"]["artifact_url_prefix_build_arg"] = "NOVA_FIXTURE_URL_PREFIXES"
+        script = (ROOT.parent / "iceberg-rest/rest-mv/update-verification-metadata.sh").read_text()
+        source = script.split("<<'PYTHON'\n", 1)[1].rsplit("\nPYTHON", 1)[0]
+        commands = []
+        def run(command, **kwargs):
+            commands.append(command)
+            if command[0] == "docker":
+                directory = Path(next(value.split("dest=", 1)[1] for value in command if value.startswith("type=local,dest=")))
+                directory.mkdir()
+                (directory / "verification-metadata.xml").write_text("contract-only metadata")
+        prefix = "https://upstream.invalid/maven2/=https://mirror.invalid/public/"
+        with mock.patch.object(sys, "argv", ["-", str(self.repo), "--artifact-url-prefix", prefix]), \
+                mock.patch.object(fixture_inputs, "load_lock", return_value=(self.lock, "lock-sha")), \
+                mock.patch("subprocess.run", side_effect=run):
+            exec(compile(source, "metadata-maintenance-contract", "exec"), {})
+        self.assertEqual(2, len(commands))
+        self.assertIn("--artifact-url-prefix", commands[0])
+        self.assertIn(prefix, commands[0])
+        payload = next(value.split("=", 1)[1] for value in commands[1] if value.startswith("NOVA_FIXTURE_URL_PREFIXES="))
+        self.assertEqual({"https://upstream.invalid/maven2/": "https://mirror.invalid/public/"}, json.loads(payload))
+        self.assertIn("verification-metadata-export", commands[1])
+
     def test_lock_rejects_context_outside_repository(self):
         for context in ("../outside", "/outside", "", None):
             with self.subTest(context=context):

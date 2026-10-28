@@ -251,7 +251,17 @@ def build_context(
     return out
 
 
-def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, lock_sha: str) -> dict[str, dict[str, str]]:
+def artifact_url_prefix_build_args(item: dict[str, Any], url_prefixes: dict[str, str] | None) -> list[str]:
+    """Only an explicitly declared recipe may consume acquisition transports."""
+    argument = item.get("artifact_url_prefix_build_arg")
+    if argument is None:
+        return []
+    payload = json.dumps(url_prefixes or {}, sort_keys=True, separators=(",", ":"))
+    return ["--build-arg", f"{argument}={payload}"]
+
+
+def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, lock_sha: str,
+                         *, url_prefixes: dict[str, str] | None = None) -> dict[str, dict[str, str]]:
     receipts: dict[str, dict[str, str]] = {}
     available = dict(lock.get("_verified_derived_images", {}))
     names = set(lock.get("_build_names", lock["derived_images"]))
@@ -280,6 +290,7 @@ def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, l
             build_args.extend(["--build-arg", f"{key}={reference}"])
         for key, value in item.get("build_args", {}).items():
             build_args.extend(["--build-arg", f"{key}={value}"])
+        build_args.extend(artifact_url_prefix_build_args(item, url_prefixes))
         iidfile = context.parent / f"{name}.iid"
         run([
             "docker", "build", "--platform", item["platform"],
@@ -413,7 +424,9 @@ def provision(
             # selected below are new, while verified retained bases stay installed.
             build_lock = {**lock, "_build_names": list(missing["derived_images"]),
                           "_verified_derived_images": retained["derived_images"]}
-            derived = {**retained["derived_images"], **build_derived_images(build_lock, repo_root, staging, lock_sha)}
+            prepared_derived = (build_derived_images(build_lock, repo_root, staging, lock_sha, url_prefixes=url_prefixes)
+                                if url_prefixes else build_derived_images(build_lock, repo_root, staging, lock_sha))
+            derived = {**retained["derived_images"], **prepared_derived}
             for name in missing["derived_images"]:
                 receipt = derived[name]
                 run(["docker", "tag", receipt["image_id"], receipt["alias"]])

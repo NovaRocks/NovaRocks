@@ -52,7 +52,8 @@ PYCONFIG
 
 docker/fixture-inputs/provision.sh --consumer iceberg-rest-oss --platform linux/amd64 \
   --artifact-url-prefix https://repo.maven.apache.org/maven2/=https://maven.aliyun.com/repository/public/ \
-  --artifact-url-prefix https://files.pythonhosted.org/packages/=https://mirrors.aliyun.com/pypi/packages/
+  --artifact-url-prefix https://files.pythonhosted.org/packages/=https://mirrors.aliyun.com/pypi/packages/ \
+  --artifact-url-prefix https://plugins.gradle.org/m2/=https://maven.aliyun.com/repository/gradle-plugin/
 docker/fixture-inputs/verify.sh --consumer iceberg-rest-oss --platform linux/amd64
 docker/iceberg-rest/fixture-runtime.sh start --config "$machine_config"
 export NOVA_ENV_OBJECT_STORE_CONFIG="$object_store_config"
