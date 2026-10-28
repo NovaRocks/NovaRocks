@@ -30,11 +30,12 @@ use crate::{
     task_causal_input::CausalInputRole,
     task_port::TaskPendingNotice,
     task_proposal_ingress::{
-        CausalEventInput, CausalEventKind, CutSourceAdmission, IngressError, RetiredCut,
-        TaskProposalIngress,
+        CausalEventInput, CausalEventKind, CutSourceAdmission, IngressError, RequestMetadata,
+        RetiredCut, TaskProposalIngress,
     },
 };
 use novarocks_control_runtime::driver::{ActorRuntime, DriverError, InputPhase};
+use novarocks_control_runtime::lease::WorkLease;
 use novarocks_control_runtime_core::{
     completion::Consumption,
     identity::{ActorId, Generation, InputId, WorkId},
@@ -68,6 +69,7 @@ pub(crate) enum CausalError {
     WrongTask,
     Source(SourcePositionError),
     UnknownSource,
+    InvalidRequestClass,
 }
 impl From<CutError> for CausalError {
     fn from(error: CutError) -> Self {
@@ -258,6 +260,14 @@ pub(crate) struct TaskCausalInbox {
     roles: BTreeMap<CutId, Role>,
     health: Arc<ExecutionHealth>,
 }
+/// The caller has already paid for this Context-local author and Source pair
+/// from the original RPC position. Neither this metadata nor admission mints
+/// a Work, a request token, or a replacement source reservation.
+pub(crate) struct TaskCausalRequest<'a> {
+    pub author: &'a WorkLease,
+    pub request: RequestMetadata,
+    pub class: InputClass,
+}
 impl TaskCausalInbox {
     pub(crate) fn new(
         runtime: ActorRuntime<WorkerActor>,
@@ -403,6 +413,47 @@ impl TaskCausalInbox {
         sender.bind_work(work);
         Ok((cut, sender))
     }
+    /// A Task RPC seals the same proposal prefix as a lifecycle fact, but its
+    /// event retains its own request class, operation and deadline. Only that
+    /// actual event input supplies the Core request token.
+    pub(crate) fn admit_request(
+        &mut self,
+        request: TaskCausalRequest<'_>,
+        consumers: u64,
+        pending: Arc<dyn TaskPendingNotice>,
+        admission: CutSourceAdmission,
+    ) -> Result<(CutId, TaskCausalSender), CausalAdmissionRefusal> {
+        if !matches!(request.class, InputClass::Ordinary | InputClass::Control) {
+            return Err(CausalAdmissionRefusal {
+                error: CausalError::InvalidRequestClass,
+                admission,
+            });
+        }
+        let inputs = match CausalInputRole::reserve_admitted(
+            &self.runtime,
+            self.actor,
+            self.source,
+            request.class,
+            request.author,
+        ) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                return Err(CausalAdmissionRefusal {
+                    error: error.into(),
+                    admission,
+                });
+            }
+        };
+        let (cut, mut sender) = self.admit_with_inputs(
+            CausalEventKind::Request(request.request),
+            consumers,
+            pending,
+            admission,
+            inputs,
+        )?;
+        sender.bind_work(request.author.id());
+        Ok((cut, sender))
+    }
     fn admit(
         &mut self,
         kind: CausalEventKind,
@@ -410,7 +461,7 @@ impl TaskCausalInbox {
         pending: Arc<dyn TaskPendingNotice>,
         admission: CutSourceAdmission,
     ) -> Result<(CutId, TaskCausalSender), CausalAdmissionRefusal> {
-        let mut inputs = match CausalInputRole::reserve(
+        let inputs = match CausalInputRole::reserve(
             &self.runtime,
             self.actor,
             self.source,
@@ -424,6 +475,16 @@ impl TaskCausalInbox {
                 });
             }
         };
+        self.admit_with_inputs(kind, consumers, pending, admission, inputs)
+    }
+    fn admit_with_inputs(
+        &mut self,
+        kind: CausalEventKind,
+        consumers: u64,
+        pending: Arc<dyn TaskPendingNotice>,
+        admission: CutSourceAdmission,
+        mut inputs: CausalInputRole<WorkerActor>,
+    ) -> Result<(CutId, TaskCausalSender), CausalAdmissionRefusal> {
         let cut = match self
             .ingress
             .reserve_event_cut(self.task, kind, consumers, admission)
@@ -535,7 +596,7 @@ impl TaskCausalInbox {
         };
         let event = WorkerMessage::Context(ContextMessage::Command {
             work: input.work,
-            request: None,
+            request: input.request,
             command: input.event,
         });
         match role.inputs.fill_with_receipt(prefix, event) {
@@ -909,3 +970,6 @@ impl TaskCausalInbox {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;

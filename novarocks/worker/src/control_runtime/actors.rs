@@ -36,13 +36,7 @@ use novarocks_worker_protocol::{
 };
 use std::{collections::BTreeMap, time::Duration};
 
-/// The token is deliberately absent: it comes only from the actual consumed
-/// runtime envelope, not a producer's role ID or another issuance counter.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RequestMetadata {
-    pub operation: TaskOperationId,
-    pub deadline: MonotonicInstant,
-}
+pub(crate) use crate::task_proposal_ingress::RequestMetadata;
 
 #[expect(
     clippy::large_enum_variant,

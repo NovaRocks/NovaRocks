@@ -21,6 +21,7 @@
 use novarocks_control_runtime::{
     actor::Actor,
     driver::{ActorRuntime, DriverError, InputRole, InputRoleId},
+    lease::WorkLease,
 };
 use novarocks_control_runtime_core::{
     identity::{ActorId, InputId},
@@ -56,12 +57,36 @@ impl<A: Actor> CausalInputRole<A> {
         source: ActorId,
         class: InputClass,
     ) -> Result<Self, DriverError> {
+        Self::reserve_with_author(runtime, target, source, class, None)
+    }
+    /// Cross-scope RPC routing must present the original Context-local Work,
+    /// rather than a numeric WorkId that may also exist in the Root scope.
+    pub(crate) fn reserve_admitted(
+        runtime: &ActorRuntime<A>,
+        target: ActorId,
+        source: ActorId,
+        class: InputClass,
+        author: &WorkLease,
+    ) -> Result<Self, DriverError> {
+        Self::reserve_with_author(runtime, target, source, class, Some(author))
+    }
+    fn reserve_with_author(
+        runtime: &ActorRuntime<A>,
+        target: ActorId,
+        source: ActorId,
+        class: InputClass,
+        author: Option<&WorkLease>,
+    ) -> Result<Self, DriverError> {
         assert!(
             class != InputClass::Timer,
             "causal roles cannot consume the actor's timer position"
         );
-        let predecessor = runtime.reserve_input(target, source, InputClass::Lifecycle)?;
-        let event = match runtime.reserve_input(target, source, class) {
+        let reserve = |class| match author {
+            Some(author) => runtime.reserve_admitted_input(target, source, class, author),
+            None => runtime.reserve_input(target, source, class),
+        };
+        let predecessor = reserve(InputClass::Lifecycle)?;
+        let event = match reserve(class) {
             Ok(event) => event,
             Err(error) => {
                 predecessor

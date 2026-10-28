@@ -36,10 +36,11 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
 use novarocks_execution_contract::{
-    RetainedTaskSource, TaskConclusionProposal, TaskFailurePhase, TaskIdentity,
+    RetainedTaskSource, TaskConclusionProposal, TaskFailurePhase, TaskIdentity, TaskOperationId,
 };
 use novarocks_worker_protocol::{
     context::ContextInput,
+    lease::MonotonicInstant,
     proposal_summary::{CausalSegments, CutError, CutId, Diagnostic, ProposalSummary, SourceId},
 };
 use std::{
@@ -125,11 +126,24 @@ struct EventCell {
     kind: CausalEventKind,
     input: Option<ContextInput>,
 }
+/// The request token comes from the actual consumed runtime envelope. A
+/// causal author retains only the original business operation and deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestMetadata {
+    pub operation: TaskOperationId,
+    pub deadline: MonotonicInstant,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CausalEventKind {
     Settlement,
     ApplyClose(Generation),
     Input,
+    Request(RequestMetadata),
+}
+impl CausalEventKind {
+    fn has_input(self) -> bool {
+        matches!(self, Self::Input | Self::Request(_))
+    }
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum EventPhase {
@@ -141,6 +155,7 @@ enum EventPhase {
 pub(crate) struct CausalEventInput {
     pub prefix: SummaryInput,
     pub work: WorkId,
+    pub request: Option<RequestMetadata>,
     pub event: ContextInput,
 }
 pub(crate) struct TaskProposalIngress {
@@ -553,10 +568,7 @@ impl TaskProposalIngress {
             .get(&cut)
             .and_then(|cell| cell.event.as_ref())
             .ok_or(CutError::Unknown)?;
-        if event.phase != EventPhase::Reserved
-            || event.work.is_none()
-            || event.kind == CausalEventKind::Input
-        {
+        if event.phase != EventPhase::Reserved || event.work.is_none() || event.kind.has_input() {
             return Err(CutError::NotReserved.into());
         }
         state.seal(cut)?;
@@ -579,23 +591,34 @@ impl TaskProposalIngress {
         let Some(event) = state.cuts.get(&cut).and_then(|cell| cell.event.as_ref()) else {
             return Err((CutError::Unknown.into(), input));
         };
-        let input_task = match &input {
-            ContextInput::Loaded { task, .. }
-            | ContextInput::Running { task }
-            | ContextInput::Flushing { task }
-            | ContextInput::CompletionIntent { task, .. }
-            | ContextInput::CompletionExited { task }
-            | ContextInput::TerminalObservation { task, .. }
-            | ContextInput::FinishWithOutput { task, .. }
-            | ContextInput::Physical { task, .. }
-            | ContextInput::Metrics { task, .. }
-            | ContextInput::OperatorStatistics { task, .. }
-            | ContextInput::DynamicFilterPublished { task, .. } => Some(*task),
+        let input_task = match (event.kind, &input) {
+            (
+                CausalEventKind::Request(metadata),
+                ContextInput::Cancel { request, task, .. }
+                | ContextInput::UpdateTask { request, task, .. }
+                | ContextInput::RootDrained { request, task }
+                | ContextInput::GetFinalInfo { request, task }
+                | ContextInput::GetDynamicFilters { request, task, .. },
+            ) if *request == metadata.operation => Some(*task),
+            (
+                CausalEventKind::Input,
+                ContextInput::Loaded { task, .. }
+                | ContextInput::Running { task }
+                | ContextInput::Flushing { task }
+                | ContextInput::CompletionIntent { task, .. }
+                | ContextInput::CompletionExited { task }
+                | ContextInput::TerminalObservation { task, .. }
+                | ContextInput::FinishWithOutput { task, .. }
+                | ContextInput::Physical { task, .. }
+                | ContextInput::Metrics { task, .. }
+                | ContextInput::OperatorStatistics { task, .. }
+                | ContextInput::DynamicFilterPublished { task, .. },
+            ) => Some(*task),
             _ => None,
         };
         if event.phase != EventPhase::Reserved
             || event.work.is_none()
-            || event.kind != CausalEventKind::Input
+            || !event.kind.has_input()
             || event.input.is_some()
             || input_task != Some(event.task)
         {
@@ -665,7 +688,7 @@ impl TaskProposalIngress {
         if event.task != task {
             return Err(IngressError::WrongTask);
         }
-        if event.kind != CausalEventKind::Input
+        if !event.kind.has_input()
             || event.phase != EventPhase::Reserved
             || event.work != Some(work)
             || event.input.is_some()
@@ -691,7 +714,7 @@ impl TaskProposalIngress {
         if event.task != task {
             return Err(IngressError::WrongTask);
         }
-        if event.kind != CausalEventKind::Input || event.work != Some(work) {
+        if !event.kind.has_input() || event.work != Some(work) {
             return Err(CutError::NotReserved.into());
         }
         Ok(())
@@ -714,7 +737,7 @@ impl TaskProposalIngress {
             .and_then(|cell| cell.event.as_ref())
             .ok_or(CutError::NotReady)?;
         if event.phase != EventPhase::Registered
-            || (event.kind == CausalEventKind::Input && event.input.is_none())
+            || (event.kind.has_input() && event.input.is_none())
         {
             return Err(CutError::NotReady.into());
         }
@@ -741,7 +764,9 @@ impl TaskProposalIngress {
             CausalEventKind::ApplyClose(generation) => {
                 ContextInput::ApplyTaskClose { task, generation }
             }
-            CausalEventKind::Input => event.input.take().expect("registered input"),
+            CausalEventKind::Input | CausalEventKind::Request(_) => {
+                event.input.take().expect("registered input")
+            }
         };
         Ok(CausalEventInput {
             prefix: SummaryInput {
@@ -749,6 +774,10 @@ impl TaskProposalIngress {
                 summary,
             },
             work,
+            request: match kind {
+                CausalEventKind::Request(metadata) => Some(metadata),
+                _ => None,
+            },
             event: input,
         })
     }
