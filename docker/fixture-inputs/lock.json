@@ -1,41 +1,90 @@
 {
-  "schema": 1,
+  "schema": 2,
   "images": {
     "paimon-spark-base": {
       "source": "apache/spark",
-      "platform": "linux/amd64",
-      "manifest_digest": "sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955",
-      "alias": "novarocks/fixture-paimon-spark-base:b2da01c5855f"
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955",
+          "alias": "novarocks/fixture-paimon-spark-base:b2da01c5855f"
+        }
+      }
     },
     "iceberg-spark-base": {
       "source": "apache/spark",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:96dc2bada923824300e1ece564389258934655ba6f463d6daff8753ff0c639ce",
-      "alias": "novarocks/fixture-iceberg-spark-base:96dc2bada923"
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:96dc2bada923824300e1ece564389258934655ba6f463d6daff8753ff0c639ce",
+          "alias": "novarocks/fixture-iceberg-spark-base:96dc2bada923"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:bb8a7f0e5a98a627dca8c1502b959a2ca010b59fe104901123934243e7cc3537",
+          "alias": "novarocks/fixture-iceberg-spark-base:bb8a7f0e5a98"
+        }
+      }
     },
     "minio": {
       "source": "quay.io/minio/minio",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
-      "alias": "novarocks/fixture-minio:14cea493d9a3"
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+          "alias": "novarocks/fixture-minio:14cea493d9a3"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:a1a8bd4ac40ad7881a245bab97323e18f971e4d4cba2c2007ec1bedd21cbaba2",
+          "alias": "novarocks/fixture-minio:a1a8bd4ac40a"
+        }
+      }
     },
     "minio-mc": {
       "source": "quay.io/minio/mc",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
-      "alias": "novarocks/fixture-minio-mc:a7fe349ef4bd"
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+          "alias": "novarocks/fixture-minio-mc:a7fe349ef4bd"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:eb4ea9884b77704230e2423e9004d2fa738dc272876b9cc41a297d29443b8780",
+          "alias": "novarocks/fixture-minio-mc:eb4ea9884b77"
+        }
+      }
     },
     "iceberg-rest": {
       "source": "apache/iceberg-rest-fixture",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
-      "alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9"
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+          "alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:319afc30ef94300f79987b1d185c4911576db0cdfaa98246cb42757ec4d53463",
+          "alias": "novarocks/fixture-iceberg-rest:319afc30ef94"
+        }
+      }
     },
     "gradle-builder": {
       "source": "gradle",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:ce50078d456e497bc86b76d386503e84aa45416d85069ad66bc072bf07566b25",
-      "alias": "novarocks/fixture-gradle-builder:ce50078d456e"
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:ce50078d456e497bc86b76d386503e84aa45416d85069ad66bc072bf07566b25",
+          "alias": "novarocks/fixture-gradle-builder:ce50078d456e"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:b6db376528d71be79c82e173c2e85769b8cc78fccbf3dc6810b9a54706076b99",
+          "alias": "novarocks/fixture-gradle-builder:b6db376528d7"
+        }
+      }
     }
   },
   "artifacts": {
@@ -77,8 +126,6 @@
   },
   "derived_images": {
     "paimon-writer": {
-      "platform": "linux/amd64",
-      "alias": "novarocks/fixture-paimon-writer:current",
       "bases": {
         "SPARK_BASE": "paimon-spark-base"
       },
@@ -91,11 +138,15 @@
       "artifacts": [
         "paimon-spark.jar",
         "paimon-s3.jar"
-      ]
+      ],
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-paimon-writer:current"
+        }
+      }
     },
     "iceberg-spark": {
-      "platform": "linux/arm64",
-      "alias": "novarocks/fixture-iceberg-spark:current",
       "bases": {
         "SPARK_BASE": "iceberg-spark-base"
       },
@@ -108,11 +159,19 @@
         "iceberg-aws-bundle-1.11.0.jar",
         "hadoop-aws-3.3.4.jar",
         "aws-java-sdk-bundle-1.12.262.jar"
-      ]
+      ],
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-iceberg-spark:current"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-iceberg-spark:amd64"
+        }
+      }
     },
     "rest-mv": {
-      "platform": "linux/arm64",
-      "alias": "novarocks/fixture-iceberg-rest-mv:current",
       "bases": {
         "BUILDER": "gradle-builder",
         "REST_BASE": "iceberg-rest"
@@ -128,7 +187,17 @@
       ],
       "artifacts": [
         "apache-iceberg-1.10.1.tar.gz"
-      ]
+      ],
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-iceberg-rest-mv:current"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-iceberg-rest-mv:amd64"
+        }
+      }
     }
   }
 }

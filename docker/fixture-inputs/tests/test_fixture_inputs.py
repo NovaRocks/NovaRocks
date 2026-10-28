@@ -23,6 +23,37 @@ verify_module = sys.modules["verify"]
 provision_module = sys.modules["provision"]
 
 
+def source_lock(effective):
+    """Test input serializer: production accepts only explicit schema-2 variants."""
+    import copy
+    source = copy.deepcopy(effective)
+    source["schema"] = 2
+    source.pop("platform", None)
+    for kind in ("images", "derived_images"):
+        for name, item in source[kind].items():
+            target = item.pop("platform")
+            variant = {"platform": target}
+            for field in (("alias", "manifest_digest") if kind == "images" else ("alias",)):
+                variant[field] = item.pop(field)
+            item["variants"] = {target: variant}
+    return source
+
+
+def setUpModule():
+    # Most tests use a synthetic daemon; native agreement is tested separately.
+    global daemon_patches
+    daemon_patches = [mock.patch.object(verify_module, "require_native_daemon"),
+                      mock.patch.object(provision_module, "require_native_daemon"),
+                      mock.patch.object(fixture_inputs, "native_platform", return_value="linux/arm64")]
+    for patch in daemon_patches:
+        patch.start()
+
+
+def tearDownModule():
+    for patch in reversed(daemon_patches):
+        patch.stop()
+
+
 class FixtureInputsTest(unittest.TestCase):
     def test_default_arm64_variant_matches_locked_platform(self) -> None:
         item = {"platform": "linux/arm64", "manifest_digest": "sha256:expected"}
@@ -39,8 +70,8 @@ class FixtureInputsTest(unittest.TestCase):
             fixture_inputs.verify_image({**image, "Variant": "v7"}, item)
 
     def test_lock_is_immutable_and_covers_all_current_inputs(self) -> None:
-        lock, digest = fixture_inputs.load_lock(ROOT / "lock.json")
-        self.assertEqual(lock["schema"], 1)
+        lock, digest = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/amd64")
+        self.assertEqual(lock["schema"], 2)
         self.assertEqual(
             lock["images"]["paimon-spark-base"]["platform"], "linux/amd64"
         )
@@ -138,14 +169,14 @@ class FixtureInputsTest(unittest.TestCase):
             with mock.patch.object(verify_module, "inspect_image") as inspect:
                 with self.assertRaises(fixture_inputs.FixtureInputError) as raised:
                     verify_module.verify(
-                        Path(temporary), ROOT.parents[1], ROOT / "lock.json"
+                        Path(temporary), ROOT.parents[1], ROOT / "lock.json", consumer="iceberg-rest"
                     )
             inspect.assert_not_called()
             self.assertIn("BOM is missing", str(raised.exception))
 
     def test_verify_rejects_base_image_bom_identity_tampering_before_inspect(self) -> None:
         lock = {
-            "schema": 1,
+            "schema": 2, "platform": "linux/amd64",
             "images": {
                 "spark": {
                     "alias": "novarocks/fixture-spark:current",
@@ -161,7 +192,7 @@ class FixtureInputsTest(unittest.TestCase):
             (store / ".provision.lock").touch()
             (store / "READY").write_text("sha256:lock-sha\n")
             (store / "bom.json").write_text(
-                '{"schema":1,"lock_sha256":"lock-sha","artifact_dir":"artifacts",'
+                '{"schema":2,"platform":"linux/amd64","lock_sha256":"lock-sha","artifact_dir":"artifacts",'
                 '"images":{"spark":{"alias":"novarocks/fixture-spark:current",'
                 '"manifest_digest":"sha256:tampered","platform":"linux/arm64"}},'
                 '"artifacts":{},"derived_images":{}}'
@@ -176,7 +207,7 @@ class FixtureInputsTest(unittest.TestCase):
 
     def test_verify_rejects_derived_image_id_bom_tampering(self) -> None:
         lock = {
-            "schema": 1,
+            "schema": 2, "platform": "linux/amd64",
             "images": {},
             "artifacts": {},
             "derived_images": {
@@ -192,7 +223,7 @@ class FixtureInputsTest(unittest.TestCase):
             (store / ".provision.lock").touch()
             (store / "READY").write_text("sha256:lock-sha\n")
             (store / "bom.json").write_text(
-                '{"schema":1,"lock_sha256":"lock-sha","artifact_dir":"artifacts",'
+                '{"schema":2,"platform":"linux/amd64","lock_sha256":"lock-sha","artifact_dir":"artifacts",'
                 '"images":{},"artifacts":{},"derived_images":{"writer":'
                 '{"alias":"novarocks/fixture-writer:current","platform":"linux/amd64",'
                 '"definition_sha256":"definition-sha","image_id":"sha256:tampered"}}}'
@@ -220,7 +251,7 @@ class FixtureInputsTest(unittest.TestCase):
             self.assertIn("derived image BOM receipt mismatch", str(raised.exception))
 
     def test_image_source_override_changes_transport_but_not_identity(self) -> None:
-        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json")
+        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/amd64")
         item = lock["images"]["paimon-spark-base"]
         overrides = provision_module.parse_image_sources(
             ["paimon-spark-base=dockerproxy.net/apache/spark"], set(lock["images"])
@@ -265,8 +296,8 @@ class ConsumerClosureTests(unittest.TestCase):
         store, repo = root / "store", root / "repo"
         store.mkdir(); repo.mkdir(); (store / ".provision.lock").touch()
         artifacts = store / "artifacts"; artifacts.mkdir()
-        lock = {"schema": 1, "images": {}, "artifacts": {}, "derived_images": {}}
-        bom = {"schema": 1, "artifact_dir": "artifacts", "images": {}, "artifacts": {}, "derived_images": {}}
+        lock = {"schema": 2, "platform": "linux/arm64", "images": {}, "artifacts": {}, "derived_images": {}}
+        bom = {"schema": 2, "platform": "linux/arm64", "artifact_dir": "artifacts", "images": {}, "artifacts": {}, "derived_images": {}}
         infos = {}
         for name in ("minio", "minio-mc", "iceberg-rest", "iceberg-spark-base", "paimon-spark-base", "gradle-builder"):
             item = {"alias": f"fixture/{name}:locked", "platform": "linux/arm64", "manifest_digest": f"sha256:{name}"}
@@ -275,7 +306,7 @@ class ConsumerClosureTests(unittest.TestCase):
             infos[item["alias"]] = {"Id": item["manifest_digest"], "Os": "linux", "Architecture": "arm64"}
         for name in ("spark.jar", "paimon.jar", "source.tar.gz"):
             path = artifacts / name; path.write_bytes(b"fixture")
-            item = {"bytes": 7, "sha1": hashlib.sha1(b"fixture").hexdigest()}
+            item = {"url": "https://example.invalid/" + name, "bytes": 7, "sha1": hashlib.sha1(b"fixture").hexdigest()}
             lock["artifacts"][name] = item
             bom["artifacts"][name] = fixture_inputs.validate_artifact(path, item)
         for name, base, jar in (("iceberg-spark", "iceberg-spark-base", "spark.jar"), ("paimon-writer", "paimon-spark-base", "paimon.jar"), ("rest-mv", "gradle-builder", "source.tar.gz")):
@@ -284,19 +315,20 @@ class ConsumerClosureTests(unittest.TestCase):
             lock["derived_images"][name] = item
             digest = fixture_inputs.definition_sha256(repo, item["definition_files"])
             bom["derived_images"][name] = {"alias": item["alias"], "platform": item["platform"], "definition_sha256": digest, "image_id": f"sha256:{name}-id"}
-        lock_sha = fixture_inputs.sha256_bytes(fixture_inputs.canonical_bytes(lock))
+        raw = source_lock(lock)
+        lock_sha = fixture_inputs.resolve_lock(raw, "linux/arm64")[1]
         bom["lock_sha256"] = lock_sha
         for name, item in lock["derived_images"].items():
             receipt = bom["derived_images"][name]
             infos[item["alias"]] = {"Id": receipt["image_id"], "Os": "linux", "Architecture": "arm64", "Config": {"Labels": {"novarocks.fixture.lock.sha256": lock_sha, "novarocks.fixture.definition.sha256": receipt["definition_sha256"]}}}
         lock_path = root / "lock.json"
-        lock_path.write_bytes(fixture_inputs.canonical_bytes(lock))
+        lock_path.write_bytes(fixture_inputs.canonical_bytes(raw))
         (store / "bom.json").write_bytes(fixture_inputs.canonical_bytes(bom))
         (store / "READY").write_text(f"sha256:{lock_sha}\n")
         return store, repo, lock_path, infos
 
     def test_actual_iceberg_consumer_closure_is_exact(self):
-        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json")
+        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/amd64")
         images, artifacts, derived = fixture_inputs.required_input_names(lock, "iceberg-rest")
         self.assertEqual(images, {"minio", "minio-mc", "iceberg-rest", "iceberg-spark-base", "gradle-builder"})
         self.assertEqual(derived, {"iceberg-spark", "rest-mv"})
@@ -305,7 +337,7 @@ class ConsumerClosureTests(unittest.TestCase):
         self.assertNotIn("paimon-spark-base", images)
 
     def test_declared_dependency_changes_are_followed_without_name_based_exclusions(self):
-        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json")
+        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/amd64")
         lock["derived_images"]["iceberg-spark"]["bases"]["BUILDER"] = "paimon-spark-base"
         lock["derived_images"]["iceberg-spark"]["artifacts"].append("paimon-s3.jar")
         images, artifacts, derived = fixture_inputs.required_input_names(lock, "iceberg-rest")
@@ -319,7 +351,7 @@ class ConsumerClosureTests(unittest.TestCase):
         (repo / "paimon-writer.txt").write_text("new unrelated definition")
         with mock.patch.object(verify_module, "inspect_image", side_effect=infos.__getitem__) as inspect:
             verified = verify_module.verify(store, repo, lock, consumer="iceberg-rest")
-            self.assertEqual(verified["schema"], 1)
+            self.assertEqual(verified["schema"], 2)
             self.assertEqual(set(call.args[0] for call in inspect.call_args_list), {"fixture/minio:locked", "fixture/minio-mc:locked", "fixture/iceberg-rest:locked", "fixture/iceberg-spark-base:locked", "fixture/iceberg-spark:current", "fixture/gradle-builder:locked", "fixture/rest-mv:current"})
             with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "definition mismatch: paimon-writer"):
                 verify_module.verify(store, repo, lock)
@@ -356,7 +388,7 @@ class ConsumerClosureTests(unittest.TestCase):
                 inspect.assert_not_called()
 
     def test_unknown_consumer_or_missing_declared_dependency_is_not_a_smaller_scope(self):
-        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json")
+        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/amd64")
         with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "unknown fixture input consumer"):
             fixture_inputs.required_input_names(lock, "unregistered")
         for category, name in (("images", "iceberg-spark-base"), ("artifacts", "hadoop-aws-3.3.4.jar"), ("derived_images", "iceberg-spark")):
@@ -365,6 +397,107 @@ class ConsumerClosureTests(unittest.TestCase):
                 selected[category].pop(name)
                 with self.assertRaises(fixture_inputs.FixtureInputError):
                     fixture_inputs.required_input_names(selected, "iceberg-rest")
+
+
+    def test_partial_provision_does_not_regress_or_republish_verified_all(self):
+        store, repo, lock, infos = self.fixture()
+        original = (store / "bom.json").read_bytes()
+        ready = (store / "READY").read_bytes()
+        with mock.patch.object(verify_module, "inspect_image", side_effect=infos.__getitem__), \
+                mock.patch.object(provision_module, "prepare_images") as images, \
+                mock.patch.object(provision_module, "prepare_artifacts") as artifacts, \
+                mock.patch.object(provision_module, "build_derived_images") as derived:
+            provision_module.provision(store, repo, lock, [], 30, consumer="iceberg-rest")
+            provision_module.provision(store, repo, lock, [], 30)
+            verify_module.verify(store, repo, lock)
+        images.assert_not_called(); artifacts.assert_not_called(); derived.assert_not_called()
+        self.assertEqual((store / "bom.json").read_bytes(), original)
+        self.assertEqual((store / "READY").read_bytes(), ready)
+
+    def test_supplement_rechecks_and_copies_valid_other_consumer_inputs(self):
+        store, repo, lock, infos = self.fixture()
+        complete = fixture_inputs.read_json(store / "bom.json")
+        partial = json.loads(json.dumps(complete))
+        del partial["artifacts"]["paimon.jar"]
+        del partial["derived_images"]["paimon-writer"]
+        (store / "bom.json").write_bytes(fixture_inputs.canonical_bytes(partial))
+        def images(selected, *_):
+            return {name: complete["images"][name] for name in selected["images"]}
+        def download(_, path):
+            path.write_bytes(b"fixture")
+        def derived(selected, *_):
+            return {name: complete["derived_images"][name] for name in selected["derived_images"]}
+        with mock.patch.object(verify_module, "inspect_image", side_effect=infos.__getitem__), \
+                mock.patch.object(provision_module, "prepare_images", side_effect=images), \
+                mock.patch.object(provision_module, "download", side_effect=download), \
+                mock.patch.object(provision_module, "build_derived_images", side_effect=derived), \
+                mock.patch.object(provision_module, "run"):
+            provision_module.provision(store, repo, lock, [], 30)
+            current = verify_module.verify(store, repo, lock)
+            self.assertEqual(current["images"], complete["images"])
+            self.assertEqual(current["derived_images"], complete["derived_images"])
+            for name in complete["artifacts"]:
+                self.assertEqual((store / current["artifact_dir"] / name).read_bytes(), b"fixture")
+            self.assertNotEqual(current["artifact_dir"], complete["artifact_dir"])
+            original = (store / "bom.json").read_bytes()
+            provision_module.provision(store, repo, lock, [], 30, consumer="iceberg-rest")
+            provision_module.provision(store, repo, lock, [], 30)
+            self.assertEqual((store / "bom.json").read_bytes(), original)
+
+
+class NativePlatformTests(unittest.TestCase):
+    def test_platform_normalization_and_native_daemon_agreement(self):
+        self.assertEqual(fixture_inputs.normalize_platform("linux/aarch64"), "linux/arm64")
+        self.assertEqual(fixture_inputs.normalize_platform("linux/x86_64"), "linux/amd64")
+        with mock.patch.object(fixture_inputs, "native_platform", return_value="linux/amd64"), \
+                mock.patch.object(fixture_inputs, "run", return_value="linux/x86_64\n"):
+            fixture_inputs.require_native_daemon("linux/amd64")
+        with mock.patch.object(fixture_inputs, "native_platform", return_value="linux/amd64"), \
+                mock.patch.object(fixture_inputs, "run", return_value="linux/arm64\n"), \
+                self.assertRaisesRegex(fixture_inputs.FixtureInputError, "native platform mismatch"):
+            fixture_inputs.require_native_daemon("linux/amd64")
+
+    def test_platform_identity_is_consumer_independent_and_all_never_shrinks(self):
+        path = ROOT / "lock.json"
+        _, all_sha = fixture_inputs.load_lock(path, platform="linux/amd64")
+        _, consumer_sha = fixture_inputs.load_lock(path, platform="linux/amd64", consumer="iceberg-rest")
+        arm, arm_sha = fixture_inputs.load_lock(path, platform="linux/arm64", consumer="iceberg-rest")
+        self.assertEqual(all_sha, consumer_sha)
+        self.assertNotEqual(all_sha, arm_sha)
+        self.assertTrue(all(item["platform"] == "linux/arm64" for item in arm["images"].values()))
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(provision_module, "require_native_daemon") as daemon, \
+                mock.patch.object(provision_module, "prepare_images") as images:
+            store = Path(temporary) / "uncreated"
+            with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "paimon-spark-base.*no linux/arm64"):
+                provision_module.provision(store, ROOT.parents[1], path, [], 30, platform="linux/arm64")
+            self.assertFalse(store.exists()); daemon.assert_not_called(); images.assert_not_called()
+
+    def test_variant_recipe_dependencies_are_resolved_after_platform_selection(self):
+        source = fixture_inputs.read_source_lock(ROOT / "lock.json")
+        source["derived_images"]["iceberg-spark"]["variants"]["linux/amd64"]["bases"] = {
+            "SPARK_BASE": "paimon-spark-base"
+        }
+        amd, _ = fixture_inputs.resolve_lock(source, "linux/amd64", consumer="derived:iceberg-spark")
+        arm, _ = fixture_inputs.resolve_lock(source, "linux/arm64", consumer="derived:iceberg-spark")
+        self.assertEqual(set(amd["images"]), {"paimon-spark-base"})
+        self.assertEqual(set(arm["images"]), {"iceberg-spark-base"})
+
+    def test_old_source_and_bom_are_explicit_reprovision_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            path.write_text('{"schema":1}')
+            with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "reprovision"):
+                fixture_inputs.load_lock(path)
+            store = Path(temporary) / "store"
+            store.mkdir(); (store / ".provision.lock").touch()
+            (store / "READY").write_text("sha256:old-lock\n")
+            (store / "bom.json").write_text('{"schema":1}')
+            with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "reprovision"):
+                verify_module.verify(store, ROOT.parents[1], ROOT / "lock.json", consumer="iceberg-rest")
+            source = {"schema": 2, "platform": "linux/arm64", "images": {}, "artifacts": {}, "derived_images": {}}
+            with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "reprovision"):
+                verify_module.verify_contents(Path(temporary), ROOT.parents[1], source, "identity", {"schema":1})
 
 
 class DerivedImageBuildTests(unittest.TestCase):
@@ -382,7 +515,7 @@ class DerivedImageBuildTests(unittest.TestCase):
         (self.staging / "artifacts").mkdir(parents=True)
         (self.staging / "artifacts/source.tar.gz").write_bytes(b"source")
         self.lock = {
-            "schema": 1,
+            "schema": 2, "platform": "linux/arm64",
             "images": {
                 name: {"source": f"example.invalid/{name}", "platform": "linux/arm64",
                        "manifest_digest": f"sha256:{name}", "alias": f"fixture/{name}:locked"}
@@ -406,7 +539,7 @@ class DerivedImageBuildTests(unittest.TestCase):
         self.write_lock()
 
     def write_lock(self):
-        self.lock_path.write_text(json.dumps(self.lock))
+        self.lock_path.write_text(json.dumps(source_lock(self.lock)))
 
     def image_info(self, identity):
         return {"Id": identity, "Os": "linux", "Architecture": "arm64"}
@@ -498,7 +631,7 @@ class DerivedImageBuildTests(unittest.TestCase):
         (store / "bom.json").write_bytes(b"old BOM\n")
         (store / "READY").write_bytes(b"old READY\n")
         def fake_artifacts(lock, staging):
-            (staging / "artifacts").mkdir()
+            (staging / "artifacts").mkdir(exist_ok=True)
             (staging / "artifacts/source.tar.gz").write_bytes(b"source")
             return {}
         def fail_second(command):

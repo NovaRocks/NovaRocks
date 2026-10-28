@@ -26,11 +26,11 @@ def setup(root, directory):
     directory.mkdir(parents=True, exist_ok=True)
     publication = directory / "r2-publication"
     publication.mkdir(exist_ok=True)
-    lock, lock_hash = load_lock(root / "docker/fixture-inputs/lock.json")
+    lock, lock_hash = load_lock(root / "docker/fixture-inputs/lock.json", consumer="derived:iceberg-spark")
     derived = lock["derived_images"]["iceberg-spark"]
     receipt = {"alias": derived["alias"], "platform": derived["platform"],
                "definition_sha256": definition_sha256(root, derived["definition_files"]), "image_id": "sha256:spark-r2"}
-    bom = {"lock_sha256": lock_hash, "derived_images": {"iceberg-spark": receipt}}
+    bom = {"schema": 2, "platform": lock["platform"], "lock_sha256": lock_hash, "derived_images": {"iceberg-spark": receipt}}
     (directory / "bom.json").write_text(json.dumps(bom))
     project = "nr-test-r2"
     for name in ("compose.env", "compose.yml"):

@@ -552,7 +552,7 @@ def verify_inputs(config: dict) -> dict:
     # Consume the verifier's locked snapshot, not a later read of mutable bom.json.
     # The closed consumer and offline verification remain owned by ADR-0155.
     bom = machine.verified_bom(Path(config['repo_root']), Path(config['fixture_inputs']['bom']).parent)
-    config['fixture_inputs'].update(lock_sha256=bom['lock_sha256'], verified=True, consumer='iceberg-rest')
+    config['fixture_inputs'].update(lock_sha256=bom['lock_sha256'], platform=bom['platform'], verified=True, consumer='iceberg-rest')
     return bom
 
 

@@ -34,7 +34,9 @@ parser.add_argument("--image-source", action="append", default=[], metavar="NAME
 parser.add_argument("--docker-pull-timeout-seconds", type=int, default=180)
 args = parser.parse_args(sys.argv[2:])
 lock_path = repo / "docker/fixture-inputs/lock.json"
-lock = json.loads(lock_path.read_text())
+sys.path.insert(0, str(repo / "docker/fixture-inputs"))
+from fixture_inputs import load_lock
+lock, _ = load_lock(lock_path, consumer="derived:rest-mv")
 recipe = lock["derived_images"]["rest-mv"]
 with tempfile.TemporaryDirectory(prefix="novarocks-rest-mv-verification-") as temporary:
     work = Path(temporary)

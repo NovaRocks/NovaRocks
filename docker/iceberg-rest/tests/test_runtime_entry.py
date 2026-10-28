@@ -841,7 +841,7 @@ class IsolatedEntryTests(RendererCase):
 
 class ConsumerInputVerificationTests(unittest.TestCase):
     def test_runtime_consumes_exact_verified_snapshot_without_rereading_bom(self):
-        snapshot = {'lock_sha256': 'verified-lock'}
+        snapshot = {'schema': 2, 'platform': 'linux/arm64', 'lock_sha256': 'verified-lock'}
         config = {'repo_root': '/fixture-repository', 'fixture_inputs': {'bom': '/fixture-store/bom.json', 'verified': False}}
         with mock.patch.object(machine, 'verified_bom', return_value=snapshot) as verify, mock.patch.object(runtime, 'read_json', side_effect=AssertionError('reread mutable BOM')):
             actual = entry.verify_inputs(config)

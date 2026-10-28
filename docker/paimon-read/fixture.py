@@ -384,6 +384,10 @@ def load_versions() -> dict[str, str]:
 def load_writer_bom(path: Path, versions: Mapping[str, str]) -> dict[str, str]:
     """Read the receipt produced by fixture-input provisioning, never Docker."""
     bom = read_json(path)
+    if bom.get("schema") != 2:
+        raise FixtureError("unsupported fixture input BOM schema; explicitly reprovision with schema 2")
+    if bom.get("platform") != versions["SPARK_IMAGE_PLATFORM"]:
+        raise FixtureError("fixture input BOM platform does not match the native Paimon writer")
     try:
         receipt = bom["derived_images"]["paimon-writer"]
         alias = receipt["alias"]

@@ -124,7 +124,7 @@ def input_facts(bom: dict[str, Any], backend: Any) -> tuple[dict, dict]:
     """Consume already verified BOM facts; actual IDs never come from a mutable tag."""
     if not bom.get("lock_sha256"):
         raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified input lock identity is missing")
-    images, facts = {}, {"lock_sha256": bom["lock_sha256"]}
+    images, facts = {}, {"lock_sha256": bom["lock_sha256"], "platform": bom["platform"]}
     for service, group, logical in (
         ("minio", "images", "minio"), ("mc", "images", "minio-mc"),
         ("rest", "images", "iceberg-rest"),
@@ -978,11 +978,18 @@ class MachineOwner:
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "machine belongs to another Docker daemon")
 
     @contextmanager
-    def maintenance_lock(self, deadline=None):
+    def maintenance_lock(self, deadline=None, *, readonly_existing=False):
         deadline = time.monotonic() + self.timeout if deadline is None else deadline
-        self.base.mkdir(parents=True, exist_ok=True)
-        self.base.chmod(0o700)
-        with (self.base / "maintenance.lock").open("a+b") as lock:
+        if not readonly_existing:
+            self.base.mkdir(parents=True, exist_ok=True)
+            self.base.chmod(0o700)
+        try:
+            lock = (self.base / "maintenance.lock").open("rb" if readonly_existing else "a+b")
+        except OSError as error:
+            if readonly_existing:
+                raise runtime.RuntimeFailure("MachineUnavailable", "existing machine maintenance lock is unavailable") from error
+            raise
+        with lock:
             while True:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -993,13 +1000,15 @@ class MachineOwner:
                     time.sleep(min(0.02, max(0, deadline - time.monotonic())))
             previous_fd = getattr(self.backend, "maintenance_fd", None)
             previous_base = getattr(self.backend, "maintenance_base", None)
-            self.backend.maintenance_fd = lock.fileno()
-            self.backend.maintenance_base = self.base
+            if not readonly_existing:
+                self.backend.maintenance_fd = lock.fileno()
+                self.backend.maintenance_base = self.base
             try:
                 yield
             finally:
-                self.backend.maintenance_fd = previous_fd
-                self.backend.maintenance_base = previous_base
+                if not readonly_existing:
+                    self.backend.maintenance_fd = previous_fd
+                    self.backend.maintenance_base = previous_base
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     def read_saved_state(self):
@@ -1058,7 +1067,8 @@ class MachineOwner:
                                       **copy.deepcopy(verified_bom["derived_images"]["iceberg-spark"])})
 
     @contextmanager
-    def ready_snapshot(self, definition, deadline=None, *, expected_generation=None, lock_deadline=None):
+    def ready_snapshot(self, definition, deadline=None, *, expected_generation=None, lock_deadline=None,
+                       readonly_existing=False):
         if lock_deadline is not None and (type(lock_deadline) not in (int, float) or not math.isfinite(lock_deadline)):
             raise runtime.RuntimeFailure("InvalidConfiguration", "machine lock deadline must be finite")
         previous = getattr(self.backend, "operation_deadline", None)
@@ -1073,7 +1083,7 @@ class MachineOwner:
         try:
             check_deadline()
             self.assert_live_daemon()
-            with self.maintenance_lock(lock_limit):
+            with self.maintenance_lock(lock_limit, **({"readonly_existing": True} if readonly_existing else {})):
                 state = self.read_saved_state()
                 if not state or state["phase"] != "ready":
                     raise runtime.RuntimeFailure("MachineUnavailable", "start or finish machine maintenance explicitly")
@@ -1091,6 +1101,12 @@ class MachineOwner:
                 yield copy.deepcopy(state)
         finally:
             self.backend.operation_deadline = previous
+
+    def check_ready(self, verified_bom, config=None):
+        """Observe the original exact readiness contract without publishing state."""
+        definition = self.required_definition(self.load_config() if config is None else config, verified_bom)
+        with self.ready_snapshot(definition, readonly_existing=True) as state:
+            return {**state, "observed_healthy": True}
 
     def _save(self, record):
         runtime.atomic_json(self.base / "state.json", record)
@@ -1342,7 +1358,7 @@ def main(argv=None):
     parser.add_argument("--root", type=Path)
     parser.add_argument("--timeout", type=float, default=90)
     commands = parser.add_subparsers(dest="operation", required=True)
-    for operation in ("start", "upgrade"):
+    for operation in ("start", "upgrade", "check"):
         sub = commands.add_parser(operation)
         sub.add_argument("--config", type=Path)
         sub.add_argument("--store", type=Path)
@@ -1354,10 +1370,13 @@ def main(argv=None):
     runtime.install_signal_handlers()
     try:
         owner = MachineOwner(args.root, timeout=args.timeout)
-        if args.operation in {"start", "upgrade"}:
+        if args.operation in {"start", "upgrade", "check"}:
             config = machine_config(runtime.read_json(args.config)) if args.config else owner.load_config()
             bom = verified_bom(runtime.SCRIPT_DIR.parent.parent, args.store)
-            result = owner.activate(owner.required_definition(config, bom), upgrade=args.operation == "upgrade")
+            if args.operation == "check":
+                result = owner.check_ready(bom, config)
+            else:
+                result = owner.activate(owner.required_definition(config, bom), upgrade=args.operation == "upgrade")
         elif args.operation == "resolve-readonly-observation":
             result = owner.resolve_readonly_observation(args.journal)
         elif args.operation == "sweep":

@@ -91,7 +91,7 @@ def source_input_digests(workspace_root, producer_inputs):
     return digests
 
 
-def producer_lock_projections(workspace_root, declarations):
+def producer_lock_projections(workspace_root, declarations, *, platform=None):
     """Hash producer semantics, never transport aliases or unrelated fixtures."""
     if not isinstance(declarations, dict) or not declarations:
         raise ValueError("fixture.producer_lock_projections must be a non-empty table")
@@ -100,10 +100,12 @@ def producer_lock_projections(workspace_root, declarations):
         relative = Path(declaration["lock"])
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("producer lock must be a workspace relative path")
-        lock = json.loads((workspace_root / relative).read_text())
+        sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "docker/fixture-inputs"))
+        from fixture_inputs import load_lock
         name = declaration["derived_image"]
+        lock, _ = load_lock(workspace_root / relative, platform=platform, consumer=f"derived:{name}")
         derived = lock["derived_images"][name]
-        base_names = [derived["base"]] if "base" in derived else list(derived["bases"].values())
+        base_names = list(derived["bases"].values())
         bases = [{field: lock["images"][base][field] for field in
                   ("source", "platform", "manifest_digest")} for base in base_names]
         projection = {
@@ -137,11 +139,13 @@ def validate_producer(workspace_root, resolved, publication, actual_image, actua
     sys.path.insert(0, str(workspace_root / "docker/fixture-inputs"))
     from fixture_inputs import load_lock, definition_sha256
     declaration = declarations["spark"]
-    lock, lock_hash = load_lock(workspace_root / declaration["lock"])
+    lock, lock_hash = load_lock(workspace_root / declaration["lock"],
+                                platform=bom.get("platform"), consumer="derived:" + declaration["derived_image"])
     derived = lock["derived_images"][declaration["derived_image"]]
     bom_receipt = bom["derived_images"][declaration["derived_image"]]
     expected = {"lock_sha256": lock_hash, **bom_receipt}
-    if (receipt != expected or saved["receipt"] != bom_receipt
+    if (bom.get("schema") != 2 or bom.get("platform") != lock["platform"]
+            or receipt != expected or saved["receipt"] != bom_receipt
             or bom["lock_sha256"] != lock_hash
             or bom_receipt["definition_sha256"] != definition_sha256(workspace_root, derived["definition_files"])
             or bom_receipt["platform"] != derived["platform"]

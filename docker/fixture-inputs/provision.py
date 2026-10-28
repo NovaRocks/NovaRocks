@@ -20,6 +20,11 @@ from fixture_inputs import (
     fixture_store_lock,
     inspect_image,
     load_lock,
+    read_source_lock,
+    resolve_lock,
+    native_platform,
+    require_native_daemon,
+    read_json,
     require_relative,
     run,
     validate_artifact,
@@ -105,7 +110,7 @@ def prepare_images(
 
 def prepare_artifacts(lock: dict[str, Any], staging: Path) -> dict[str, dict[str, Any]]:
     artifacts_dir = staging / "artifacts"
-    artifacts_dir.mkdir(parents=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     receipts: dict[str, dict[str, Any]] = {}
     for name, item in lock["artifacts"].items():
         output = artifacts_dir / name
@@ -197,11 +202,13 @@ def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, l
 def context_only(
     repo_root: Path, lock_path: Path, name: str, out: Path,
     image_source_specs: list[str], pull_timeout_seconds: int,
+    platform: str | None = None,
 ) -> Path:
     """Prepare one build context without reading or publishing the fixture store."""
     if pull_timeout_seconds < 1:
         raise FixtureInputError("--docker-pull-timeout-seconds must be a positive integer")
-    lock, _ = load_lock(lock_path)
+    lock, _ = load_lock(lock_path, platform=platform, consumer=f"derived:{name}")
+    require_native_daemon(lock["platform"])
     item = lock["derived_images"].get(name)
     if item is None:
         raise FixtureInputError(f"unknown fixture derived image: {name}")
@@ -220,34 +227,88 @@ def context_only(
     return out
 
 
+def retained_inputs(store: Path, repo_root: Path, source: dict[str, Any],
+                    platform: str, lock_sha: str) -> tuple[dict[str, Any], Path | None]:
+    """Retain only independently reverified closures from this lock/platform."""
+    from verify import verify_contents
+    retained: dict[str, Any] = {kind: {} for kind in ("images", "artifacts", "derived_images")}
+    try:
+        bom = read_json(store / "bom.json")
+        if ((store / "READY").read_text().strip() != f"sha256:{lock_sha}"
+                or bom.get("schema") != 2 or bom.get("lock_sha256") != lock_sha
+                or bom.get("platform") != platform):
+            return retained, None
+        directory = store / require_relative(str(bom.get("artifact_dir", "")))
+    except (FixtureInputError, OSError):
+        return retained, None
+    for kind, prefix in (("images", "image"), ("artifacts", "artifact"), ("derived_images", "derived")):
+        entries = bom.get(kind, {})
+        if not isinstance(entries, dict):
+            continue
+        for name in entries:
+            if name not in source[kind]:
+                continue
+            try:
+                closure, _ = resolve_lock(source, platform, consumer=f"{prefix}:{name}")
+                verify_contents(store, repo_root, closure, lock_sha, bom)
+            except FixtureInputError:
+                continue
+            for category in retained:
+                for dependency in closure[category]:
+                    retained[category][dependency] = bom[category][dependency]
+    return retained, directory
+
+
 def provision(
     store: Path,
     repo_root: Path,
     lock_path: Path,
     image_source_specs: list[str],
     pull_timeout_seconds: int,
+    *, consumer: str = "all", platform: str | None = None,
 ) -> Path:
     if pull_timeout_seconds < 1:
         raise FixtureInputError("--docker-pull-timeout-seconds must be a positive integer")
-    lock, lock_sha = load_lock(lock_path)
-    image_sources = parse_image_sources(image_source_specs, set(lock["images"]))
+    source = read_source_lock(lock_path)
+    lock, lock_sha = resolve_lock(source, platform or native_platform(), consumer=consumer)
+    # Missing variants and unsupported consumers fail before touching Docker/store.
+    image_sources = parse_image_sources(image_source_specs, set(source["images"]))
+    require_native_daemon(lock["platform"])
     store.mkdir(parents=True, exist_ok=True)
     with fixture_store_lock(store, exclusive=True, create=True):
+        retained, previous_artifacts = retained_inputs(store, repo_root, source, lock["platform"], lock_sha)
+        if all(set(lock[kind]).issubset(retained[kind]) for kind in retained):
+            print(store / "bom.json")
+            return store / "bom.json"
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=store))
         try:
-            images = prepare_images(lock, image_sources, pull_timeout_seconds)
-            artifacts = prepare_artifacts(lock, staging)
-            derived = build_derived_images(lock, repo_root, staging, lock_sha)
-            # Only successful builds enter the mutable publication segment.
-            # A crash here can still require a new provision to repair aliases.
-            for receipt in derived.values():
+            artifacts_dir = staging / "artifacts"
+            artifacts_dir.mkdir()
+            for name in retained["artifacts"]:
+                assert previous_artifacts is not None
+                target = artifacts_dir / require_relative(name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(previous_artifacts / require_relative(name), target)
+                validate_artifact(artifacts_dir / name, source["artifacts"][name])
+            missing = {**lock, **{kind: {name: item for name, item in lock[kind].items()
+                                              if name not in retained[kind]}
+                                 for kind in retained}}
+            images = {**retained["images"], **prepare_images(missing, image_sources, pull_timeout_seconds)}
+            artifacts = {**retained["artifacts"], **prepare_artifacts(missing, staging)}
+            # Recipes still need their complete base declarations; only builders
+            # selected below are new, while verified retained bases stay installed.
+            build_lock = {**lock, "derived_images": missing["derived_images"]}
+            derived = {**retained["derived_images"], **build_derived_images(build_lock, repo_root, staging, lock_sha)}
+            for name in missing["derived_images"]:
+                receipt = derived[name]
                 run(["docker", "tag", receipt["image_id"], receipt["alias"]])
             generation = f"generation-{uuid.uuid4().hex}"
             generations = store / "generations"
             generations.mkdir(exist_ok=True)
             staging.replace(generations / generation)
             bom = {
-                "schema": 1,
+                "schema": 2,
+                "platform": lock["platform"],
                 "lock_sha256": lock_sha,
                 "artifact_dir": f"generations/{generation}/artifacts",
                 "images": images,
@@ -255,10 +316,12 @@ def provision(
                 "derived_images": derived,
             }
             atomic_json(store / "bom.json", bom)
-            (store / "READY").write_text(f"sha256:{lock_sha}\n")
+            ready = store / f".READY.tmp-{os.getpid()}"
+            ready.write_text(f"sha256:{lock_sha}\n")
+            ready.replace(store / "READY")
         except Exception:
-            # A failed staging directory has no READY/BOM reachability. Retain it
-            # for diagnosis instead of deleting a store another provision may use.
+            # Failed staging/generations are unreachable or fail verification;
+            # retain them for diagnosis rather than deleting another attempt.
             raise
     print(store / "bom.json")
     return store / "bom.json"
@@ -269,6 +332,8 @@ def main() -> int:
     parser.add_argument("--store")
     parser.add_argument("--repo-root", default=SCRIPT_DIR.parents[1])
     parser.add_argument("--lock", default=SCRIPT_DIR / "lock.json")
+    parser.add_argument("--platform", help="explicit native target, checked against host and Docker daemon")
+    parser.add_argument("--consumer", choices=("all", "iceberg-rest"), default="all")
     parser.add_argument("--context-only", metavar="NAME", help="prepare one derived image context without publishing a BOM")
     parser.add_argument("--out", type=Path, metavar="DIR", help="empty output directory for --context-only")
     parser.add_argument(
@@ -292,7 +357,7 @@ def main() -> int:
             context_only(
                 Path(args.repo_root).resolve(), Path(args.lock).resolve(),
                 args.context_only, args.out.resolve(), args.image_source,
-                args.docker_pull_timeout_seconds,
+                args.docker_pull_timeout_seconds, args.platform,
             )
             return 0
         provision(
@@ -300,7 +365,7 @@ def main() -> int:
             Path(args.repo_root).resolve(),
             Path(args.lock).resolve(),
             args.image_source,
-            args.docker_pull_timeout_seconds,
+            args.docker_pull_timeout_seconds, consumer=args.consumer, platform=args.platform,
         )
     except FixtureInputError as error:
         print(f"PROVISION FAILED: {error}")
