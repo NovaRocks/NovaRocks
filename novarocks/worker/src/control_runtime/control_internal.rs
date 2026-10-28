@@ -36,6 +36,7 @@ use novarocks_control_runtime_core::{
 use novarocks_worker_protocol::control::{ControlCore, ControlEffect, ControlInput};
 
 pub(crate) const CONTROL_INTERNAL_STORAGE: StorageNeed = StorageNeed {
+    requests: 0,
     inputs: 1,
     batches: 1,
     effects: ControlCore::MAX_STEP_WORK,

@@ -59,6 +59,9 @@ pub(crate) struct ControlRequestReady {
     shared: Arc<ReadyShared>,
 }
 impl ControlRequestReady {
+    pub(super) fn same_runtime(&self, runtime: &ActorRuntime<WorkerActor>) -> bool {
+        self.shared.runtime.same_runtime(runtime)
+    }
     pub(crate) fn new(limit: NonZeroUsize, runtime: ActorRuntime<WorkerActor>) -> Self {
         Self {
             shared: Arc::new(ReadyShared {

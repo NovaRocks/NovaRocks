@@ -41,6 +41,7 @@ pub(crate) const CONTEXT_IO_CALLBACKS: usize = 2;
 /// keeps the actual instance, credential and retained host sources separately
 /// from each call's body/report. U has not been included in this inventory.
 pub(crate) const CONTEXT_IO_STORAGE: StorageNeed = StorageNeed {
+    requests: 0,
     inputs: CONTEXT_IO_CALLBACKS,
     batches: CONTEXT_IO_CALLBACKS,
     effects: CONTEXT_IO_CALLBACKS * ContextCore::MAX_STEP_WORK,

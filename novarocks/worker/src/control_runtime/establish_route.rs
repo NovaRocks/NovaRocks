@@ -54,6 +54,7 @@ use std::sync::{
 };
 
 pub(crate) const CONTEXT_ROUTE_ESCROW_STORAGE: StorageNeed = StorageNeed {
+    requests: 0,
     inputs: 1,
     batches: 1,
     effects: ContextCore::MAX_STEP_WORK,
@@ -64,6 +65,7 @@ pub(crate) const CONTEXT_ROUTE_ESCROW_STORAGE: StorageNeed = StorageNeed {
     replies: 0,
 };
 pub(crate) const ROOT_ROUTE_RETURN_STORAGE: StorageNeed = StorageNeed {
+    requests: 0,
     inputs: 1,
     batches: 1,
     effects: ControlCore::MAX_STEP_WORK,

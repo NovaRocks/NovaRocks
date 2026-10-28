@@ -42,6 +42,7 @@ use std::{mem::ManuallyDrop, sync::Arc};
 /// no additional Work or report, and source positions are paid separately.
 pub(crate) const OPEN_SUMMARY_STORAGE: crate::control_runtime_policy::StorageNeed =
     crate::control_runtime_policy::StorageNeed {
+        requests: 0,
         inputs: 1,
         batches: 1,
         effects: novarocks_worker_protocol::context::ContextCore::MAX_STEP_WORK,

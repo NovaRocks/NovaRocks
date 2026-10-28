@@ -72,6 +72,7 @@ const TIMER: usize = 1;
 const FAILURE: usize = 2;
 
 pub(crate) const PROCESS_CONTROL_BOOTSTRAP_STORAGE: StorageNeed = StorageNeed {
+    requests: 0,
     inputs: 1,
     batches: 1,
     effects: ControlCore::MAX_STEP_WORK,

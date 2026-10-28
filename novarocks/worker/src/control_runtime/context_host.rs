@@ -70,6 +70,7 @@ const FAILURE: usize = 2;
 /// Includes the fixed M/R/opaque-holder inventory. Jobs must bind those actual
 /// roles and both callbacks before capture; shared-domain U is still separate.
 pub(crate) const CONTEXT_BOOTSTRAP_STORAGE: StorageNeed = StorageNeed {
+    requests: 0,
     inputs: 1 + CONTEXT_IO_STORAGE.inputs + CONTEXT_LIFECYCLE_STORAGE.inputs,
     batches: 1 + CONTEXT_IO_STORAGE.batches + CONTEXT_LIFECYCLE_STORAGE.batches,
     effects: ContextCore::MAX_STEP_WORK
@@ -132,6 +133,10 @@ pub(crate) struct ContextHostResources {
     pub lifecycle: Option<ContextLifecycle>,
     pub notice: Option<ContextReadyNotice>,
     io_attempted: bool,
+    pub requests:
+        BTreeMap<novarocks_control_runtime_core::identity::WorkId, requests::ContextRequestCustody>,
+    pub request_partials:
+        BTreeMap<novarocks_control_runtime_core::identity::WorkId, requests::ContextRequestPartial>,
 }
 
 pub(crate) struct ContextHostRefusal {
@@ -164,6 +169,7 @@ pub(crate) struct ContextHostRecord {
     max_live_tasks: usize,
     max_routes: usize,
     pub dispatch: EffectDispatch,
+    request_inputs: BTreeMap<InputId, novarocks_control_runtime_core::identity::WorkId>,
 }
 impl ContextHostRecord {
     #[cfg(test)]
@@ -300,6 +306,8 @@ impl ContextHostRecord {
             lifecycle: None,
             notice: None,
             io_attempted: false,
+            requests: BTreeMap::new(),
+            request_partials: BTreeMap::new(),
         };
         let result = (|| -> Result<(), ContextHostError> {
             let paid = resources
@@ -382,6 +390,7 @@ impl ContextHostRecord {
             max_live_tasks: binding.max_live_tasks,
             max_routes,
             dispatch: EffectDispatch::context(runtime.clone(), binding.actor, effect_limit),
+            request_inputs: BTreeMap::new(),
         })
     }
     pub(crate) fn identity(&self) -> QueryContextRef {
@@ -775,10 +784,18 @@ impl ContextHostRecord {
     }
 }
 
+mod requests;
+pub(crate) use requests::{
+    ContextRequestAdmissionRefusal, ContextRequestError, ContextRequestHandle,
+    ContextRequestPublishRefusal, ContextRequestSubmitRefusal,
+};
+
 #[cfg(test)]
 mod tests {
     mod io_bank;
     mod lifecycle_bank;
+    #[path = "../requests/tests.rs"]
+    mod requests;
     use super::*;
     use crate::control_runtime::actors::{
         ControlActor, ControlMessage, RequestMetadata, WorkerMessage,
@@ -862,6 +879,12 @@ mod tests {
     }
     impl Harness {
         fn new(context_storage: StorageNeed) -> Self {
+            Self::new_with_request_capacity(context_storage, 0)
+        }
+        fn new_with_request_capacity(context_storage: StorageNeed, requests: usize) -> Self {
+            let request_storage = super::requests::CONTEXT_REQUEST_STORAGE
+                .checked_mul(requests)
+                .unwrap();
             let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
                 ordinary_running: 1,
                 ordinary_waiting: 0,
@@ -875,6 +898,7 @@ mod tests {
             // return/request position. The ticket and Context pay separately.
             let mut limits = Vec::new();
             for dimension in [
+                Dimension::Requests,
                 Dimension::ActiveTasks,
                 Dimension::PreparingTasks,
                 Dimension::PreparingBytes,
@@ -892,11 +916,18 @@ mod tests {
                 Dimension::Work,
             ] {
                 let count = match dimension {
+                    Dimension::Requests => requests,
                     Dimension::Contexts | Dimension::Tickets => 1,
-                    Dimension::Inputs | Dimension::Batches => 2 + context_storage.inputs,
-                    Dimension::Effects => 2 * ContextCore::MAX_STEP_WORK + context_storage.effects,
-                    Dimension::Replies => 2,
-                    Dimension::Work => 3 + 1 + context_storage.work,
+                    Dimension::Inputs | Dimension::Batches => {
+                        2 + context_storage.inputs + request_storage.inputs
+                    }
+                    Dimension::Effects => {
+                        2 * ContextCore::MAX_STEP_WORK
+                            + context_storage.effects
+                            + request_storage.effects
+                    }
+                    Dimension::Replies => 2 + request_storage.replies,
+                    Dimension::Work => 3 + 1 + context_storage.work + request_storage.work,
                     _ => 1024,
                 };
                 limits.push((dimension.id(), u64::try_from(count).unwrap()));

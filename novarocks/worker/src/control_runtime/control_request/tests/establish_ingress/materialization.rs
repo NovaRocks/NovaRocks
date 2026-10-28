@@ -67,6 +67,7 @@ fn context_actor() -> ActorId {
 // Its pre-reserved input can finish the zero-task Core close after admission
 // closes, without asking the closed scope for a fresh external position.
 const BRIDGE_STORAGE: StorageNeed = StorageNeed {
+    requests: 0,
     inputs: 1,
     batches: 1,
     effects: ContextCore::MAX_STEP_WORK,
@@ -707,7 +708,7 @@ fn poll_noticed_host_returns(f: &mut Fixture, notice: &ContextReadyNotice) -> us
         .unwrap()
 }
 
-fn all_worker_fees(f: &Fixture) -> [u64; 15] {
+fn all_worker_fees(f: &Fixture) -> [u64; 16] {
     [
         Dimension::ActiveTasks,
         Dimension::PreparingTasks,
@@ -724,6 +725,7 @@ fn all_worker_fees(f: &Fixture) -> [u64; 15] {
         Dimension::Completions,
         Dimension::Captures,
         Dimension::Work,
+        Dimension::Requests,
     ]
     .map(|dimension| f.ledger.used(dimension.id()))
 }

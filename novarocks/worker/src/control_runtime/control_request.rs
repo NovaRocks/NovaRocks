@@ -21,8 +21,9 @@
 mod source_io;
 pub(crate) use source_io::{RequestIoError, RequestIoProgress};
 
+use super::request_endpoint::{RequestDelivery, RequestEndpoint, RequestHandle};
 pub(crate) use super::request_ready::ControlRequestReady;
-use super::request_ready::{RequestExternalLeg, RequestReadySlot};
+use super::request_ready::RequestExternalLeg;
 use super::{
     actors::{ControlMessage, RequestMetadata, WorkerAction, WorkerActor, WorkerMessage},
     context_host::ContextHostRecord,
@@ -69,6 +70,7 @@ use novarocks_worker_protocol::{
 use std::sync::Arc;
 
 pub(crate) const CONTROL_REQUEST_STORAGE: StorageNeed = StorageNeed {
+    requests: 1,
     inputs: 1,
     batches: 1,
     effects: ControlCore::MAX_STEP_WORK,
@@ -200,53 +202,10 @@ impl std::fmt::Debug for ControlRequestPublishRefusal {
 
 pub(crate) use novarocks_worker_protocol::control::ControlReplyBody;
 
-struct Endpoint {
-    request: RequestContext,
-    ready: ControlRequestReady,
-    reply: PublishedReply<ControlReplyBody>,
-    external: RequestExternalLeg,
-}
-impl Endpoint {
-    fn end_external(this: &Arc<Self>) {
-        this.external.end();
-    }
-    fn external_ended(&self) -> bool {
-        self.external.is_ended()
-    }
-}
-/// This endpoint cannot be cloned. Cancellation ends only the external leg.
-#[must_use = "Take the original reply or end only this external wait"]
-pub(crate) struct ControlRequestHandle {
-    endpoint: Arc<Endpoint>,
-    active: bool,
-}
-impl ControlRequestHandle {
-    pub(crate) fn request(&self) -> RequestContext {
-        self.endpoint.request
-    }
-    pub(crate) fn try_take(&mut self) -> Option<ControlRequestDelivery> {
-        if !self.active {
-            return None;
-        }
-        let body = self.endpoint.external.try_take(&self.endpoint.reply)?;
-        self.active = false;
-        Some(ControlRequestDelivery {
-            endpoint: self.endpoint.clone(),
-            body: Some(body),
-        })
-    }
-}
-/// Concrete coalesced metadata wake; it executes no application callback.
-#[derive(Clone)]
-pub(super) struct ControlRequestNotice(Arc<RequestReadySlot>);
-impl ControlRequestNotice {
-    pub(super) fn belongs_to(&self, ready: &ControlRequestReady) -> bool {
-        self.0.belongs_to(ready)
-    }
-    pub(super) fn notify(&self) {
-        self.0.notify();
-    }
-}
+type Endpoint = RequestEndpoint<ControlReplyBody>;
+pub(crate) type ControlRequestHandle = RequestHandle<ControlReplyBody>;
+pub(crate) type ControlRequestDelivery = RequestDelivery<ControlReplyBody>;
+pub(super) use super::request_endpoint::RequestNotice as ControlRequestNotice;
 
 #[must_use = "The original request remains owned on ingress refusal"]
 pub(crate) struct EstablishIngressBeginRefusal {
@@ -271,35 +230,6 @@ impl std::fmt::Debug for EstablishIngressBeginRefusal {
             .finish_non_exhaustive()
     }
 }
-impl Drop for ControlRequestHandle {
-    fn drop(&mut self) {
-        if self.active {
-            Endpoint::end_external(&self.endpoint);
-        }
-    }
-}
-/// Taking the outbox transfers the same endpoint's physical external exit
-/// obligation here. The body is disposed before that exit fact is published.
-#[must_use = "The actual sender retains delivery custody until it really ends"]
-pub(crate) struct ControlRequestDelivery {
-    endpoint: Arc<Endpoint>,
-    body: Option<Arc<ControlReplyBody>>,
-}
-impl ControlRequestDelivery {
-    pub(crate) fn request(&self) -> RequestContext {
-        self.endpoint.request
-    }
-    pub(crate) fn body(&self) -> &ControlReplyBody {
-        self.body.as_deref().expect("live original reply delivery")
-    }
-}
-impl Drop for ControlRequestDelivery {
-    fn drop(&mut self) {
-        drop(self.body.take());
-        Endpoint::end_external(&self.endpoint);
-    }
-}
-
 #[derive(Clone, Copy)]
 enum RequestKind {
     Acquire {

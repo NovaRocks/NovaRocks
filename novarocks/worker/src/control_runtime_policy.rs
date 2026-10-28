@@ -93,11 +93,17 @@ pub struct StorageNeed {
     pub completions: usize,
     pub captures: usize,
     pub work: usize,
+    /// Actual external request positions, not a count of reply cells.
+    pub requests: usize,
 }
 
 impl StorageNeed {
     pub fn checked_sub(self, other: Self) -> Result<Self, PolicyError> {
         Ok(Self {
+            requests: self
+                .requests
+                .checked_sub(other.requests)
+                .ok_or(PolicyError::InvalidStorageGeometry)?,
             inputs: self
                 .inputs
                 .checked_sub(other.inputs)
@@ -134,6 +140,10 @@ impl StorageNeed {
     }
     pub fn checked_add(self, other: Self) -> Result<Self, PolicyError> {
         Ok(Self {
+            requests: self
+                .requests
+                .checked_add(other.requests)
+                .ok_or(PolicyError::Overflow)?,
             inputs: self
                 .inputs
                 .checked_add(other.inputs)
@@ -171,6 +181,10 @@ impl StorageNeed {
 
     pub fn checked_mul(self, count: usize) -> Result<Self, PolicyError> {
         Ok(Self {
+            requests: self
+                .requests
+                .checked_mul(count)
+                .ok_or(PolicyError::Overflow)?,
             inputs: self
                 .inputs
                 .checked_mul(count)
@@ -212,6 +226,7 @@ impl StorageNeed {
             effects: ContextCore::MAX_STEP_WORK * crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
             cuts: 1,
             replies: usize::from(reply),
+            requests: usize::from(reply),
             completions: 3,
             captures: 3,
             work: 3,
@@ -425,6 +440,9 @@ mod tests {
         let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
         assert_eq!(policy.request_roles, (3 + 2 + 2 + 1) * 7);
         assert_eq!(policy.request_pool.replies, policy.request_roles);
+        assert_eq!(policy.request_pool.requests, policy.request_roles);
+        assert_eq!(policy.task_base.requests, 0);
+        assert_eq!(policy.root_read_pool_per_root.requests, 0);
         assert_eq!(policy.request_pool.cuts, policy.request_roles);
         let actor = policy.context_actor(9).unwrap();
         assert_eq!(
@@ -526,6 +544,8 @@ mod tests {
         let one = policy.process_task_storage(1, 0).unwrap();
         let two = policy.process_task_storage(2, 0).unwrap();
         assert_eq!(two.replies, one.replies);
+        assert_eq!(one.requests, policy.request_roles);
+        assert_eq!(two.requests, policy.request_roles);
         assert_eq!(two.inputs - one.inputs, policy.task_base.inputs);
         assert_eq!(two.cuts - one.cuts, policy.task_base.cuts);
         assert_eq!(two.work - one.work, policy.task_base.work);
@@ -535,6 +555,7 @@ mod tests {
         );
         let root = policy.process_task_storage(2, 1).unwrap();
         assert_eq!(root.cuts - two.cuts, 2);
+        assert_eq!(root.requests, policy.request_roles);
         assert_eq!(root.work - two.work, policy.root_read_pool_per_root.work);
         assert_eq!(
             root.completions - two.completions,
@@ -608,5 +629,48 @@ mod tests {
         );
         assert!(policy.context_actor(usize::MAX).is_err());
         assert!(policy.context_actor(0).is_err());
+    }
+
+    #[test]
+    fn request_geometry_is_checked_independently_of_reply_cell_count() {
+        let one = StorageNeed {
+            requests: 1,
+            ..StorageNeed::default()
+        };
+        assert_eq!(one.checked_add(one).unwrap().requests, 2);
+        assert_eq!(one.checked_mul(3).unwrap().requests, 3);
+        assert_eq!(one.checked_sub(one).unwrap(), StorageNeed::default());
+        assert_eq!(
+            StorageNeed::default().checked_sub(one),
+            Err(PolicyError::InvalidStorageGeometry)
+        );
+        let full = StorageNeed {
+            requests: usize::MAX,
+            ..StorageNeed::default()
+        };
+        assert_eq!(full.checked_add(one), Err(PolicyError::Overflow));
+        assert_eq!(full.checked_mul(2), Err(PolicyError::Overflow));
+        let cells = StorageNeed {
+            replies: 3,
+            ..StorageNeed::default()
+        };
+        assert_eq!(
+            cells.requests, 0,
+            "a reply cell alone is not an external request grant"
+        );
+        assert_eq!(StorageNeed::role(false).requests, 0);
+        assert_eq!(StorageNeed::role(true).requests, 1);
+        assert_eq!(
+            crate::control_runtime::control_request::ESTABLISH_REQUEST_STORAGE.requests,
+            1
+        );
+        assert_eq!(
+            crate::control_runtime::control_request::ESTABLISH_REQUEST_STORAGE
+                .checked_sub(crate::control_runtime::control_request::CONTROL_REQUEST_STORAGE)
+                .unwrap()
+                .requests,
+            0,
+            "Establish's extra source/route storage does not buy a second R"
+        );
     }
 }

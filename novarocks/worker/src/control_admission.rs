@@ -56,6 +56,8 @@ pub(crate) enum Dimension {
     Completions,
     Captures,
     Work,
+    /// One actually admitted external request, independent of reply cells.
+    Requests,
 }
 impl Dimension {
     pub(crate) const fn id(self) -> DimensionId {
@@ -74,6 +76,7 @@ impl StorageNeed {
             (Dimension::Completions, self.completions),
             (Dimension::Captures, self.captures),
             (Dimension::Work, self.work),
+            (Dimension::Requests, self.requests),
         ]
         .into_iter()
         .map(|(dimension, value)| {
@@ -310,6 +313,7 @@ mod tests {
                 Dimension::Completions,
                 Dimension::Captures,
                 Dimension::Work,
+                Dimension::Requests,
             ]
             .map(|d| {
                 (
@@ -493,6 +497,88 @@ mod tests {
         for port in [a, b] {
             port.scope.close_external().unwrap();
             ledger.remove_scope(port.scope.id()).unwrap();
+        }
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn external_requests_in_two_scopes_share_one_physical_request_dimension() {
+        use crate::control_runtime::control_request::CONTROL_REQUEST_STORAGE;
+        // Keep every other storage dimension slack. Only the one actual
+        // process-wide request position can refuse the competing scope.
+        let budget = StorageNeed {
+            requests: 1,
+            ..CONTROL_REQUEST_STORAGE.checked_mul(2).unwrap()
+        };
+        let ledger = RuntimeLedger::new(budget.resources().unwrap(), 4, 2);
+        let first = ledger.open_scope_next(None, generation(), 2, 2).unwrap();
+        let second = ledger.open_scope_next(None, generation(), 2, 2).unwrap();
+        let resources = CONTROL_REQUEST_STORAGE.resources().unwrap();
+        let (mut work, mut capacity) = first
+            .reserve_next(
+                generation(),
+                resources.clone(),
+                WorkKind::Cleanup,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Cleanup)
+            .unwrap();
+        work.start().unwrap();
+        assert_eq!(ledger.used(Dimension::Requests.id()), 1);
+        let before = second.snapshot().unwrap();
+        let denied = match second.reserve_next(
+            generation(),
+            resources.clone(),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the same process request dimension must refuse this scope"),
+        };
+        assert!(
+            matches!(denied, RuntimeError::CapacityDenied(denial) if denial.dimension == Dimension::Requests.id() && denial.requested == 1 && denial.committed == 1 && denial.limit == 1)
+        );
+        assert_eq!(second.snapshot().unwrap(), before);
+        // This is a quota-container probe, not a full RPC/report lifecycle.
+        // Even genuine Work reaping cannot silently refund the held bundle.
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        assert_eq!(ledger.reap_scope_ready(first.id(), 1).unwrap(), 1);
+        assert_eq!(ledger.used(Dimension::Requests.id()), 1);
+        let denied = match second.reserve_next(
+            generation(),
+            resources.clone(),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the same process request dimension must refuse this scope"),
+        };
+        assert!(
+            matches!(denied, RuntimeError::CapacityDenied(denial) if denial.dimension == Dimension::Requests.id())
+        );
+        capacity.release(&resources).unwrap();
+        assert_eq!(ledger.used(Dimension::Requests.id()), 0);
+        let (mut work, mut capacity) = second
+            .reserve_next(
+                generation(),
+                resources.clone(),
+                WorkKind::Cleanup,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Cleanup)
+            .unwrap();
+        work.start().unwrap();
+        assert_eq!(ledger.used(Dimension::Requests.id()), 1);
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        assert_eq!(ledger.reap_scope_ready(second.id(), 1).unwrap(), 1);
+        capacity.release(&resources).unwrap();
+        for scope in [first, second] {
+            scope.close_external().unwrap();
+            ledger.remove_scope(scope.id()).unwrap();
         }
         assert!(ledger.is_empty());
     }

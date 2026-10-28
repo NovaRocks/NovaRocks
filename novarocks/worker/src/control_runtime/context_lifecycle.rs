@@ -42,6 +42,7 @@ use novarocks_worker_protocol::{
 
 pub(crate) const CONTEXT_LIFECYCLE_INPUTS: usize = 2;
 pub(crate) const CONTEXT_LIFECYCLE_STORAGE: StorageNeed = StorageNeed {
+    requests: 0,
     inputs: CONTEXT_LIFECYCLE_INPUTS,
     batches: CONTEXT_LIFECYCLE_INPUTS,
     effects: CONTEXT_LIFECYCLE_INPUTS * ControlCore::MAX_STEP_WORK,

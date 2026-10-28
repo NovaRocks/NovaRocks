@@ -32,6 +32,7 @@ pub(crate) mod establish_executors;
 pub(crate) mod establish_ingress;
 pub(crate) mod establish_route;
 pub(crate) mod process_control;
+pub(crate) mod request_endpoint;
 pub(crate) mod request_ready;
 pub(crate) mod service;
 
