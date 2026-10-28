@@ -37,7 +37,7 @@ fn wait_original_ready(f: &Fixture, input: InputId) {
         f.runtime.wait_after_timeout(version, remaining);
     }
 }
-fn original_fees(f: &Fixture) -> [u64; 5] {
+pub(super) fn original_fees(f: &Fixture) -> [u64; 5] {
     [
         Dimension::Work,
         Dimension::Captures,

@@ -106,7 +106,7 @@ fn an_actual_stopped_rpc_start_is_not_an_unknown_getter_failure() {
 
 // These symbolic opaque sources exercise real Worker custody and foreign
 // invocation/Drop boundaries. They do not claim Native ingress integration.
-fn symbolic_panicking_source(
+pub(super) fn symbolic_panicking_source(
     f: &Fixture,
     drop_gate: Option<Arc<Gate>>,
 ) -> (EstablishQueryContext, Arc<AtomicUsize>, Arc<AtomicUsize>) {

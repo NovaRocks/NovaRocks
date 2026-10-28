@@ -148,6 +148,9 @@ pub(crate) struct EstablishExecutorHandles {
     cleanup: HostExecutorHandle<Queued>,
 }
 impl EstablishExecutorHandles {
+    pub(super) fn belongs_to(&self, ready: &ControlRequestReady) -> bool {
+        self.ready.same_owner(ready)
+    }
     pub(crate) fn try_submit_getter(
         &self,
         original: EstablishIngressJob,

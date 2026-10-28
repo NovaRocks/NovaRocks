@@ -1736,7 +1736,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
         job,
         getters,
         drops,
-        mut source_pools,
+        source_pools,
         ..
     } = MaterializationFixture::with_factory(
         Gate::new(),
@@ -1932,12 +1932,13 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
         }
         complete_root(&mut f, effect);
     }
-    let raw = f
+    // The actual rejection publisher has retained the original raw job in R.
+    // Only the unified owner turn dispatches it to the same cleanup pool.
+    let raw_progress = f
         .root
-        .take_consumed_creator_disposal(input)
-        .unwrap()
-        .expect("withdrawn M returned the original source loan and observed its actual exit");
-    source_pools.disposal(raw);
+        .advance_ready_requests(source_pools.handles(), 8)
+        .unwrap();
+    let raw_dispatched = raw_progress.dispatched == 1;
     let raw_disposed = matches!(
         source_pools::wait_disposal(&f, input),
         ExitRolePhase::Exited | ExitRolePhase::Retired
@@ -1948,7 +1949,9 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     drop(delivery);
     drop(external);
     for _ in 0..8 {
-        f.root.reap_ready_requests(8).unwrap();
+        f.root
+            .advance_ready_requests(source_pools.handles(), 8)
+            .unwrap();
     }
     let raw_drops_before_r = drops.load(Ordering::SeqCst);
     let rpc_fee_after_m = f.ledger.used(Dimension::Replies.id());
@@ -2105,7 +2108,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     assert_eq!(factory_before_m, 0);
     assert!(no_cleanup_worker_occupied);
     assert_eq!(m_callbacks, 1);
-    assert!(source_after_m && raw_disposed);
+    assert!(source_after_m && raw_dispatched && raw_disposed);
     assert!(!before_m_effect && !m_retired_but_r_not_issued);
     assert_eq!(
         actual_decision,

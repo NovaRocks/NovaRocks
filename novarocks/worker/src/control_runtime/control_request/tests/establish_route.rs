@@ -19,6 +19,7 @@
 //! never invokes Native materialization or invents a successful host result.
 mod deferred;
 mod late_return;
+mod owner_turn_fairness;
 mod partial;
 use super::*;
 use crate::{

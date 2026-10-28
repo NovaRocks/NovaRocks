@@ -18,6 +18,9 @@
 //! Original process-root request and external reply custody. Neutral body facts
 //! may be shared between actual waiters; publication and exit authority cannot.
 
+mod source_io;
+pub(crate) use source_io::{RequestIoError, RequestIoProgress};
+
 use super::{
     actors::{ControlMessage, RequestMetadata, WorkerAction, WorkerActor, WorkerMessage},
     context_host::ContextHostRecord,
@@ -203,6 +206,7 @@ pub(crate) use novarocks_worker_protocol::control::ControlReplyBody;
 struct ReadyState {
     slots: BTreeMap<InputId, Weak<Endpoint>>,
     ready: BTreeSet<InputId>,
+    cursor: Option<InputId>,
 }
 struct ReadyShared {
     limit: NonZeroUsize,
@@ -217,6 +221,9 @@ pub(crate) struct ControlRequestReady {
     shared: Arc<ReadyShared>,
 }
 impl ControlRequestReady {
+    pub(super) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
     pub(super) fn limit(&self) -> NonZeroUsize {
         self.shared.limit
     }
@@ -227,6 +234,7 @@ impl ControlRequestReady {
                 state: Mutex::new(ReadyState {
                     slots: BTreeMap::new(),
                     ready: BTreeSet::new(),
+                    cursor: None,
                 }),
                 changed: Notify::default(),
                 runtime,
@@ -292,12 +300,27 @@ impl ControlRequestReady {
         self.shared.changed.version()
     }
     pub(crate) fn next_ready(&self) -> Option<InputId> {
-        self.shared
+        let mut state = self
+            .shared
             .state
             .lock()
-            .expect("control request ready index")
-            .ready
-            .pop_first()
+            .expect("control request ready index");
+        let next = state
+            .cursor
+            .and_then(|cursor| {
+                state
+                    .ready
+                    .range((
+                        std::ops::Bound::Excluded(cursor),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .copied()
+            })
+            .or_else(|| state.ready.first().copied())?;
+        state.ready.remove(&next);
+        state.cursor = Some(next);
+        Some(next)
     }
     pub(crate) fn registered(&self) -> usize {
         self.shared
@@ -490,8 +513,9 @@ pub(crate) struct ControlRequestCustody {
     retired: bool,
     ingress_enabled: bool,
     ingress_issued: bool,
-    ingress_panicked: bool,
-    ingress_projection: Option<super::establish_ingress::EstablishProjection>,
+    ingress_outcome: Option<EstablishIngressOutcome>,
+    pending_getter: Option<EstablishIngressJob>,
+    pending_disposal: Option<EstablishDisposalJob>,
     ingress_owner: Option<EstablishIngressOwner>,
     ingress_partial: Option<EstablishIngressPartial>,
     ingress_return: Option<OwnedReturnReader<EstablishIngressReturned>>,
@@ -692,8 +716,9 @@ impl ControlRequestCustody {
                 retired: false,
                 ingress_enabled,
                 ingress_issued: false,
-                ingress_panicked: false,
-                ingress_projection: None,
+                ingress_outcome: None,
+                pending_getter: None,
+                pending_disposal: None,
                 ingress_owner: None,
                 ingress_partial: None,
                 ingress_return: None,
@@ -790,16 +815,25 @@ impl ControlRequestCustody {
             std::mem::forget(returned);
             std::process::abort();
         }
-        self.ingress_panicked = matches!(returned.outcome, EstablishIngressOutcome::GetterPanicked);
+        self.authority = returned.authority;
+        self.ingress_outcome = Some(returned.outcome);
         self.started = matches!(
             returned.outcome,
             EstablishIngressOutcome::Projected(_) | EstablishIngressOutcome::GetterPanicked
         );
-        if let EstablishIngressOutcome::Projected(projection) = &returned.outcome {
-            self.ingress_projection = Some(*projection);
-        }
-        self.authority = returned.authority;
         Ok(Some(returned.outcome))
+    }
+    fn ingress_projection(&self) -> Option<super::establish_ingress::EstablishProjection> {
+        match self.ingress_outcome {
+            Some(EstablishIngressOutcome::Projected(projection)) => Some(projection),
+            _ => None,
+        }
+    }
+    fn ingress_panicked(&self) -> bool {
+        matches!(
+            self.ingress_outcome,
+            Some(EstablishIngressOutcome::GetterPanicked)
+        )
     }
     pub(super) fn prepare_establish_route(
         &mut self,
@@ -827,7 +861,7 @@ impl ControlRequestCustody {
             return Err(ControlRequestError::WrongRequest);
         }
         let projection = self
-            .ingress_projection
+            .ingress_projection()
             .ok_or(ControlRequestError::IngressPending)?;
         if projection.context != *context
             || projection.operation != request.request.operation
@@ -871,7 +905,7 @@ impl ControlRequestCustody {
             return Err(ControlRequestError::WrongEffect);
         };
         let projection = self
-            .ingress_projection
+            .ingress_projection()
             .ok_or(ControlRequestError::IngressPending)?;
         if ticket.actor != self.actor
             || ticket.input != self.input_id()
@@ -942,7 +976,7 @@ impl ControlRequestCustody {
             return Err(ControlRequestError::WrongEffect);
         };
         let p = self
-            .ingress_projection
+            .ingress_projection()
             .ok_or(ControlRequestError::IngressPending)?;
         if ticket.actor != self.actor
             || ticket.input != self.input_id()
@@ -1049,7 +1083,7 @@ impl ControlRequestCustody {
             || *request != self.request()
             || !self.route_issued
             || self
-                .ingress_projection
+                .ingress_projection()
                 .is_none_or(|projection| projection.context != *context)
         {
             return Err(ControlRequestError::WrongRequest);
@@ -1109,7 +1143,7 @@ impl ControlRequestCustody {
         if self.submitted
             || self.failed_submission.is_some()
             || self.authority.is_none()
-            || self.ingress_panicked
+            || self.ingress_panicked()
         {
             return Err(ControlRequestError::WrongPhase);
         }
@@ -1240,7 +1274,7 @@ impl ControlRequestCustody {
                 command: Some(command),
             });
         }
-        let observed_panic = self.ingress_panicked
+        let observed_panic = self.ingress_panicked()
             && self.authority.is_some()
             && self.started
             && self.role.phase() == ExitRolePhase::Started
@@ -1279,7 +1313,7 @@ impl ControlRequestCustody {
             return Err(reject(ControlRequestError::WrongPhase, command));
         }
         if self.ingress_enabled {
-            let Some(projection) = self.ingress_projection else {
+            let Some(projection) = self.ingress_projection() else {
                 return Err(reject(ControlRequestError::IngressPending, command));
             };
             let matches_projection = matches!(&command,
@@ -1448,6 +1482,9 @@ impl ControlRequestCustody {
         }
         if self.failed_submission.is_some() {
             return Err(ControlRequestError::SubmissionUnresolved);
+        }
+        if self.pending_getter.is_some() || self.pending_disposal.is_some() {
+            return Ok(false);
         }
         if self.withdrawal {
             if !self.endpoint.external_ended() || !self.close_ingress()? || !self.close_route()? {

@@ -434,7 +434,7 @@ fn independent_raw_field_panics_never_unwind_through_another_field_or_return_rpc
     let cleanup = f.root.begin_unsubmitted_withdrawal(input).unwrap().unwrap();
     pools.disposal(cleanup);
     let disposition = source_pools::wait_disposal(&f, input);
-    let retired = f.root.reap_ready_requests(8);
+    let retired = f.root.advance_ready_requests(pools.handles(), 8);
     let held = f.ledger.used(Dimension::Replies.id());
     pools.finish();
     // This exact bounded Unknown is intentionally retained; it is not a green
@@ -445,7 +445,10 @@ fn independent_raw_field_panics_never_unwind_through_another_field_or_return_rpc
     assert_eq!(drops.load(Ordering::SeqCst), 4);
     assert_eq!(disposition, ExitRolePhase::Unresolved);
     assert!(
-        matches!(retired, Err(ControlRequestError::SourceUnresolved { input: failed }) if failed == input)
+        matches!(retired, Err(crate::control_runtime::process_control::RootRequestAdvanceError::Request {
+            input: actual,
+            error: RequestIoError::Control(ControlRequestError::SourceUnresolved { input: source }),
+        }) if actual == input && source == input)
     );
     assert_eq!(held, 1);
 }

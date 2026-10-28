@@ -20,6 +20,9 @@
 //! Request, ticket, materialization and transport inventories are independent
 //! owners; this constructor does not expose a ready Native request facade.
 
+mod source_io;
+pub(crate) use source_io::RootRequestAdvanceError;
+
 use super::{
     actors::{ControlActor, WorkerActor},
     context_host::{ContextHostBinding, ContextMetadataRole},
@@ -861,6 +864,7 @@ impl ProcessControlOwner {
     }
     /// Drain only actual ready addresses. False retirement waits for an
     /// original completion/delivery wake; no request thread scans the table.
+    #[cfg(test)]
     pub(crate) fn reap_ready_requests(
         &mut self,
         budget: usize,
@@ -933,6 +937,9 @@ impl ProcessControlOwner {
             input: ticket.input,
             action: ticket.descriptor.id,
         };
+        if let Err(error) = custody.stage_reply_disposal(&ticket) {
+            return Err(ControlRequestPublishRefusal::Rejected { error, ticket });
+        }
         custody.publish(ticket)?;
         // The original effect has actually completed. Missing its own root
         // ordering entry is a shared invariant, not a retriable RPC refusal.

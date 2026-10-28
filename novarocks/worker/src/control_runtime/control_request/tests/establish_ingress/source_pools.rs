@@ -24,6 +24,7 @@ use std::time::Instant;
 
 const WATCHDOG: Duration = Duration::from_secs(5);
 
+mod owner_turn;
 mod tests;
 
 fn join(owner: EstablishExecutors) {
@@ -40,6 +41,9 @@ pub(super) struct SourcePoolGuard {
     refused_disposals: Vec<EstablishDisposalJob>,
 }
 impl SourcePoolGuard {
+    pub(super) fn handles(&self) -> &EstablishExecutorHandles {
+        self.handles.as_ref().unwrap()
+    }
     pub(super) fn start(f: &mut Fixture) -> Self {
         let owner = match f
             .root

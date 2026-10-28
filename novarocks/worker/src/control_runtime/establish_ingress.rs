@@ -190,6 +190,7 @@ pub(crate) struct EstablishIngressBootstrapRefusal {
     pub partial: Option<EstablishIngressPartial>,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum EstablishIngressOutcome {
     Projected(EstablishProjection),
     StartRefused(ExitRoleError),
@@ -495,6 +496,9 @@ impl QueuedPreparation for EstablishDisposalJob {
     }
 }
 impl EstablishIngressJob {
+    pub(super) fn belongs_to_owner(&self, original: &EstablishIngressOwner) -> bool {
+        Arc::ptr_eq(&self.owner.0, &original.0)
+    }
     pub(super) fn belongs_to(&self, ready: &super::control_request::ControlRequestReady) -> bool {
         self.owner.0.notice.belongs_to(ready)
     }
@@ -583,6 +587,9 @@ impl Drop for EstablishIngressJob {
     }
 }
 impl EstablishDisposalJob {
+    pub(super) fn belongs_to_owner(&self, original: &EstablishIngressOwner) -> bool {
+        Arc::ptr_eq(&self.owner.0, &original.0)
+    }
     pub(super) fn belongs_to(&self, ready: &super::control_request::ControlRequestReady) -> bool {
         self.owner.0.notice.belongs_to(ready)
     }
