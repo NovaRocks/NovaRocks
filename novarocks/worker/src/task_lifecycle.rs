@@ -43,14 +43,20 @@ impl std::fmt::Debug for TaskStartPermit {
     }
 }
 #[derive(Debug)]
-pub struct TaskStartHandoffError;
-impl std::fmt::Display for TaskStartHandoffError {
+pub struct TaskLifecycleHandoffError {
+    role: &'static str,
+}
+impl std::fmt::Display for TaskLifecycleHandoffError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the original Task Running input could not be handed off")
+        write!(
+            f,
+            "the original Task {} input could not be handed off",
+            self.role
+        )
     }
 }
-impl std::error::Error for TaskStartHandoffError {}
-impl novarocks_execution_contract::failure::FailureProjection for TaskStartHandoffError {
+impl std::error::Error for TaskLifecycleHandoffError {}
+impl novarocks_execution_contract::failure::FailureProjection for TaskLifecycleHandoffError {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         use novarocks_execution_contract::failure::{FailureClass, FailureFact};
         FailureFact::new(
@@ -73,20 +79,107 @@ impl TaskStartPermit {
     }
     /// Success transfers the input at the Task's original causal fence. It
     /// does not claim that the Core has consumed it or published RUNNING.
-    pub fn handoff_running(mut self) -> Result<(), TaskStartHandoffError> {
+    pub fn handoff_running(mut self) -> Result<(), TaskLifecycleHandoffError> {
         self.author
             .take()
             .expect("one original dormant start input")
             .publish(novarocks_worker_protocol::context::ContextInput::Running {
                 task: self.identity,
             })
-            .map_err(|_retained| TaskStartHandoffError)
+            .map_err(|_retained| TaskLifecycleHandoffError { role: "Running" })
     }
 }
 impl Drop for TaskStartPermit {
     fn drop(&mut self) {
         if let Some(author) = self.author.take() {
             let _reported = author.withdraw();
+        }
+    }
+}
+
+/// The terminal callback's original observation role. Attachment and actual
+/// callback exit are separate: a bound callback that loses its observation
+/// keeps Unknown custody, while a never-invoked creation may withdraw it.
+#[must_use = "The original terminal observation must publish or retain its responsibility"]
+pub struct TaskTerminalPermit {
+    identity: TaskIdentity,
+    author: Option<crate::control_runtime::causal_input::InputAuthor>,
+    bound: bool,
+}
+impl std::fmt::Debug for TaskTerminalPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskTerminalPermit")
+            .field("identity", &self.identity)
+            .field("bound", &self.bound)
+            .finish_non_exhaustive()
+    }
+}
+impl TaskTerminalPermit {
+    pub(crate) fn custody(&self) -> crate::control_runtime::causal_input::CausalInputCustody {
+        self.author
+            .as_ref()
+            .expect("original terminal observation author")
+            .custody()
+    }
+    pub(crate) fn from_admitted_author(
+        author: crate::control_runtime::causal_input::InputAuthor,
+    ) -> Self {
+        Self {
+            identity: author.task(),
+            author: Some(author),
+            bound: false,
+        }
+    }
+    pub const fn identity(&self) -> TaskIdentity {
+        self.identity
+    }
+    pub(crate) fn bind(&mut self) {
+        assert!(!self.bound, "one original terminal observation attachment");
+        self.bound = true;
+    }
+    /// Transfer facts co-observed by the original callback at one causal
+    /// prefix fence. Failure proposals still transfer their actual source
+    /// before this call; this input cannot originate a failure or claim exit.
+    pub fn handoff(
+        mut self,
+        observation: crate::TaskTerminalObservation,
+    ) -> Result<(), TaskLifecycleHandoffError> {
+        let author = self
+            .author
+            .take()
+            .expect("one original terminal observation");
+        let input = novarocks_worker_protocol::context::ContextInput::TerminalObservation {
+            task: self.identity,
+            observation,
+        };
+        if !self.bound {
+            author.reject(input);
+            return Err(TaskLifecycleHandoffError {
+                role: "TerminalObservation",
+            });
+        }
+        author
+            .publish(input)
+            .map_err(|_retained| TaskLifecycleHandoffError {
+                role: "TerminalObservation",
+            })
+    }
+    /// Only the original completion owner, after proving it never invoked
+    /// this callback, can revoke a bound observation without fabricating it.
+    pub(crate) fn withdraw_uninvoked(mut self) {
+        if let Some(author) = self.author.take() {
+            let _reported = author.withdraw();
+        }
+    }
+}
+impl Drop for TaskTerminalPermit {
+    fn drop(&mut self) {
+        if let Some(author) = self.author.take() {
+            if self.bound {
+                author.unresolved();
+            } else {
+                let _reported = author.withdraw();
+            }
         }
     }
 }

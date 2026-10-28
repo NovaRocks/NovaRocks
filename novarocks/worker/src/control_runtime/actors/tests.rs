@@ -2006,12 +2006,12 @@ enum SettlementScenario {
     FailAfterBarrier,
 }
 fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementScenario) {
-    exercise_fragment_roles_with_start(task_stopped, settlement, false);
+    exercise_fragment_roles_with_lifecycle(task_stopped, settlement, None);
 }
-fn exercise_fragment_roles_with_start(
+fn exercise_fragment_roles_with_lifecycle(
     task_stopped: bool,
     settlement: SettlementScenario,
-    start_role: bool,
+    lifecycle_role: Option<crate::control_runtime_policy::TaskLifecycleRole>,
 ) {
     use crate::control_runtime::{
         effect_dispatch::EffectDispatch,
@@ -2237,20 +2237,31 @@ fn exercise_fragment_roles_with_start(
             self.calls.fetch_add(2, Ordering::SeqCst);
         }
     }
-    if start_role {
-        let permit = host.issue_start_permit().unwrap();
-        assert_eq!(permit.identity(), task);
+    if let Some(kind) = lifecycle_role {
+        // Actual typed permits have no common public issuer or clone. This
+        // test erases only their local destructor after recording identity.
+        let (identity, permit): (_, Box<dyn Any>) = match kind {
+            TaskLifecycleRole::Running => {
+                let permit = host.issue_start_permit().unwrap();
+                (permit.identity(), Box::new(permit))
+            }
+            TaskLifecycleRole::TerminalObservation => {
+                let permit = host.issue_terminal_permit().unwrap();
+                (permit.identity(), Box::new(permit))
+            }
+            _ => unreachable!("this fixture issues only original start/terminal roles"),
+        };
+        assert_eq!(identity, task);
         let issued = f.scope.snapshot().unwrap();
-        let cut = host
-            .lifecycle_input(TaskLifecycleRole::Running)
-            .unwrap()
-            .cut();
-        assert!(matches!(
-            host.issue_start_permit(),
-            Err(TaskHostError::LifecycleAlreadyIssued(
-                TaskLifecycleRole::Running
-            ))
-        ));
+        let cut = host.lifecycle_input(kind).unwrap().cut();
+        let refused = match kind {
+            TaskLifecycleRole::Running => host.issue_start_permit().map(drop),
+            TaskLifecycleRole::TerminalObservation => host.issue_terminal_permit().map(drop),
+            _ => unreachable!("fixed test role"),
+        };
+        assert!(
+            matches!(refused, Err(TaskHostError::LifecycleAlreadyIssued(actual)) if actual == kind)
+        );
         assert_eq!(f.scope.snapshot().unwrap(), issued);
         // The dormant start is never called. Its unique typed permit owns
         // this unused withdrawal, independently of the still-live preparation.
@@ -2268,9 +2279,7 @@ fn exercise_fragment_roles_with_start(
         dispose_retired_pair(&f, port.ingress(), retired);
         f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
         assert_eq!(
-            host.lifecycle_input(TaskLifecycleRole::Running)
-                .unwrap()
-                .phase(),
+            host.lifecycle_input(kind).unwrap().phase(),
             novarocks_control_runtime::exit_role::ExitRolePhase::Retired
         );
         assert!(host.causal().is_empty());
@@ -2692,10 +2701,10 @@ fn exercise_fragment_roles_with_start(
         "this component issued no open-summary role"
     );
     assert!(causal.is_empty());
-    if start_role {
+    if let Some(kind) = lifecycle_role {
         assert_eq!(lifecycle_inputs.len(), 1);
         assert_eq!(
-            lifecycle_inputs[&TaskLifecycleRole::Running].phase(),
+            lifecycle_inputs[&kind].phase(),
             novarocks_control_runtime::exit_role::ExitRolePhase::Retired
         );
     } else {
@@ -2767,7 +2776,20 @@ fn exercise_fragment_roles_with_start(
 
 #[test]
 fn an_accepted_start_issuer_holds_one_original_role_and_withdraws_only_its_unused_permit() {
-    exercise_fragment_roles_with_start(false, SettlementScenario::Unused, true);
+    exercise_fragment_roles_with_lifecycle(
+        false,
+        SettlementScenario::Unused,
+        Some(crate::control_runtime_policy::TaskLifecycleRole::Running),
+    );
+}
+
+#[test]
+fn an_accepted_terminal_issuer_withdraws_only_its_unbound_original_observation() {
+    exercise_fragment_roles_with_lifecycle(
+        false,
+        SettlementScenario::Unused,
+        Some(crate::control_runtime_policy::TaskLifecycleRole::TerminalObservation),
+    );
 }
 
 #[test]

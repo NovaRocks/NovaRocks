@@ -55,6 +55,9 @@ pub struct TaskRecord {
     pub filter_advertisement: Option<DynamicFilterAdvertisement>,
     pub operator_statistics: Vec<OperatorStatistics>,
     pub operator_statistics_truncated: bool,
+    /// One original terminal observation seals final statistics against late samples.
+    pub statistics_sealed: bool,
+    pub terminal_observation_received: bool,
     pub loader_exited: bool,
     pub preparation_body_exited: bool,
     pub preparation_exited: bool,
@@ -108,6 +111,8 @@ impl TaskRecord {
             filter_advertisement: None,
             operator_statistics: Vec::new(),
             operator_statistics_truncated: false,
+            statistics_sealed: false,
+            terminal_observation_received: false,
             loader_exited: false,
             preparation_body_exited: false,
             preparation_exited: false,

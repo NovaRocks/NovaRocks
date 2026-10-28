@@ -585,6 +585,7 @@ impl TaskProposalIngress {
             | ContextInput::Flushing { task }
             | ContextInput::CompletionIntent { task, .. }
             | ContextInput::CompletionExited { task }
+            | ContextInput::TerminalObservation { task, .. }
             | ContextInput::FinishWithOutput { task, .. }
             | ContextInput::Physical { task, .. }
             | ContextInput::Metrics { task, .. }

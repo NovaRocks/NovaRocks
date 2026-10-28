@@ -231,7 +231,7 @@ pub enum TaskLifecycleRole {
     PreparationExited,
     Installed,
     Running,
-    Flushing,
+    TerminalObservation,
     ActualStopped,
     OutputReleased,
     ResourcesConverged,

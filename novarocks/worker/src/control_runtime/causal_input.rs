@@ -222,8 +222,23 @@ impl CausalInputCustody {
     }
 }
 impl InputAuthor {
+    pub(crate) fn custody(&self) -> CausalInputCustody {
+        self.custody.clone()
+    }
     pub(crate) fn task(&self) -> TaskIdentity {
         self.custody.task()
+    }
+    /// A typed owner rejected its own exact neutral input before transfer.
+    /// Retain it and the original sender without inventing an unused exit.
+    pub(crate) fn reject(mut self, input: ContextInput) {
+        *self
+            .custody
+            .0
+            .rejected
+            .lock()
+            .expect("refused original input") = Some(input);
+        drop(self.authority.take());
+        self.custody.unresolved();
     }
     fn take_sender(&self) -> TaskCausalSender {
         self.custody
@@ -287,6 +302,7 @@ impl Drop for InputAuthor {
 #[cfg(test)]
 mod tests {
     mod generic_negative;
+    mod terminal_observation;
     use super::*;
     use crate::control_admission::{AdmissionStorage, Dimension};
     use crate::control_runtime::actors::*;

@@ -107,6 +107,86 @@ impl novarocks_execution_contract::failure::FailureProjection for CompletionRese
 /// Called at most once, borrowing the slot's fact and its captured owners.
 /// The slot retains the action until its separately supervised destruction.
 pub type TaskCompletionAction = Box<dyn FnMut(&FragmentTerminalFact) + Send + 'static>;
+/// One terminal callback receives its original observation authority once.
+pub type TaskTerminalCallback =
+    Box<dyn FnMut(&FragmentTerminalFact, crate::TaskTerminalPermit) + Send + 'static>;
+/// The Task's original terminal callback and its preissued observation role.
+/// Refusal returns this same object; attachment alone invokes no callback.
+pub struct TaskTerminalAction {
+    body: TaskTerminalCallback,
+    observation: Option<crate::TaskTerminalPermit>,
+    original: crate::control_runtime::causal_input::CausalInputCustody,
+}
+impl TaskTerminalAction {
+    pub fn new(observation: crate::TaskTerminalPermit, body: TaskTerminalCallback) -> Self {
+        let original = observation.custody();
+        Self {
+            body,
+            observation: Some(observation),
+            original,
+        }
+    }
+    fn identity(&self) -> TaskIdentity {
+        self.observation
+            .as_ref()
+            .expect("original terminal observation")
+            .identity()
+    }
+    pub(crate) fn bind(&mut self) {
+        self.observation
+            .as_mut()
+            .expect("original terminal observation")
+            .bind();
+    }
+    pub(crate) fn invoke(&mut self, fact: &FragmentTerminalFact) -> bool {
+        let observation = self
+            .observation
+            .take()
+            .expect("one actual terminal invocation");
+        (self.body)(fact, observation);
+        self.original.actual_exit_ready().unwrap_or(false)
+    }
+    pub(crate) fn withdraw_uninvoked(&mut self) -> bool {
+        self.observation
+            .take()
+            .expect("never-invoked original terminal observation")
+            .withdraw_uninvoked();
+        self.original.actual_exit_ready().unwrap_or(false)
+    }
+}
+enum CompletionAction {
+    Standalone(TaskCompletionAction),
+    Terminal(TaskTerminalAction),
+}
+impl CompletionAction {
+    fn identity(&self) -> Option<TaskIdentity> {
+        match self {
+            Self::Standalone(_) => None,
+            Self::Terminal(action) => Some(action.identity()),
+        }
+    }
+    fn bind(&mut self) {
+        if let Self::Terminal(action) = self {
+            action.bind();
+        }
+    }
+
+    fn invoke(&mut self, fact: &FragmentTerminalFact) -> bool {
+        match self {
+            Self::Standalone(action) => {
+                action(fact);
+                true
+            }
+            Self::Terminal(action) => action.invoke(fact),
+        }
+    }
+    fn withdraw_uninvoked(&mut self) -> bool {
+        match self {
+            Self::Standalone(_) => true,
+            Self::Terminal(action) => action.withdraw_uninvoked(),
+        }
+    }
+}
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,7 +198,7 @@ enum CompletionPhase {
 }
 
 struct CompletionWork {
-    action: Option<TaskCompletionAction>,
+    action: Option<CompletionAction>,
     fact: Option<FragmentTerminalFact>,
     reporter: Option<crate::TaskStatusReporter>,
     // The original independently admitted sender outlives this work's own
@@ -126,7 +206,7 @@ struct CompletionWork {
     exit: Option<crate::task_lifecycle::CompletionExitNotice>,
     // At most one secondary payload per foreign invocation/destruction phase.
     // These are work custody, never accepted Task causes or wire diagnostics.
-    unresolved_payloads: [Option<PanicPayload>; 5],
+    unresolved_payloads: [Option<PanicPayload>; 6],
 }
 
 impl CompletionWork {
@@ -146,13 +226,35 @@ impl CompletionWork {
         if !withdrawn {
             let Self { action, fact, .. } = self;
             let result = catch_unwind(AssertUnwindSafe(|| {
-                action.as_mut().expect("one completion action")(
-                    fact.as_ref().expect("a committed completion has its fact"),
-                );
+                action
+                    .as_mut()
+                    .expect("one completion action")
+                    .invoke(fact.as_ref().expect("a committed completion has its fact"))
             }));
-            if let Err(payload) = result {
-                failed = true;
-                self.dispose_panic(payload);
+            match result {
+                Ok(true) => {}
+                Ok(false) => failed = true,
+                Err(payload) => {
+                    failed = true;
+                    self.dispose_panic(payload);
+                }
+            }
+        }
+        if withdrawn {
+            // No callback was invoked. Revoke only its original observation
+            // permission; action/fact/reporter destruction remains separate.
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                self.action
+                    .as_mut()
+                    .is_none_or(CompletionAction::withdraw_uninvoked)
+            }));
+            match result {
+                Ok(true) => {}
+                Ok(false) => failed = true,
+                Err(payload) => {
+                    failed = true;
+                    self.dispose_panic(payload);
+                }
             }
         }
         // Each holder is taken exactly once. A failed destructor is never retried.
@@ -423,8 +525,31 @@ impl TaskCompletionReservation {
     /// Rejection returns the original callback without running its destructor.
     pub fn bind_action(
         &mut self,
-        action: TaskCompletionAction,
-    ) -> Result<(), (CompletionReservationError, TaskCompletionAction)> {
+        action: TaskTerminalAction,
+    ) -> Result<(), (CompletionReservationError, TaskTerminalAction)> {
+        match self.bind_original_action(CompletionAction::Terminal(action)) {
+            Ok(()) => Ok(()),
+            Err((error, CompletionAction::Terminal(action))) => Err((error, action)),
+            Err((_error, CompletionAction::Standalone(_))) => {
+                unreachable!("the original action variant is preserved")
+            }
+        }
+    }
+    fn bind_original_action(
+        &mut self,
+        mut action: CompletionAction,
+    ) -> Result<(), (CompletionReservationError, CompletionAction)> {
+        if let Some(actual) = action.identity()
+            && actual != self.identity
+        {
+            return Err((
+                CompletionReservationError::StatusIdentity {
+                    reserved: self.identity,
+                    reporter: actual,
+                },
+                action,
+            ));
+        }
         let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
         let Some(slot) = state.slots.get_mut(&self.identity) else {
             return Err((
@@ -453,6 +578,7 @@ impl TaskCompletionReservation {
         if let Some(exit) = work.exit.as_mut() {
             exit.bind();
         }
+        action.bind();
         work.action = Some(action);
         Ok(())
     }
@@ -734,7 +860,7 @@ impl TaskCompletionSupervisor {
                 ticket: Arc::clone(&ticket),
                 expected_fragment,
                 work: Arc::new(Mutex::new(CompletionWork {
-                    action: standalone_action,
+                    action: standalone_action.map(CompletionAction::Standalone),
                     fact: None,
                     reporter,
                     exit,
@@ -987,10 +1113,10 @@ mod admitted_exit_tests {
         let mut exit = notice(mask, outcome, 3);
         exit.bind();
         CompletionWork {
-            action: Some(Box::new(move |_| {
+            action: Some(CompletionAction::Standalone(Box::new(move |_| {
                 let _ = &capture;
                 assert!(!panic_body, "original completion action panic");
-            })),
+            }))),
             fact: Some(FragmentTerminalFact::new(
                 QueryId::new(107001, 107002),
                 UniqueId::new(107003, 107004),
@@ -1044,7 +1170,9 @@ mod admitted_exit_tests {
             entered: entered_tx,
             release: release_rx,
         };
-        work.action = Some(Box::new(move |fact| action.run(fact)));
+        work.action = Some(CompletionAction::Standalone(Box::new(move |fact| {
+            action.run(fact)
+        })));
         let join = std::thread::spawn(move || work.run(false));
         let entered = entered_rx.recv_timeout(Duration::from_secs(5));
         let before_exit = outcome.load(Ordering::Acquire);
@@ -1118,10 +1246,11 @@ mod admitted_exit_tests {
             let _ = &capture;
             panic!("the rejected action cannot run");
         });
-        let (refusal, action) = match reservation.bind_action(action) {
-            Ok(()) => panic!("a drained slot cannot bind an action"),
-            Err(refusal) => refusal,
-        };
+        let (refusal, action) =
+            match reservation.bind_original_action(CompletionAction::Standalone(action)) {
+                Ok(()) => panic!("a drained slot cannot bind an action"),
+                Err(refusal) => refusal,
+            };
         assert!(matches!(
             refusal,
             CompletionReservationError::Unavailable(_)

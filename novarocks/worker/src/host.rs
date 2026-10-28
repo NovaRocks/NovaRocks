@@ -45,6 +45,7 @@ pub struct TaskPreparationContext<'a> {
     children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
     cadence: std::time::Duration,
     start: Option<crate::TaskStartPermit>,
+    terminal: Option<crate::TaskTerminalPermit>,
     roles: Option<
         novarocks_execution_contract::AdmittedFragmentRoles<
             novarocks_execution::runtime::fragment::ExecutionFailure,
@@ -60,10 +61,12 @@ impl<'a> TaskPreparationContext<'a> {
             novarocks_execution::runtime::fragment::ExecutionFailure,
         >,
         start: crate::TaskStartPermit,
+        terminal: crate::TaskTerminalPermit,
     ) -> Result<Self, novarocks_execution::runtime::task_control::TaskControlIdentityMismatch> {
         if roles.identity() != Some(owner.identity())
             || children.identity() != owner.identity()
             || start.identity() != owner.identity()
+            || terminal.identity() != owner.identity()
         {
             return Err(novarocks_execution::runtime::task_control::TaskControlIdentityMismatch);
         }
@@ -73,6 +76,7 @@ impl<'a> TaskPreparationContext<'a> {
             cadence,
             roles: Some(roles),
             start: Some(start),
+            terminal: Some(terminal),
         })
     }
     /// Registers before the provider child attaches kernel/root captures. The
@@ -110,10 +114,34 @@ impl<'a> TaskPreparationContext<'a> {
     > {
         self.roles.take().ok_or(TaskCompletionRolesTaken)
     }
+    /// The final callback receives its own original observation role. It
+    /// cannot borrow the independently supervised CompletionExited authority.
+    pub fn take_terminal_permit(
+        &mut self,
+    ) -> Result<crate::TaskTerminalPermit, TaskTerminalPermitTaken> {
+        self.terminal.take().ok_or(TaskTerminalPermitTaken)
+    }
     /// Transfer this original capability into the prepared dormant start.
     /// The metadata view above cannot sign or recover another start role.
     pub fn take_start_permit(&mut self) -> Result<crate::TaskStartPermit, TaskStartPermitTaken> {
         self.start.take().ok_or(TaskStartPermitTaken)
+    }
+}
+#[derive(Debug)]
+pub struct TaskTerminalPermitTaken;
+impl std::fmt::Display for TaskTerminalPermitTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the original Task terminal observation permit was already transferred")
+    }
+}
+impl std::error::Error for TaskTerminalPermitTaken {}
+impl novarocks_execution_contract::failure::FailureProjection for TaskTerminalPermitTaken {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::CausalInputUnresolved.reason(),
+        )
     }
 }
 #[derive(Debug)]

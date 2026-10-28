@@ -47,6 +47,9 @@ use novarocks_execution_contract::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+mod terminal;
+pub use terminal::{TerminalIntent, TerminalObservation, TerminalStatistics};
+
 /// The complete original Establish identity selected by the Root. Mutable
 /// Context domains never replace this record during replay or lease changes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +242,12 @@ pub enum ContextInput {
     CompletionIntent {
         task: TaskIdentity,
         completed_output: Option<TaskOutputFacts>,
+    },
+    /// Facts co-observed by one original terminal action. Its own actual
+    /// exit remains the separate CompletionExited input below.
+    TerminalObservation {
+        task: TaskIdentity,
+        observation: TerminalObservation,
     },
     /// The original terminal action, its captures and its fact have actually
     /// exited after receiving the runtime's real retired-resource proof.
@@ -1078,6 +1087,9 @@ impl ContextCore {
                 record.completion_success_pending = !record.state.is_terminal();
                 self.try_finish_completion_intent(task, &mut step)?;
             }
+            ContextInput::TerminalObservation { task, observation } => {
+                self.observe_terminal(task, observation, &mut step)?;
+            }
             ContextInput::CompletionExited { task } => {
                 self.flush(task, &mut step)?;
                 let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
@@ -1211,7 +1223,7 @@ impl ContextCore {
             } => {
                 self.flush(task, &mut step)?;
                 let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
-                if !record.state.is_terminal() {
+                if !record.state.is_terminal() && !record.statistics_sealed {
                     if statistics.len() > FINAL_TASK_INFO_MAX_OPERATORS {
                         return Err(CoreError::IllegalFact);
                     }

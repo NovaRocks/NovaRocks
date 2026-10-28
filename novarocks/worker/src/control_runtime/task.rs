@@ -281,6 +281,7 @@ struct HostPreparationBinding {
     cadence: std::time::Duration,
     roles: AdmittedFragmentRoles<ExecutionFailure>,
     start: crate::TaskStartPermit,
+    terminal: crate::TaskTerminalPermit,
     pending: Arc<dyn TaskPendingNotice>,
     health: Arc<ExecutionHealth>,
 }
@@ -320,6 +321,7 @@ impl TaskPreparationJob {
                 binding.cadence,
                 binding.roles,
                 binding.start,
+                binding.terminal,
             )
             .expect("original admitted role and child identities match the Task");
             let installed = host
@@ -987,6 +989,12 @@ impl TaskHostRecord {
         self.issue_lifecycle_author(TaskLifecycleRole::Running)
             .map(crate::TaskStartPermit::from_admitted_author)
     }
+    pub(crate) fn issue_terminal_permit(
+        &mut self,
+    ) -> Result<crate::TaskTerminalPermit, TaskHostError> {
+        self.issue_lifecycle_author(TaskLifecycleRole::TerminalObservation)
+            .map(crate::TaskTerminalPermit::from_admitted_author)
+    }
     fn issue_lifecycle_author(
         &mut self,
         kind: TaskLifecycleRole,
@@ -1196,23 +1204,26 @@ impl TaskHostRecord {
         job: &mut TaskPreparationJob,
         roles: AdmittedFragmentRoles<ExecutionFailure>,
         start: crate::TaskStartPermit,
+        terminal: crate::TaskTerminalPermit,
         cadence: std::time::Duration,
     ) -> Result<
         (),
         (
             AdmittedFragmentRoles<ExecutionFailure>,
             crate::TaskStartPermit,
+            crate::TaskTerminalPermit,
         ),
     > {
         if roles.identity() != Some(self.task)
             || start.identity() != self.task
+            || terminal.identity() != self.task
             || job.host.is_some()
             || !job
                 .request
                 .as_ref()
                 .is_some_and(|request| request.identity() == self.task)
         {
-            return Err((roles, start));
+            return Err((roles, start, terminal));
         }
         let preparation = self
             .resources
@@ -1230,6 +1241,7 @@ impl TaskHostRecord {
             cadence,
             roles,
             start,
+            terminal,
             pending: self.pending.clone(),
             health: self.health.clone(),
         });

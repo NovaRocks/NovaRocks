@@ -276,6 +276,7 @@ struct TaskRuntime {
     preparation: Arc<NativePreparationChild>,
     /// The original Worker capability moves once into the dormant start.
     start: Mutex<Option<novarocks_worker::TaskStartPermit>>,
+    terminal: Mutex<Option<novarocks_worker::TaskTerminalPermit>>,
     /// Physical ingress survives actual driver stop until the original
     /// capability owner closes its route. Taken synchronously on retirement.
     exchange_retirement: Mutex<Option<ExchangeReceiverRetirement>>,
@@ -894,6 +895,10 @@ impl NativeTaskExecutionHost {
             let cause = ExecutionFailure::from_domain(cause);
             HostRejection::from_failure(failure_category(&cause), cause)
         })?;
+        let terminal = preparation_scope.take_terminal_permit().map_err(|cause| {
+            let cause = ExecutionFailure::from_domain(cause);
+            HostRejection::from_failure(failure_category(&cause), cause)
+        })?;
         let kernel_control = Arc::clone(&task_control);
         let root_session = self.open_root_result_session(
             identity,
@@ -1062,6 +1067,7 @@ impl NativeTaskExecutionHost {
                 sink_kind,
                 preparation: preparation_child,
                 start: Mutex::new(Some(start)),
+                terminal: Mutex::new(Some(terminal)),
                 exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
@@ -1623,7 +1629,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let attempt = runtime.attempt;
         let sink_kind = runtime.sink_kind;
         let root_channel = runtime.root_channel.clone();
-        let operator_statistics = Arc::clone(&runtime.operator_statistics);
+        let terminal = runtime
+            .terminal
+            .lock()
+            .expect("original terminal observation permit")
+            .take()
+            .expect("the original prepared Task owns one terminal observation");
         let completion_reporter = reporter.clone();
         let completion_runtime = Arc::clone(&runtime);
         let exit = reporter
@@ -1641,43 +1652,51 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 host_failure(error)
             })?;
         completion
-            .bind_action(Box::new(move |fact| {
-                let completion_worker = completion_worker
-                    .upgrade()
-                    .expect("an installed Task retains its runnable until actual completion");
-                // Preserve the kernel's original removal/cancellation
-                // disposition before any fact can make the task retire.
-                // Only the inbound-close owner performs physical cleanup.
-                if let Some(retirement) = completion_runtime
-                    .exchange_retirement
-                    .lock()
-                    .expect(DORMANT_LOCK)
-                    .as_mut()
-                {
-                    retirement.record_terminal(fact);
-                }
-                // The sampling tick stops firing the moment the drivers
-                // finish, so the last event-driven snapshot predates the
-                // rows the operators counted on their way out. The
-                // terminal fact carries the final frozen profile.
-                if let Some(profile) = fact.profile() {
-                    operator_statistics.record_profile(profile);
-                }
-                report_terminal_with_root(
-                    &completion_reporter,
-                    sink_kind,
-                    root_channel.as_deref(),
-                    fact,
-                    completion_worker.stand_down(),
-                );
-                completion_worker.finish(
-                    (sink_kind == FragmentSinkKind::Result && root_channel.is_none())
-                        .then_some(&completion_reporter),
-                );
-                split_queues.close_attempt(attempt);
-                queries.unregister_fragment_execution(execution, kernel_key);
-                queries.finish_fragment(execution);
-            }))
+            .bind_action(novarocks_worker::TaskTerminalAction::new(
+                terminal,
+                Box::new(move |fact, observation| {
+                    let completion_worker = completion_worker
+                        .upgrade()
+                        .expect("an installed Task retains its runnable until actual completion");
+                    // Preserve the kernel's original removal/cancellation
+                    // disposition before any fact can make the task retire.
+                    // Only the inbound-close owner performs physical cleanup.
+                    if let Some(retirement) = completion_runtime
+                        .exchange_retirement
+                        .lock()
+                        .expect(DORMANT_LOCK)
+                        .as_mut()
+                    {
+                        retirement.record_terminal(fact);
+                    }
+                    let final_statistics = fact.profile().map(|profile| {
+                        let mut statistics = project_operator_statistics(profile).into_statistics();
+                        let truncated = statistics.len()
+                            > novarocks_execution_contract::FINAL_TASK_INFO_MAX_OPERATORS;
+                        statistics
+                            .truncate(novarocks_execution_contract::FINAL_TASK_INFO_MAX_OPERATORS);
+                        novarocks_worker::TaskTerminalStatistics {
+                            statistics,
+                            truncated,
+                        }
+                    });
+                    let observed = observe_compiled_terminal(
+                        &completion_reporter,
+                        sink_kind,
+                        root_channel.as_deref(),
+                        fact,
+                        completion_worker.stand_down(),
+                        final_statistics,
+                    );
+                    observation.handoff(observed).unwrap_or_else(|_retained| {
+                        std::panic::panic_any(NativePreparationUnresolved)
+                    });
+                    completion_worker.finish(None);
+                    split_queues.close_attempt(attempt);
+                    queries.unregister_fragment_execution(execution, kernel_key);
+                    queries.finish_fragment(execution);
+                }),
+            ))
             .map_err(|(error, action)| {
                 // A refusal returns the original action without disposing it.
                 // Its actual Drop remains inside the preparation scope.
@@ -2113,11 +2132,12 @@ impl NativeRunnableTask {
 
     /// Publishes the same handle and replays any latched physical stand-down.
     fn attach(&self, handle: Arc<dyn FragmentStandDown>) {
-        let latched = {
+        let (latched, replaced) = {
             let mut state = self.state.lock().expect(RUNNABLE_LOCK);
-            state.handle = Some(Arc::clone(&handle));
-            state.stand_down
+            let replaced = state.handle.replace(Arc::clone(&handle));
+            (state.stand_down, replaced)
         };
+        drop(replaced);
         if let Some(stand_down) = latched {
             handle.cancel(stand_down.reason());
         }
@@ -2132,18 +2152,24 @@ impl NativeRunnableTask {
     /// completion owner has its terminal fact, so the kernel handle's last
     /// drop belongs to that owner rather than to a later canceller.
     fn finish(&self, root_reporter: Option<&TaskStatusReporter>) {
-        let late_stand_down = {
+        let (late_stand_down, handle, replaced_reporter) = {
             let mut state = self.state.lock().expect(RUNNABLE_LOCK);
             state.finished = true;
-            state.handle = None;
-            state.finished_root_reporter = root_reporter.cloned();
-            state.stand_down.and_then(|stand_down| {
+            let handle = state.handle.take();
+            let replaced_reporter =
+                std::mem::replace(&mut state.finished_root_reporter, root_reporter.cloned());
+            let late = state.stand_down.and_then(|stand_down| {
                 state
                     .finished_root_reporter
                     .take()
                     .map(|reporter| (stand_down, reporter))
-            })
+            });
+            (late, handle, replaced_reporter)
         };
+        // A last kernel/reporter alias may run foreign teardown. The same
+        // completion Work supervises it after the runnable metadata unlocks.
+        drop(handle);
+        drop(replaced_reporter);
         if let Some((stand_down, reporter)) = late_stand_down {
             settle_finished_root_result(&reporter, stand_down);
         }
@@ -2250,6 +2276,92 @@ impl RunnableTask for NativeRunnableTask {
     }
 }
 
+/// One compiled terminal callback supplies neutral observation facts; the
+/// original rich failure always transfers before the same causal fence.
+fn observe_compiled_terminal(
+    reporter: &TaskStatusReporter,
+    sink_kind: FragmentSinkKind,
+    root_channel: Option<&novarocks_worker::root_result_channel::RootResultChannel>,
+    fact: &FragmentTerminalFact,
+    stand_down: Option<StandDown>,
+    final_statistics: Option<novarocks_worker::TaskTerminalStatistics>,
+) -> novarocks_worker::TaskTerminalObservation {
+    use novarocks_worker::{TaskTerminalIntent, TaskTerminalObservation};
+    let stand_down = stand_down.or_else(|| {
+        if !root_channel.is_some_and(|channel| channel.is_closed()) {
+            return None;
+        }
+        match reporter.current().termination() {
+            Some(novarocks_execution_contract::TerminationDetail::Aborted(cause)) => {
+                Some(StandDown::Abort(*cause))
+            }
+            Some(novarocks_execution_contract::TerminationDetail::Canceled(reason)) => {
+                Some(StandDown::Cancel(*reason))
+            }
+            _ => None,
+        }
+    });
+    let context_handoff = root_channel.is_some_and(|channel| {
+        matches!(
+            channel.producer_state(),
+            novarocks_execution::runtime::fragment::io::RootProducerState::ContextHeld
+        )
+    });
+    let intent = if let Some(stand_down) = stand_down {
+        let output = (!matches!(stand_down, StandDown::Abort(_))
+            && matches!(fact.outcome(), FragmentOutcome::Succeeded)
+            && (sink_kind != FragmentSinkKind::Result || context_handoff))
+            .then_some(TaskOutputFacts::new(true));
+        match fact.outcome() {
+            FragmentOutcome::Failed(error) => reporter.failing(
+                ExecutionFailure::from_domain(error.clone()),
+                novarocks_execution_contract::TaskFailurePhase::Execution,
+            ),
+            _ => match stand_down.proposal() {
+                novarocks_worker::TaskStopIntent::Canceled(reason) => reporter.canceling(reason),
+                novarocks_worker::TaskStopIntent::Aborted(cause) => reporter.aborting(cause),
+            },
+        }
+        TaskTerminalIntent::FinishExistingTermination { output }
+    } else {
+        match fact.outcome() {
+            FragmentOutcome::Succeeded
+                if sink_kind != FragmentSinkKind::Result || context_handoff =>
+            {
+                TaskTerminalIntent::SuccessfulProduction {
+                    completed_output: Some(TaskOutputFacts::new(true)),
+                }
+            }
+            FragmentOutcome::Succeeded => {
+                reporter.failing(
+                    ExecutionFailure::from_domain(RootHandoffMissing),
+                    novarocks_execution_contract::TaskFailurePhase::Execution,
+                );
+                TaskTerminalIntent::FinishExistingTermination { output: None }
+            }
+            FragmentOutcome::Cancelled { reason } => {
+                reporter.failing(
+                    ExecutionFailure::from_domain(reason.clone()),
+                    novarocks_execution_contract::TaskFailurePhase::Execution,
+                );
+                TaskTerminalIntent::FinishExistingTermination { output: None }
+            }
+            FragmentOutcome::Failed(error) => {
+                reporter.failing(
+                    ExecutionFailure::from_domain(error.clone()),
+                    novarocks_execution_contract::TaskFailurePhase::Execution,
+                );
+                TaskTerminalIntent::FinishExistingTermination { output: None }
+            }
+        }
+    };
+    TaskTerminalObservation {
+        intent,
+        output_released: true,
+        final_statistics,
+    }
+}
+
 /// Publishes one fragment's terminal fact as this task's terminal status.
 ///
 /// Bounded roots finish after actual production and context handoff. The S0
@@ -2264,6 +2376,7 @@ fn report_terminal(
     report_terminal_with_root(reporter, sink_kind, None, fact, stand_down);
 }
 
+#[cfg(test)]
 fn report_terminal_with_root(
     reporter: &TaskStatusReporter,
     sink_kind: FragmentSinkKind,
@@ -4130,6 +4243,52 @@ pub(crate) mod tests {
                 .expect("reasons")
                 .push(reason.detail().to_owned());
         }
+    }
+
+    #[test]
+    fn replacing_and_finishing_a_runnable_drop_original_handles_outside_its_metadata_lock() {
+        struct ReentrantDrop {
+            owner: Weak<NativeRunnableTask>,
+            unlocked_drops: Arc<std::sync::atomic::AtomicUsize>,
+            locked_drops: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl FragmentStandDown for ReentrantDrop {
+            fn cancel(&self, _: FragmentCancelReason) {}
+        }
+        impl Drop for ReentrantDrop {
+            fn drop(&mut self) {
+                let owner = self
+                    .owner
+                    .upgrade()
+                    .expect("the actual runnable outlives this handle");
+                let unlocked = owner.state.try_lock().is_ok();
+                let observed = if unlocked {
+                    &self.unlocked_drops
+                } else {
+                    &self.locked_drops
+                };
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let task = Arc::new(NativeRunnableTask::new_without_receiver_with_stop(
+            identity(14, 1, 9),
+            UniqueId::new(81, 89),
+            ConnectorStopOwner::new(),
+        ));
+        let unlocked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let locked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make = || {
+            Arc::new(ReentrantDrop {
+                owner: Arc::downgrade(&task),
+                unlocked_drops: unlocked.clone(),
+                locked_drops: locked.clone(),
+            }) as Arc<dyn FragmentStandDown>
+        };
+        task.attach(make());
+        task.attach(make());
+        task.finish(None);
+        assert_eq!(unlocked.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(locked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

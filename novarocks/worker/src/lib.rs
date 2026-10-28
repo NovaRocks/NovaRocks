@@ -92,7 +92,9 @@ pub use task_preparation::{
 mod task_registry;
 mod task_registry_config;
 mod task_registry_entry;
-pub use host::{TaskCompletionRolesTaken, TaskPreparationContext, TaskStartPermitTaken};
+pub use host::{
+    TaskCompletionRolesTaken, TaskPreparationContext, TaskStartPermitTaken, TaskTerminalPermitTaken,
+};
 pub use task_registry_entry::TaskPreparationView;
 #[cfg(test)]
 mod task_registry_tests;
@@ -160,6 +162,10 @@ pub use lifecycle::{
     classify_operation_admission, classify_root_drain, classify_task_transition,
 };
 pub use novarocks_execution_contract::AdmissionEpochCapability;
+pub use novarocks_worker_protocol::context::{
+    TerminalIntent as TaskTerminalIntent, TerminalObservation as TaskTerminalObservation,
+    TerminalStatistics as TaskTerminalStatistics,
+};
 pub use observation::{
     ContextConvergenceCursorError, CoveredObservationBookmark, CoveredObservationFact,
     CoveredObservationFrame, CoveredSubscription, CoveredSubscriptionError, CursorObservation,
@@ -184,7 +190,8 @@ pub use status::{
 };
 pub use task_completion::{
     CompletionReservationError, TaskCompletionAction, TaskCompletionReservation,
-    TaskCompletionSignal, TaskCompletionSlotRefusal, TaskCompletionSupervisor,
+    TaskCompletionSignal, TaskCompletionSlotRefusal, TaskCompletionSupervisor, TaskTerminalAction,
+    TaskTerminalCallback,
 };
 pub use task_creation_gate::{NoopTaskCreationGate, TaskCreationGate};
 pub use task_diagnostics::{
@@ -200,9 +207,9 @@ pub use task_execution_ports::{
     TaskExecutionMetrics, TaskExecutionPorts, TaskProtocolObserver, TaskResultLifecycle,
 };
 pub use task_lifecycle::{
-    CompletionExitCapability, CompletionExitNotice, TaskLifecycleEvent, TaskLifecyclePort,
-    TaskRootDrainCapability, TaskRootDrainFuture, TaskRootDrainOutcome, TaskRootDrainPermit,
-    TaskStartHandoffError, TaskStartPermit, TaskStopIntent,
+    CompletionExitCapability, CompletionExitNotice, TaskLifecycleEvent, TaskLifecycleHandoffError,
+    TaskLifecyclePort, TaskRootDrainCapability, TaskRootDrainFuture, TaskRootDrainOutcome,
+    TaskRootDrainPermit, TaskStartPermit, TaskStopIntent, TaskTerminalPermit,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{
