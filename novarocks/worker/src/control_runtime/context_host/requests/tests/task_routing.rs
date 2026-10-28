@@ -25,12 +25,14 @@ use crate::control_runtime::{
 
 #[test]
 fn unknown_task_request_is_refused_without_a_direct_context_request_fallback() {
-    let mut f = original_context(1, StorageNeed::default());
+    let f = original_context(1, StorageNeed::default());
     let ready = ready(&f, 1);
     let missing = task(f.identity, 1);
     let refusal = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_task_request(
             &ready,
@@ -56,6 +58,8 @@ fn closed_task_admission_keeps_the_original_request_routable_until_unused_retire
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_task_request(
             &ready,
             task,
@@ -66,7 +70,8 @@ fn closed_task_admission_keeps_the_original_request_routable_until_unused_retire
         .unwrap();
     assert_eq!(f.ledger.used(Dimension::Requests.id()), 1);
     assert_eq!(ready.registered(), 1);
-    let host = f.service.context(f.identity).unwrap();
+    let host_address = f.service.context(f.identity).unwrap();
+    let mut host = host_address.lock().unwrap();
     host.close_task_request_admission(task).unwrap();
     host.close_task_request_admission(task).unwrap();
     let refusal = host
@@ -96,14 +101,28 @@ fn closed_task_admission_keeps_the_original_request_routable_until_unused_retire
     // This exact request has never submitted a command or started Native
     // execution. Ending its real external wait lets its original sender and
     // unused author/source holders retire through the actual host route.
+    drop(host);
     drop(handle);
     assert!(advance(&mut f, work));
     assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
     assert_eq!(ready.registered(), 0);
-    assert!(f.service.context(f.identity).unwrap().task(task).is_some());
+    assert!(
+        f.service
+            .context(f.identity)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .task(task)
+            .is_some()
+    );
     assert!(
         matches!(
-            f.service.context(f.identity).unwrap().take_task(task),
+            f.service
+                .context(f.identity)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .take_task(task),
             Err(ContextHostError::TaskStillOwned)
         ),
         "the original Source/lifetime publication inventory remains owned after R exits"

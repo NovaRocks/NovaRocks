@@ -825,8 +825,8 @@ impl Fixture {
             self.ledger.reap_scope_ready(work.scope().id(), 32).unwrap();
             capacity.release(&capacity.resources().unwrap()).unwrap();
         }
-        while let Some(id) = self.runtime.claim_effect_actor() {
-            self.runtime.release_effect_actor(id, false).unwrap();
+        while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         drop(self.runtime.take_failure_payload(actor()).unwrap());
         self.scope.close_external().unwrap();
@@ -1838,8 +1838,8 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         f.ledger.reap_scope_ready(control_scope.id(), 16).unwrap();
         capacity.release(&capacity.resources().unwrap()).unwrap();
     }
-    while let Some(id) = f.runtime.claim_effect_actor() {
-        f.runtime.release_effect_actor(id, false).unwrap();
+    while let Some(original_host_turn) = f.runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
     control_scope.close_external().unwrap();
     f.runtime

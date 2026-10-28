@@ -250,8 +250,8 @@ fn drain(mut f: Fixture) {
     f.runtime.retire_input(aid(), f.first).unwrap();
     f.ledger.reap_ready(2).unwrap();
     drop(f.runtime.take_failure_payload(aid()).unwrap());
-    while let Some(actor) = f.runtime.claim_effect_actor() {
-        f.runtime.release_effect_actor(actor, false).unwrap();
+    while let Some(original_host_turn) = f.runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
     f.runtime.remove_actor(aid()).unwrap();
     f.ledger.remove_scope(f.scope.id()).unwrap();
@@ -319,8 +319,8 @@ fn retire_incarnation(
     runtime.retire_input(aid(), incarnation.input).unwrap();
     ledger.reap_scope_ready(incarnation.scope.id(), 2).unwrap();
     drop(runtime.take_failure_payload(aid()).unwrap());
-    while let Some(actor) = runtime.claim_effect_actor() {
-        runtime.release_effect_actor(actor, false).unwrap();
+    while let Some(original_host_turn) = runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
     runtime.remove_actor(aid()).unwrap();
     ledger.remove_scope(incarnation.scope.id()).unwrap();
@@ -533,8 +533,8 @@ fn cleanup_work_must_be_started_and_still_have_a_live_body_for_each_commit() {
     f.runtime.retire_input(aid(), f.first).unwrap();
     f.ledger.reap_ready(2).unwrap();
     drop(f.runtime.take_failure_payload(aid()).unwrap());
-    while let Some(actor) = f.runtime.claim_effect_actor() {
-        f.runtime.release_effect_actor(actor, false).unwrap();
+    while let Some(original_host_turn) = f.runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
     f.runtime.remove_actor(aid()).unwrap();
     f.ledger.remove_scope(f.scope.id()).unwrap();

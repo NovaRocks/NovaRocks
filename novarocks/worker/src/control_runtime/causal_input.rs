@@ -625,8 +625,8 @@ mod tests {
                 self.ledger.reap_scope_ready(work.scope().id(), 32).unwrap();
                 capacity.release(&capacity.resources().unwrap()).unwrap();
             }
-            while let Some(id) = self.runtime.claim_effect_actor() {
-                self.runtime.release_effect_actor(id, false).unwrap();
+            while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+                original_host_turn.release(false).unwrap();
             }
             drop(self.runtime.take_failure_payload(actor()).unwrap());
             self.scope.close_external().unwrap();

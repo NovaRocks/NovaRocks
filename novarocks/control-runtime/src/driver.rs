@@ -125,6 +125,10 @@ impl ActorRegistration {
     pub fn scope_id(&self) -> ScopeId {
         self.scope.id()
     }
+    /// Original scope identity only; this grants no Work or publication right.
+    pub fn matches_scope(&self, scope: &ScopeHandle) -> bool {
+        self.scope.same_scope(scope)
+    }
 }
 impl std::fmt::Debug for ActorRegistration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -346,6 +350,74 @@ impl<A: Actor> Clone for ActorRuntime<A> {
     fn clone(&self) -> Self {
         Self {
             shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Exclusive dispatch ownership for one original actor's host metadata turn.
+/// This is not a WorkLease, input, publication or capacity permit. Dropping an
+/// unfinished turn merely requeues its original address; it observes no exit.
+#[must_use = "Release or retire the original host turn explicitly"]
+pub struct ActorHostTurn<A: Actor> {
+    runtime: ActorRuntime<A>,
+    node: Arc<ActorCell<A>>,
+    active: bool,
+}
+impl<A: Actor> std::fmt::Debug for ActorHostTurn<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorHostTurn")
+            .field("actor", &self.node.id)
+            .field("scope", &self.node.scope.id())
+            .field("active", &self.active)
+            .finish()
+    }
+}
+impl<A: Actor> ActorHostTurn<A> {
+    pub fn actor(&self) -> ActorId {
+        self.node.id
+    }
+    pub fn registration(&self) -> ActorRegistration {
+        ActorRegistration {
+            actor: self.node.id,
+            attachment: self.node.attachment,
+            scope: self.node.scope.clone(),
+            origin: self.node.origin.clone(),
+        }
+    }
+    pub fn matches_registration(&self, registration: &ActorRegistration) -> bool {
+        self.node.id == registration.actor
+            && self.node.attachment == registration.attachment
+            && self.node.scope.same_scope(&registration.scope)
+            && Arc::ptr_eq(&self.node.origin, &registration.origin)
+    }
+    /// A mark racing this release is retained by the same ready queue, even
+    /// when the caller has no currently runnable work of its own.
+    pub fn release(mut self, has_runnable: bool) -> Result<(), (DriverError, Self)> {
+        if let Err(error) = self.runtime.release_host_turn(&self.node, has_runnable) {
+            return Err((error, self));
+        }
+        self.active = false;
+        Ok(())
+    }
+    /// Retire only after actual Scope/input/effect custody has drained. The
+    /// current claim and pending metadata marks are withdrawn atomically with
+    /// this original actor's removal. A refusal returns the same active turn.
+    pub fn retire_actor(mut self) -> Result<A, (DriverError, Self)> {
+        match self.runtime.remove_actor_node(&self.node, true) {
+            Ok(actor) => {
+                self.active = false;
+                Ok(actor)
+            }
+            Err(error) => Err((error, self)),
+        }
+    }
+}
+impl<A: Actor> Drop for ActorHostTurn<A> {
+    fn drop(&mut self) {
+        if self.active && self.runtime.release_host_turn(&self.node, true).is_err() {
+            // A duplicated/lost scheduler claim is shared runtime corruption;
+            // neither actor replacement nor implicit Work exit can repair it.
+            std::process::abort();
         }
     }
 }
@@ -2598,26 +2670,73 @@ impl<A: Actor> ActorRuntime<A> {
         self.shared.changed.notify();
         Ok(())
     }
-    /// One host dispatcher claims an actor; no request thread scans the actor directory.
-    pub fn claim_effect_actor(&self) -> Option<ActorId> {
-        self.shared
-            .state
-            .lock()
-            .expect("runtime scheduler lock")
-            .effect_ready
-            .claim()
+    fn validate_registration_in_state(
+        state: &DriverState<A>,
+        registration: &ActorRegistration,
+    ) -> Result<(), DriverError> {
+        let node = state
+            .actors
+            .get(&registration.actor)
+            .ok_or(DriverError::UnknownActor)?;
+        if node.attachment != registration.attachment
+            || !node.scope.same_scope(&registration.scope)
+            || !Arc::ptr_eq(&node.origin, &registration.origin)
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        Ok(())
     }
-    pub fn release_effect_actor(
+    /// Qualify the actual current registration without scheduling or granting
+    /// admission. Equal public IDs in another runtime cannot pass this check.
+    pub fn validate_registration(
         &self,
-        actor: ActorId,
+        registration: &ActorRegistration,
+    ) -> Result<(), DriverError> {
+        let state = self.shared.state.lock().expect("runtime scheduler lock");
+        Self::validate_registration_in_state(&state, registration)
+    }
+    /// A host completion/retry mark, including during failure or process drain.
+    /// Qualify origin and enqueue under the same scheduler transaction, so an
+    /// old witness can never wake an actor registered later at the same ID.
+    pub fn notify_host_actor(&self, registration: &ActorRegistration) -> Result<(), DriverError> {
+        let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+        Self::validate_registration_in_state(&state, registration)?;
+        state.effect_ready.notify(registration.actor)?;
+        drop(state);
+        self.shared.changed.notify();
+        Ok(())
+    }
+    /// One poller owns this original actor's host turn. Pure Core dispatch has
+    /// its independent queue and can proceed while this metadata turn exists.
+    pub fn claim_host_actor(&self) -> Option<ActorHostTurn<A>> {
+        let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+        let actor = state.effect_ready.claim()?;
+        let node = state
+            .actors
+            .get(&actor)
+            .expect("ready actor retains its original owner")
+            .clone();
+        Some(ActorHostTurn {
+            runtime: self.clone(),
+            node,
+            active: true,
+        })
+    }
+    fn release_host_turn(
+        &self,
+        node: &Arc<ActorCell<A>>,
         has_runnable: bool,
     ) -> Result<(), DriverError> {
-        self.shared
-            .state
-            .lock()
-            .expect("runtime scheduler lock")
-            .effect_ready
-            .release(actor, has_runnable)?;
+        let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+        if !state
+            .actors
+            .get(&node.id)
+            .is_some_and(|actual| Arc::ptr_eq(actual, node))
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        state.effect_ready.release(node.id, has_runnable)?;
+        drop(state);
         self.shared.changed.notify();
         Ok(())
     }
@@ -2758,6 +2877,10 @@ impl<A: Actor> ActorRuntime<A> {
     /// in scope storage until all actual input/effect custody has retired here.
     pub fn remove_actor(&self, actor: ActorId) -> Result<A, DriverError> {
         let node = self.node(actor)?;
+        self.remove_actor_node(&node, false)
+    }
+    fn remove_actor_node(&self, node: &Arc<ActorCell<A>>, claimed: bool) -> Result<A, DriverError> {
+        let actor = node.id;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         if !inbox.inputs.is_empty()
             || !inbox.roles.is_empty()
@@ -2768,7 +2891,21 @@ impl<A: Actor> ActorRuntime<A> {
             return Err(DriverError::ActorNotRetired);
         }
         let mut state = self.shared.state.lock().expect("runtime scheduler lock");
-        if !state.ready.is_idle(actor)? || !state.effect_ready.is_idle(actor)? {
+        if !state
+            .actors
+            .get(&actor)
+            .is_some_and(|actual| Arc::ptr_eq(actual, node))
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        if !state.ready.is_idle(actor)? {
+            return Err(SchedulerError::Busy.into());
+        }
+        if claimed {
+            if !state.effect_ready.is_claimed(actor)? {
+                return Err(SchedulerError::NotClaimed.into());
+            }
+        } else if !state.effect_ready.is_idle(actor)? {
             return Err(SchedulerError::Busy.into());
         }
         // A producer may already have looked up this exact Arc and be waiting
@@ -2777,18 +2914,25 @@ impl<A: Actor> ActorRuntime<A> {
         inbox.sealed = true;
         inbox.timer_closed = true;
         state.ready.unregister(actor)?;
-        state.effect_ready.unregister(actor)?;
+        if claimed {
+            state.effect_ready.unregister_claimed(actor)?;
+        } else {
+            state.effect_ready.unregister(actor)?;
+        }
         state.timers.cancel(actor);
         state.timers.acknowledge_tick(actor);
         state.actors.remove(&actor);
         drop(state);
         node.scope.detach_actor(node.attachment)?;
-        Ok(node
+        let actor = node
             .core
             .lock()
             .expect("actor core lock")
             .take()
-            .expect("one core owner"))
+            .expect("one core owner");
+        drop(inbox);
+        self.shared.changed.notify();
+        Ok(actor)
     }
     pub fn is_empty(&self) -> bool {
         self.shared
@@ -2855,6 +2999,37 @@ impl<A: Actor> PollerPool<A> {
         clock: Arc<dyn Clock>,
         workers: usize,
     ) -> Result<Self, std::io::Error> {
+        Self::start_with_dispatch(runtime, clock, workers, |_, _| false)
+    }
+    /// Runs finite host metadata turns on the same pollers as protocol turns.
+    /// The callback must hand foreign calls and destructors to their admitted
+    /// executors, and release or retire the original exclusive host turn.
+    pub fn start_with_host<H>(
+        runtime: ActorRuntime<A>,
+        clock: Arc<dyn Clock>,
+        workers: usize,
+        host: H,
+    ) -> Result<Self, std::io::Error>
+    where
+        H: Fn(Tick, ActorHostTurn<A>) + Send + Sync + 'static,
+    {
+        Self::start_with_dispatch(runtime, clock, workers, move |runtime, now| {
+            let Some(turn) = runtime.claim_host_actor() else {
+                return false;
+            };
+            host(now, turn);
+            true
+        })
+    }
+    fn start_with_dispatch<H>(
+        runtime: ActorRuntime<A>,
+        clock: Arc<dyn Clock>,
+        workers: usize,
+        host: H,
+    ) -> Result<Self, std::io::Error>
+    where
+        H: Fn(&ActorRuntime<A>, Tick) -> bool + Send + Sync + 'static,
+    {
         if workers == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -2862,11 +3037,13 @@ impl<A: Actor> PollerPool<A> {
             ));
         }
         let stop = Arc::new(crate::sync::AtomicBool::new(false));
+        let host = Arc::new(host);
         let mut threads = Vec::new();
         for index in 0..workers {
             let worker_runtime = runtime.clone();
             let worker_stop = stop.clone();
             let worker_clock = clock.clone();
+            let worker_host = host.clone();
             let worker = std::thread::Builder::new()
                 .name(format!("control-poller-{index}"))
                 .spawn(move || {
@@ -2877,10 +3054,14 @@ impl<A: Actor> PollerPool<A> {
                             worker_runtime
                                 .advance_time(now, 64)
                                 .unwrap_or_else(|_| std::process::abort());
-                            if worker_runtime
+                            let core_progressed = worker_runtime
                                 .poll_one_with_clock(worker_clock.as_ref())
-                                .unwrap_or_else(|_| std::process::abort())
-                            {
+                                .unwrap_or_else(|_| std::process::abort());
+                            // A continuously ready protocol actor must not starve
+                            // host handoffs or retirement. Each queue gets one
+                            // finite opportunity before another turn begins.
+                            let host_progressed = worker_host(&worker_runtime, worker_clock.now());
+                            if core_progressed || host_progressed {
                                 continue;
                             }
                             if worker_stop.load(crate::sync::Ordering::Acquire) {
@@ -3055,8 +3236,8 @@ mod effect_ticket_incarnation_tests {
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
             ledger.reap_scope_ready(scope.id(), 1).unwrap();
-            while let Some(ready) = runtime.claim_effect_actor() {
-                runtime.release_effect_actor(ready, false).unwrap();
+            while let Some(original_host_turn) = runtime.claim_host_actor() {
+                original_host_turn.release(false).unwrap();
             }
             runtime.remove_actor(actor).unwrap();
             capacity.release(&capacity.resources().unwrap()).unwrap();

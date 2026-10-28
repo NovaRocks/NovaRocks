@@ -42,6 +42,8 @@ fn original_port(f: &mut Harness, task: TaskIdentity) -> Arc<crate::task_port::T
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .port()
@@ -56,6 +58,8 @@ fn same_identity_loading_fixture(identity: QueryContextRef) -> (Harness, TaskIde
     let (mut f, task, work, create, load) = pending_loading_task_fixture(Some(identity));
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .adopt_task(
             &f.runtime,
@@ -77,7 +81,8 @@ fn same_identity_loading_fixture(identity: QueryContextRef) -> (Harness, TaskIde
     (f, task)
 }
 fn funder(f: &mut Harness, task: TaskIdentity, calls: usize) -> ContextMetadataRole {
-    let host = f.service.context(f.identity).unwrap();
+    let host_address = f.service.context(f.identity).unwrap();
+    let mut host = host_address.lock().unwrap();
     let parent = host
         .task(task)
         .unwrap()
@@ -109,6 +114,8 @@ fn original_call(f: &mut Harness, task: TaskIdentity, kind: TaskHostCallKind) ->
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .host_call(kind)
@@ -125,12 +132,16 @@ fn publish_failure(f: &mut Harness) {
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .begin_failure_publications(failure)
         .unwrap();
     let mut drained = false;
     for _ in 0..128 {
         if f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_failure_publications(1)
             .unwrap()
@@ -211,6 +222,8 @@ fn take_original_retire_job(
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .take_failed_retire_borrowing_job(task)
 }
 
@@ -226,7 +239,8 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
     let port = original_port(&mut f, task);
     publish_failure(&mut f);
     {
-        let context = f.service.context(f.identity).unwrap();
+        let context_address = f.service.context(f.identity).unwrap();
+        let context = context_address.lock().unwrap();
         let stage = context.failure_publication_stage().unwrap();
         assert!(matches!(
             close.take_failure_job(&stage).err().unwrap(),
@@ -247,7 +261,8 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
             .stop_observable()
             .subscribe(Arc::new(move || observer.observe()));
         let job = if call.kind() == TaskHostCallKind::Stop {
-            let context = f.service.context(f.identity).unwrap();
+            let context_address = f.service.context(f.identity).unwrap();
+            let context = context_address.lock().unwrap();
             let stage = context.failure_publication_stage().unwrap();
             let job = call.take_failure_job(&stage).unwrap();
             assert!(matches!(
@@ -276,6 +291,8 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
         let progressed = f
             .service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_failure_publications(1);
         let borrowing_closed = port.prepare_source_retirement().is_ok();
@@ -342,7 +359,8 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
         retire_call(call, &f.ledger);
         assert_eq!(usage(&f.ledger), [held[0] - 1, held[1] - 1, held[2] - 1]);
         if call.kind() == TaskHostCallKind::Stop {
-            let context = f.service.context(f.identity).unwrap();
+            let context_address = f.service.context(f.identity).unwrap();
+            let context = context_address.lock().unwrap();
             let stage = context.failure_publication_stage().unwrap();
             assert!(matches!(
                 call.take_failure_job(&stage).err().unwrap(),
@@ -400,7 +418,8 @@ fn observer_panic_keeps_the_original_payload_port_and_fee_in_unknown_custody() {
         panic_any(payload);
     }));
     let job = {
-        let host = f.service.context(f.identity).unwrap();
+        let host_address = f.service.context(f.identity).unwrap();
+        let host = host_address.lock().unwrap();
         let stage = host.failure_publication_stage().unwrap();
         let job = call.take_failure_job(&stage).unwrap();
         assert!(matches!(
@@ -454,6 +473,8 @@ fn foreign_runtime_with_equal_scope_numbers_returns_the_whole_paid_original_for_
     let foreign_scope = other
         .service
         .context(other.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .scope()
         .clone();
@@ -527,7 +548,8 @@ fn foreign_runtime_with_equal_scope_numbers_returns_the_whole_paid_original_for_
     let before_late_handoff = scope.snapshot().unwrap();
     let paid_before_late_handoff = usage(&f.ledger);
     {
-        let host = f.service.context(f.identity).unwrap();
+        let host_address = f.service.context(f.identity).unwrap();
+        let host = host_address.lock().unwrap();
         let stage = host.failure_publication_stage().unwrap();
         assert!(matches!(
             call.take_failure_job(&stage)
@@ -560,6 +582,8 @@ fn normal_stop_ticket(
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .open_summary_mut()
@@ -572,6 +596,8 @@ fn normal_stop_ticket(
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .dispatch
         .index_committed(&runtime, ContextCore::MAX_STEP_WORK)
         .unwrap();
@@ -579,6 +605,8 @@ fn normal_stop_ticket(
         let ticket = f
             .service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .dispatch
             .take_ready(&runtime, ContextCore::MAX_STEP_WORK)
@@ -593,6 +621,8 @@ fn normal_stop_ticket(
                 f.service
                     .context(f.identity)
                     .unwrap()
+                    .lock()
+                    .unwrap()
                     .task(task)
                     .unwrap()
                     .open_summary_mut()
@@ -606,6 +636,8 @@ fn normal_stop_ticket(
         drop(commit_task_projection(&runtime, &ticket, &port).unwrap());
         f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .dispatch
             .publication_committed(&runtime, &ticket)
@@ -650,6 +682,8 @@ fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage()
         f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .failure_publication_stage()
             .is_err()
     );
@@ -660,12 +694,16 @@ fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage()
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .begin_failure_publications(failure)
         .unwrap();
     let mut drained = false;
     for _ in 0..128 {
         if f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_failure_publications(1)
             .unwrap()
@@ -676,7 +714,8 @@ fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage()
     }
     assert!(drained);
     let actual = {
-        let host = f.service.context(f.identity).unwrap();
+        let host_address = f.service.context(f.identity).unwrap();
+        let host = host_address.lock().unwrap();
         call.take_failure_job(&host.failure_publication_stage().unwrap())
             .unwrap()
     };
@@ -699,6 +738,8 @@ fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage()
         .unwrap();
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .task(task)
         .unwrap()

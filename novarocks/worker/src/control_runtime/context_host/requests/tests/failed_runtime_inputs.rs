@@ -29,10 +29,24 @@ use novarocks_control_runtime_core::identity::ActionId;
 #[test]
 fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_until_delivery_ends()
  {
-    let mut f = original_context(1, StorageNeed::default());
+    let f = original_context(1, StorageNeed::default());
     let ready = ready(&f, 1);
-    let scope = f.service.context(f.identity).unwrap().scope().id();
-    let fault_work = f.service.context(f.identity).unwrap().resources.roles[TIMER]
+    let scope = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .id();
+    let fault_work = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .resources
+        .roles[TIMER]
         .work
         .id();
     let unknown = task(f.identity, 999);
@@ -56,6 +70,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_request(
             &ready,
             ActorId::new(89).unwrap(),
@@ -67,6 +83,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
     let request = handle.request();
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .submit_request(work, renew())
         .unwrap();
@@ -87,11 +105,15 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .begin_failure_publications(failure)
         .unwrap();
     assert!(matches!(
         f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_failed_runtime_inputs(1)
             .expect_err("publication drain is a real prerequisite"),
@@ -101,6 +123,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
     for _ in 0..128 {
         if f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_failure_publications(1)
             .unwrap()
@@ -132,6 +156,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
             !f.service
                 .context(f.identity)
                 .unwrap()
+                .lock()
+                .unwrap()
                 .advance_request(actual_work)
                 .unwrap()
         );
@@ -148,6 +174,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
     let zero = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .advance_failed_runtime_inputs(0)
         .unwrap();
@@ -167,6 +195,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
         let progress = f
             .service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_failed_runtime_inputs(1)
             .unwrap();
@@ -192,6 +222,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
         !f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_request(work)
             .unwrap(),
         "abandoning the Core input does not end the real external delivery"
@@ -207,6 +239,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
         assert_eq!(original, (scope, work));
         if f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_request(original.1)
             .unwrap()
@@ -224,6 +258,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
             .service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_failed_runtime_inputs(1)
             .unwrap();
         assert!(progress.units <= 1);
@@ -240,6 +276,8 @@ fn queued_submitted_request_is_woken_by_actual_failed_input_take_and_stays_paid_
     let final_observation = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .advance_failed_runtime_inputs(0)
         .unwrap();

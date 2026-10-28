@@ -41,7 +41,8 @@ impl Drop for PoolJoin {
 fn probe_in_handoff_order(f: &mut RouteFixture, input: InputId) -> EstablishReplayResult {
     let runtime = f.f.runtime.clone();
     for claimed in 0..=2 {
-        let host = f.f.root.service().context(f.f.context).unwrap();
+        let host_address = f.f.root.service().context(f.f.context).unwrap();
+        let mut host = host_address.lock().unwrap();
         host.dispatch.index_committed(&runtime, 64).unwrap();
         if let Some(probe) = host.dispatch.take_ready(&runtime, 64).unwrap() {
             let result = match &probe.effect {
@@ -148,13 +149,9 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
     let retired_original = !f.f.root.resources().requests.contains_key(&withdrawn)
         && f.f.ledger.used(Dimension::Replies.id()) + 1 == replies_before;
     {
-        let routes =
-            &f.f.root
-                .service()
-                .context(f.f.context)
-                .unwrap()
-                .resources_for_test()
-                .routes;
+        let original_address = f.f.root.service().context(f.f.context).unwrap();
+        let mut original_context = original_address.lock().unwrap();
+        let routes = &original_context.resources_for_test().routes;
         assert_eq!(routes.len(), 2);
         assert!(routes.contains_key(&first) && routes.contains_key(&second));
     }
@@ -171,6 +168,8 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
             .service()
             .context(f.f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_establish_route(first)
             .unwrap()
     );
@@ -183,6 +182,8 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
         f.f.root
             .service()
             .context(f.f.context)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_establish_route(second)
             .unwrap()

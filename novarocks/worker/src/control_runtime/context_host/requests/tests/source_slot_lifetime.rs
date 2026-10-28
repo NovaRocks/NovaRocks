@@ -66,13 +66,20 @@ fn source_fees(f: &Harness) -> [u64; 3] {
 // same unstarted preparation, Task lifetime and Context inventories. This is
 // the existing fixture's genuine unused teardown, not a Native stop report.
 pub(super) fn finish_after_consuming_pair_detached(
-    mut f: Harness,
+    f: Harness,
     task: TaskIdentity,
     mut preparation: ContextMetadataRole,
 ) {
     preparation.work.body_exited().unwrap();
     preparation.work.captures_exited().unwrap();
-    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    let scope = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
     preparation
         .capacity
@@ -80,11 +87,13 @@ pub(super) fn finish_after_consuming_pair_detached(
         .unwrap();
     drop(preparation);
 
-    let host = f.service.context(f.identity).unwrap();
+    let host_address = f.service.context(f.identity).unwrap();
+    let mut host = host_address.lock().unwrap();
     host.close_task_request_admission(task).unwrap();
     let TaskHostOwner::Ready(task) = host.take_task_for_teardown(task).unwrap() else {
         panic!("the original ready Task remains owned by this Context");
     };
+    drop(host);
     let mut resources = task.into_resources();
     assert!(resources.causal.is_empty());
     let ingress = resources.port.ingress().clone();
@@ -146,6 +155,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .port()
@@ -159,6 +170,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_task_request(
             &ready,
             task,
@@ -169,6 +182,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
         .unwrap();
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .submit_request(
             work,
@@ -181,6 +196,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
     let actual = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .deliver_task_event(task)
         .unwrap()
@@ -217,6 +234,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .publish_request_reply(ticket)
         .unwrap();
     let delivered = handle.try_take().unwrap();
@@ -228,6 +247,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
     let delivery_still_holds_r = !f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .advance_request(work)
         .unwrap()
@@ -257,6 +278,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_task_request(
             &ready,
             task,
@@ -275,6 +298,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .open_summary_mut()
@@ -286,6 +311,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
     let core_receipt = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .task(task)
         .unwrap()
@@ -327,6 +354,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
                 .service
                 .context(f.identity)
                 .unwrap()
+                .lock()
+                .unwrap()
                 .task(task)
                 .unwrap()
                 .open_summary_mut()
@@ -348,7 +377,16 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
         assert!(original.custody.try_retire().unwrap());
     }
     f.ledger
-        .reap_scope_ready(f.service.context(f.identity).unwrap().scope().id(), 32)
+        .reap_scope_ready(
+            f.service
+                .context(f.identity)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scope()
+                .id(),
+            32,
+        )
         .unwrap();
     let reaped = ingress
         .prepare_pair_reap(PairRoute::ConsumingOpen)
@@ -356,6 +394,8 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
         .map(|probe| probe.observe_reaped().unwrap());
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .task(task)
         .unwrap()
@@ -401,6 +441,8 @@ fn an_original_prefix_source_blocks_its_own_r_until_real_alias_exit_and_source_r
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .port()
@@ -425,6 +467,8 @@ fn an_original_prefix_source_blocks_its_own_r_until_real_alias_exit_and_source_r
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_task_request(
             &ready,
             task,
@@ -436,11 +480,15 @@ fn an_original_prefix_source_blocks_its_own_r_until_real_alias_exit_and_source_r
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .submit_request(work, ContextCommand::GetFinalInfo { task })
         .unwrap();
     let actual = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .deliver_task_event(task)
         .unwrap()
@@ -461,6 +509,8 @@ fn an_original_prefix_source_blocks_its_own_r_until_real_alias_exit_and_source_r
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .publish_request_reply(ticket)
         .unwrap();
     let delivered = handle.try_take().unwrap();
@@ -471,6 +521,8 @@ fn an_original_prefix_source_blocks_its_own_r_until_real_alias_exit_and_source_r
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .advance_request(work)
         .unwrap()
         && f.ledger.used(Dimension::Requests.id()) == 1
@@ -479,6 +531,8 @@ fn an_original_prefix_source_blocks_its_own_r_until_real_alias_exit_and_source_r
     let prefix_core_consumed = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .task(task)
         .unwrap()

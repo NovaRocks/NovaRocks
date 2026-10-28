@@ -24,7 +24,8 @@ use super::*;
 fn probe_in_handoff_order(f: &mut RouteFixture, input: InputId) -> EstablishReplayResult {
     let runtime = f.f.runtime.clone();
     for claimed in 0..=2 {
-        let host = f.f.root.service().context(f.f.context).unwrap();
+        let host_address = f.f.root.service().context(f.f.context).unwrap();
+        let mut host = host_address.lock().unwrap();
         host.dispatch.index_committed(&runtime, 64).unwrap();
         if let Some(probe) = host.dispatch.take_ready(&runtime, 64).unwrap() {
             let result = match &probe.effect {
@@ -99,19 +100,17 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
             .service()
             .context(f.f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .resources_for_test()
             .routes
             .is_empty()
     );
     assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 1);
     {
-        let routes =
-            &f.f.root
-                .service()
-                .context(f.f.context)
-                .unwrap()
-                .resources_for_test()
-                .routes;
+        let original_address = f.f.root.service().context(f.f.context).unwrap();
+        let mut original_context = original_address.lock().unwrap();
+        let routes = &original_context.resources_for_test().routes;
         assert_eq!(routes.len(), 1);
         assert!(routes.contains_key(&input));
     }
@@ -124,6 +123,8 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
         f.f.root
             .service()
             .context(f.f.context)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_establish_route(input)
             .unwrap()
@@ -187,6 +188,8 @@ fn cancelling_a_never_registered_target_clears_only_that_original_route_address(
             .service()
             .context(f.f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .resources_for_test()
             .routes
             .is_empty()
@@ -197,6 +200,8 @@ fn cancelling_a_never_registered_target_clears_only_that_original_route_address(
         .service()
         .context(f.f.context)
         .unwrap()
+        .lock()
+        .unwrap()
         .dispatch
         .index_committed(&runtime, 64)
         .unwrap();
@@ -204,6 +209,8 @@ fn cancelling_a_never_registered_target_clears_only_that_original_route_address(
         f.f.root
             .service()
             .context(f.f.context)
+            .unwrap()
+            .lock()
             .unwrap()
             .dispatch
             .take_ready(&runtime, 64)
@@ -309,32 +316,26 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
             .service()
             .context(f.f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .resources_for_test()
             .routes
             .is_empty()
     );
     assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 1);
     {
-        let routes =
-            &f.f.root
-                .service()
-                .context(f.f.context)
-                .unwrap()
-                .resources_for_test()
-                .routes;
+        let original_address = f.f.root.service().context(f.f.context).unwrap();
+        let mut original_context = original_address.lock().unwrap();
+        let routes = &original_context.resources_for_test().routes;
         assert_eq!(routes.len(), 1);
         assert!(routes.contains_key(&later_token));
         assert!(!routes.contains_key(&earlier_token));
     }
     assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 1);
     {
-        let routes =
-            &f.f.root
-                .service()
-                .context(f.f.context)
-                .unwrap()
-                .resources_for_test()
-                .routes;
+        let original_address = f.f.root.service().context(f.f.context).unwrap();
+        let mut original_context = original_address.lock().unwrap();
+        let routes = &original_context.resources_for_test().routes;
         assert_eq!(routes.len(), 2);
         assert!(routes.contains_key(&later_token));
         assert!(routes.contains_key(&earlier_token));
@@ -349,6 +350,8 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
             .service()
             .context(f.f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_establish_route(later_token)
             .unwrap()
     );
@@ -360,6 +363,8 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
         f.f.root
             .service()
             .context(f.f.context)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_establish_route(earlier_token)
             .unwrap()

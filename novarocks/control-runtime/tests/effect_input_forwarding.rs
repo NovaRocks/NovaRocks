@@ -217,8 +217,8 @@ impl Fixture {
             owner.work.captures_exited().unwrap();
             owner.ledger.reap_scope_ready(owner.scope.id(), 8).unwrap();
         }
-        while let Some(actor) = self.runtime.claim_effect_actor() {
-            self.runtime.release_effect_actor(actor, false).unwrap();
+        while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         let mut received = vec![];
         for owner in &mut self.owners {

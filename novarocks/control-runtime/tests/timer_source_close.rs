@@ -110,8 +110,8 @@ impl<A: Actor> Fixture<A> {
         for role in &mut self.roles {
             role.close_after_exit().unwrap();
         }
-        while let Some(id) = self.runtime.claim_effect_actor() {
-            self.runtime.release_effect_actor(id, false).unwrap();
+        while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         self.runtime.seal_actor(actor()).unwrap();
         self.work.body_exited().unwrap();

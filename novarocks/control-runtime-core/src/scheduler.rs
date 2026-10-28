@@ -110,6 +110,24 @@ impl ReadyQueue {
         }
         Ok(())
     }
+    /// Remove the caller's claimed scheduling position after its real actor
+    /// has independently satisfied retirement. Pending marks carry no input,
+    /// Work or exit fact, so they do not keep a retired actor address alive.
+    /// The claim already removed its sole FIFO entry.
+    pub fn unregister_claimed(&mut self, actor: ActorId) -> Result<(), SchedulerError> {
+        let state = self
+            .actors
+            .get(&actor)
+            .ok_or(SchedulerError::UnknownActor)?;
+        if !state.claimed {
+            return Err(SchedulerError::NotClaimed);
+        }
+        if state.queued {
+            return Err(SchedulerError::Busy);
+        }
+        self.actors.remove(&actor);
+        Ok(())
+    }
     /// Used to validate multi-queue retirement before mutating either index.
     pub fn is_idle(&self, actor: ActorId) -> Result<bool, SchedulerError> {
         self.actors

@@ -300,11 +300,14 @@ impl MaterializationFixture {
             .service()
             .context(f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .prepare_host_jobs()
             .unwrap();
         f.root.bind_materialization_return(&materialize).unwrap();
         let source = f.root.take_materialization_source(&materialize).unwrap();
-        let owner = f.root.service().context(f.context).unwrap();
+        let owner_address = f.root.service().context(f.context).unwrap();
+        let owner = owner_address.lock().unwrap();
         let jobs = owner.host_jobs().unwrap().clone();
         let job = owner.capture_materialization(source, factory).unwrap();
         complete_root(&mut f, materialize);
@@ -356,6 +359,8 @@ fn complete_context(f: &mut Fixture, ticket: EffectTicket<WorkerAction>) {
             .service()
             .context(context)
             .unwrap()
+            .lock()
+            .unwrap()
             .handoff_establishment_decision(ticket)
             .unwrap();
         return;
@@ -367,6 +372,8 @@ fn complete_context(f: &mut Fixture, ticket: EffectTicket<WorkerAction>) {
         f.root
             .service()
             .context(context)
+            .unwrap()
+            .lock()
             .unwrap()
             .handoff_retention(ticket)
             .unwrap();
@@ -380,6 +387,8 @@ fn complete_context(f: &mut Fixture, ticket: EffectTicket<WorkerAction>) {
     f.root
         .service()
         .context(context)
+        .unwrap()
+        .lock()
         .unwrap()
         .complete_host_effect(ticket)
         .unwrap();
@@ -400,7 +409,8 @@ fn context_effects(f: &mut Fixture) -> Vec<EffectTicket<WorkerAction>> {
     const BUDGET: usize = 64;
     let context = f.context;
     let runtime = f.runtime.clone();
-    let host = f.root.service().context(context).unwrap();
+    let host_address = f.root.service().context(context).unwrap();
+    let mut host = host_address.lock().unwrap();
     host.dispatch.index_committed(&runtime, BUDGET).unwrap();
     let mut result = Vec::new();
     for _ in 0..BUDGET {
@@ -423,6 +433,8 @@ fn poll_host_returns(f: &mut Fixture) -> usize {
     service
         .ready_context(&notice)
         .expect("the ready notice names this still-registered original owner")
+        .lock()
+        .unwrap()
         .host_jobs()
         .unwrap()
         .poll_returns()
@@ -435,12 +447,13 @@ fn dispose_context_metadata(f: &mut Fixture) {
     let runtime = f.runtime.clone();
     let ledger = f.ledger.clone();
     let context = f.context;
-    while let Some(ready) = runtime.claim_effect_actor() {
-        runtime.release_effect_actor(ready, false).unwrap();
+    while let Some(original_host_turn) = runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
     runtime.close_actor_admission(context_actor()).unwrap();
     runtime.seal_actor(context_actor()).unwrap();
-    let host = f.root.service().context(context).unwrap();
+    let host_address = f.root.service().context(context).unwrap();
+    let mut host = host_address.lock().unwrap();
     let resources = host.resources_for_test();
     let scope = resources.scope.as_ref().unwrap().clone();
     for role in resources.roles.iter_mut().rev() {
@@ -471,6 +484,8 @@ fn handoff_release(f: &mut Fixture, ticket: EffectTicket<WorkerAction>) {
     f.root
         .service()
         .context(context)
+        .unwrap()
+        .lock()
         .unwrap()
         .handoff_host_release(ticket)
         .unwrap();
@@ -702,6 +717,8 @@ fn poll_noticed_host_returns(f: &mut Fixture, notice: &ContextReadyNotice) -> us
         .service()
         .ready_context(notice)
         .expect("the retained notice still names its original Service owner")
+        .lock()
+        .unwrap()
         .host_jobs()
         .unwrap()
         .poll_returns()
@@ -873,8 +890,8 @@ fn removed_owner_rejects_reused_actor(
     work.captures_exited().unwrap();
     f.ledger.reap_scope_ready(scope.id(), 4).unwrap();
     capacity.release(&capacity.resources().unwrap()).unwrap();
-    while let Some(ready) = f.runtime.claim_effect_actor() {
-        f.runtime.release_effect_actor(ready, false).unwrap();
+    while let Some(original_host_turn) = f.runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
     drop(f.runtime.remove_actor(context_actor()).unwrap());
     f.ledger.remove_scope(scope.id()).unwrap();
@@ -932,7 +949,15 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
             (false, false)
         }
     };
-    let scope = f.root.service().context(f.context).unwrap().scope().clone();
+    let scope = f
+        .root
+        .service()
+        .context(f.context)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     let route = PublishedSnapshot::new(
         &f.root.resources().scope,
         Arc::new(QueryContextState::Absent),
@@ -954,11 +979,13 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
         .unwrap();
     let mut continuation: InputRole<WorkerActor> = permit.into_role().unwrap();
 
-    let host = f.root.service().context(f.context).unwrap();
+    let host_address = f.root.service().context(f.context).unwrap();
+    let mut host = host_address.lock().unwrap();
     if let Err((reason, original)) = host.stage_materialization(job) {
         pools.refused.push(original);
         panic!("original M staging refused: {reason:?}");
     }
+    drop(host);
     // Matching numeric actors in another runtime grant no submission or
     // report-consumption authority over this already staged original M.
     let before_foreign_pool = all_worker_fees(&f);
@@ -1385,7 +1412,15 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
         mut source_pools,
         ..
     } = MaterializationFixture::new(gate.clone(), calls.clone(), releases.clone());
-    let scope = f.root.service().context(f.context).unwrap().scope().clone();
+    let scope = f
+        .root
+        .service()
+        .context(f.context)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     let route = PublishedSnapshot::new(
         &f.root.resources().scope,
         Arc::new(QueryContextState::Absent),
@@ -1747,7 +1782,15 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
         Some(factory),
     );
     let mut pools = FixedPoolGuard::start(&mut f, Arc::new(FixedPoolLatch::default()));
-    let scope = f.root.service().context(f.context).unwrap().scope().clone();
+    let scope = f
+        .root
+        .service()
+        .context(f.context)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     let route = PublishedSnapshot::new(
         &f.root.resources().scope,
         Arc::new(QueryContextState::Absent),

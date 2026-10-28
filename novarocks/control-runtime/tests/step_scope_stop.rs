@@ -195,8 +195,8 @@ impl Fixture {
             admitted.work.captures_exited().unwrap();
         }
         self.ledger.reap_scope_ready(self.scope.id(), 3).unwrap();
-        while let Some(ready) = self.runtime.claim_effect_actor() {
-            self.runtime.release_effect_actor(ready, false).unwrap();
+        while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         self.runtime.seal_actor(actor()).unwrap();
         drop(self.runtime.remove_actor(actor()).unwrap());

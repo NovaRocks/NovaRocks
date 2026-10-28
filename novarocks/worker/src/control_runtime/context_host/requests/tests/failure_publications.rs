@@ -61,6 +61,8 @@ fn actual_failure(f: &mut Harness) -> EffectTicket<WorkerAction> {
         f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .scope()
             .snapshot()
             .unwrap()
@@ -69,7 +71,8 @@ fn actual_failure(f: &mut Harness) -> EffectTicket<WorkerAction> {
     ticket
 }
 fn failure_is_still_started(f: &mut Harness, input: InputId) -> bool {
-    let host = f.service.context(f.identity).unwrap();
+    let host_address = f.service.context(f.identity).unwrap();
+    let host = host_address.lock().unwrap();
     host.resources.failure.is_some()
         && matches!(
             host.resources.roles[FAILURE].work.actual_exit_ready(),
@@ -94,6 +97,8 @@ fn drain_one_unit_turns(f: &mut Harness, input: InputId) -> (bool, bool) {
         let drained = f
             .service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_failure_publications(1)
             .unwrap();
@@ -120,6 +125,8 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .publish_request_reply(ticket)
         .unwrap();
     let published_delivery = published_handle.try_take().unwrap();
@@ -134,12 +141,16 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .begin_failure_publications(failure)
         .unwrap();
 
     let zero_did_not_drain = !f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .advance_failure_publications(0)
         .unwrap();
@@ -148,6 +159,8 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .advance_failure_publications(1)
         .unwrap()
         && empty_handle.try_take().is_none();
@@ -155,6 +168,8 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
     let refusal = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_request(
             &ready,
@@ -170,6 +185,8 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
     let refusal = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .submit_request(empty_work, renew())
         .unwrap_err();
@@ -236,12 +253,21 @@ fn only_the_real_publication_drain_abandons_a_queued_source_and_its_alias_still_
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .port()
         .ingress()
         .clone();
-    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    let scope = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     let original_generation = scope.gates().unwrap().generation;
     let drops = Arc::new(AtomicUsize::new(0));
     let cause = ExecutionFailure::from_domain(QueuedSource(drops.clone()));
@@ -263,6 +289,8 @@ fn only_the_real_publication_drain_abandons_a_queued_source_and_its_alias_still_
         f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .take_failed_task_open(task),
         Err(FailurePublicationError::NotStarted)
     );
@@ -271,11 +299,15 @@ fn only_the_real_publication_drain_abandons_a_queued_source_and_its_alias_still_
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .begin_failure_publications(failure)
         .unwrap();
     let not_drained = matches!(
         f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .take_failed_task_open(task),
         Err(FailurePublicationError::NotDrained)
@@ -285,6 +317,8 @@ fn only_the_real_publication_drain_abandons_a_queued_source_and_its_alias_still_
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .take_failed_task_open(task)
         .unwrap()
         .expect(
@@ -292,17 +326,15 @@ fn only_the_real_publication_drain_abandons_a_queued_source_and_its_alias_still_
         );
     let exact_summary = original.cut.is_none()
         && original.summary.candidate_sources().collect::<Vec<_>>() == vec![source];
-    let open = f
-        .service
-        .context(f.identity)
-        .unwrap()
-        .task(task)
-        .unwrap()
-        .open_summary_mut()
-        .unwrap();
-    let abandoned_not_consumed =
-        open.source_core_consumption(source).unwrap() == Consumption::AbandonedByOwnerFailure;
-    let never_filled = open.source_input(source).unwrap().is_none();
+    let (abandoned_not_consumed, never_filled) = {
+        let address = f.service.context(f.identity).unwrap();
+        let mut host = address.lock().unwrap();
+        let open = host.task(task).unwrap().open_summary_mut().unwrap();
+        (
+            open.source_core_consumption(source).unwrap() == Consumption::AbandonedByOwnerFailure,
+            open.source_input(source).unwrap().is_none(),
+        )
+    };
     let ordinal = ingress
         .pair_inventory(PairRoute::ConsumingOpen)
         .unwrap()
@@ -359,6 +391,8 @@ fn only_the_real_publication_drain_abandons_a_queued_source_and_its_alias_still_
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .open_summary_mut()
@@ -413,10 +447,19 @@ fn a_foreign_same_number_failure_ticket_cannot_start_the_local_work_and_returns_
     let same_numeric_identity = local_ticket.actor == foreign_ticket.actor
         && local_ticket.descriptor.work == foreign_ticket.descriptor.work
         && local_ticket.input == foreign_ticket.input
-        && local.service.context(local.identity).unwrap().scope().id()
+        && local
+            .service
+            .context(local.identity)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .scope()
+            .id()
             == foreign
                 .service
                 .context(foreign.identity)
+                .unwrap()
+                .lock()
                 .unwrap()
                 .scope()
                 .id();
@@ -424,6 +467,8 @@ fn a_foreign_same_number_failure_ticket_cannot_start_the_local_work_and_returns_
     let refusal = local
         .service
         .context(local.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .begin_failure_publications(foreign_ticket)
         .unwrap_err();
@@ -441,11 +486,15 @@ fn a_foreign_same_number_failure_ticket_cannot_start_the_local_work_and_returns_
         .service
         .context(local.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .begin_failure_publications(local_ticket)
         .unwrap();
     foreign
         .service
         .context(foreign.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .begin_failure_publications(refusal.ticket)
         .unwrap();

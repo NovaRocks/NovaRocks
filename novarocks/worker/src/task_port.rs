@@ -956,8 +956,8 @@ mod tests {
                 .release(&self.capacity.resources().unwrap())
                 .unwrap();
             self.scope.close_external().unwrap();
-            while let Some(id) = self.runtime.claim_effect_actor() {
-                self.runtime.release_effect_actor(id, false).unwrap();
+            while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+                original_host_turn.release(false).unwrap();
             }
             self.runtime.remove_actor(actor()).unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();

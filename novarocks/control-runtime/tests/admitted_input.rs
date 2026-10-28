@@ -115,8 +115,8 @@ impl Fixture {
         self.runtime.close_actor_admission(actor()).unwrap();
         // A committed empty batch still delivered a real dispatcher wake.
         // Consume it after the original inputs retired, before sealing.
-        while let Some(ready) = self.runtime.claim_effect_actor() {
-            self.runtime.release_effect_actor(ready, false).unwrap();
+        while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         self.runtime.seal_actor(actor()).unwrap();
         self.scope.close_external().unwrap();

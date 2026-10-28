@@ -1721,8 +1721,8 @@ mod tests {
             assert!(resources.tickets.is_empty());
             resources.scope.close_external().unwrap();
             self.runtime.close_actor_admission(actor()).unwrap();
-            while let Some(ready) = self.runtime.claim_effect_actor() {
-                self.runtime.release_effect_actor(ready, false).unwrap();
+            while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+                original_host_turn.release(false).unwrap();
             }
             self.runtime.seal_actor(actor()).unwrap();
             for role in resources.roles.iter_mut().rev() {

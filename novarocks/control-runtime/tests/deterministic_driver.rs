@@ -146,8 +146,8 @@ impl Actor for Recorder {
     }
 }
 fn quiet<A: Actor>(runtime: &ActorRuntime<A>) {
-    while let Some(actor) = runtime.claim_effect_actor() {
-        runtime.release_effect_actor(actor, false).unwrap();
+    while let Some(original_host_turn) = runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
 }
 fn remove_actor<A: Actor>(runtime: &ActorRuntime<A>, actor: ActorId) -> Result<A, DriverError> {

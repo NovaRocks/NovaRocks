@@ -60,6 +60,8 @@ fn task_rpc_consumes_its_actual_proposal_prefix_before_its_control_event() {
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .task(task)
         .unwrap()
         .port()
@@ -73,16 +75,22 @@ fn task_rpc_consumes_its_actual_proposal_prefix_before_its_control_event() {
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_task_request(&ready, task, InputClass::Control, operation, deadline)
         .unwrap();
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .submit_request(work, ContextCommand::GetFinalInfo { task })
         .unwrap();
     let actual = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .deliver_task_event(task)
         .unwrap()
@@ -128,6 +136,8 @@ fn task_rpc_consumes_its_actual_proposal_prefix_before_its_control_event() {
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .publish_request_reply(ticket)
         .unwrap();
     let delivered = handle.try_take().expect("the original request's reply");
@@ -142,10 +152,21 @@ fn task_rpc_consumes_its_actual_proposal_prefix_before_its_control_event() {
         let (scope, actual_work) = ready
             .next_context_ready()
             .expect("the same original Task request remains ready to retire");
-        assert_eq!(scope, f.service.context(f.identity).unwrap().scope().id());
+        assert_eq!(
+            scope,
+            f.service
+                .context(f.identity)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scope()
+                .id()
+        );
         assert_eq!(actual_work, work);
         if f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_request(actual_work)
             .unwrap()

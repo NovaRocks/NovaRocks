@@ -68,6 +68,8 @@ fn admit(
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_request(
             ready,
             ActorId::new(91).unwrap(),
@@ -86,6 +88,8 @@ fn renew() -> ContextCommand {
 fn submit_renew(f: &mut Harness, work: WorkId) {
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .submit_request(work, renew())
         .unwrap();
@@ -108,6 +112,8 @@ fn advance(f: &mut Harness, work: WorkId) -> bool {
         if f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_request(work)
             .unwrap()
         {
@@ -122,6 +128,8 @@ fn finish(mut f: Harness) {
         f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .resources
             .requests
             .is_empty()
@@ -130,12 +138,16 @@ fn finish(mut f: Harness) {
         f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .resources
             .request_partials
             .is_empty()
     );
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .complete_failure_publications_for_test();
     f.dispose_service_bootstrap(context_actor());
@@ -161,6 +173,8 @@ fn original_delivery_keeps_shared_r_until_its_actual_drop_and_core_receipt_survi
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .advance_request(work)
         .unwrap();
     let ticket = reply(&f, request.token);
@@ -170,6 +184,8 @@ fn original_delivery_keeps_shared_r_until_its_actual_drop_and_core_receipt_survi
     };
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .publish_request_reply(ticket)
         .unwrap();
@@ -186,6 +202,8 @@ fn original_delivery_keeps_shared_r_until_its_actual_drop_and_core_receipt_survi
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .advance_request(work)
         .unwrap();
     let input_retired = f
@@ -197,6 +215,8 @@ fn original_delivery_keeps_shared_r_until_its_actual_drop_and_core_receipt_survi
     let refused = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_request(
             &ready,
@@ -231,12 +251,16 @@ fn canceled_external_wait_does_not_revoke_the_already_owned_core_command() {
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .submit_request(work, renew())
         .unwrap();
     drop(handle);
     let before_core = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .advance_request(work)
         .unwrap();
@@ -248,6 +272,8 @@ fn canceled_external_wait_does_not_revoke_the_already_owned_core_command() {
             && reply.body.matches(reply.result));
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .publish_request_reply(ticket)
         .unwrap();
@@ -278,6 +304,8 @@ fn matching_numeric_context_work_and_input_cannot_publish_a_foreign_runtime_tick
         .service
         .context(b.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .publish_request_reply(at)
     {
         Err(ContextRequestPublishRefusal::Publication { ticket, .. }) => ticket,
@@ -287,6 +315,8 @@ fn matching_numeric_context_work_and_input_cannot_publish_a_foreign_runtime_tick
     let bt = match a
         .service
         .context(a.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .publish_request_reply(bt)
     {
@@ -298,10 +328,14 @@ fn matching_numeric_context_work_and_input_cannot_publish_a_foreign_runtime_tick
     a.service
         .context(a.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .publish_request_reply(at)
         .unwrap();
     b.service
         .context(b.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .publish_request_reply(bt)
         .unwrap();
@@ -331,6 +365,8 @@ fn task_command_refusal_returns_the_original_and_the_unused_r_withdraws() {
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .submit_request(work, command)
         .expect_err("the original admission is refused");
     let original = matches!(refused.command,
@@ -346,6 +382,8 @@ fn task_command_refusal_returns_the_original_and_the_unused_r_withdraws() {
     let retained = !f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .advance_request(work)
         .unwrap();
@@ -373,7 +411,8 @@ fn partial_input_header_refusal_keeps_the_original_then_cleans_only_its_unused_i
     // Materialize vector. Its actual exit enters the common reaper before the
     // later partial R, without adding an RPC or a synthetic ready witness.
     let (mut sibling, mut sibling_capacity) = {
-        let host = f.service.context(f.identity).unwrap();
+        let host_address = f.service.context(f.identity).unwrap();
+        let host = host_address.lock().unwrap();
         host.scope()
             .reserve_child_next(
                 generation(),
@@ -391,7 +430,8 @@ fn partial_input_header_refusal_keeps_the_original_then_cleans_only_its_unused_i
     let sibling_pending = !sibling_retirement.is_retired();
     let mut headers = Vec::new();
     {
-        let host = f.service.context(f.identity).unwrap();
+        let host_address = f.service.context(f.identity).unwrap();
+        let host = host_address.lock().unwrap();
         while let Ok(permit) = f.runtime.reserve_admitted_input(
             context_actor(),
             ActorId::new(93).unwrap(),
@@ -404,6 +444,8 @@ fn partial_input_header_refusal_keeps_the_original_then_cleans_only_its_unused_i
     let refused = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_request(
             &ready,
@@ -425,6 +467,8 @@ fn partial_input_header_refusal_keeps_the_original_then_cleans_only_its_unused_i
         && f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .resources
             .request_partials
             .contains_key(&partial);
@@ -434,13 +478,20 @@ fn partial_input_header_refusal_keeps_the_original_then_cleans_only_its_unused_i
     // Consume admission's coalesced Context mark. A later mark must therefore
     // come from this bounded cleanup turn, not an old mark or another RPC.
     let admitted_notice = f.service.next_host_ready().unwrap();
-    let admission_mark_is_original = admitted_notice
-        .as_ref()
-        .is_some_and(|notice| f.service.context(f.identity).unwrap().matches_ready(notice));
+    let admission_mark_is_original = admitted_notice.as_ref().is_some_and(|notice| {
+        f.service
+            .context(f.identity)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .matches_ready(notice)
+    });
     let admission_mark_drained = f.service.next_host_ready().unwrap().is_none();
     let first_retired = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .advance_request(partial)
         .unwrap();
@@ -455,7 +506,14 @@ fn partial_input_header_refusal_keeps_the_original_then_cleans_only_its_unused_i
     let cleaned = first_retired || advance(&mut f, partial);
     // Retire only already-exited original metadata. Release the sibling's
     // actual zero-resource header bundle, never an R/storage refund surrogate.
-    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    let scope = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
     sibling_capacity
         .release(&sibling_capacity.resources().unwrap())
@@ -487,7 +545,8 @@ fn partial_report_header_refusal_retains_and_retires_the_original_unstarted_work
     let ready = ready(&f, 1);
     let mut reports = Vec::new();
     {
-        let host = f.service.context(f.identity).unwrap();
+        let host_address = f.service.context(f.identity).unwrap();
+        let host = host_address.lock().unwrap();
         while let Ok(report) = ReportSlot::reserve_next(
             host.scope(),
             generation(),
@@ -501,6 +560,8 @@ fn partial_report_header_refusal_retains_and_retires_the_original_unstarted_work
     let refused = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_request(
             &ready,
@@ -561,6 +622,8 @@ fn delayed_quiesce_reply_uses_its_original_token_after_the_initial_input_retires
     f.service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .submit_request(work, ContextCommand::Quiesce)
         .unwrap();
     f.runtime.poll_one(Tick(2)).unwrap();
@@ -587,6 +650,8 @@ fn delayed_quiesce_reply_uses_its_original_token_after_the_initial_input_retires
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .advance_request(work)
         .unwrap();
     let original_input_retired = f
@@ -598,7 +663,8 @@ fn delayed_quiesce_reply_uses_its_original_token_after_the_initial_input_retires
     // exercises Core continuation/reply correlation, not a Native Q runner or
     // membership snapshot structural-funding acceptance claim.
     let continuation = {
-        let host = f.service.context(f.identity).unwrap();
+        let host_address = f.service.context(f.identity).unwrap();
+        let host = host_address.lock().unwrap();
         f.runtime
             .reserve_admitted_input(
                 context_actor(),
@@ -621,6 +687,8 @@ fn delayed_quiesce_reply_uses_its_original_token_after_the_initial_input_retires
             && matches!(reply.body.as_ref(), ContextReplyBody::Quiesce { .. }));
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .publish_request_reply(ticket)
         .unwrap();
@@ -679,6 +747,8 @@ fn task_request_source_siblings_and_outer_keep_shared_r_after_the_original_autho
             .service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .reserve_task_request_funding()
             .unwrap();
         let author = funding.author;
@@ -696,7 +766,14 @@ fn task_request_source_siblings_and_outer_keep_shared_r_after_the_original_autho
         // These holders have never been exposed to a Task, producer or RPC.
         // Only their own actual unused exit may be observed here.
         authority.withdraw_unpublished_and_exit().unwrap();
-        let scope = f.service.context(f.identity).unwrap().scope().clone();
+        let scope = f
+            .service
+            .context(f.identity)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .scope()
+            .clone();
         f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
         all_authors_retired &= main_retirement.is_retired()
             && main.try_retire().unwrap()
@@ -719,6 +796,8 @@ fn task_request_source_siblings_and_outer_keep_shared_r_after_the_original_autho
         let refusal = f
             .service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .reserve_task_request_funding()
             .err()
@@ -758,7 +837,8 @@ fn partial_task_source_report_admission_retains_original_outer_until_its_actual_
     });
     let mut probes = Vec::new();
     {
-        let host = f.service.context(f.identity).unwrap();
+        let host_address = f.service.context(f.identity).unwrap();
+        let host = host_address.lock().unwrap();
         while let Ok(report) = ReportSlot::reserve_next(
             host.scope(),
             generation(),
@@ -783,12 +863,16 @@ fn partial_task_source_report_admission_retains_original_outer_until_its_actual_
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .scope()
         .snapshot()
         .unwrap();
     let refusal = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .reserve_task_request_funding()
         .err()
@@ -800,6 +884,8 @@ fn partial_task_source_report_admission_retains_original_outer_until_its_actual_
     let before = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .scope()
         .snapshot()
@@ -819,6 +905,8 @@ fn partial_task_source_report_admission_retains_original_outer_until_its_actual_
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .scope()
         .snapshot()
         .unwrap();
@@ -831,14 +919,23 @@ fn partial_task_source_report_admission_retains_original_outer_until_its_actual_
 fn task_funding_in_a_cleanup_epoch_keeps_the_original_core_consumer_generation() {
     use crate::control_runtime::admitted_role::{adopt_reported_work, dispose_unused_completion};
     use novarocks_control_runtime::exit_role::ExitRole;
-    let mut f = task_funding_context(StorageNeed::default());
-    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    let f = task_funding_context(StorageNeed::default());
+    let scope = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     let original_generation = scope.gates().unwrap().generation;
     let cleanup_generation = scope.fail().unwrap();
     assert!(cleanup_generation > original_generation);
     let funding = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .reserve_task_request_funding()
         .unwrap();
@@ -886,7 +983,14 @@ impl crate::task_port::TaskPendingNotice for RpcTaskPending {
     fn pending(&self) {}
 }
 fn model_fact(f: &mut Harness, fact: ContextInput, at: u64) -> InputId {
-    let work = f.service.context(f.identity).unwrap().resources.roles[TIMER]
+    let work = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .resources
+        .roles[TIMER]
         .work
         .id();
     let input = f
@@ -968,6 +1072,8 @@ fn complete_model_effects_with_preparation(
                 f.service
                     .context(f.identity)
                     .unwrap()
+                    .lock()
+                    .unwrap()
                     .publish_request_reply(ticket)
                     .unwrap();
             } else {
@@ -1013,6 +1119,8 @@ fn pending_loading_task_fixture(
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_request(
             &ready,
             ActorId::new(87).unwrap(),
@@ -1024,6 +1132,8 @@ fn pending_loading_task_fixture(
     let input = create.request().token;
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .submit_request(
             work,
@@ -1052,6 +1162,8 @@ fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
     let (mut f, task, work, create, load) = pending_loading_task_fixture(None);
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .adopt_task(
             &f.runtime,
@@ -1084,6 +1196,8 @@ fn finish_create_waiter(
         !f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_request(work)
             .unwrap()
     );
@@ -1107,9 +1221,10 @@ fn finish_create_waiter(
     assert!(advance(f, work));
     assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
 }
-fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
+fn finish_task_fixture(f: Harness, task: TaskIdentity) {
     use crate::task_proposal_ingress::PairRoute;
-    let host = f.service.context(f.identity).unwrap();
+    let host_address = f.service.context(f.identity).unwrap();
+    let mut host = host_address.lock().unwrap();
     host.close_task_request_admission(task).unwrap();
     let owner = host
         .take_task_for_teardown(task)
@@ -1117,6 +1232,7 @@ fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
     let crate::control_runtime::task::TaskHostOwner::Ready(task) = owner else {
         panic!("same actual ready Task");
     };
+    drop(host);
     let mut resources = task.into_resources();
     assert!(resources.causal.is_empty());
     let ingress = resources.port.ingress().clone();
@@ -1135,7 +1251,14 @@ fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
             assert!(source.custody.try_retire().unwrap());
         }
     }
-    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    let scope = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
     for route in [PairRoute::Open, PairRoute::ConsumingOpen] {
         let reaped = ingress
@@ -1169,7 +1292,7 @@ fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
 
 #[test]
 fn actual_task_r_repeats_at_r_one_and_retains_the_original_delivery_and_real_delayed_token() {
-    let (mut f, task) = live_loading_task_fixture();
+    let (f, task) = live_loading_task_fixture();
     let ready = ready(&f, 1);
     let mut prior_input = None;
     for sequence in 0..3 {
@@ -1177,6 +1300,8 @@ fn actual_task_r_repeats_at_r_one_and_retains_the_original_delivery_and_real_del
         let (work, mut handle) = f
             .service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .admit_task_request(
                 &ready,
@@ -1190,11 +1315,15 @@ fn actual_task_r_repeats_at_r_one_and_retains_the_original_delivery_and_real_del
         f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .submit_request(work, ContextCommand::GetFinalInfo { task })
             .unwrap();
         let delivery = f
             .service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .deliver_task_event(task)
             .unwrap()
@@ -1214,6 +1343,8 @@ fn actual_task_r_repeats_at_r_one_and_retains_the_original_delivery_and_real_del
         f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .publish_request_reply(ticket)
             .unwrap();
         let delivered = handle.try_take().unwrap();
@@ -1227,6 +1358,8 @@ fn actual_task_r_repeats_at_r_one_and_retains_the_original_delivery_and_real_del
         assert!(
             !f.service
                 .context(f.identity)
+                .unwrap()
+                .lock()
                 .unwrap()
                 .advance_request(work)
                 .unwrap()
@@ -1247,10 +1380,21 @@ fn actual_task_r_repeats_at_r_one_and_retains_the_original_delivery_and_real_del
             let (scope, actual) = ready
                 .next_context_ready()
                 .expect("same original R must remain ready");
-            assert_eq!(scope, f.service.context(f.identity).unwrap().scope().id());
+            assert_eq!(
+                scope,
+                f.service
+                    .context(f.identity)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .scope()
+                    .id()
+            );
             assert_eq!(actual, work);
             if f.service
                 .context(f.identity)
+                .unwrap()
+                .lock()
                 .unwrap()
                 .advance_request(actual)
                 .unwrap()
@@ -1286,6 +1430,8 @@ fn task_input_admission_pressure_keeps_the_original_unexposed_partial_and_refund
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .admit_task_request(
             &ready,
             task,
@@ -1305,6 +1451,8 @@ fn task_input_admission_pressure_keeps_the_original_unexposed_partial_and_refund
         f.service
             .context(f.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .task(task)
             .unwrap()
             .causal()
@@ -1313,7 +1461,14 @@ fn task_input_admission_pressure_keeps_the_original_unexposed_partial_and_refund
     // Cleanup of those never-exposed originals does not wait for the mailbox
     // probes, another RPC, Task close, or an invented input consumption fact.
     let retired = advance(&mut f, partial);
-    let original_task_still_owned = f.service.context(f.identity).unwrap().task(task).is_some();
+    let original_task_still_owned = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .task(task)
+        .is_some();
     let refunded = f.ledger.used(Dimension::Requests.id()) == 0;
     for permit in probes {
         permit.revoke_unused().unwrap();
@@ -1321,6 +1476,8 @@ fn task_input_admission_pressure_keeps_the_original_unexposed_partial_and_refund
     let (work, handle) = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_task_request(
             &ready,
@@ -1367,7 +1524,7 @@ fn accepted_task_fixture() -> (Harness, TaskIdentity, ContextMetadataRole) {
     )
 }
 fn finish_accepted_task_fixture(
-    mut f: Harness,
+    f: Harness,
     task: TaskIdentity,
     mut preparation: ContextMetadataRole,
 ) {
@@ -1375,7 +1532,14 @@ fn finish_accepted_task_fixture(
     // host input/body. Its actual unused holder exits here before Task close.
     preparation.work.body_exited().unwrap();
     preparation.work.captures_exited().unwrap();
-    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    let scope = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .scope()
+        .clone();
     f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
     preparation
         .capacity
@@ -1389,11 +1553,13 @@ fn finish_accepted_task_fixture(
 
 #[test]
 fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_preparation() {
-    let (mut f, task, preparation) = accepted_task_fixture();
+    let (f, task, preparation) = accepted_task_fixture();
     let ready = ready(&f, 1);
     let (work, mut handle) = f
         .service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_task_request(
             &ready,
@@ -1405,6 +1571,8 @@ fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_pr
         .unwrap();
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .submit_request(
             work,
@@ -1418,6 +1586,8 @@ fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_pr
         .service
         .context(f.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .deliver_task_event(task)
         .unwrap()
         .unwrap();
@@ -1425,6 +1595,8 @@ fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_pr
     let ticket = reply(&f, delivery.event);
     f.service
         .context(f.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .publish_request_reply(ticket)
         .unwrap();
@@ -1440,9 +1612,20 @@ fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_pr
             .next_context_ready()
             .expect("actual R ready or bounded-reaper retry");
         assert_eq!(actual, work);
-        assert_eq!(scope, f.service.context(f.identity).unwrap().scope().id());
+        assert_eq!(
+            scope,
+            f.service
+                .context(f.identity)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scope()
+                .id()
+        );
         if f.service
             .context(f.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_request(work)
             .unwrap()
@@ -1462,7 +1645,7 @@ fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_pr
 #[test]
 fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and_actor_identities()
 {
-    let mut owner = original_context(1, StorageNeed::default());
+    let owner = original_context(1, StorageNeed::default());
     let (mut original, task, work, create, load) =
         pending_loading_task_fixture(Some(owner.identity));
     assert_eq!(owner.identity, original.identity);
@@ -1482,11 +1665,13 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
             novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
         ),
     };
-    let refused = owner.service.context(owner.identity).unwrap().adopt_task(
-        &original.runtime,
-        &load,
-        binding(),
-    );
+    let refused = owner
+        .service
+        .context(owner.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .adopt_task(&original.runtime, &load, binding());
     let wrong_runtime = matches!(refused, Err(ContextHostError::WrongRuntime));
     let guard_preserved = original
         .runtime
@@ -1496,6 +1681,8 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
     let foreign_not_owned = owner
         .service
         .context(owner.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .task(task)
         .is_none();
@@ -1507,6 +1694,8 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
             .service
             .context(owner.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .tasks
             .remove(&task)
             .unwrap();
@@ -1514,6 +1703,8 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
             original
                 .service
                 .context(original.identity)
+                .unwrap()
+                .lock()
                 .unwrap()
                 .tasks
                 .insert(task, actual)
@@ -1523,6 +1714,8 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
         original
             .service
             .context(original.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .adopt_task(&original.runtime, &load, binding())
             .unwrap();

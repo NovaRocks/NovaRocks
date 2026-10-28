@@ -546,8 +546,7 @@ impl ProcessControlOwner {
         let jobs = self
             .service
             .context(*context)
-            .and_then(|h| h.host_jobs())
-            .cloned()
+            .and_then(|address| address.lock().and_then(|host| host.host_jobs().cloned()))
             .ok_or(ControlRequestError::WrongPhase)?;
         let custody = self
             .resources
@@ -696,7 +695,11 @@ impl ProcessControlOwner {
             self.resources.ready_routes.remove(&context);
             return Ok(false);
         };
-        let Some(host) = self.service.context(context) else {
+        let Some(address) = self.service.context(context) else {
+            self.resources.ready_routes.remove(&context);
+            return Ok(false);
+        };
+        let Some(mut host) = address.lock() else {
             self.resources.ready_routes.remove(&context);
             return Ok(false);
         };
@@ -707,7 +710,7 @@ impl ProcessControlOwner {
             .expect("route address retains its original R owner");
         assert_eq!(custody.pending_route(), Some((context, order)));
         let initialization =
-            custody.bind_pending_establish_route(host, &self.resources.roles[FAILURE].work)?;
+            custody.bind_pending_establish_route(&mut host, &self.resources.roles[FAILURE].work)?;
         if let Some(role) = custody.route_return_role() {
             assert!(self.resources.return_routes.insert(role, input).is_none());
         }
@@ -786,9 +789,10 @@ impl ProcessControlOwner {
                 });
             }
         };
-        let result = self
-            .service
-            .context(context)
+        let address = self.service.context(context);
+        let mut host = address.as_ref().and_then(|address| address.lock());
+        let result = host
+            .as_mut()
             .and_then(|host| host.host_jobs())
             .ok_or(ContextHostJobError::WrongOwner)
             .and_then(|jobs| jobs.request_holder_disposal(&ticket));
@@ -1085,8 +1089,8 @@ mod tests {
         ledger.reap_scope_ready(resources.scope.id(), 4).unwrap();
         if resources.registered {
             runtime.close_actor_admission(actor()).unwrap();
-            while let Some(ready) = runtime.claim_effect_actor() {
-                runtime.release_effect_actor(ready, false).unwrap();
+            while let Some(original_host_turn) = runtime.claim_host_actor() {
+                original_host_turn.release(false).unwrap();
             }
             runtime.seal_actor(actor()).unwrap();
         }

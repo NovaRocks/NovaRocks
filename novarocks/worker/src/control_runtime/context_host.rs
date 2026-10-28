@@ -415,6 +415,12 @@ impl ContextHostRecord {
     pub(crate) fn actor(&self) -> ActorId {
         self.actor
     }
+    pub(super) fn registration(&self) -> &ActorRegistration {
+        self.resources
+            .registration
+            .as_ref()
+            .expect("registered original Context")
+    }
     pub(crate) fn scope(&self) -> &ScopeHandle {
         self.resources
             .scope
@@ -877,6 +883,7 @@ pub(crate) use requests::{
 mod tests {
     mod io_bank;
     mod lifecycle_bank;
+    mod owner_cells;
     #[path = "../requests/tests.rs"]
     mod requests;
     use super::*;
@@ -1478,13 +1485,15 @@ mod tests {
             }
         }
         fn release_drained_effect_claims(runtime: &ActorRuntime<WorkerActor>) {
-            while let Some(actor) = runtime.claim_effect_actor() {
+            while let Some(original_host_turn) = runtime.claim_host_actor() {
+                let actor = original_host_turn.actor();
                 assert!(runtime.pending_batches(actor, None, 1).unwrap().is_empty());
-                runtime.release_effect_actor(actor, false).unwrap();
+                original_host_turn.release(false).unwrap();
             }
         }
         fn dispose_service_bootstrap(&mut self, actor: ActorId) {
-            let host = self.service.context(self.identity).unwrap();
+            let host_address = self.service.context(self.identity).unwrap();
+            let mut host = host_address.lock().unwrap();
             Self::dispose_inventory(
                 &self.runtime,
                 &self.ledger,
@@ -1697,7 +1706,8 @@ mod tests {
             _ => unreachable!(),
         };
         fixture.service.adopt_context(&ticket, binding).unwrap();
-        let host = fixture.service.context(fixture.identity).unwrap();
+        let host_address = fixture.service.context(fixture.identity).unwrap();
+        let host = host_address.lock().unwrap();
         assert_eq!(host.admission(), original);
         assert_eq!(host.identity(), fixture.identity);
         assert_eq!(host.actor(), context_actor());
@@ -1713,6 +1723,7 @@ mod tests {
             fixture.runtime.take_step_reservation(&ticket, original),
             Err(DriverError::UnknownReservation)
         ));
+        drop(host);
         fixture.complete_materialize_handoff(ticket);
         fixture.dispose_service_bootstrap(context_actor());
         fixture.finish_model_refusal();
@@ -1737,7 +1748,8 @@ mod tests {
             fixture.complete_materialize_handoff(materialize);
         }
         let (first_host, first_retirement) = first.actual_model_refusal_retirement();
-        let second_host = second.service.context(second.identity).unwrap();
+        let second_host_address = second.service.context(second.identity).unwrap();
+        let mut second_host = second_host_address.lock().unwrap();
         assert_eq!(first_host.admission(), second_host.admission());
         assert_eq!(first_retirement.actor, second_host.control);
         let original = second_host
@@ -1760,6 +1772,7 @@ mod tests {
         // broken target rule has already released B's unit; B's own genuine
         // retirement is idempotent and still permits honest cleanup below.
         first.finish_retired_context(first_host, first_retirement);
+        drop(second_host);
         let (second_host, second_retirement) = second.actual_model_refusal_retirement();
         second.finish_retired_context(second_host, second_retirement);
         assert!(matches!(
@@ -1792,15 +1805,16 @@ mod tests {
         }
         let removal = first.actual_model_refusal_removal();
         let original = {
-            let host = second.service.context(second.identity).unwrap();
+            let host_address = second.service.context(second.identity).unwrap();
+            let host = host_address.lock().unwrap();
             (host.admission(), host.scope().id(), host.tasks.len())
         };
         let fee = second.ledger.used(Dimension::Contexts.id());
         let outcome = second.service.take_removing_context(&removal);
-        let retained = second
-            .service
-            .context(second.identity)
-            .map(|host| (host.admission(), host.scope().id(), host.tasks.len()));
+        let retained = second.service.context(second.identity).map(|address| {
+            let host = address.lock().unwrap();
+            (host.admission(), host.scope().id(), host.tasks.len())
+        });
         let fee_after = second.ledger.used(Dimension::Contexts.id());
         let (error, moved) = match outcome {
             Err(error) => (Some(error), None),
@@ -1854,7 +1868,8 @@ mod tests {
         let binding = fixture.binding(context_actor(), &ticket);
         assert_eq!(binding.core.state(), QueryContextState::Establishing);
         fixture.service.adopt_context(&ticket, binding).unwrap();
-        let host = fixture.service.context(fixture.identity).unwrap();
+        let host_address = fixture.service.context(fixture.identity).unwrap();
+        let host = host_address.lock().unwrap();
         let scope = host.scope();
         assert!(!scope.gates().unwrap().external_open);
         assert!(matches!(
@@ -1899,6 +1914,7 @@ mod tests {
             fixture.ledger.used(Dimension::Work.id()),
             4 + u64::try_from(fixture.context_storage.work).unwrap()
         );
+        drop(host);
         fixture.complete_materialize_handoff(ticket);
         fixture.dispose_service_bootstrap(context_actor());
         fixture.finish_model_refusal();
@@ -1947,6 +1963,8 @@ mod tests {
                 fixture
                     .service
                     .context(fixture.identity)
+                    .unwrap()
+                    .lock()
                     .unwrap()
                     .admission(),
                 guards[0].0

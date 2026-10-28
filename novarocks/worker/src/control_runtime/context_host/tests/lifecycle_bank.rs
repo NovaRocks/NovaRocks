@@ -48,6 +48,8 @@ fn a_partial_root_lifecycle_bank_stays_owned_and_withdraws_without_reissuing_or_
         .service
         .context(fixture.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .scope()
         .clone();
     let baseline = child.snapshot().unwrap();
@@ -63,6 +65,8 @@ fn a_partial_root_lifecycle_bank_stays_owned_and_withdraws_without_reissuing_or_
             .service
             .context(fixture.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .prepare_host_jobs(),
         Err(ContextHostError::HostJob(ContextHostJobError::Driver(
             DriverError::InputCapacity
@@ -72,7 +76,9 @@ fn a_partial_root_lifecycle_bank_stays_owned_and_withdraws_without_reissuing_or_
     let root_partial = fixture.runtime.snapshot(control_actor()).unwrap();
     let context_partial = fixture.runtime.snapshot(context_actor()).unwrap();
     let (io_kept, lifecycle_kept, no_captured_host_jobs) = {
-        let resources = &fixture.service.context(fixture.identity).unwrap().resources;
+        let original_address = fixture.service.context(fixture.identity).unwrap();
+        let original_context = original_address.lock().unwrap();
+        let resources = &original_context.resources;
         (
             resources.io.is_some(),
             resources.lifecycle.is_some(),
@@ -84,6 +90,8 @@ fn a_partial_root_lifecycle_bank_stays_owned_and_withdraws_without_reissuing_or_
         fixture
             .service
             .context(fixture.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .prepare_host_jobs(),
         Err(ContextHostError::Io(ContextIoError::AlreadyAdmitted))
@@ -97,6 +105,8 @@ fn a_partial_root_lifecycle_bank_stays_owned_and_withdraws_without_reissuing_or_
         .service
         .context(fixture.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .resources
         .lifecycle
         .as_mut()
@@ -107,6 +117,8 @@ fn a_partial_root_lifecycle_bank_stays_owned_and_withdraws_without_reissuing_or_
     fixture
         .service
         .context(fixture.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .resources
         .lifecycle
@@ -119,12 +131,16 @@ fn a_partial_root_lifecycle_bank_stays_owned_and_withdraws_without_reissuing_or_
         .service
         .context(fixture.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .resources
         .lifecycle
         .is_some();
     let inventory = fixture
         .service
         .context(fixture.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .resources
         .io
@@ -141,6 +157,8 @@ fn a_partial_root_lifecycle_bank_stays_owned_and_withdraws_without_reissuing_or_
         fixture
             .service
             .context(fixture.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .prepare_host_jobs(),
         Err(ContextHostError::Io(ContextIoError::AlreadyAdmitted))

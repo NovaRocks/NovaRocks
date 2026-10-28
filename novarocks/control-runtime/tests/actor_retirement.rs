@@ -62,8 +62,8 @@ impl Actor for Recorder {
     }
 }
 fn quiet<A: Actor>(runtime: &ActorRuntime<A>) {
-    while let Some(id) = runtime.claim_effect_actor() {
-        runtime.release_effect_actor(id, false).unwrap();
+    while let Some(original_host_turn) = runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
 }
 #[test]

@@ -213,8 +213,8 @@ fn child(mode: &str) {
     runtime.retire_input(actor(), input).unwrap();
     runtime.close_actor_admission(actor()).unwrap();
     scope.close_external().unwrap();
-    while let Some(ready) = runtime.claim_effect_actor() {
-        runtime.release_effect_actor(ready, false).unwrap();
+    while let Some(original_host_turn) = runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
     runtime.seal_actor(actor()).unwrap();
     failure.body_exited().unwrap();

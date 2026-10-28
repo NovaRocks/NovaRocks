@@ -172,8 +172,8 @@ impl Fixture {
         if self.runtime.snapshot(actor()).unwrap().failed {
             drop(self.runtime.take_failure_payload(actor()).unwrap());
         }
-        while let Some(id) = self.runtime.claim_effect_actor() {
-            self.runtime.release_effect_actor(id, false).unwrap();
+        while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         self.failure.body_exited().unwrap();
         self.failure.captures_exited().unwrap();

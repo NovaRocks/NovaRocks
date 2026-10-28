@@ -117,8 +117,8 @@ fn remove_after_turn(
     scope.close_external().unwrap();
     loop {
         let version = runtime.change_version();
-        while let Some(ready) = runtime.claim_effect_actor() {
-            runtime.release_effect_actor(ready, false).unwrap();
+        while let Some(original_host_turn) = runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         match runtime.remove_actor(actor) {
             Ok(core) => return core,

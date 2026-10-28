@@ -493,7 +493,8 @@ impl RouteFixture {
     fn probe(&mut self, input: InputId) -> EstablishReplayResult {
         self.f.runtime.poll_one(Tick(3)).unwrap();
         let runtime = self.f.runtime.clone();
-        let host = self.f.root.service().context(self.f.context).unwrap();
+        let host_address = self.f.root.service().context(self.f.context).unwrap();
+        let mut host = host_address.lock().unwrap();
         host.dispatch.index_committed(&runtime, 64).unwrap();
         let probe = host.dispatch.take_ready(&runtime, 64).unwrap().unwrap();
         let result = match &probe.effect {
@@ -509,7 +510,8 @@ impl RouteFixture {
         let runtime = self.f.runtime.clone();
         let ledger = self.f.ledger.clone();
         let root_scope = self.f.root.resources().scope.clone();
-        let host = self.f.root.service().context(self.f.context).unwrap();
+        let host_address = self.f.root.service().context(self.f.context).unwrap();
+        let mut host = host_address.lock().unwrap();
         let resources = host.resources_for_test();
         assert!(resources.routes.is_empty());
         if resources.scope.is_none() {
@@ -518,19 +520,20 @@ impl RouteFixture {
         runtime.close_timer_source(context_actor()).unwrap();
         runtime.close_actor_admission(context_actor()).unwrap();
         let mut other_claims = Vec::new();
-        while let Some(ready) = runtime.claim_effect_actor() {
+        while let Some(original_host_turn) = runtime.claim_host_actor() {
+            let ready = original_host_turn.actor();
             if ready == context_actor() {
                 assert!(runtime.pending_batches(ready, None, 1).unwrap().is_empty());
-                runtime.release_effect_actor(ready, false).unwrap();
+                original_host_turn.release(false).unwrap();
             } else {
                 // This Context's metadata exit does not require another
                 // actor's committed input to retire. Retain each other
                 // scheduling claim once, then restore its actual ready edge.
-                other_claims.push(ready);
+                other_claims.push(original_host_turn);
             }
         }
-        for ready in other_claims {
-            runtime.release_effect_actor(ready, true).unwrap();
+        for original_host_turn in other_claims {
+            original_host_turn.release(true).unwrap();
         }
         runtime.seal_actor(context_actor()).unwrap();
         let scope = resources.scope.take().unwrap();
@@ -665,6 +668,8 @@ fn the_context_leg_retires_before_root_consumes_its_original_routed_reply() {
             .service()
             .context(f.f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_establish_route(input)
             .unwrap()
     );
@@ -743,6 +748,8 @@ fn a_root_timeout_cannot_dispose_raw_until_the_real_context_leg_and_cleanup_job_
         f.f.root
             .service()
             .context(f.f.context)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_establish_route(input)
             .unwrap()

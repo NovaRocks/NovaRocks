@@ -141,8 +141,8 @@ fn actual_cleanup_body_exit_and_actual_snapshot_swap_have_one_gate_order() {
         runtime.retire_input(actor, input).unwrap();
         ledger.reap_ready(1).unwrap();
         drop(runtime.take_failure_payload(actor).unwrap());
-        while let Some(ready) = runtime.claim_effect_actor() {
-            runtime.release_effect_actor(ready, false).unwrap();
+        while let Some(original_host_turn) = runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         runtime.remove_actor(actor).unwrap();
         ledger.remove_scope(scope.id()).unwrap();

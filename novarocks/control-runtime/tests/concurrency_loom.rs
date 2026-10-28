@@ -273,8 +273,8 @@ fn enqueue_racing_claim_release_cannot_lose_readiness_with_two_preemptions() {
         runtime.retire_input(aid(1), first).unwrap();
         runtime.retire_input(aid(1), second_id).unwrap();
         scope.close_external().unwrap();
-        while let Some(ready) = runtime.claim_effect_actor() {
-            runtime.release_effect_actor(ready, false).unwrap();
+        while let Some(original_host_turn) = runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         assert_eq!(runtime.remove_actor(aid(1)).unwrap().seen, vec![1, 2]);
         ledger.remove_scope(sid(1)).unwrap();
@@ -429,8 +429,8 @@ fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preempt
         assert_eq!(*snapshot.read(), usize::from(committed));
         runtime.effect_completed(ticket).unwrap();
         runtime.retire_input(aid(1), input).unwrap();
-        while let Some(actor) = runtime.claim_effect_actor() {
-            runtime.release_effect_actor(actor, false).unwrap();
+        while let Some(original_host_turn) = runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         runtime.remove_actor(aid(1)).unwrap();
         ledger.remove_scope(sid(1)).unwrap();
@@ -490,8 +490,8 @@ fn prepaid_role_fill_and_retirement_have_one_reuse_order_after_close_with_two_pr
         for _ in 0..3 {
             runtime.poll_one(Tick(2)).unwrap();
         }
-        while let Some(actor) = runtime.claim_effect_actor() {
-            runtime.release_effect_actor(actor, false).unwrap();
+        while let Some(original_host_turn) = runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         assert_eq!(runtime.remove_actor(aid(1)).unwrap().seen, vec![1, 2]);
         ledger.remove_scope(sid(1)).unwrap();
@@ -735,8 +735,8 @@ fn timer_source_close_and_advance_preserve_real_pending_input_with_two_preemptio
         runtime.poll_one(Tick(2)).unwrap();
         runtime.retire_input(aid(1), next).unwrap();
         role.close_after_exit().unwrap();
-        while let Some(actor) = runtime.claim_effect_actor() {
-            runtime.release_effect_actor(actor, false).unwrap();
+        while let Some(original_host_turn) = runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         runtime.seal_actor(aid(1)).unwrap();
         work.body_exited().unwrap();
@@ -1078,8 +1078,8 @@ impl EffectForwardFixture {
             owner.work.captures_exited().unwrap();
             self.ledger.reap_scope_ready(owner.scope.id(), 1).unwrap();
         }
-        while let Some(actor) = self.runtime.claim_effect_actor() {
-            self.runtime.release_effect_actor(actor, false).unwrap();
+        while let Some(original_host_turn) = self.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
         }
         let mut seen = Vec::with_capacity(2);
         for owner in &mut self.owners {
@@ -1306,8 +1306,8 @@ mod staged_scope_stop_model {
                 work.captures_exited().unwrap();
             }
             ledger.reap_scope_ready(scope.id(), 3).unwrap();
-            while let Some(actor) = runtime.claim_effect_actor() {
-                runtime.release_effect_actor(actor, false).unwrap();
+            while let Some(original_host_turn) = runtime.claim_host_actor() {
+                original_host_turn.release(false).unwrap();
             }
             runtime.seal_actor(aid(1)).unwrap();
             let _retired_actor = runtime.remove_actor(aid(1)).unwrap();

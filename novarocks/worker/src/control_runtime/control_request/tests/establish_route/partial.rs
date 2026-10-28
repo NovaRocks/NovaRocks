@@ -36,12 +36,9 @@ struct PaidMetadata {
 impl PaidMetadata {
     fn admit(f: &mut RouteFixture, need: StorageNeed) -> Self {
         let context = f.f.context;
-        let resources =
-            f.f.root
-                .service()
-                .context(context)
-                .unwrap()
-                .resources_for_test();
+        let original_address = f.f.root.service().context(context).unwrap();
+        let mut original_context = original_address.lock().unwrap();
+        let resources = original_context.resources_for_test();
         let scope = resources.scope.as_ref().unwrap().clone();
         let parent = resources.roles[0].work.id();
         let (mut work, capacity) = scope
@@ -175,6 +172,8 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
             .service()
             .context(f.f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_establish_route(input)
             .unwrap();
     let partial_report_retired = scope.snapshot().unwrap().storage == baseline.storage;
@@ -182,6 +181,8 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
         f.f.root
             .service()
             .context(f.f.context)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_establish_route(input)
             .unwrap();
@@ -232,6 +233,8 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
             .service()
             .context(f.f.context)
             .unwrap()
+            .lock()
+            .unwrap()
             .advance_establish_route(input)
             .unwrap();
     let escrow_held = before
@@ -241,6 +244,8 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
         f.f.root
             .service()
             .context(f.f.context)
+            .unwrap()
+            .lock()
             .unwrap()
             .advance_establish_route(input)
             .unwrap();

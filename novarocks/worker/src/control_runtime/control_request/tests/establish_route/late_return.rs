@@ -29,7 +29,8 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     // back the answer. Let the real Root timer settle the RPC first.
     runtime.poll_one(Tick(3)).unwrap();
     let probe = {
-        let host = f.f.root.service().context(f.f.context).unwrap();
+        let host_address = f.f.root.service().context(f.f.context).unwrap();
+        let mut host = host_address.lock().unwrap();
         host.dispatch.index_committed(&runtime, 64).unwrap();
         host.dispatch.take_ready(&runtime, 64).unwrap().unwrap()
     };
@@ -54,7 +55,8 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     // Context input, captures, report and escrow retire before Root consumes
     // that original return occurrence.
     let context_retired = {
-        let host = f.f.root.service().context(f.f.context).unwrap();
+        let host_address = f.f.root.service().context(f.f.context).unwrap();
+        let mut host = host_address.lock().unwrap();
         host.handoff_establish_probe(probe).unwrap();
         host.advance_establish_route(input).unwrap()
     };

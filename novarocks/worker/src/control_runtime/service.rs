@@ -21,6 +21,9 @@
 //! invoking a provider. Transport facades and driver composition use this same
 //! inventory. This module does not make bootstrap equivalent to Active or exit.
 
+mod directory;
+pub(crate) use directory::{ContextDirectory, ContextHostAddress};
+
 use super::{
     actors::{WorkerAction, WorkerActor},
     context_executors::{
@@ -38,7 +41,7 @@ use super::{
     loading_events::{LoadingEventOutcome, LoadingJobReturned},
     loading_host_job::LoadingHostJob,
     process_control::RegisteredControl,
-    task::{LoadingSubmission, TaskHostBinding, TaskHostRecord},
+    task::{LoadingSubmission, TaskHostBinding},
 };
 use novarocks_control_runtime::{
     driver::{ActorRuntime, DriverError, EffectTicket},
@@ -47,7 +50,7 @@ use novarocks_control_runtime::{
 use novarocks_control_runtime_core::identity::ActorId;
 use novarocks_execution_contract::{QueryContextRef, TaskIdentity};
 use novarocks_worker_protocol::{context::ContextEffect, control::ControlEffect};
-use std::{collections::BTreeMap, num::NonZeroUsize};
+use std::num::NonZeroUsize;
 
 #[derive(Debug)]
 pub(crate) enum ServiceHostError {
@@ -87,8 +90,7 @@ pub(crate) struct WorkerService {
     runtime: ActorRuntime<WorkerActor>,
     ledger: RuntimeLedger,
     control: ActorId,
-    contexts: BTreeMap<QueryContextRef, ContextHostRecord>,
-    actors: BTreeMap<ActorId, QueryContextRef>,
+    directory: ContextDirectory,
     max_contexts: NonZeroUsize,
     request_positions: usize,
     context_ready: ContextReady,
@@ -123,8 +125,7 @@ impl WorkerService {
             runtime,
             ledger,
             control,
-            contexts: BTreeMap::new(),
-            actors: BTreeMap::new(),
+            directory: ContextDirectory::default(),
             max_contexts,
             request_positions,
         }
@@ -171,13 +172,17 @@ impl WorkerService {
             } if ticket.actor == self.control => *context,
             _ => return Err(ServiceHostError::WrongEffect),
         };
-        if self.contexts.contains_key(&context) {
+        // Registration and publication are one directory transaction. A host
+        // poller cannot resolve the newly registered actor before its original
+        // Context cell has been published here.
+        let mut directory = self.directory.state();
+        if directory.contexts.contains_key(&context) {
             return Err(ServiceHostError::ContextAlreadyOwned);
         }
-        if self.actors.contains_key(&binding.actor) || binding.actor == self.control {
+        if directory.actors.contains_key(&binding.actor) || binding.actor == self.control {
             return Err(ServiceHostError::ActorAlreadyOwned);
         }
-        if self.contexts.len() == self.max_contexts.get() {
+        if directory.contexts.len() == self.max_contexts.get() {
             return Err(ServiceHostError::ContextTableFull);
         }
         let mut host = ContextHostRecord::adopt_with_routes(
@@ -197,8 +202,13 @@ impl WorkerService {
             }));
         }
         assert_eq!(host.identity(), context);
-        assert!(self.actors.insert(host.actor(), context).is_none());
-        assert!(self.contexts.insert(context, host).is_none());
+        assert!(directory.actors.insert(host.actor(), context).is_none());
+        assert!(
+            directory
+                .contexts
+                .insert(context, ContextHostAddress::new(host))
+                .is_none()
+        );
         Ok(())
     }
 
@@ -216,29 +226,35 @@ impl WorkerService {
         ) {
             return Err(ServiceHostError::WrongEffect);
         }
-        let context = *self
-            .actors
-            .get(&ticket.actor)
-            .ok_or(ServiceHostError::UnknownContext)?;
-        self.contexts
-            .get_mut(&context)
-            .expect("actor index addresses its actual owner")
-            .adopt_task(&self.runtime, ticket, binding)
+        let address = {
+            let directory = self.directory.state();
+            let context = directory
+                .actors
+                .get(&ticket.actor)
+                .ok_or(ServiceHostError::UnknownContext)?;
+            directory
+                .contexts
+                .get(context)
+                .expect("actor index addresses its actual owner")
+                .clone()
+        };
+        let mut host = address.lock().ok_or(ServiceHostError::UnknownContext)?;
+        host.adopt_task(&self.runtime, ticket, binding)
             .map_err(ServiceHostError::Task)
     }
-    pub(crate) fn context(&mut self, context: QueryContextRef) -> Option<&mut ContextHostRecord> {
-        self.contexts.get_mut(&context)
+    pub(crate) fn directory(&self) -> ContextDirectory {
+        self.directory.clone()
+    }
+    pub(crate) fn context(&self, context: QueryContextRef) -> Option<ContextHostAddress> {
+        self.directory.context(context)
     }
     pub(crate) fn next_host_ready(&self) -> Result<Option<ContextReadyNotice>, ContextReadyError> {
         self.context_ready.next_ready()
     }
-    pub(crate) fn ready_context(
-        &mut self,
-        notice: &ContextReadyNotice,
-    ) -> Option<&mut ContextHostRecord> {
-        self.contexts
-            .get_mut(&notice.context())
-            .filter(|host| host.matches_ready(notice))
+    pub(crate) fn ready_context(&self, notice: &ContextReadyNotice) -> Option<ContextHostAddress> {
+        let address = self.context(notice.context())?;
+        let matches = address.lock()?.matches_ready(notice);
+        matches.then_some(address)
     }
     /// One already coalesced original address per bounded host turn. The
     /// driver retains this inventory on error; it cannot turn a submission
@@ -248,9 +264,11 @@ impl WorkerService {
         notice: &ContextReadyNotice,
         handles: &ContextExecutorHandles,
     ) -> Result<ContextHostProgress, ContextHostProgressError> {
-        self.ready_context(notice)
-            .ok_or(ContextHostJobError::WrongOwner)?
-            .advance_host_io(handles)
+        let address = self
+            .ready_context(notice)
+            .ok_or(ContextHostJobError::WrongOwner)?;
+        let mut host = address.lock().ok_or(ContextHostJobError::WrongOwner)?;
+        host.advance_host_io(handles)
     }
     /// The real host job receives its fixed Loaded/LoaderExited authors before
     /// any request getter runs. An initializing/refused owner is retained for
@@ -261,7 +279,13 @@ impl WorkerService {
         payload: TaskCreatePayload,
         executor: &HostExecutorHandle<LoadingHostJob>,
     ) -> Result<LoadingSubmission, (ServiceHostError, TaskCreatePayload)> {
-        let Some(host) = self.task(context, payload.request.identity()) else {
+        let Some(address) = self.context(context) else {
+            return Err((ServiceHostError::TaskUnavailable, payload));
+        };
+        let Some(mut context) = address.lock() else {
+            return Err((ServiceHostError::TaskUnavailable, payload));
+        };
+        let Some(host) = context.task(payload.request.identity()) else {
             return Err((ServiceHostError::TaskUnavailable, payload));
         };
         host.submit_loading(payload, executor)
@@ -278,8 +302,12 @@ impl WorkerService {
         task: TaskIdentity,
         executor: &HostExecutorHandle<LoadingHostJob>,
     ) -> Result<LoadingSubmission, ServiceHostError> {
-        Ok(self
-            .task(context, task)
+        let address = self
+            .context(context)
+            .ok_or(ServiceHostError::TaskUnavailable)?;
+        let mut host = address.lock().ok_or(ServiceHostError::TaskUnavailable)?;
+        Ok(host
+            .task(task)
             .ok_or(ServiceHostError::TaskUnavailable)?
             .retry_loading_submission(executor))
     }
@@ -293,7 +321,19 @@ impl WorkerService {
         task: TaskIdentity,
         returned: LoadingJobReturned,
     ) -> Result<LoadingEventOutcome, ServiceLoadingReturnRefusal> {
-        let Some(host) = self.task(context, task) else {
+        let Some(address) = self.context(context) else {
+            return Err(ServiceLoadingReturnRefusal {
+                error: ServiceHostError::TaskUnavailable,
+                returned,
+            });
+        };
+        let Some(mut context) = address.lock() else {
+            return Err(ServiceLoadingReturnRefusal {
+                error: ServiceHostError::TaskUnavailable,
+                returned,
+            });
+        };
+        let Some(host) = context.task(task) else {
             return Err(ServiceLoadingReturnRefusal {
                 error: ServiceHostError::TaskUnavailable,
                 returned,
@@ -310,17 +350,14 @@ impl WorkerService {
         context: QueryContextRef,
         task: TaskIdentity,
     ) -> Result<Option<LoadingJobReturned>, ServiceHostError> {
-        self.task(context, task)
+        let address = self
+            .context(context)
+            .ok_or(ServiceHostError::TaskUnavailable)?;
+        let mut host = address.lock().ok_or(ServiceHostError::TaskUnavailable)?;
+        host.task(task)
             .ok_or(ServiceHostError::TaskUnavailable)?
             .take_loading_return()
             .map_err(|error| ServiceHostError::Task(ContextHostError::Task(error)))
-    }
-    pub(crate) fn task(
-        &mut self,
-        context: QueryContextRef,
-        task: TaskIdentity,
-    ) -> Option<&mut TaskHostRecord> {
-        self.contexts.get_mut(&context)?.task(task)
     }
 
     /// Move an actual Removing Context to its original cleanup executor.
@@ -341,9 +378,12 @@ impl WorkerService {
             } if ticket.actor == self.control => *context,
             _ => return Err(ServiceHostError::WrongEffect),
         };
-        let owner = self.contexts.remove(&context);
-        if let Some(owner) = &owner {
-            assert_eq!(self.actors.remove(&owner.actor()), Some(context));
+        let Some(address) = self.context(context) else {
+            return Ok(None);
+        };
+        let owner = address.take();
+        if owner.is_some() {
+            self.directory.remove_original(&address);
         }
         Ok(owner)
     }
@@ -355,17 +395,19 @@ impl WorkerService {
         &mut self,
         context: QueryContextRef,
     ) -> Result<Option<ContextHostRecord>, super::context_host_jobs::ContextHostJobError> {
-        let Some(host) = self.contexts.get_mut(&context) else {
+        let Some(address) = self.context(context) else {
+            return Ok(None);
+        };
+        let Some(mut host) = address.lock() else {
             return Ok(None);
         };
         if !host.publish_host_removed()? {
             return Ok(None);
         }
-        let host = self
-            .contexts
-            .remove(&context)
-            .expect("original physical Context owner");
-        assert_eq!(self.actors.remove(&host.actor()), Some(context));
+        // Keep publication and the physical transfer in this same owner lock;
+        // aliases that arrived earlier observe None after the original moves.
+        let host = host.take_original();
+        self.directory.remove_original(&address);
         Ok(Some(host))
     }
 }

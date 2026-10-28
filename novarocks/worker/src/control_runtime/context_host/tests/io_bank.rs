@@ -48,6 +48,8 @@ fn an_original_context_binds_and_withdraws_its_prepaid_io_bank_without_new_charg
         .service
         .context(fixture.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .scope()
         .clone();
     let baseline = scope.snapshot().unwrap();
@@ -55,6 +57,8 @@ fn an_original_context_binds_and_withdraws_its_prepaid_io_bank_without_new_charg
     fixture
         .service
         .context(fixture.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_io()
         .unwrap();
@@ -66,6 +70,8 @@ fn an_original_context_binds_and_withdraws_its_prepaid_io_bank_without_new_charg
             .service
             .context(fixture.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .admit_io(),
         Err(ContextHostError::Io(ContextIoError::AlreadyAdmitted))
     );
@@ -73,6 +79,8 @@ fn an_original_context_binds_and_withdraws_its_prepaid_io_bank_without_new_charg
     let inventory = fixture
         .service
         .context(fixture.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .resources
         .io
@@ -85,6 +93,8 @@ fn an_original_context_binds_and_withdraws_its_prepaid_io_bank_without_new_charg
         fixture
             .service
             .context(fixture.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .admit_io(),
         Err(ContextHostError::Io(ContextIoError::AlreadyAdmitted))
@@ -125,6 +135,8 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
         .service
         .context(fixture.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .scope()
         .clone();
     let baseline = scope.snapshot().unwrap();
@@ -139,6 +151,8 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
             .service
             .context(fixture.identity)
             .unwrap()
+            .lock()
+            .unwrap()
             .admit_io(),
         Err(ContextHostError::Io(ContextIoError::Driver(
             DriverError::Closed
@@ -149,6 +163,8 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
         .service
         .context(fixture.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .resources
         .io
         .is_none();
@@ -158,6 +174,8 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
         fixture
             .service
             .context(fixture.identity)
+            .unwrap()
+            .lock()
             .unwrap()
             .admit_io(),
         Err(ContextHostError::Io(ContextIoError::AlreadyAdmitted))
@@ -209,6 +227,8 @@ fn an_actual_holder_cleanup_retires_with_only_its_host_observer_and_no_core_call
         .service
         .context(fixture.identity)
         .unwrap()
+        .lock()
+        .unwrap()
         .scope()
         .clone();
     let baseline = scope.snapshot().unwrap();
@@ -216,6 +236,8 @@ fn an_actual_holder_cleanup_retires_with_only_its_host_observer_and_no_core_call
     fixture
         .service
         .context(fixture.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .admit_io()
         .unwrap();
@@ -228,6 +250,8 @@ fn an_actual_holder_cleanup_retires_with_only_its_host_observer_and_no_core_call
     } = fixture
         .service
         .context(fixture.identity)
+        .unwrap()
+        .lock()
         .unwrap()
         .resources
         .io

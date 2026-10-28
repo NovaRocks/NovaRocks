@@ -994,8 +994,8 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
     drop(service);
     resources.scope.close_external().unwrap();
     f.runtime.close_actor_admission(foreign_actor).unwrap();
-    while let Some(ready) = f.runtime.claim_effect_actor() {
-        f.runtime.release_effect_actor(ready, false).unwrap();
+    while let Some(original_host_turn) = f.runtime.claim_host_actor() {
+        original_host_turn.release(false).unwrap();
     }
     f.runtime.seal_actor(foreign_actor).unwrap();
     for role in resources.roles.iter_mut().rev() {
