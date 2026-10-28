@@ -35,7 +35,6 @@ VALID_ENSURE_STATES = {"ReadyValid"}
 VALID_ERROR_CODES = {
     "ready_invalid",
     "writer_failed",
-    "publication_conflict",
     "publication_failed",
 }
 

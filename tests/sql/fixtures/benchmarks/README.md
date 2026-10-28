@@ -96,9 +96,12 @@ rm -f "$resolved_dataset"
 Use `--suite tpc-h --scale 1` for TPC-H SF1 and `--suite tpc-ds --scale 1GB`
 for TPC-DS 1GB. The TPC-DS `1GB` label is passed to `dsdgen` as scale `1`.
 
-`--check` reports a typed READY result without building. `--ensure` builds only
-when READY is absent; a malformed READY fixture fails closed. `--rebuild` is an
-explicit exact-key repair operation and preserves every sibling contract key.
+`--check` reports a typed READY result without building. `--ensure` reuses a
+valid READY and builds only when READY is absent; a malformed READY fixture
+fails closed. Each build writes its own staging prefix and publishes READY
+with a normal PUT after the manifest and referenced objects are complete.
+READY records the completed data location; simultaneous manual producers are
+not coordinated. Published data and sibling contract keys are retained.
 
 ## Runner Auto Bootstrap
 

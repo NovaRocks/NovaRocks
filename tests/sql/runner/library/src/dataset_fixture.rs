@@ -363,12 +363,7 @@ fn validate_checked_result(
 }
 
 fn validate_fixture_error(error: FixtureError, resolved: &ResolvedDataset) -> Result<()> {
-    const KNOWN_ERRORS: &[&str] = &[
-        "ready_invalid",
-        "writer_failed",
-        "publication_conflict",
-        "publication_failed",
-    ];
+    const KNOWN_ERRORS: &[&str] = &["ready_invalid", "writer_failed", "publication_failed"];
     if error.schema_version != 1
         || error.dataset_key != resolved.dataset_key
         || !KNOWN_ERRORS.contains(&error.error.as_str())

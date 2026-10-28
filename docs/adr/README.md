@@ -553,7 +553,8 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 - ADR-0155 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
 - [ADR-0191](ADR-0191-machine-shared-fixture-and-bounded-scratch.md) — 每个daemon为何只有一组共享fixture服务，维护显式、scratch有界、原owner确认实际writer退出（active；替代ADR-0165运行层，保留ADR-0155供给与ADR-0173 check-only消费）
 - [ADR-0199](ADR-0199-readonly-observation-and-mutation-settlement.md) — 只读观察失败为何与变更结算分开，由原owner显式处置准确观察而保留原失败及未知退出（active；补充ADR-0191，原writer退出与scratch屏障保留）
-- [ADR-0173](ADR-0173-prepared-dataset-consumption-is-check-only.md) — 已有数据消费者为何仅check准确READY绑定，而实际producer核验与数据写入保留给显式供给（active；部分替代ADR-0165条9）
+- [ADR-0200](ADR-0200-benchmark-ready-after-complete-data.md) — 标准数据为何只在完整后普通发布 READY，删除条件覆盖与原地重建而保留准确只读消费（active；部分替代 ADR-0173 的条件发布与 rebuild）
+- [ADR-0173](ADR-0173-prepared-dataset-consumption-is-check-only.md) — 已有数据消费者为何仅check准确READY绑定，而实际producer核验与数据写入保留给显式供给（active；部分替代ADR-0165条9；条件发布与原地 rebuild 由 ADR-0200 替代）
 
 #### 历史
 

@@ -41,18 +41,14 @@ export AWS_S3_ENDPOINT="http://unused"
 export AWS_S3_ACCESS_KEY_ID="test-key"
 export AWS_S3_SECRET_ACCESS_KEY="test-secret"
 
-# Conditional READY races: a second absent writer loses, and a rebuild needs
-# the exact ETag it observed.  No helper ever exposes credentials in argv.
+# Ordinary publication writes one object and keeps its observed identity.
 source "$PUBLICATION"
-printf '{"winner":1}\n' > "$TMP/ready-one"
+printf '{"complete":true}\n' > "$TMP/ready-one"
 uri='s3://fixture/bench/READY.json'
-[[ "$(fixture_publication_put_conditional "$uri" "$TMP/ready-one" absent)" == 200 ]] || fail 'first absent publication'
-[[ "$(fixture_publication_put_conditional "$uri" "$TMP/ready-one" absent)" == 412 ]] || fail 'second absent publication'
+[[ "$(fixture_publication_put "$uri" "$TMP/ready-one")" == 200 ]] || fail 'READY publication'
 fixture_publication_get "$uri"
-etag="$FIXTURE_PUBLICATION_ETAG"
-printf '{"winner":2}\n' > "$TMP/ready-two"
-[[ "$(fixture_publication_put_conditional "$uri" "$TMP/ready-two" rebuild bad-etag)" == 412 ]] || fail 'stale rebuild ETag'
-[[ "$(fixture_publication_put_conditional "$uri" "$TMP/ready-two" rebuild "$etag")" == 200 ]] || fail 'exact rebuild ETag'
+[[ "$FIXTURE_PUBLICATION_BODY" == "$(cat "$TMP/ready-one")" ]] || fail 'published READY body'
+[[ -n "$FIXTURE_PUBLICATION_ETAG" ]] || fail 'published READY identity'
 
 # The injected binder returns one immutable publication. Docker is a local
 # command fake that checks every project/path and returns the exact image ID.
@@ -99,19 +95,16 @@ python3 "$ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --sui
 [[ "$output" != *test-secret* ]] || fail 'credential leaked to stdout'
 [[ ! -f "$TMP/binding/calls.jsonl" ]] || fail 'read-only check bound or inspected a producer'
 
-# A malformed READY still exposes its exact ETag to explicit rebuild.  The
-# bootstrap must retain it (rather than treating ReadyInvalid as Absent), and
-# conditional repair cannot touch an unrelated sibling key.
 source "$BOOTSTRAP"
 
 # No lease configuration or helper image is required to resolve fixture paths.
-# The production Absent path allocates a unique staging prefix before its
-# conditional READY publication.
+# The production Absent path allocates a unique staging prefix before READY
+# publication.
 dry_run_output="$(NOVA_ENV_REST_ENV_FILE="$env_file" BENCHMARK_FIXTURE_STORAGE_DIR="$BENCHMARK_FIXTURE_STORAGE_DIR" "$BOOTSTRAP" --suite ssb --scale 1 --resolved-dataset "$resolved" --dry-run 2>&1 >/dev/null)"
 grep -F 'DRY_RUN suite=ssb scale=1' <<<"$dry_run_output" >/dev/null || fail 'absent dry run did not resolve without lease configuration'
 
 # Cancellation must stop after cleanup. A TERM before READY publication cannot
-# return to the caller and continue with the conditional PUT.
+# return to the caller and continue with the PUT.
 term_continuation="$TMP/term-continuation"
 if bash -ceu '
 source "$1"
@@ -158,18 +151,33 @@ PY
 fixture_publication_get "$ready_uri"
 ready_etag="$FIXTURE_PUBLICATION_ETAG"
 observed_ready_etag="$ready_etag"
+ready_body="$FIXTURE_PUBLICATION_BODY"
+# A completed marker cannot make missing statistics valid. Its observed
+# identity remains available, but validation never repairs or publishes data.
 mv "$BENCHMARK_FIXTURE_STORAGE_DIR/${warehouse#s3://}/customer/metadata/stats.puffin" "$TMP/missing-stats"
 if check_readiness; then fail 'broken statistics accepted'; else [[ "$?" == 2 ]] || fail 'broken statistics status'; fi
 [[ "$ready_etag" == "$observed_ready_etag" && -n "$ready_etag" ]] || fail 'invalid READY ETag was not preserved'
+if invalid_output="$(NOVA_ENV_REST_ENV_FILE="$env_file" BENCHMARK_FIXTURE_STORAGE_DIR="$BENCHMARK_FIXTURE_STORAGE_DIR" BENCHMARK_FIXTURE_UP_COMMAND="$TMP/binding/bind" "$BOOTSTRAP" --suite ssb --scale 1 --resolved-dataset "$resolved" --check)"; then
+  fail 'read-only check accepted incomplete data'
+fi
+python3 - "$invalid_output" <<'PY'
+import json, sys
+assert json.loads(sys.argv[1])['error'] == 'ready_invalid'
+PY
+[[ ! -f "$TMP/binding/calls.jsonl" ]] || fail 'invalid read-only check bound or inspected a producer'
+fixture_publication_get "$ready_uri"
+[[ "$FIXTURE_PUBLICATION_BODY" == "$ready_body" ]] || fail 'invalid read-only check changed READY'
 mv "$TMP/missing-stats" "$BENCHMARK_FIXTURE_STORAGE_DIR/${warehouse#s3://}/customer/metadata/stats.puffin"
+check_readiness || fail 'restored statistics not accepted'
+# Publishing a completed object changes only its exact key.
 sibling='s3://fixture/shared/benchmarks/sibling/READY.json'
 printf '{"sibling":true}\n' > "$TMP/sibling"
-fixture_publication_put_conditional "$sibling" "$TMP/sibling" absent >/dev/null
+fixture_publication_put "$sibling" "$TMP/sibling" >/dev/null
 fixture_publication_get "$sibling"; sibling_etag="$FIXTURE_PUBLICATION_ETAG"; sibling_body="$FIXTURE_PUBLICATION_BODY"
-printf '{"repaired":true}\n' > "$TMP/repaired"
-[[ "$(fixture_publication_put_conditional "$ready_uri" "$TMP/repaired" rebuild "$ready_etag")" == 200 ]] || fail 'exact invalid READY rebuild'
+printf '%s\n' "$ready_body" > "$TMP/completed-ready"
+[[ "$(fixture_publication_put "$ready_uri" "$TMP/completed-ready")" == 200 ]] || fail 'completed READY publication'
 fixture_publication_get "$sibling"
-[[ "$FIXTURE_PUBLICATION_ETAG" == "$sibling_etag" && "$FIXTURE_PUBLICATION_BODY" == "$sibling_body" ]] || fail 'rebuild touched sibling key'
+[[ "$FIXTURE_PUBLICATION_ETAG" == "$sibling_etag" && "$FIXTURE_PUBLICATION_BODY" == "$sibling_body" ]] || fail 'publication touched sibling key'
 echo 'bootstrap lifecycle tests passed'
 
 python3 "$ROOT/tests/sql/fixtures/benchmarks/tests/producer-binding-test.py"

@@ -36,7 +36,7 @@ fixture_publication_s3_url() {
 }
 
 fixture_publication_make_curl_config() {
-  local config="$1" method="$2" uri="$3" conditional_header="${4:-}" body="${5:-}" query="${6:-}"
+  local config="$1" method="$2" uri="$3" request_header="${4:-}" body="${5:-}" query="${6:-}"
   umask 077
   : > "$config"
   chmod 600 "$config"
@@ -51,7 +51,7 @@ fixture_publication_make_curl_config() {
     printf 'aws-sigv4 = "aws:amz:%s:s3"\n' "${AWS_REGION:-us-east-1}"
     # curl config keeps this credential out of argv and out of command logs.
     printf 'user = "%s:%s"\n' "${AWS_S3_ACCESS_KEY_ID:?AWS_S3_ACCESS_KEY_ID is required}" "${AWS_S3_SECRET_ACCESS_KEY:?AWS_S3_SECRET_ACCESS_KEY is required}"
-    [[ -z "$conditional_header" ]] || printf 'header = "%s"\n' "$conditional_header"
+    [[ -z "$request_header" ]] || printf 'header = "%s"\n' "$request_header"
     [[ -z "$body" ]] || printf 'data-binary = "@%s"\n' "$body"
   } >> "$config"
 }
@@ -65,7 +65,7 @@ fixture_publication_list_prefix() {
     path="$(fixture_publication_uri_path "$prefix_uri")"
     root="${BENCHMARK_FIXTURE_STORAGE_DIR%/}/"
     [[ -d "$path" ]] || return 44
-    find "$path" -type f ! -name '*.etag' ! -name '*.conditional-lock' -print | while IFS= read -r object; do
+    find "$path" -type f ! -name '*.etag' -print | while IFS= read -r object; do
       printf 's3://%s\n' "${object#"$root"}"
     done
     return
@@ -150,40 +150,21 @@ fixture_publication_head() {
   [[ "$status" == 200 || "$status" == 206 || "$status" == 416 ]]
 }
 
-fixture_publication_put_conditional() {
-  # stdout is 200/201 or precondition status 409/412; never retries/blind-writes.
-  local uri="$1" body="$2" mode="$3" observed_etag="${4:-}"
-  local header
-  case "$mode" in
-    absent) header='If-None-Match: *' ;;
-    rebuild) [[ -n "$observed_etag" ]] || return 64; header="If-Match: $observed_etag" ;;
-    *) return 64 ;;
-  esac
+fixture_publication_put() {
+  # stdout is the HTTP status of one ordinary object PUT.
+  local uri="$1" body="$2"
   if [[ -n "${BENCHMARK_FIXTURE_STORAGE_DIR:-}" ]]; then
-    local path lock etag
-    path="$(fixture_publication_uri_path "$uri")"; lock="$path.conditional-lock"
+    local path
+    path="$(fixture_publication_uri_path "$uri")"
     mkdir -p "$(dirname "$path")"
-    if ! mkdir "$lock" 2>/dev/null; then printf '409\n'; return; fi
-    if [[ -f "$path.etag" ]]; then
-      etag="$(cat "$path.etag")"
-    elif [[ -f "$path" ]]; then
-      etag="$(sha256sum "$path" | awk '{print $1}')"
-    else
-      etag=""
-    fi
-    if [[ "$mode" == absent && -e "$path" ]]; then rmdir "$lock"; printf '412\n'; return; fi
-    if [[ "$mode" == rebuild && "$etag" != "$observed_etag" ]]; then rmdir "$lock"; printf '412\n'; return; fi
-    if ! cp "$body" "$path" || ! sha256sum "$path" | awk '{print $1}' > "$path.etag"; then
-      rmdir "$lock" 2>/dev/null || true
-      return 1
-    fi
-    rmdir "$lock"
+    cp "$body" "$path" || return 1
+    sha256sum "$path" | awk '{print $1}' > "$path.etag" || return 1
     printf '200\n'; return
   fi
   fixture_publication_curl_capable || return 64
   local config status
   config="$(mktemp)"
-  fixture_publication_make_curl_config "$config" PUT "$uri" "$header" "$body"
+  fixture_publication_make_curl_config "$config" PUT "$uri" "" "$body"
   status="$(curl --config "$config" --output /dev/null --write-out '%{http_code}' 2>/dev/null || true)"
   rm -f "$config"
   printf '%s\n' "$status"
