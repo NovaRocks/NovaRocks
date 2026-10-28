@@ -986,8 +986,9 @@ impl TaskHostRecord {
     /// Issue before the dormant runtime start captures this capability. Only
     /// this owner can consume the original Running role's paid inventory.
     pub(crate) fn issue_start_permit(&mut self) -> Result<crate::TaskStartPermit, TaskHostError> {
+        let generation = self.core_generation;
         self.issue_lifecycle_author(TaskLifecycleRole::Running)
-            .map(crate::TaskStartPermit::from_admitted_author)
+            .map(|author| crate::TaskStartPermit::from_admitted_author(author, generation))
     }
     pub(crate) fn issue_terminal_permit(
         &mut self,
@@ -1008,7 +1009,11 @@ impl TaskHostRecord {
         let role = reserve_reported_role(
             &self.scope,
             self.resources.active.id(),
-            WorkKind::Cleanup,
+            if kind == TaskLifecycleRole::Running {
+                WorkKind::Business
+            } else {
+                WorkKind::Cleanup
+            },
             Some(self.core_generation),
         )?;
         let sources = match reserve_source_roles::<2>(

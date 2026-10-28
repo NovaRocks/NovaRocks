@@ -603,3 +603,70 @@ fn original_authority_child_scope_and_parent_stop_keep_one_actual_link_order() {
         assert!(ledger.is_empty());
     });
 }
+
+#[test]
+fn generation_guarded_start_and_scope_failure_have_one_order_without_inventing_exit() {
+    model(|| {
+        let ledger = RuntimeLedger::new(resources(), 1, 1);
+        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
+        let (work, capacity) = scope
+            .reserve_next(
+                generation(),
+                resources(),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Business)
+            .unwrap();
+        let observer = ConsumerId::new(1).unwrap();
+        let report = ReportSlot::reserve_next(
+            &scope,
+            generation(),
+            work.id(),
+            1,
+            [(observer, ConsumerKind::Observer)],
+        )
+        .unwrap();
+        let (role, mut authority) = ExitRole::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                work,
+                capacity,
+                report.clone(),
+            )
+            .unwrap(),
+        );
+        let starting = thread::spawn(move || {
+            let result = authority.start_in_generation(generation());
+            (authority, result)
+        });
+        let failing_scope = scope.clone();
+        let failing = thread::spawn(move || failing_scope.fail().unwrap());
+        let (authority, started) = starting.join().unwrap();
+        assert!(failing.join().unwrap() > generation());
+        match started {
+            Ok(()) => assert_eq!(role.phase(), ExitRolePhase::Started),
+            Err(novarocks_control_runtime::exit_role::ExitRoleError::Runtime(
+                RuntimeError::Scope(
+                    novarocks_control_runtime_core::scope::ScopeError::GenerationMismatch,
+                ),
+            )) => assert_eq!(role.phase(), ExitRolePhase::Admitted),
+            other => panic!("unexpected guarded-start result: {other:?}"),
+        }
+        assert!(!role.body_exited());
+        assert!(!role.captures_exited());
+        assert!(!role.actual_exit_ready().unwrap());
+        assert_eq!(ledger.used(dimension()), 1);
+        // Both outcomes retain the same authority. Its real holder can finish
+        // after failure; neither race outcome acknowledged the observer.
+        authority.exited().unwrap();
+        assert!(!role.try_retire().unwrap());
+        assert_eq!(ledger.used(dimension()), 1);
+        report.consume(observer).unwrap();
+        assert!(role.try_retire().unwrap());
+        assert_eq!(ledger.reap_scope_ready(scope.id(), 1).unwrap(), 1);
+        scope.close_external().unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    });
+}

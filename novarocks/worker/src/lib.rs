@@ -209,7 +209,7 @@ pub use task_execution_ports::{
 pub use task_lifecycle::{
     CompletionExitCapability, CompletionExitNotice, TaskLifecycleEvent, TaskLifecycleHandoffError,
     TaskLifecyclePort, TaskRootDrainCapability, TaskRootDrainFuture, TaskRootDrainOutcome,
-    TaskRootDrainPermit, TaskStartPermit, TaskStopIntent, TaskTerminalPermit,
+    TaskRootDrainPermit, TaskStartPermit, TaskStartRefusal, TaskStopIntent, TaskTerminalPermit,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{

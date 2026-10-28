@@ -34,6 +34,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 pub struct TaskStartPermit {
     identity: TaskIdentity,
     author: Option<crate::control_runtime::causal_input::InputAuthor>,
+    runtime_generation: novarocks_control_runtime_core::identity::Generation,
 }
 impl std::fmt::Debug for TaskStartPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,14 +69,43 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskLifecycleH
 impl TaskStartPermit {
     pub(crate) fn from_admitted_author(
         author: crate::control_runtime::causal_input::InputAuthor,
+        runtime_generation: novarocks_control_runtime_core::identity::Generation,
     ) -> Self {
         Self {
             identity: author.task(),
             author: Some(author),
+            runtime_generation,
         }
     }
     pub const fn identity(&self) -> TaskIdentity {
         self.identity
+    }
+    /// Order this actual production start against the original scope's stop
+    /// and failure fence. This Business role cannot borrow cleanup's ability
+    /// to start after stop. A refusal returns the same never-started permit.
+    pub fn authorize_running(mut self) -> Result<(), TaskStartRefusal> {
+        if let Err(error) = self
+            .author
+            .as_mut()
+            .expect("one original start authority")
+            .start_in_generation(self.runtime_generation)
+        {
+            if matches!(
+                error,
+                novarocks_control_runtime::exit_role::ExitRoleError::Runtime(
+                    novarocks_control_runtime::transaction::RuntimeError::Scope(
+                        novarocks_control_runtime_core::scope::ScopeError::Stopped
+                    )
+                )
+            ) {
+                return Err(TaskStartRefusal::Stopped { permit: self });
+            }
+            return Err(TaskStartRefusal::Start {
+                error,
+                permit: self,
+            });
+        }
+        self.handoff_running().map_err(TaskStartRefusal::Handoff)
     }
     /// Success transfers the input at the Task's original causal fence. It
     /// does not claim that the Core has consumed it or published RUNNING.
@@ -88,6 +118,18 @@ impl TaskStartPermit {
             })
             .map_err(|_retained| TaskLifecycleHandoffError { role: "Running" })
     }
+}
+#[must_use = "A refused start retains its original authority for explicit withdrawal"]
+#[derive(Debug)]
+pub enum TaskStartRefusal {
+    Stopped {
+        permit: TaskStartPermit,
+    },
+    Start {
+        error: novarocks_control_runtime::exit_role::ExitRoleError,
+        permit: TaskStartPermit,
+    },
+    Handoff(TaskLifecycleHandoffError),
 }
 impl Drop for TaskStartPermit {
     fn drop(&mut self) {

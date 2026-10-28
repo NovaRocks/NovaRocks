@@ -26,10 +26,10 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
-    completion::{CompletionError, ConsumerKind},
+    completion::{CompletionError, ConsumerKind, Consumption},
     history::HistoryFact,
     identity::{ConsumerId, DimensionId, Generation, WorkId},
-    scope::{WorkAdmission, WorkKind},
+    scope::{ScopeError, WorkAdmission, WorkKind},
 };
 fn generation() -> Generation {
     Generation::new(1).unwrap()
@@ -56,18 +56,16 @@ fn fixture() -> Fixture {
     fixture_with_preobserved_body(false)
 }
 fn fixture_with_preobserved_body(body_exited: bool) -> Fixture {
+    fixture_with_kind_and_preobserved_body(WorkKind::Cleanup, body_exited)
+}
+fn fixture_with_kind_and_preobserved_body(kind: WorkKind, body_exited: bool) -> Fixture {
     let history = HistoryCapture::new(64);
     let ledger = RuntimeLedger::with_history(resources(1), 1, 1, history.clone());
     let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
     let (mut work, capacity) = scope
-        .reserve_next(
-            generation(),
-            resources(1),
-            WorkKind::Cleanup,
-            WorkAdmission::External,
-        )
+        .reserve_next(generation(), resources(1), kind, WorkAdmission::External)
         .unwrap()
-        .bind(WorkKind::Cleanup)
+        .bind(kind)
         .unwrap();
     let owner = ConsumerId::new(1).unwrap();
     let observer = ConsumerId::new(2).unwrap();
@@ -583,4 +581,128 @@ fn a_partial_exit_observation_failure_keeps_the_real_lease_report_and_capacity_u
     assert_eq!(f.ledger.unresolved_work(), vec![(f.scope.id(), f.work)]);
     assert_eq!(f.scope.snapshot().unwrap().work, 1);
     assert_eq!(f.scope.snapshot().unwrap().storage, 1);
+}
+
+#[test]
+fn an_old_generation_cannot_start_cleanup_after_failure_or_release_its_original_custody() {
+    let mut f = fixture();
+    let failed_generation = f.scope.fail().unwrap();
+    assert!(failed_generation > generation());
+    assert_eq!(
+        f.authority
+            .as_mut()
+            .unwrap()
+            .start_in_generation(generation()),
+        Err(ExitRoleError::Runtime(RuntimeError::Scope(
+            ScopeError::GenerationMismatch
+        )))
+    );
+    assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
+    assert!(!f.role.body_exited() && !f.role.captures_exited());
+    assert!(!f.role.actual_exit_ready().unwrap());
+    assert!(!f.role.try_retire().unwrap());
+    assert_eq!(f.ledger.used(dimension()), 1);
+    assert_eq!(f.report.consumption(f.owner).unwrap(), Consumption::Pending);
+    assert_eq!(
+        f.report.consumption(f.observer).unwrap(),
+        Consumption::Pending
+    );
+    // The exact never-run original may now withdraw. Failure supplied no exit,
+    // report consumption or refund; the authority supplies the real unused exit.
+    f.authority
+        .take()
+        .unwrap()
+        .revoke_unused_and_exit()
+        .unwrap();
+    retire_revoked(&f);
+}
+
+#[test]
+fn generation_guarded_start_obeys_business_stop_while_current_cleanup_still_runs() {
+    let mut business = fixture_with_kind_and_preobserved_body(WorkKind::Business, false);
+    business.scope.request_stop().unwrap();
+    assert_eq!(
+        business
+            .authority
+            .as_mut()
+            .unwrap()
+            .start_in_generation(generation()),
+        Err(ExitRoleError::Runtime(RuntimeError::Scope(
+            ScopeError::Stopped
+        )))
+    );
+    assert_eq!(business.role.phase(), ExitRolePhase::Admitted);
+    assert!(!business.role.body_exited() && !business.role.captures_exited());
+    assert_eq!(business.ledger.used(dimension()), 1);
+    business
+        .authority
+        .take()
+        .unwrap()
+        .revoke_unused_and_exit()
+        .unwrap();
+    retire_revoked(&business);
+
+    let mut cleanup = fixture();
+    cleanup.scope.request_stop().unwrap();
+    let current = cleanup.scope.fail().unwrap();
+    cleanup
+        .authority
+        .as_mut()
+        .unwrap()
+        .start_in_generation(current)
+        .unwrap();
+    assert_eq!(cleanup.role.phase(), ExitRolePhase::Started);
+    assert!(!cleanup.role.body_exited() && !cleanup.role.captures_exited());
+    cleanup.authority.take().unwrap().exited().unwrap();
+    assert_eq!(
+        cleanup.report.consumption(cleanup.owner).unwrap(),
+        Consumption::Pending
+    );
+    assert_eq!(
+        cleanup.report.consumption(cleanup.observer).unwrap(),
+        Consumption::Pending
+    );
+    retire(&cleanup);
+}
+
+#[test]
+fn a_start_that_won_before_failure_keeps_real_exit_independent_from_core_consumption() {
+    let mut f = fixture_with_kind_and_preobserved_body(WorkKind::Business, false);
+    f.authority
+        .as_mut()
+        .unwrap()
+        .start_in_generation(generation())
+        .unwrap();
+    assert_eq!(f.role.phase(), ExitRolePhase::Started);
+    f.scope.fail().unwrap();
+    assert_eq!(f.role.phase(), ExitRolePhase::Started);
+    assert!(!f.role.body_exited() && !f.role.captures_exited());
+    assert_eq!(f.ledger.used(dimension()), 1);
+    f.authority.take().unwrap().exited().unwrap();
+    assert_eq!(f.role.phase(), ExitRolePhase::Exited);
+    assert!(f.role.actual_exit_ready().unwrap());
+    assert_eq!(f.report.consumption(f.owner).unwrap(), Consumption::Pending);
+    assert_eq!(
+        f.report.consumption(f.observer).unwrap(),
+        Consumption::Pending
+    );
+    assert!(!f.role.try_retire().unwrap());
+    // This is an explicit failed owner's consumption-leg abandonment; no Core
+    // event commit is fabricated by the start, failure, or actual host exit.
+    f.report
+        .abandon_failed_owner(f.owner, &f.scope, generation())
+        .unwrap();
+    assert_eq!(
+        f.report.consumption(f.owner).unwrap(),
+        Consumption::AbandonedByOwnerFailure
+    );
+    assert!(!f.role.try_retire().unwrap());
+    assert_eq!(f.ledger.used(dimension()), 1);
+    f.report.consume(f.observer).unwrap();
+    assert!(f.role.try_retire().unwrap());
+    assert_eq!(f.ledger.used(dimension()), 0);
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
+    f.scope.close_external().unwrap();
+    f.ledger.remove_scope(f.scope.id()).unwrap();
+    assert!(f.ledger.is_empty());
 }

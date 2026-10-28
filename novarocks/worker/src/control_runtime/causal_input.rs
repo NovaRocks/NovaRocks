@@ -222,6 +222,15 @@ impl CausalInputCustody {
     }
 }
 impl InputAuthor {
+    pub(crate) fn start_in_generation(
+        &mut self,
+        generation: novarocks_control_runtime_core::identity::Generation,
+    ) -> Result<(), ExitRoleError> {
+        self.authority
+            .as_mut()
+            .expect("one original input authority")
+            .start_in_generation(generation)
+    }
     pub(crate) fn custody(&self) -> CausalInputCustody {
         self.custody.clone()
     }
@@ -680,6 +689,9 @@ mod tests {
         fixture_with_author(false)
     }
     fn fixture_with_author(generic: bool) -> Fixture {
+        fixture_with_role(generic, WorkKind::Cleanup)
+    }
+    fn fixture_with_role(generic: bool, kind: WorkKind) -> Fixture {
         let mut runtime = RuntimeFixture::new();
         let task = task(runtime.identity, 1);
         let created = runtime.run(
@@ -721,11 +733,11 @@ mod tests {
             .reserve_next(
                 generation(),
                 ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap(),
-                WorkKind::Cleanup,
+                kind,
                 WorkAdmission::External,
             )
             .unwrap()
-            .bind(WorkKind::Cleanup)
+            .bind(kind)
             .unwrap();
         let report = ReportSlot::reserve_next(
             &runtime.scope,
@@ -912,13 +924,14 @@ mod tests {
     }
     #[test]
     fn a_running_author_uses_its_original_causal_role_without_publishing_completion_exit() {
-        let mut f = fixture_with_author(true);
+        let mut f = fixture_with_role(true, WorkKind::Business);
         let task = f.custody.task();
         f.runtime.run(ContextInput::Installed { task }, None);
         let fees = f.runtime.ledger.used(Dimension::ActiveTasks.id());
-        let start = crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap());
+        let start =
+            crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap(), generation());
         assert_eq!(start.identity(), task);
-        start.handoff_running().unwrap();
+        start.authorize_running().unwrap();
         assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
         assert!(f.custody.actual_exit_ready().unwrap());
         assert!(!f.custody.observe_consumers(&mut f.inbox).unwrap());

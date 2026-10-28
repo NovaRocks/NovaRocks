@@ -267,6 +267,15 @@ impl ExitAuthority {
     /// Starts only the original admitted work. A refused start changes no exit
     /// evidence, so the holder can still positively exit a never-run role.
     pub fn start(&mut self) -> Result<(), ExitRoleError> {
+        self.start_guarded(None)
+    }
+    /// Checks the delayed call's original generation and starts its Work in
+    /// the same ledger transaction as scope failure and stop. Refusal leaves
+    /// this authority admitted, with no positive body or capture exit.
+    pub fn start_in_generation(&mut self, generation: Generation) -> Result<(), ExitRoleError> {
+        self.start_guarded(Some(generation))
+    }
+    fn start_guarded(&mut self, generation: Option<Generation>) -> Result<(), ExitRoleError> {
         let mut state = self
             .role
             .0
@@ -276,7 +285,11 @@ impl ExitAuthority {
         if state.phase != ExitRolePhase::Admitted {
             return Err(ExitRoleError::InvalidPhase(state.phase));
         }
-        state.work.as_mut().expect("original role work").start()?;
+        let work = state.work.as_mut().expect("original role work");
+        match generation {
+            Some(generation) => work.start_in_generation(generation)?,
+            None => work.start()?,
+        }
         state.phase = ExitRolePhase::Started;
         Ok(())
     }

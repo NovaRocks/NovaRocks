@@ -1971,6 +1971,9 @@ impl StandDown {
 #[derive(Default)]
 struct RunnableState {
     prepared_start: Option<PreparedNativeStart>,
+    /// Only an original StartRuntime already attempted this same dormant
+    /// start. An earlier stop must not start a never-issued action itself.
+    start_deferred: bool,
     handle: Option<Arc<dyn FragmentStandDown>>,
     stand_down: Option<StandDown>,
     finished: bool,
@@ -2072,6 +2075,7 @@ impl NativeRunnableTask {
                 .prepared_start
                 .take()
                 .expect("a committed native task has one dormant start");
+            state.start_deferred = false;
             (prepared, state.stand_down.is_some())
         };
         let stopped_before_start = latched_stop
@@ -2086,7 +2090,6 @@ impl NativeRunnableTask {
             #[cfg(novarocks_dev_controls)]
             injected_execution_failure,
         } = prepared;
-        let completion = completion.commit_creation();
         // A stopped Task still drains the already prepared operators through
         // their real cleanup/exit protocol. The shared Task control prevents
         // provider activation; no synthetic stopped fact bypasses those jobs.
@@ -2095,12 +2098,31 @@ impl NativeRunnableTask {
             // prepared runtime still owes its independent physical teardown.
             drop(start);
         } else {
-            start.handoff_running().unwrap_or_else(|_retained| {
-                // Original input/Work custody has recorded the unresolved
-                // handoff. Do not activate a kernel behind that failed owner.
-                std::panic::panic_any(NativePreparationUnresolved)
-            });
+            match start.authorize_running() {
+                Ok(()) => {}
+                Err(novarocks_worker::TaskStartRefusal::Stopped { permit }) => {
+                    // A normal Context stop may win after the observation
+                    // above, before its ordered Task stop effect is applied.
+                    // Retain this exact dormant start until that effect can
+                    // drive real cleanup; do not activate or invent a cause.
+                    self.defer_prepared_start(PreparedNativeStart {
+                        kernel,
+                        completion,
+                        start: permit,
+                        #[cfg(novarocks_dev_controls)]
+                        injected_execution_failure,
+                    });
+                    return;
+                }
+                Err(_original_refusal) => {
+                    // A lost owner or refused causal handoff has its original
+                    // finite custody. No kernel activation or synthetic exit
+                    // is authorized here; failure takeover retains the rest.
+                    std::panic::panic_any(NativePreparationUnresolved)
+                }
+            }
         }
+        let completion = completion.commit_creation();
         #[cfg(novarocks_dev_controls)]
         let initial_failure = if stopped_before_start {
             None
@@ -2128,6 +2150,25 @@ impl NativeRunnableTask {
         kernel
             .finish_handoff(completion)
             .unwrap_or_else(|_| std::panic::panic_any(NativePreparationUnresolved));
+    }
+
+    fn defer_prepared_start(&self, prepared: PreparedNativeStart) {
+        let stop_already_applied = {
+            let mut state = self.state.lock().expect(RUNNABLE_LOCK);
+            assert!(
+                state.prepared_start.is_none(),
+                "retain one original deferred start"
+            );
+            state.prepared_start = Some(prepared);
+            state.start_deferred = true;
+            state.stand_down.is_some()
+        };
+        // Stop and restore share this lock. Either the already-applied stop
+        // resumes here, or its actual later handoff resumes the same original.
+        // The resumed path sees that exact stop and performs cleanup once.
+        if stop_already_applied {
+            self.start_committed();
+        }
     }
 
     /// Publishes the same handle and replays any latched physical stand-down.
@@ -2197,7 +2238,7 @@ impl NativeRunnableTask {
     }
 
     fn request_physical(&self, stand_down: StandDown) {
-        let (handle, finished_root_reporter) = {
+        let (handle, finished_root_reporter, resume_start) = {
             let mut state = self.state.lock().expect(RUNNABLE_LOCK);
             if state.stand_down.is_some() {
                 return;
@@ -2205,11 +2246,18 @@ impl NativeRunnableTask {
             state.stand_down = Some(stand_down);
             self.stop.request_stop();
             if state.finished {
-                (None, state.finished_root_reporter.take())
+                (None, state.finished_root_reporter.take(), false)
             } else {
-                (state.handle.as_ref().map(Arc::clone), None)
+                (
+                    state.handle.as_ref().map(Arc::clone),
+                    None,
+                    state.start_deferred && state.prepared_start.is_some(),
+                )
             }
         };
+        if resume_start {
+            self.start_committed();
+        }
         // The kernel may have stopped while a root result is still FLUSHING.
         // The finished runnable supplies the missing terminal/output facts.
         if let Some(reporter) = finished_root_reporter {

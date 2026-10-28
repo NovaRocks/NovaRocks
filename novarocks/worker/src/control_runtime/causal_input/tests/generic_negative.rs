@@ -155,7 +155,8 @@ fn another_real_core_cannot_consume_a_generic_authors_original_core_leg() {
 fn a_start_permit_dropped_after_scope_failure_withdraws_only_its_original_unused_role() {
     let mut f = fixture_with_author(true);
     let cut = f.custody.cut();
-    let start = crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap());
+    let start =
+        crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap(), generation());
     let funded = original_fees(&f);
     let failed_generation = f.runtime.scope.fail().unwrap();
     assert!(failed_generation > generation());
@@ -218,7 +219,8 @@ fn a_late_start_handoff_after_scope_failure_retains_running_without_core_consump
     let mut f = ManuallyDrop::new(fixture_with_author(true));
     let task = f.custody.task();
     let cut = f.custody.cut();
-    let start = crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap());
+    let start =
+        crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap(), generation());
     let funded = original_fees(&f);
     f.runtime.scope.fail().unwrap();
 
@@ -276,4 +278,53 @@ fn a_late_start_handoff_after_scope_failure_retains_running_without_core_consump
     // Retain the exact failed Core input and its same finite owner together;
     // do not fabricate a CompletionExited, abandon or successful cleanup.
     let _retained_original_failure = ManuallyDrop::new((f, rejected));
+}
+
+#[test]
+fn an_original_business_start_is_refused_after_stop_or_failure_without_fabricating_running() {
+    for failed in [false, true] {
+        let mut f = fixture_with_role(true, WorkKind::Business);
+        let task = f.custody.task();
+        let cut = f.custody.cut();
+        let permit =
+            crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap(), generation());
+        let funded = original_fees(&f);
+        if failed {
+            f.runtime.scope.fail().unwrap();
+        } else {
+            f.runtime.scope.request_stop().unwrap();
+        }
+        let (error, permit) = match permit.authorize_running() {
+            Err(crate::TaskStartRefusal::Start { error, permit }) => (Some(error), permit),
+            Err(crate::TaskStartRefusal::Stopped { permit }) => (None, permit),
+            other => panic!(
+                "this real stopped/failed Business start must retain its original permit: {other:?}"
+            ),
+        };
+        assert_eq!(permit.identity(), task);
+        assert_eq!(f.custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(original_fees(&f), funded);
+        assert!(!f.ingress.event_unused(cut).unwrap());
+        assert!(f.inbox.deliver_next().unwrap().is_none());
+        assert!(!f.custody.actual_exit_ready().unwrap());
+        if failed {
+            assert!(matches!(
+                error,
+                Some(ExitRoleError::Runtime(RuntimeError::Scope(
+                    novarocks_control_runtime_core::scope::ScopeError::GenerationMismatch
+                )))
+            ));
+        } else {
+            assert!(error.is_none());
+        }
+        // The exact refused original never started. Its explicit withdrawal
+        // supplies no Running, stopped-runtime or shared scope exit fact.
+        drop(permit);
+        assert!(f.ingress.event_unused(cut).unwrap());
+        assert!(f.custody.observe_consumers(&mut f.inbox).unwrap());
+        f.ingress.observe_cut_exit(cut, true, true).unwrap();
+        f.retire_cut(cut);
+        assert!(!f.runtime.scope.join_ready().unwrap());
+        f.finish();
+    }
 }
