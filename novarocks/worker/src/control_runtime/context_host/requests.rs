@@ -721,6 +721,19 @@ impl ContextRequestCustody {
 }
 
 impl ContextHostRecord {
+    /// The same runtime receipt has just become Abandoned. Wake only the R
+    /// indexed by this exact original token, not a scan or a synthetic return.
+    pub(super) fn notify_failed_request_input(&self, input: InputId) {
+        if let Some(work) = self.request_inputs.get(&input) {
+            self.resources
+                .requests
+                .get(work)
+                .expect("same original R input index")
+                .endpoint
+                .external()
+                .notify();
+        }
+    }
     fn retain_request_partial(
         &mut self,
         error: ContextRequestError,

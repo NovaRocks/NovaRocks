@@ -46,6 +46,15 @@ pub(crate) enum FailurePublicationError {
     Request(ContextRequestError),
     Open(OpenSummaryError),
 }
+/// Visits count actual mailbox classes, including empty ones. Taking a neutral
+/// message neither retires its input receipt nor claims any source/R exit.
+#[derive(Debug, Default)]
+pub(crate) struct FailureInputProgress {
+    pub units: usize,
+    pub taken: usize,
+    pub empty: bool,
+}
+
 #[derive(Debug)]
 #[must_use = "Retain the same original failed-owner effect on refusal"]
 pub(crate) struct FailurePublicationStartRefusal {
@@ -98,6 +107,8 @@ pub(super) struct ScopeFailureOwner {
     ticket: EffectTicket<WorkerAction>,
     phase: Phase,
     pending_projection: Option<Arc<TaskProjection>>,
+    next_input_class: usize,
+    empty_input_classes: usize,
 }
 impl ScopeFailureOwner {
     pub(super) fn is_drained(&self) -> bool {
@@ -340,6 +351,8 @@ impl ContextHostRecord {
             ticket,
             phase: Phase::Tasks(None),
             pending_projection: None,
+            next_input_class: 0,
+            empty_input_classes: 0,
         });
         self.notify_host_progress();
         Ok(())
@@ -358,6 +371,71 @@ impl ContextHostRecord {
             .ok_or(FailurePublicationError::NotStarted)?;
         let result = original.advance(self, budget);
         self.resources.failure = Some(original);
+        if budget > 0 && matches!(result, Ok(false)) {
+            // Only finite metadata remains; no I/O or live holder is polled.
+            self.notify_host_progress();
+        }
+        result
+    }
+    /// After the real publication stage, recover queued neutral messages in
+    /// bounded fair class order. The runtime marks each original receipt as
+    /// Abandoned; its original R/causal owner must still observe that receipt
+    /// and its own true body/capture/report exit before retirement or refund.
+    pub(crate) fn advance_failed_runtime_inputs(
+        &mut self,
+        budget: usize,
+    ) -> Result<FailureInputProgress, FailurePublicationError> {
+        const CLASSES: [InputClass; 4] = [
+            InputClass::Lifecycle,
+            InputClass::Control,
+            InputClass::Ordinary,
+            InputClass::Timer,
+        ];
+        let mut original = self
+            .resources
+            .failure
+            .take()
+            .ok_or(FailurePublicationError::NotStarted)?;
+        let result = (|| {
+            original
+                .drained()?
+                .validate(&self.control_runtime, self.actor)
+                .map_err(FailurePublicationError::Driver)?;
+            let mut progress = FailureInputProgress {
+                empty: original.empty_input_classes == CLASSES.len(),
+                ..Default::default()
+            };
+            for _ in 0..budget {
+                if progress.empty {
+                    break;
+                }
+                let class = CLASSES[original.next_input_class];
+                original.next_input_class = (original.next_input_class + 1) % CLASSES.len();
+                progress.units += 1;
+                match self
+                    .control_runtime
+                    .take_failed_input(self.actor, class)
+                    .map_err(FailurePublicationError::Driver)?
+                {
+                    Some((receipt, message)) => {
+                        // WorkerMessage is the closed pure-protocol vocabulary,
+                        // not a provider/callback/opaque source carrier. Drop
+                        // this original neutral value after inbox locks exit.
+                        drop(message);
+                        original.empty_input_classes = 0;
+                        progress.taken += 1;
+                        self.notify_failed_request_input(receipt.input);
+                    }
+                    None => original.empty_input_classes += 1,
+                }
+                progress.empty = original.empty_input_classes == CLASSES.len();
+            }
+            Ok(progress)
+        })();
+        self.resources.failure = Some(original);
+        if budget > 0 && result.as_ref().is_ok_and(|progress| !progress.empty) {
+            self.notify_host_progress();
+        }
         result
     }
     pub(crate) fn failure_publications_drained(&self) -> bool {

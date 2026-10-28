@@ -1537,3 +1537,6 @@ mod source_slot_lifetime;
 
 #[path = "tests/failure_publications.rs"]
 mod failure_publications;
+
+#[path = "tests/failed_runtime_inputs.rs"]
+mod failed_runtime_inputs;
