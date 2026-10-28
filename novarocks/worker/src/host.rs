@@ -37,6 +37,36 @@ use crate::RuntimeFilterReleaseObservation;
 use crate::TaskStatusReporter;
 use crate::root_result_channel::RootResultChannel;
 
+/// The actual preparation capture moves this complete original role set.
+/// Binding refusal returns the same set; observers cannot recreate any role.
+pub struct TaskPreparationRoles {
+    pub fragments: novarocks_execution_contract::AdmittedFragmentRoles<
+        novarocks_execution::runtime::fragment::ExecutionFailure,
+    >,
+    pub start: crate::TaskStartPermit,
+    pub terminal: crate::TaskTerminalPermit,
+    pub statistics: crate::TaskStatisticsProducer,
+    pub final_statistics: crate::TaskStatisticsFinalizer,
+    pub completion_exit: crate::CompletionExitNotice,
+}
+impl TaskPreparationRoles {
+    pub(crate) fn matches(&self, identity: novarocks_execution_contract::TaskIdentity) -> bool {
+        self.fragments.identity() == Some(identity)
+            && self.start.identity() == identity
+            && self.terminal.identity() == identity
+            && self.statistics.identity() == identity
+            && self.final_statistics.identity() == identity
+            && self.completion_exit.identity() == identity
+    }
+}
+impl fmt::Debug for TaskPreparationRoles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskPreparationRoles")
+            .field("identity", &self.start.identity())
+            .finish_non_exhaustive()
+    }
+}
+
 /// One actual preparation body owns one original, finite fragment role set.
 /// Metadata gets only a weak stop view. Moving this context into the Native
 /// host cannot copy the finisher or sign another settlement registration.
@@ -44,39 +74,32 @@ pub struct TaskPreparationContext<'a> {
     owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
     children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
     cadence: std::time::Duration,
-    start: Option<crate::TaskStartPermit>,
-    terminal: Option<crate::TaskTerminalPermit>,
-    roles: Option<
-        novarocks_execution_contract::AdmittedFragmentRoles<
-            novarocks_execution::runtime::fragment::ExecutionFailure,
-        >,
-    >,
+    roles: Option<TaskPreparationRoles>,
 }
 impl<'a> TaskPreparationContext<'a> {
     pub(crate) fn from_admitted(
         owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
         children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
         cadence: std::time::Duration,
-        roles: novarocks_execution_contract::AdmittedFragmentRoles<
-            novarocks_execution::runtime::fragment::ExecutionFailure,
-        >,
-        start: crate::TaskStartPermit,
-        terminal: crate::TaskTerminalPermit,
-    ) -> Result<Self, novarocks_execution::runtime::task_control::TaskControlIdentityMismatch> {
-        if roles.identity() != Some(owner.identity())
-            || children.identity() != owner.identity()
-            || start.identity() != owner.identity()
-            || terminal.identity() != owner.identity()
-        {
-            return Err(novarocks_execution::runtime::task_control::TaskControlIdentityMismatch);
+        roles: TaskPreparationRoles,
+    ) -> Result<
+        Self,
+        (
+            novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
+            TaskPreparationRoles,
+        ),
+    > {
+        if !roles.matches(owner.identity()) || children.identity() != owner.identity() {
+            return Err((
+                novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
+                roles,
+            ));
         }
         Ok(Self {
             owner,
             children,
             cadence,
             roles: Some(roles),
-            start: Some(start),
-            terminal: Some(terminal),
         })
     }
     /// Registers before the provider child attaches kernel/root captures. The
@@ -102,74 +125,22 @@ impl<'a> TaskPreparationContext<'a> {
             .expect("admitted preparation retains its exact Task port"),
         )
     }
-    /// The Native builder takes these original roles once, before the dormant
-    /// fragment binds callbacks. No control handle exposes a role factory.
-    pub fn take_completion_roles(
-        &mut self,
-    ) -> Result<
-        novarocks_execution_contract::AdmittedFragmentRoles<
-            novarocks_execution::runtime::fragment::ExecutionFailure,
-        >,
-        TaskCompletionRolesTaken,
-    > {
-        self.roles.take().ok_or(TaskCompletionRolesTaken)
-    }
-    /// The final callback receives its own original observation role. It
-    /// cannot borrow the independently supervised CompletionExited authority.
-    pub fn take_terminal_permit(
-        &mut self,
-    ) -> Result<crate::TaskTerminalPermit, TaskTerminalPermitTaken> {
-        self.terminal.take().ok_or(TaskTerminalPermitTaken)
-    }
-    /// Transfer this original capability into the prepared dormant start.
-    /// The metadata view above cannot sign or recover another start role.
-    pub fn take_start_permit(&mut self) -> Result<crate::TaskStartPermit, TaskStartPermitTaken> {
-        self.start.take().ok_or(TaskStartPermitTaken)
+    /// Move the complete original capture once, before the Native builder
+    /// attaches any kernel or completion callback. An error returns no partial
+    /// set, and metadata views expose no role factory.
+    pub fn take_roles(&mut self) -> Result<TaskPreparationRoles, TaskPreparationRolesTaken> {
+        self.roles.take().ok_or(TaskPreparationRolesTaken)
     }
 }
 #[derive(Debug)]
-pub struct TaskTerminalPermitTaken;
-impl std::fmt::Display for TaskTerminalPermitTaken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the original Task terminal observation permit was already transferred")
+pub struct TaskPreparationRolesTaken;
+impl fmt::Display for TaskPreparationRolesTaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the original Task preparation roles were already transferred")
     }
 }
-impl std::error::Error for TaskTerminalPermitTaken {}
-impl novarocks_execution_contract::failure::FailureProjection for TaskTerminalPermitTaken {
-    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
-        FailureFact::new(
-            FailureClass::Invariant,
-            crate::failure_reason::WorkerFailureReason::CausalInputUnresolved.reason(),
-        )
-    }
-}
-#[derive(Debug)]
-pub struct TaskStartPermitTaken;
-impl std::fmt::Display for TaskStartPermitTaken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the original Task start permit was already transferred")
-    }
-}
-impl std::error::Error for TaskStartPermitTaken {}
-impl novarocks_execution_contract::failure::FailureProjection for TaskStartPermitTaken {
-    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
-        FailureFact::new(
-            FailureClass::Invariant,
-            crate::failure_reason::WorkerFailureReason::CausalInputUnresolved.reason(),
-        )
-    }
-}
-#[derive(Debug)]
-pub struct TaskCompletionRolesTaken;
-impl std::fmt::Display for TaskCompletionRolesTaken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the original fragment completion roles were already transferred")
-    }
-}
-impl std::error::Error for TaskCompletionRolesTaken {}
-impl novarocks_execution_contract::failure::FailureProjection for TaskCompletionRolesTaken {
+impl std::error::Error for TaskPreparationRolesTaken {}
+impl FailureProjection for TaskPreparationRolesTaken {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         use novarocks_execution_contract::failure::{FailureClass, FailureFact};
         FailureFact::new(

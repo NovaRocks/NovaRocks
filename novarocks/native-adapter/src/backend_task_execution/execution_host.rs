@@ -49,7 +49,7 @@ use super::prepared_owner::{
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::mem::ManuallyDrop;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use novarocks_execution::connector::{
@@ -277,6 +277,8 @@ struct TaskRuntime {
     /// The original Worker capability moves once into the dormant start.
     start: Mutex<Option<novarocks_worker::TaskStartPermit>>,
     terminal: Mutex<Option<novarocks_worker::TaskTerminalPermit>>,
+    final_statistics: Mutex<Option<novarocks_worker::TaskStatisticsFinalizer>>,
+    completion_exit: Mutex<Option<novarocks_worker::CompletionExitNotice>>,
     /// Physical ingress survives actual driver stop until the original
     /// capability owner closes its route. Taken synchronously on retirement.
     exchange_retirement: Mutex<Option<ExchangeReceiverRetirement>>,
@@ -285,8 +287,9 @@ struct TaskRuntime {
     #[cfg(novarocks_dev_controls)]
     replay_gate: Mutex<Option<Arc<super::task_update_replay_gate::TaskUpdateReplayGate>>>,
     read_context: Arc<TypedReadAttemptContext>,
-    /// This task's metrics owner, retained so `submit_runnable` can hand it
-    /// the status reporter that only exists once the task is runnable.
+    /// This actual sampling producer is bound during original preparation.
+    /// Terminal sealing withdraws its owner; concurrent samples keep only
+    /// their original producer loan until that actual call exits.
     operator_statistics: Arc<TaskOperatorStatisticsSink>,
 }
 
@@ -460,44 +463,51 @@ impl FragmentEventSink for CompositeFragmentEventSink {
 /// The task's own metrics owner: it turns this fragment's profile into the
 /// operator statistics its final info carries.
 ///
-/// The reporter is bound late because it does not exist yet when the fragment
-/// is prepared: the creation transaction mints it only for `submit_runnable`,
-/// the last install step. Until then this sink has nothing to report onto and
-/// says so by dropping the event, rather than buffering statistics for a task
-/// that may never become runnable.
+/// Original preparation transfers its prepaid producer before any fragment
+/// event can run. A terminal observation seals the same producer and withdraws
+/// this owner's handle; in-flight calls retain their actual producer loan.
 struct TaskOperatorStatisticsSink {
     fragment_instance_id: UniqueId,
     /// `None` when the query did not ask for a profile. Without one there is
     /// no counter to read, which is a different statement from an operator
     /// that ran and counted nothing.
     profiler: Option<Profiler>,
-    reporter: OnceLock<TaskStatusReporter>,
+    producer: Mutex<Option<novarocks_worker::TaskStatisticsProducer>>,
 }
 
 impl TaskOperatorStatisticsSink {
-    fn new(fragment_instance_id: UniqueId, profiler: Option<Profiler>) -> Self {
+    fn new(
+        fragment_instance_id: UniqueId,
+        profiler: Option<Profiler>,
+        producer: novarocks_worker::TaskStatisticsProducer,
+    ) -> Self {
         Self {
             fragment_instance_id,
             profiler,
-            reporter: OnceLock::new(),
+            producer: Mutex::new(Some(producer)),
         }
     }
 
-    /// Binds the status reporter this task's statistics are recorded onto.
-    fn bind(&self, reporter: TaskStatusReporter) {
-        // Set once: a second reporter would address a second task, and this
-        // sink belongs to exactly one.
-        let _ = self.reporter.set(reporter);
+    fn stop_sampling(&self) {
+        let producer = self
+            .producer
+            .lock()
+            .expect("original statistics producer")
+            .take();
+        // A concurrent record call keeps the same original producer alive.
+        // Last producer/report destruction must occur outside this lock.
+        drop(producer);
     }
 
     /// Records the operator statistics one profile tree attributes.
     ///
-    /// The reporter owns the entry bound and its truncation marker, so the
+    /// The original producer owns the entry bound and truncation marker, so the
     /// whole attributed list is handed over rather than pre-trimmed here.
-    fn record_profile(&self, profile: &RuntimeProfileTree) {
-        let Some(reporter) = self.reporter.get() else {
-            return;
-        };
+    fn record_profile(
+        &self,
+        producer: &novarocks_worker::TaskStatisticsProducer,
+        profile: &RuntimeProfileTree,
+    ) {
         let projection = project_operator_statistics(profile);
         if projection.unattributed_operators() > 0 {
             // Named, not folded: these operators belong to no plan node, so
@@ -509,33 +519,46 @@ impl TaskOperatorStatisticsSink {
                 projection.unattributed_operators()
             );
         }
-        reporter.record_operator_statistics(projection.into_statistics());
+        producer.submit(novarocks_worker::TaskTerminalStatistics {
+            statistics: projection.into_statistics(),
+            truncated: false,
+        });
     }
 
     /// Records from the profiler this sink holds, if the query asked for one.
-    fn record_current(&self) {
+    fn record_current(&self, producer: &novarocks_worker::TaskStatisticsProducer) {
         if let Some(profiler) = self.profiler.as_ref() {
-            self.record_profile(&profiler.to_native_tree());
+            self.record_profile(producer, &profiler.to_native_tree());
         }
     }
 }
 
 impl FragmentEventSink for TaskOperatorStatisticsSink {
     fn record(&self, event: FragmentEvent) {
+        let producer = self
+            .producer
+            .lock()
+            .expect("original statistics producer")
+            .clone();
+        let Some(producer) = producer else {
+            return;
+        };
+        // Keep this same loan across profiling, projection and disposal of the
+        // actual event capture, even if terminal sealing races the sample.
         match event {
             // A snapshot carries its own tree, so it is reported as given
             // rather than re-read from this sink's profiler: the two are not
             // required to be the same profile.
             FragmentEvent::ProfileSnapshot(snapshot) => {
                 debug_assert_eq!(snapshot.fragment_instance_id(), self.fragment_instance_id);
-                self.record_profile(snapshot.profile());
+                self.record_profile(&producer, snapshot.profile());
             }
             // Progress is the sampling tick. It carries whole-fragment totals,
             // which say nothing per operator, so the tick is used only as the
             // moment to read the operators' own counters.
             FragmentEvent::Progress(progress) => {
                 debug_assert_eq!(progress.fragment_instance_id(), self.fragment_instance_id);
-                self.record_current();
+                self.record_current(&producer);
             }
             // Runtime-filter evidence answers to the query context's filter
             // participant. Folding it here would put two unrelated facts
@@ -886,19 +909,14 @@ impl NativeTaskExecutionHost {
             instance_input.backend_num,
         );
         let task_control = preparation_scope.runtime_control();
-        let completion_roles = preparation_scope.take_completion_roles().map_err(|cause| {
-            let cause =
-                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(cause);
-            HostRejection::from_failure(failure_category(&cause), cause)
-        })?;
-        let start = preparation_scope.take_start_permit().map_err(|cause| {
-            let cause = ExecutionFailure::from_domain(cause);
-            HostRejection::from_failure(failure_category(&cause), cause)
-        })?;
-        let terminal = preparation_scope.take_terminal_permit().map_err(|cause| {
-            let cause = ExecutionFailure::from_domain(cause);
-            HostRejection::from_failure(failure_category(&cause), cause)
-        })?;
+        let novarocks_worker::TaskPreparationRoles {
+            fragments: completion_roles,
+            start,
+            terminal,
+            statistics,
+            final_statistics,
+            completion_exit,
+        } = preparation_scope.take_roles().map_err(host_failure)?;
         let kernel_control = Arc::clone(&task_control);
         let root_session = self.open_root_result_session(
             identity,
@@ -939,6 +957,7 @@ impl NativeTaskExecutionHost {
         let operator_statistics = Arc::new(TaskOperatorStatisticsSink::new(
             kernel_key,
             profiler.clone(),
+            statistics,
         ));
         let event_sink: Arc<dyn FragmentEventSink> =
             Arc::new(CompositeFragmentEventSink::new(vec![
@@ -1068,6 +1087,8 @@ impl NativeTaskExecutionHost {
                 preparation: preparation_child,
                 start: Mutex::new(Some(start)),
                 terminal: Mutex::new(Some(terminal)),
+                final_statistics: Mutex::new(Some(final_statistics)),
+                completion_exit: Mutex::new(Some(completion_exit)),
                 exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
@@ -1580,9 +1601,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // can block on an empty queue.
         runtime.read_context.publish();
 
-        // The metrics owner can only report onto a task that has a reporter,
-        // and this is the first moment one exists.
-        runtime.operator_statistics.bind(reporter.clone());
         // Same reason for the filter feedback carrier: the domain a channel
         // reduces is advertised through a task's status, and a task has a
         // status owner only once it is being submitted. Before the worker
@@ -1637,9 +1655,21 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .expect("the original prepared Task owns one terminal observation");
         let completion_reporter = reporter.clone();
         let completion_runtime = Arc::clone(&runtime);
-        let exit = reporter
-            .take_completion_exit_notice()
-            .map_err(host_failure)?;
+        let mut final_statistics = runtime
+            .final_statistics
+            .lock()
+            .expect("original statistics finalizer")
+            .take();
+        assert!(
+            final_statistics.is_some(),
+            "the original prepared Task owns one statistics finalizer"
+        );
+        let exit = runtime
+            .completion_exit
+            .lock()
+            .expect("original completion exit notice")
+            .take()
+            .expect("the original prepared Task owns one completion exit notice");
         let mut completion = self
             .completion_supervisor
             .reserve_task_slot(identity, kernel_key, reporter.clone(), exit)
@@ -1669,7 +1699,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     {
                         retirement.record_terminal(fact);
                     }
-                    let final_statistics = fact.profile().map(|profile| {
+                    let final_snapshot = fact.profile().map(|profile| {
                         let mut statistics = project_operator_statistics(profile).into_statistics();
                         let truncated = statistics.len()
                             > novarocks_execution_contract::FINAL_TASK_INFO_MAX_OPERATORS;
@@ -1680,6 +1710,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                             truncated,
                         }
                     });
+                    let final_statistics = final_statistics
+                        .take()
+                        .expect("one original terminal observation")
+                        .seal_for_terminal(final_snapshot);
+                    completion_runtime.operator_statistics.stop_sampling();
                     let observed = observe_compiled_terminal(
                         &completion_reporter,
                         sink_kind,

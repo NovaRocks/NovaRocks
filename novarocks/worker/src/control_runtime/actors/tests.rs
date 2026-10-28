@@ -2015,10 +2015,21 @@ fn exercise_fragment_roles_with_lifecycle(
     settlement: SettlementScenario,
     lifecycle_role: Option<crate::control_runtime_policy::TaskLifecycleRole>,
 ) {
+    exercise_fragment_roles_with_preparation(task_stopped, settlement, lifecycle_role, false);
+}
+fn exercise_fragment_roles_with_preparation(
+    task_stopped: bool,
+    settlement: SettlementScenario,
+    lifecycle_role: Option<crate::control_runtime_policy::TaskLifecycleRole>,
+    transfer_bundle: bool,
+) {
     use crate::control_runtime::{
         effect_dispatch::EffectDispatch,
         preparation::PreparationOutcome,
-        task::{TaskHostBinding, TaskHostError, TaskHostRecord, TaskHostResources},
+        task::{
+            HostInstallationOutcome, TaskHostBinding, TaskHostError, TaskHostRecord,
+            TaskHostResources,
+        },
     };
     use crate::{
         control_runtime_policy::TaskLifecycleRole, settlement::RegistrationNotice,
@@ -2058,6 +2069,82 @@ fn exercise_fragment_roles_with_lifecycle(
         }
         fn into_stored(self: Box<Self>) -> Box<dyn Any + Send> {
             self
+        }
+    }
+    struct CapturePreparationHost {
+        task: TaskIdentity,
+        calls: AtomicUsize,
+        receiver_cleanup: AtomicUsize,
+        inbound_cleanup: AtomicUsize,
+        roles: std::sync::Mutex<Option<crate::TaskPreparationRoles>>,
+    }
+    impl crate::TaskExecutionHost for CapturePreparationHost {
+        fn close_context_admission(&self, _: QueryContextRef) {
+            panic!("this test transfers preparation roles only");
+        }
+        fn retire_context_execution(&self, _: QueryContextRef) {
+            panic!("this test transfers preparation roles only");
+        }
+        fn forget_context_admission(&self, _: QueryContextRef) {
+            panic!("this test transfers preparation roles only");
+        }
+        fn install_receiver(
+            &self,
+            descriptor: &novarocks_execution_contract::TaskDescriptor,
+            input: TaskCreationInput,
+            mut preparation: crate::TaskPreparationContext<'_>,
+        ) -> Result<crate::PreparedTaskInstallation, crate::HostRejection> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let roles = preparation.take_roles().unwrap();
+            assert!(roles.matches(descriptor.identity()));
+            assert!(matches!(
+                preparation.take_roles(),
+                Err(crate::TaskPreparationRolesTaken)
+            ));
+            let previous = self.roles.lock().unwrap().replace(roles);
+            assert!(previous.is_none());
+            drop(previous);
+            drop(input);
+            // This metadata-only host has no kernel, root or provider child.
+            // Its actual call/input exit is the only preparation proof here.
+            crate::PreparedTaskInstallation::new(
+                novarocks_execution_contract::PreparedTaskFacts::new(
+                    novarocks_execution_contract::FragmentSinkKind::Noop,
+                ),
+                None,
+            )
+        }
+        fn remove_receiver(&self, descriptor: &novarocks_execution_contract::TaskDescriptor) {
+            assert_eq!(descriptor.identity(), self.task);
+            self.receiver_cleanup.fetch_add(1, Ordering::SeqCst);
+        }
+        fn install_inbound_capability(
+            &self,
+            _: &novarocks_execution_contract::TaskDescriptor,
+        ) -> Result<(), crate::HostRejection> {
+            panic!("this test transfers preparation roles only");
+        }
+        fn remove_inbound_capability(
+            &self,
+            descriptor: &novarocks_execution_contract::TaskDescriptor,
+        ) {
+            assert_eq!(descriptor.identity(), self.task);
+            self.inbound_cleanup.fetch_add(1, Ordering::SeqCst);
+        }
+        fn submit_runnable(
+            &self,
+            _: &novarocks_execution_contract::TaskDescriptor,
+            _: crate::TaskStatusReporter,
+        ) -> Result<Arc<dyn crate::RunnableTask>, crate::HostRejection> {
+            panic!("this test transfers preparation roles only");
+        }
+        fn apply_task_domain(
+            &self,
+            _: &novarocks_execution_contract::TaskDescriptor,
+            _: &novarocks_execution_contract::task_execution::operation::TaskDomainUpdate,
+            _: TaskOperationId,
+        ) -> Result<Option<u64>, crate::HostRejection> {
+            panic!("this test transfers preparation roles only");
         }
     }
     let mut f = Fixture::with_policy_byte_limits(4096);
@@ -2160,6 +2247,7 @@ fn exercise_fragment_roles_with_lifecycle(
     .unwrap();
     let inbound_bytes =
         novarocks_worker_protocol::inbound_cost::record_bytes(&descriptor).unwrap() as u64;
+    let cleanup_descriptor = transfer_bundle.then(|| descriptor.clone());
     let request = Arc::new(
         novarocks_execution_contract::CreateTask::try_new(
             operation(1),
@@ -2219,7 +2307,7 @@ fn exercise_fragment_roles_with_lifecycle(
         .publication_committed(&f.runtime, &publication)
         .unwrap();
     let preparation = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
-    let job = host
+    let mut job = host
         .adopt_preparation(&f.runtime, &preparation)
         .unwrap_or_else(|error| panic!("actual Task prep: {error}"));
     struct CountedRegistration {
@@ -2335,16 +2423,80 @@ fn exercise_fragment_roles_with_lifecycle(
         f.runtime.role_inventory(actor(), None, 32).unwrap().len(),
         2
     );
-    let admitted = host
-        .issue_completion_roles(Box::new(CountedRegistration {
+    let mut admitted = Some(
+        host.issue_completion_roles(Box::new(CountedRegistration {
             notice,
             calls: registration.clone(),
         }))
-        .unwrap_or_else(|(error, _)| panic!("original completion issuer: {error}"));
+        .unwrap_or_else(|(error, _)| panic!("original completion issuer: {error}")),
+    );
     assert!(matches!(
         host.issue_completion_roles(Box::new(Registered(registration.clone()))),
         Err((TaskHostError::CompletionAlreadyIssued, _))
     ));
+    let capture = CapturePreparationHost {
+        task,
+        calls: AtomicUsize::new(0),
+        receiver_cleanup: AtomicUsize::new(0),
+        inbound_cleanup: AtomicUsize::new(0),
+        roles: std::sync::Mutex::new(None),
+    };
+    let mut bundle_cuts = Vec::new();
+    let mut bundle_inventory = None;
+    if transfer_bundle {
+        assert!(lifecycle_role.is_none());
+        assert!(settlement == SettlementScenario::Unused);
+        let start = host.issue_start_permit().unwrap();
+        let terminal = host.issue_terminal_permit().unwrap();
+        let (statistics, final_statistics) = host.issue_statistics_producer().unwrap();
+        let completion_exit = host.issue_completion_exit_notice().unwrap();
+        for kind in [
+            TaskLifecycleRole::Running,
+            TaskLifecycleRole::TerminalObservation,
+        ] {
+            bundle_cuts.push(host.lifecycle_input(kind).unwrap().cut());
+        }
+        bundle_cuts.push(host.completion_action().unwrap().cut());
+        let roles = crate::TaskPreparationRoles {
+            fragments: admitted.take().unwrap(),
+            start,
+            terminal,
+            statistics,
+            final_statistics,
+            completion_exit,
+        };
+        let original = f.scope.snapshot().unwrap();
+        let input_roles = f.runtime.role_inventory(actor(), None, 32).unwrap();
+        let wrong_children = Arc::new(crate::task_preparation::TaskPreparationScope::new(
+            self::task(f.identity, 999),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+        ));
+        // Rejection must return the same original bundle. It cannot drop,
+        // sign an unused exit, reserve a replacement, or borrow a reporter.
+        let (_, returned) = match crate::TaskPreparationContext::from_admitted(
+            port.execution_port(),
+            &wrong_children,
+            Duration::from_millis(10),
+            roles,
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("mismatched preparation children must return the original bundle"),
+        };
+        assert!(returned.matches(task));
+        assert_eq!(f.scope.snapshot().unwrap(), original);
+        assert_eq!(
+            f.runtime.role_inventory(actor(), None, 32).unwrap(),
+            input_roles
+        );
+        host.bind_host_preparation(&mut job, returned, Duration::from_millis(10))
+            .unwrap_or_else(|_| panic!("the returned original bundle binds to its actual job"));
+        assert_eq!(f.scope.snapshot().unwrap(), original);
+        assert_eq!(
+            f.runtime.role_inventory(actor(), None, 32).unwrap(),
+            input_roles
+        );
+        bundle_inventory = Some(input_roles);
+    }
     f.runtime.effect_completed(preparation).unwrap();
     f.runtime.effect_completed(publication).unwrap();
     f.drain(loaded);
@@ -2445,22 +2597,71 @@ fn exercise_fragment_roles_with_lifecycle(
     queue
         .enqueue(job)
         .unwrap_or_else(|_| panic!("actual Task request/input queue custody"));
-    let outcome = queue.pop().unwrap().run(|_request, input, _| {
-        called.fetch_add(1, Ordering::SeqCst);
-        drop(input)
-    });
-    if task_stopped {
-        assert!(matches!(outcome, PreparationOutcome::TaskStopped));
-        assert_eq!(called.load(Ordering::SeqCst), 0);
+    let mut transferred = None;
+    if transfer_bundle {
+        let outcome = queue.pop().unwrap().install_receiver(&capture);
+        if task_stopped {
+            assert!(matches!(outcome, PreparationOutcome::TaskStopped));
+            assert_eq!(capture.calls.load(Ordering::SeqCst), 0);
+            assert!(capture.roles.lock().unwrap().is_none());
+        } else {
+            assert!(matches!(
+                outcome,
+                PreparationOutcome::Returned(HostInstallationOutcome::Installed(_))
+            ));
+            assert_eq!(capture.calls.load(Ordering::SeqCst), 1);
+            let original = capture.roles.lock().unwrap().take().unwrap();
+            assert!(original.matches(task));
+            assert_eq!(
+                f.runtime.role_inventory(actor(), None, 32).unwrap(),
+                bundle_inventory.take().unwrap(),
+                "taking the bundle twice cannot reserve another role position"
+            );
+            admitted = Some(original.fragments);
+            transferred = Some((
+                original.start,
+                original.terminal,
+                original.statistics,
+                original.final_statistics,
+                original.completion_exit,
+            ));
+        }
     } else {
-        assert!(matches!(outcome, PreparationOutcome::Returned(())));
-        assert_eq!(called.load(Ordering::SeqCst), 1);
+        let outcome = queue.pop().unwrap().run(|_request, input, _| {
+            called.fetch_add(1, Ordering::SeqCst);
+            drop(input)
+        });
+        if task_stopped {
+            assert!(matches!(outcome, PreparationOutcome::TaskStopped));
+            assert_eq!(called.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(matches!(outcome, PreparationOutcome::Returned(())));
+            assert_eq!(called.load(Ordering::SeqCst), 1);
+        }
     }
     assert!(
         request_weak.upgrade().is_none(),
         "preparation exit must release the original opaque Create carrier while Task finishers remain alive"
     );
     let prep = host.preparation().unwrap();
+    if transfer_bundle {
+        // The real install wrapper registered its original host-child scope.
+        // Body return, even without a provider child, cannot settle that scope.
+        assert!(!prep.publish_whole_exit().unwrap());
+        let descriptor = cleanup_descriptor.as_ref().unwrap();
+        // This host created no kernel/root/provider. We intentionally decline
+        // activation and drive its real once-only empty-resource rollback.
+        assert!(prep.rollback_host_runtime(
+            || crate::TaskExecutionHost::remove_inbound_capability(&capture, descriptor),
+            || crate::TaskExecutionHost::remove_receiver(&capture, descriptor),
+        ));
+        assert!(prep.host_children().unwrap().host_captures_exited());
+        assert_eq!(capture.inbound_cleanup.load(Ordering::SeqCst), 1);
+        assert_eq!(capture.receiver_cleanup.load(Ordering::SeqCst), 1);
+        // A real successful call also owned its refusal position. Reap only
+        // actual exited children before checking the original parent's exit.
+        f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
+    }
     assert!(
         prep.publish_whole_exit().unwrap(),
         "original finishers are Task children, not preparation children"
@@ -2480,6 +2681,39 @@ fn exercise_fragment_roles_with_lifecycle(
         !completion.try_retire(),
         "the original capabilities are still live"
     );
+    if transfer_bundle {
+        if let Some((start, terminal, statistics, finalizer, exit)) = transferred.take() {
+            // The entire original preparation has already physically exited
+            // and returned P/bytes. Task children still own these exact roles.
+            let in_call = statistics.clone();
+            drop(statistics);
+            assert!(finalizer.seal_for_terminal(None).is_none());
+            assert_eq!(
+                host.statistics().unwrap().phase(),
+                novarocks_control_runtime::exit_role::ExitRolePhase::Admitted
+            );
+            assert!(!host.statistics().unwrap().advance().unwrap().retired);
+            drop(in_call);
+            drop((start, terminal, exit));
+        }
+        assert!(host.statistics().unwrap().advance().unwrap().retired);
+        assert!(host.observe_lifecycle_inputs().unwrap());
+        assert!(host.observe_completion_action().unwrap());
+        for cut in bundle_cuts {
+            assert!(port.ingress().event_unused(cut).unwrap());
+            port.ingress().observe_cut_exit(cut, true, true).unwrap();
+            let retired = host
+                .causal()
+                .retire_after_exit(
+                    cut,
+                    crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
+                )
+                .unwrap();
+            dispose_retired_pair(&f, port.ingress(), retired);
+        }
+        f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
+        f.assert_storage_paid(policy.task_base);
+    }
     let failed = matches!(
         settlement,
         SettlementScenario::FailBeforeBarrier | SettlementScenario::FailAfterBarrier
@@ -2494,7 +2728,7 @@ fn exercise_fragment_roles_with_lifecycle(
         assert_eq!(registration.load(Ordering::SeqCst), 2);
     } else {
         use crate::settlement::{SettlementDispatchError, SettlementRun};
-        let (finisher, wall_time, publisher) = admitted.into_parts();
+        let (finisher, wall_time, publisher) = admitted.unwrap().into_parts();
         let (permit, mut original) = finisher.into_parts();
         original.bind();
         original.started();
@@ -2714,16 +2948,30 @@ fn exercise_fragment_roles_with_lifecycle(
     );
     assert!(loading_return.is_none());
     assert!(pending_loading.is_none());
-    assert!(
-        completion_action.is_none(),
-        "this fixture issued only original fragment roles"
-    );
+    if transfer_bundle {
+        assert_eq!(
+            completion_action.as_ref().unwrap().phase(),
+            novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+        );
+    } else {
+        assert!(
+            completion_action.is_none(),
+            "this fixture issued only original fragment roles"
+        );
+    }
     assert!(
         open_summary.is_none(),
         "this component issued no open-summary role"
     );
     assert!(causal.is_empty());
-    if lifecycle_role == Some(TaskLifecycleRole::OperatorStatistics) {
+    if transfer_bundle {
+        assert_eq!(lifecycle_inputs.len(), 2);
+        assert!(
+            lifecycle_inputs.values().all(|input| input.phase()
+                == novarocks_control_runtime::exit_role::ExitRolePhase::Retired)
+        );
+        assert!(statistics.as_ref().unwrap().is_retired());
+    } else if lifecycle_role == Some(TaskLifecycleRole::OperatorStatistics) {
         assert!(lifecycle_inputs.is_empty());
         assert!(statistics.as_ref().unwrap().is_retired());
     } else if let Some(kind) = lifecycle_role {
@@ -2737,6 +2985,7 @@ fn exercise_fragment_roles_with_lifecycle(
         assert!(statistics.is_none());
     }
     drop(lifecycle_inputs);
+    drop(completion_action);
     drop(statistics);
     drop(causal);
     drop(completion);
@@ -2799,6 +3048,16 @@ fn exercise_fragment_roles_with_lifecycle(
         usize::from(settlement != SettlementScenario::Unused),
         "a reentrant executor cannot refresh or run the same original callback"
     );
+}
+
+#[test]
+fn the_original_preparation_bundle_returns_whole_on_refusal_and_transfers_once_to_the_host() {
+    exercise_fragment_roles_with_preparation(false, SettlementScenario::Unused, None, true);
+}
+
+#[test]
+fn stopped_preparation_really_drops_its_unused_bundle_without_entering_the_host() {
+    exercise_fragment_roles_with_preparation(true, SettlementScenario::Unused, None, true);
 }
 
 #[test]
