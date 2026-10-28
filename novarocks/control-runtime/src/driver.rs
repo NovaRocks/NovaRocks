@@ -863,6 +863,11 @@ impl<A: Actor> ActorRuntime<A> {
     pub fn same_runtime(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
     }
+    /// Read-only original scope identity, not admission, current generation,
+    /// publication permission or evidence that any Work has exited.
+    pub fn owns_scope(&self, actor: ActorId, scope: &ScopeHandle) -> Result<bool, DriverError> {
+        Ok(self.node(actor)?.scope.same_scope(scope))
+    }
     pub fn new(max_actors: usize) -> Self {
         Self::build(max_actors, None)
     }

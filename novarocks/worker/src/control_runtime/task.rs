@@ -1463,12 +1463,14 @@ impl TaskHostRecord {
         });
         Ok(())
     }
-    /// Host ownership transfer only. The receiving cleanup job must dispose
-    /// opaque sources/captures and observe real body/children/report exits
-    /// before releasing these bundles; Core terminal is no substitute.
+    /// Read-only inventory used to assess actual retirement readiness. This
+    /// borrow transfers no resource or exit authority.
     pub(super) fn resources_for_retirement(&self) -> &TaskHostResources {
         &self.resources
     }
+    /// Host ownership transfer only. The receiving cleanup job must dispose
+    /// opaque sources/captures and observe real body/children/report exits
+    /// before releasing these bundles; Core terminal is no substitute.
     pub(crate) fn into_resources(self) -> TaskHostResources {
         self.resources
     }

@@ -1540,3 +1540,6 @@ mod failure_publications;
 
 #[path = "tests/failed_runtime_inputs.rs"]
 mod failed_runtime_inputs;
+
+#[path = "tests/task_host_calls.rs"]
+mod task_host_calls;

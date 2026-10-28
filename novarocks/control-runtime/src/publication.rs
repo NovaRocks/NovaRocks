@@ -48,6 +48,11 @@ impl<T> Clone for PublishedSnapshot<T> {
     }
 }
 impl<T> PublishedSnapshot<T> {
+    /// Qualify only the original owner scope. Matching grants no publication
+    /// action, resource credit, current-generation start or physical exit.
+    pub fn owned_by(&self, owner: &ScopeHandle) -> bool {
+        self.owner.same_scope(owner)
+    }
     /// `initial` is the already published bootstrap projection. Every later
     /// business update must use ActorRuntime::commit_snapshot.
     pub fn new(owner: &ScopeHandle, initial: Arc<T>) -> Self {

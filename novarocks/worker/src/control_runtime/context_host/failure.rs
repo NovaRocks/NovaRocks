@@ -438,6 +438,23 @@ impl ContextHostRecord {
         }
         result
     }
+    /// Borrow the stage produced by this original Context's completed scope
+    /// publication traversal. Its live failure Work is revalidated; a caller
+    /// cannot construct this authority from a failed flag or one Task value.
+    pub(crate) fn failure_publication_stage(
+        &self,
+    ) -> Result<ScopePublicationsDrained<'_>, FailurePublicationError> {
+        let original = self
+            .resources
+            .failure
+            .as_ref()
+            .ok_or(FailurePublicationError::NotStarted)?;
+        let stage = original.drained()?;
+        stage
+            .validate(&self.control_runtime, self.actor)
+            .map_err(FailurePublicationError::Driver)?;
+        Ok(stage)
+    }
     pub(crate) fn failure_publications_drained(&self) -> bool {
         self.resources
             .failure

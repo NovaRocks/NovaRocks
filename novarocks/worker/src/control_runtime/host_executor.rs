@@ -36,6 +36,7 @@ use std::{
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
+    task::Waker,
     thread::{self, JoinHandle},
 };
 
@@ -123,6 +124,8 @@ struct Shared<J: QueuedPreparation> {
     queue: PreparationQueue<HostJob<J>>,
     gate: Mutex<Gate>,
     ready: Notify,
+    // One fixed driver I/O wake primitive, never a per-job callback.
+    waker: Option<Waker>,
 }
 enum NextBody<J: QueuedPreparation> {
     Run(RunningPreparation<HostJob<J>>),
@@ -130,9 +133,17 @@ enum NextBody<J: QueuedPreparation> {
     Wait(u64),
 }
 impl<J: QueuedPreparation> Shared<J> {
+    fn wake_driver(&self) {
+        // Call only after all executor/queue locks have been released. A
+        // driver may immediately inspect capacity or retry its original job.
+        if let Some(waker) = &self.waker {
+            waker.wake_by_ref();
+        }
+    }
     fn close_external(&self) {
         self.gate.lock().expect("host admission gate").accepting = false;
         self.ready.notify();
+        self.wake_driver();
     }
     fn failed(&self) -> bool {
         self.gate
@@ -187,6 +198,7 @@ impl<J: QueuedPreparation> Shared<J> {
             gate.accepting = false;
         }
         self.ready.notify();
+        self.wake_driver();
     }
     fn record_exit(&self, index: usize) {
         {
@@ -197,6 +209,7 @@ impl<J: QueuedPreparation> Shared<J> {
             }
         }
         self.ready.notify();
+        self.wake_driver();
     }
 }
 
@@ -252,6 +265,7 @@ impl<J: QueuedPreparation> HostExecutorHandle<J> {
     pub(crate) fn cancel_queued(&self, scope: ScopeId, work: WorkId) -> Result<J, FairQueueError> {
         let original = self.shared.queue.cancel(scope, work)?.original;
         self.shared.ready.notify();
+        self.shared.wake_driver();
         Ok(original)
     }
 }
@@ -282,6 +296,23 @@ where
         limits: HostExecutorLimits,
         runner: F,
     ) -> Result<Self, (std::io::Error, Self)> {
+        Self::start_inner(limits, runner, None)
+    }
+    /// The original driver retries retained jobs after real physical capacity
+    /// or shutdown state changes. Its standard I/O waker runs without any
+    /// executor lock and grants no job, Work, report or capture exit.
+    pub(crate) fn start_with_waker(
+        limits: HostExecutorLimits,
+        runner: F,
+        waker: Waker,
+    ) -> Result<Self, (std::io::Error, Self)> {
+        Self::start_inner(limits, runner, Some(waker))
+    }
+    fn start_inner(
+        limits: HostExecutorLimits,
+        runner: F,
+        waker: Option<Waker>,
+    ) -> Result<Self, (std::io::Error, Self)> {
         let count = limits.workers.get();
         let shared = Arc::new(Shared {
             queue: PreparationQueue::new(
@@ -300,6 +331,7 @@ where
                     .collect(),
             }),
             ready: Notify::default(),
+            waker,
         });
         let mut executor = Self {
             shared: ManuallyDrop::new(shared),
@@ -397,7 +429,13 @@ where
                         ManuallyDrop::new(catch_unwind(AssertUnwindSafe(|| runner(job.original))))
                     });
                     match ManuallyDrop::into_inner(result) {
-                        Ok(()) => shared.ready.notify(),
+                        Ok(()) => {
+                            // run_body has already retired the actual running
+                            // membership/key and physical worker slot. An
+                            // earlier business-result notice cannot do this.
+                            shared.ready.notify();
+                            shared.wake_driver();
+                        }
                         Err(payload) => {
                             shared.record_failure(index, payload);
                             break;
@@ -1125,6 +1163,7 @@ mod tests {
                     .into_boxed_slice(),
                 }),
                 ready: Notify::default(),
+                waker: None,
             });
             let _original = catch_unwind(AssertUnwindSafe(|| {
                 let _gate = shared.gate.lock().unwrap();
@@ -1158,6 +1197,7 @@ mod tests {
                 workers: Box::new([]),
             }),
             ready: Notify::default(),
+            waker: None,
         });
         let observed = match shared.next_body() {
             NextBody::Wait(v) => v,
@@ -1234,5 +1274,234 @@ mod tests {
         // The failed original owner remains retained. No Work exit or report
         // consumption is synthesized by this physical-driver test.
         let _retained_owner = ManuallyDrop::new(executor);
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RetryWake {
+        Idle,
+        Accepted,
+        Refused(HostSubmitError),
+    }
+    #[derive(Clone, Copy, Debug)]
+    struct WakeObservation {
+        empty: bool,
+        closed: bool,
+        failed: bool,
+        exited: bool,
+        retry: RetryWake,
+    }
+    struct CapacityWake {
+        handle: Mutex<Option<HostExecutorHandle<Job>>>,
+        pending: Mutex<Option<Job>>,
+        notices: mpsc::Sender<WakeObservation>,
+    }
+    impl std::task::Wake for CapacityWake {
+        fn wake(self: Arc<Self>) {
+            std::task::Wake::wake_by_ref(&self);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let handle = self.handle.lock().unwrap().clone();
+            let Some(handle) = handle else { return };
+            // Real reentrant reads and submission deliberately acquire both
+            // executor locks. The standard wake must not be called under them.
+            let empty = handle.shared.queue.is_empty();
+            let (closed, failed, exited) = {
+                let gate = handle.shared.gate.lock().unwrap();
+                (
+                    !gate.accepting,
+                    gate.workers
+                        .iter()
+                        .any(|worker| worker.state == WorkerState::Failed),
+                    gate.workers
+                        .iter()
+                        .any(|worker| worker.state == WorkerState::Exited),
+                )
+            };
+            let original = self.pending.lock().unwrap().take();
+            let retry = match original {
+                None => RetryWake::Idle,
+                Some(original) => match handle.try_submit(original) {
+                    Ok(()) => RetryWake::Accepted,
+                    Err((reason, original)) => {
+                        assert!(self.pending.lock().unwrap().replace(original).is_none());
+                        RetryWake::Refused(reason)
+                    }
+                },
+            };
+            let _sent = self.notices.send(WakeObservation {
+                empty,
+                closed,
+                failed,
+                exited,
+                retry,
+            });
+        }
+    }
+
+    #[test]
+    fn the_real_physical_tail_reawakens_a_consumed_busy_retry_and_the_wake_can_reenter_submission()
+    {
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let (retried_tx, retried_rx) = mpsc::channel();
+        let identity = Arc::new(vec![19_u8]);
+        let captured = identity.clone();
+        let retry = job(1, 1, move || retried_tx.send(captured).unwrap());
+        let original_body = (&*retry.body as *const dyn FnOnce()) as *const ();
+        let probe = Arc::new(CapacityWake {
+            handle: Mutex::new(None),
+            pending: Mutex::new(Some(retry)),
+            notices: wake_tx,
+        });
+        let waker = Waker::from(probe.clone());
+        let business_waker = waker.clone();
+        let (business_tx, business_rx) = mpsc::channel();
+        let (tail_tx, tail_rx) = mpsc::channel();
+        let tail = Mutex::new(tail_rx);
+        let calls = AtomicUsize::new(0);
+        let executor = match HostExecutor::start_with_waker(
+            HostExecutorLimits {
+                contexts: NonZeroUsize::new(2).unwrap(),
+                jobs: NonZeroUsize::new(2).unwrap(),
+                per_context: NonZeroUsize::new(2).unwrap(),
+                workers: NonZeroUsize::new(1).unwrap(),
+            },
+            move |original: Job| {
+                // The actual business call has returned. A domain notice may
+                // already wake its owner, while this real runner still retains
+                // RunningPreparation's physical membership/key below.
+                run(original);
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    business_waker.wake_by_ref();
+                    tail.lock().unwrap().recv().unwrap();
+                }
+            },
+            waker,
+        ) {
+            Ok(executor) => executor,
+            Err((error, _owner)) => panic!("actual physical worker startup: {error}"),
+        };
+        let handle = executor.handle();
+        *probe.handle.lock().unwrap() = Some(handle.clone());
+        submit(&handle, job(1, 1, move || business_tx.send(()).unwrap()));
+        business_rx.recv_timeout(WAIT).unwrap();
+        // Consume the early business notice while the true key remains Busy.
+        let busy = wake_rx.recv_timeout(WAIT).unwrap();
+        let same_refused_job = probe
+            .pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|original| {
+                (&*original.body as *const dyn FnOnce()) as *const () == original_body
+            });
+        let (queued_tx, queued_rx) = mpsc::channel();
+        submit(&handle, job(2, 1, move || queued_tx.send(()).unwrap()));
+        let full_capture = identity.clone();
+        let full = job(1, 3, move || {
+            panic!(
+                "the refused full original cannot run: {}",
+                full_capture.len()
+            )
+        });
+        let full_body = (&*full.body as *const dyn FnOnce()) as *const ();
+        let (full_error, full) = handle.try_submit(full).err().unwrap();
+        let full_original = (&*full.body as *const dyn FnOnce()) as *const () == full_body;
+        drop(full);
+        let canceled = handle
+            .cancel_queued(ScopeId::new(2).unwrap(), WorkId::new(1).unwrap())
+            .unwrap();
+        let cancel_wake = wake_rx.recv_timeout(WAIT).unwrap();
+        submit(&handle, canceled);
+        let no_unearned_tail_notice = wake_rx.try_recv().is_err();
+        tail_tx.send(()).unwrap();
+        // Only the real run_body return frees this exact key; its subsequent
+        // wake reenters try_submit and accepts the same previously refused J.
+        let available = wake_rx.recv_timeout(WAIT).unwrap();
+        let same_capture = Arc::ptr_eq(&retried_rx.recv_timeout(WAIT).unwrap(), &identity);
+        queued_rx.recv_timeout(WAIT).unwrap();
+        drop(
+            executor
+                .shutdown()
+                .unwrap_or_else(|_| panic!("true physical tail drain")),
+        );
+        let closed_capture = identity.clone();
+        let closed = job(3, 1, move || {
+            panic!(
+                "the original closed job cannot run: {}",
+                closed_capture.len()
+            )
+        });
+        let closed_body = (&*closed.body as *const dyn FnOnce()) as *const ();
+        let (closed_error, closed) = handle.try_submit(closed).err().unwrap();
+        let closed_original = (&*closed.body as *const dyn FnOnce()) as *const () == closed_body;
+        drop(closed);
+        let later = wake_rx.try_iter().collect::<Vec<_>>();
+        probe.handle.lock().unwrap().take();
+        drop(handle);
+
+        assert!(
+            !busy.empty
+                && busy.retry
+                    == RetryWake::Refused(HostSubmitError::Queue(FairQueueError::DuplicateWork))
+        );
+        assert!(same_refused_job && full_original && same_capture && closed_original);
+        assert_eq!(full_error, HostSubmitError::Queue(FairQueueError::Full));
+        assert_eq!(closed_error, HostSubmitError::Closed);
+        assert_eq!(
+            cancel_wake.retry,
+            RetryWake::Refused(HostSubmitError::Queue(FairQueueError::DuplicateWork))
+        );
+        assert!(no_unearned_tail_notice && available.retry == RetryWake::Accepted);
+        assert!(later.iter().any(|notice| notice.closed));
+        assert!(later.iter().any(|notice| notice.exited));
+    }
+
+    #[test]
+    fn a_real_worker_failure_wakes_the_external_owner_after_retaining_its_original_panic() {
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let probe = Arc::new(CapacityWake {
+            handle: Mutex::new(None),
+            pending: Mutex::new(None),
+            notices: wake_tx,
+        });
+        let executor = match HostExecutor::start_with_waker(
+            limits(1),
+            run as fn(Job),
+            Waker::from(probe.clone()),
+        ) {
+            Ok(executor) => executor,
+            Err((error, _owner)) => panic!("actual physical worker startup: {error}"),
+        };
+        let handle = executor.handle();
+        *probe.handle.lock().unwrap() = Some(handle.clone());
+        submit(
+            &handle,
+            job(1, 1, || panic!("the original physical runner failure")),
+        );
+        let observed = wake_rx.recv_timeout(WAIT).unwrap();
+        let (reason, owner) = match executor.shutdown() {
+            Err(original) => original,
+            Ok(runner) => {
+                drop(runner);
+                panic!("a retained panic cannot prove successful shutdown");
+            }
+        };
+        let retained_panic = owner
+            .shared
+            .gate
+            .lock()
+            .unwrap()
+            .workers
+            .iter()
+            .filter(|worker| worker.panic.is_some())
+            .count()
+            == 1;
+        probe.handle.lock().unwrap().take();
+        drop(handle);
+        // Mechanical driver failure custody only: the original panic remains
+        // quarantined; no business Work, report or capture exit is fabricated.
+        let _retained_owner = ManuallyDrop::new(owner);
+        assert!(observed.empty && observed.closed && observed.failed);
+        assert_eq!(reason, HostShutdownError::DriverFailed);
+        assert!(retained_panic);
     }
 }
