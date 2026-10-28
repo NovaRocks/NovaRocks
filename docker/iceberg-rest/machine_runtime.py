@@ -528,6 +528,8 @@ class MachineDocker(runtime.Docker):
 
     def run_mc(self, record, script, *, deadline=None, binary=False):
         """Register, execute and actually settle one exact transient container."""
+        if is_cloud(record):
+            raise runtime.RuntimeFailure("CloudIamUnsupported", "OSS requires explicit SDK operations; MinIO mc is unavailable")
         limits = [time.monotonic() + self.timeout]
         limits += [limit for limit in (deadline, getattr(self, "operation_deadline", None)) if limit is not None]
         deadline = min(limits)

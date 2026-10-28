@@ -58,6 +58,16 @@ class CloudBackend(Backend):
 
 
 class CloudMachineTests(unittest.TestCase):
+    def test_native_mc_rejects_cloud_before_journal_or_command_dispatch(self):
+        backend = machine.MachineDocker(environment={})
+        with mock.patch.object(backend, "command") as command, \
+                mock.patch.object(machine.runtime, "atomic_json") as journal:
+            with self.assertRaises(runtime.RuntimeFailure) as caught:
+                backend.run_mc({"config": {"object_store": CLOUD}}, "mc admin info")
+        self.assertEqual("CloudIamUnsupported", caught.exception.code)
+        command.assert_not_called()
+        journal.assert_not_called()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
