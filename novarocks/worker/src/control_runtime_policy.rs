@@ -260,10 +260,9 @@ pub enum TaskLifecycleRole {
     TerminalPublisher,
     TerminalAction,
     ContextClose,
-    FailureProjection,
 }
 impl TaskLifecycleRole {
-    pub(crate) const COUNT: usize = Self::FailureProjection as usize + 1;
+    pub(crate) const COUNT: usize = Self::ContextClose as usize + 1;
     const LOADING: [Self; 2] = [Self::InputLoaded, Self::LoaderExited];
 }
 
@@ -292,9 +291,12 @@ impl ControlRuntimePolicy {
             .checked_add(crate::task_preparation::BODY_ROLES)
             .and_then(|n| n.checked_add(crate::task_preparation::STEPS))
             .ok_or(PolicyError::Overflow)?;
+        let host_calls = crate::control_runtime::task_host_call::HOST_CALL_STORAGE
+            .checked_mul(crate::control_runtime::task_host_call::HOST_CALL_KINDS.len())?;
         let mut task_base = StorageNeed::role(false)
             .checked_mul(fixed_roles)?
-            .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?;
+            .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?
+            .checked_add(host_calls)?;
         // Protocol lifecycle roles are bounded input authors. The original
         // Task lifetime is a separate parent, not another notification author.
         task_base.work = task_base.work.checked_add(1).ok_or(PolicyError::Overflow)?;
@@ -349,6 +351,9 @@ impl ControlRuntimePolicy {
             .completions
             .checked_add(4)
             .ok_or(PolicyError::Overflow)?;
+        // Stop and execution-borrow retirement are host calls, not causal
+        // input authors. Both must exist before exposing the first Task port.
+        loading = loading.checked_add(host_calls)?;
         let accepted = task_base.checked_sub(loading)?;
         let max_task_cuts = fixed_roles
             .checked_add(request_roles)
@@ -594,19 +599,20 @@ mod tests {
     fn loading_pays_one_open_notification_without_a_second_work_or_cut() {
         let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
         // InputLoaded and LoaderExited each own prefix/event positions. The
-        // Task also owns one independent coalesced open-summary position.
+        // Task also owns one independent coalesced open-summary position;
+        // its two host calls add Work/report/capture only, never input/cut.
         assert_eq!(policy.loading.inputs, 5);
         assert_eq!(policy.loading.batches, 5);
         assert_eq!(policy.loading.effects, 5 * ContextCore::MAX_STEP_WORK);
         assert_eq!(policy.loading.cuts, 2);
-        assert_eq!(policy.loading.work, 11);
-        assert_eq!(policy.loading.completions, 10);
-        assert_eq!(policy.loading.captures, 10);
+        assert_eq!(policy.loading.work, 13);
+        assert_eq!(policy.loading.completions, 12);
+        assert_eq!(policy.loading.captures, 12);
         assert_eq!(
             policy.loading.checked_add(policy.accepted).unwrap(),
             policy.task_base
         );
-        assert_eq!(policy.accepted.inputs, 64);
+        assert_eq!(policy.accepted.inputs, 62);
     }
 
     #[test]

@@ -21,7 +21,7 @@
 
 use super::{
     actors::{WorkerAction, WorkerActor},
-    admitted_role::{dispose_unused_completion, reserve_reported_role},
+    admitted_role::{adopt_reported_work, dispose_unused_completion, reserve_reported_role},
     causal::{
         CausalAdmissionRefusal, CausalError, RpcAuthorAdmission, RpcAuthorAdmissionError,
         RpcAuthorAdmissionRefusal, TaskCausalInbox,
@@ -44,6 +44,10 @@ use super::{
         RunningPreparation,
     },
     preparation_refusal::{HostPreparationRefusal, RefusalPosition},
+    task_host_call::{
+        HOST_CALL_KINDS, TaskHostCall, TaskHostCallError, TaskHostCallKind, TaskHostCallOwner,
+        TaskHostCallPayment,
+    },
 };
 use super::{
     source_positions::{SOURCE_SLOT_STORAGE, SourceSlotAdmission},
@@ -95,6 +99,7 @@ pub(crate) enum TaskHostError {
     SourceSlots(SourceSlotIssueError),
     SourceStorage(PreparationStorageSplitError),
     SourceInventoryPending,
+    HostCall(TaskHostCallError),
     OwnerFailed,
     WrongEffect,
     WrongTaskOrPayload,
@@ -125,6 +130,9 @@ impl std::fmt::Display for TaskHostError {
             Self::SourceSlots(error) => write!(f, "source slot admission failed: {error:?}"),
             Self::SourceStorage(error) => {
                 write!(f, "original source storage transfer failed: {error:?}")
+            }
+            Self::HostCall(error) => {
+                write!(f, "original Task host-call admission failed: {error:?}")
             }
             Self::OwnerFailed => f.write_str("the Task owner failed before new business capture"),
             Self::SourceInventoryPending => {
@@ -190,6 +198,33 @@ pub(crate) struct UnpublishedTask {
     pub lifetime: WorkLease,
     pub active: CapacityBundle,
     pub source_partials: Vec<SourceSlotIssuePartial>,
+    pub host_calls: Vec<TaskHostCall>,
+    /// A split fee whose empty reported holder could not be created. It never
+    /// acquired a callback or port and stays with this original unpublished Task.
+    pub host_call_payments: Vec<CapacityBundle>,
+}
+impl UnpublishedTask {
+    /// No host job, port, getter or observer was ever exposed. Retire only the
+    /// same empty roles, then the never-bound pure fee, before the Task exits.
+    pub(crate) fn retire_host_calls(
+        &mut self,
+        ledger: &novarocks_control_runtime::transaction::RuntimeLedger,
+    ) -> Result<bool, TaskHostCallError> {
+        let mut retired = true;
+        for call in &self.host_calls {
+            retired &= call.retire_unused(ledger)?;
+        }
+        if !retired {
+            return Ok(false);
+        }
+        for fee in &mut self.host_call_payments {
+            if !fee.is_released() {
+                fee.release(&fee.resources()?)?;
+            }
+        }
+        self.host_call_payments.clear();
+        Ok(true)
+    }
 }
 pub(crate) struct TaskAdoptionRefusal {
     pub error: TaskHostError,
@@ -238,6 +273,7 @@ pub(crate) struct TaskHostResources {
     pub lifetime: TaskLifetime,
     pub active: CapacityBundle,
     pub port: Arc<TaskRuntimePort>,
+    pub host_calls: [TaskHostCall; HOST_CALL_KINDS.len()],
     pub loader: Option<LoaderCustody>,
     pub loading_events: Option<LoadingEvents>,
     pub loading_return: Option<OwnedReturnReader<LoadingJobReturned>>,
@@ -262,10 +298,11 @@ impl TaskHostResources {
     /// a Task terminal or a stopped execution borrow gate is insufficient.
     pub(crate) fn seal_read_observation(&self) -> Result<Arc<TaskReadSnapshot>, TaskReadError> {
         use novarocks_control_runtime::exit_role::ExitRolePhase;
-        if self
-            .source_partials
-            .iter()
-            .any(|partial| !partial.is_empty())
+        if self.host_calls.iter().any(|call| !call.is_retired())
+            || self
+                .source_partials
+                .iter()
+                .any(|partial| !partial.is_empty())
             || self.pending_preparation_adoption.is_some()
             || !self.causal.is_empty()
             || self
@@ -522,10 +559,90 @@ impl TaskHostRecord {
                         lifetime,
                         active,
                         source_partials: vec![refusal.partial],
+                        host_calls: Vec::new(),
+                        host_call_payments: Vec::new(),
                     })),
                 });
             }
         };
+        // Source4 has its own complete original holders. Bootstrap the two
+        // host-only roles before constructing or exposing any Task port/view.
+        let unpublished = |error,
+                           lifetime,
+                           active,
+                           sources: [SourceSlotAdmission; 4],
+                           host_calls,
+                           host_call_payments| {
+            TaskAdoptionRefusal {
+                error,
+                unpublished: Some(Box::new(UnpublishedTask {
+                    task,
+                    lifetime,
+                    active,
+                    source_partials: vec![SourceSlotIssuePartial::from_admissions(&scope, sources)],
+                    host_calls,
+                    host_call_payments,
+                })),
+            }
+        };
+        let mut host_calls = Vec::with_capacity(HOST_CALL_KINDS.len());
+        for kind in HOST_CALL_KINDS {
+            let payment = match TaskHostCallPayment::split_from(
+                &mut active,
+                #[cfg(test)]
+                binding.source_storage_model,
+            ) {
+                Ok(payment) => payment,
+                Err(error) => {
+                    return Err(unpublished(
+                        TaskHostError::HostCall(error.into()),
+                        lifetime,
+                        active,
+                        sources,
+                        host_calls,
+                        Vec::new(),
+                    ));
+                }
+            };
+            let role = match reserve_reported_role(&scope, parent, WorkKind::Cleanup, None) {
+                Ok(role) => role,
+                Err(error) => {
+                    let fees = match payment {
+                        TaskHostCallPayment::Paid(fee) => vec![fee],
+                        #[cfg(test)]
+                        TaskHostCallPayment::ProtocolModel => Vec::new(),
+                    };
+                    return Err(unpublished(
+                        TaskHostError::HostCall(error.into()),
+                        lifetime,
+                        active,
+                        sources,
+                        host_calls,
+                        fees,
+                    ));
+                }
+            };
+            let owner = TaskHostCallOwner {
+                kind,
+                runtime: runtime.clone(),
+                actor: ticket.actor,
+                task,
+                pending: binding.pending.clone(),
+                health: binding.health.clone(),
+            };
+            let original = adopt_reported_work(role.work, role.capacity, role.report);
+            let call = match TaskHostCall::from_unbound_admitted(owner, original, payment) {
+                Ok(call) => call,
+                Err(refusal) => {
+                    // These freshly reserved, unexposed originals have exact
+                    // origin/fee geometry and a single unclaimed return. A
+                    // violated binding is a shared invariant, not quota refusal.
+                    std::mem::forget((refusal, lifetime, active, sources, host_calls));
+                    std::process::abort();
+                }
+            };
+            host_calls.push(call);
+        }
         let ingress = match TaskProposalIngress::from_admitted(
             task,
             binding.max_cuts,
@@ -535,16 +652,14 @@ impl TaskHostRecord {
         ) {
             Ok(ingress) => Arc::new(ingress),
             Err((_error, sources)) => {
-                let partial = SourceSlotIssuePartial::from_admissions(&scope, sources);
-                return Err(TaskAdoptionRefusal {
-                    error: TaskHostError::InvalidGeometry,
-                    unpublished: Some(Box::new(UnpublishedTask {
-                        task,
-                        lifetime,
-                        active,
-                        source_partials: vec![partial],
-                    })),
-                });
+                return Err(unpublished(
+                    TaskHostError::InvalidGeometry,
+                    lifetime,
+                    active,
+                    sources,
+                    host_calls,
+                    Vec::new(),
+                ));
             }
         };
         let port = Arc::new(TaskRuntimePort::from_admitted(
@@ -554,6 +669,19 @@ impl TaskHostRecord {
             binding.pending.clone(),
             binding.health.clone(),
         ));
+        for call in &host_calls {
+            if let Err(error) = call.attach_port(&port) {
+                std::mem::forget((error, port, lifetime, active, host_calls));
+                std::process::abort();
+            }
+        }
+        let host_calls = match host_calls.try_into() {
+            Ok(calls) => calls,
+            Err(originals) => {
+                std::mem::forget((originals, port, lifetime, active));
+                std::process::abort();
+            }
+        };
         let lifetime = TaskLifetime::from_admitted(lifetime, &port);
         Ok(Self {
             task,
@@ -569,6 +697,7 @@ impl TaskHostRecord {
                 lifetime,
                 active,
                 port,
+                host_calls,
                 loader: None,
                 loading_events: None,
                 loading_return: None,
@@ -602,6 +731,15 @@ impl TaskHostRecord {
             source_storage_model: binding.source_storage_model,
             lifecycle_issued: [false; TaskLifecycleRole::COUNT],
         })
+    }
+    /// Address the original preadmitted role. Cloning its observer handle
+    /// grants no replacement Work, report, fee or execution permission.
+    pub(crate) fn host_call(&self, kind: TaskHostCallKind) -> &TaskHostCall {
+        self.resources
+            .host_calls
+            .iter()
+            .find(|call| call.kind() == kind)
+            .expect("the elected Task retains each fixed original host call")
     }
     pub(crate) fn task_id(&self) -> TaskIdentity {
         self.task
@@ -1473,6 +1611,29 @@ impl TaskHostRecord {
     /// before releasing these bundles; Core terminal is no substitute.
     pub(crate) fn into_resources(self) -> TaskHostResources {
         self.resources
+    }
+}
+
+/// Component teardown owns never-issued original callbacks. This calls the
+/// same real unused/report/reaper protocol; it supplies no synthetic exit and
+/// cannot withdraw a queued or started production host call.
+#[cfg(test)]
+pub(in crate::control_runtime) fn retire_unused_host_calls_for_test(
+    calls: &[TaskHostCall],
+    ledger: &novarocks_control_runtime::transaction::RuntimeLedger,
+) {
+    for call in calls {
+        if call.is_retired() {
+            continue;
+        }
+        let mut retired = false;
+        for _ in 0..64 {
+            if call.retire_unused(ledger).unwrap() {
+                retired = true;
+                break;
+            }
+        }
+        assert!(retired && call.is_retired());
     }
 }
 

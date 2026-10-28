@@ -69,6 +69,8 @@ pub(crate) enum TaskHostCallKind {
     Stop,
     RetireBorrowing,
 }
+pub(crate) const HOST_CALL_KINDS: [TaskHostCallKind; 2] =
+    [TaskHostCallKind::Stop, TaskHostCallKind::RetireBorrowing];
 #[derive(Clone, Debug)]
 pub(crate) enum TaskHostCallOutcome {
     Completed,
@@ -87,6 +89,7 @@ pub(crate) enum TaskHostCallError {
     Withdrawn,
     AwaitingFailurePublication,
     AlreadyCaptured,
+    PortAlreadyAttached,
     MissingPort,
     MissingConclusion,
 }
@@ -115,12 +118,53 @@ pub(crate) struct TaskHostCallBinding {
     pub pending: Arc<dyn TaskPendingNotice>,
     pub health: Arc<ExecutionHealth>,
 }
+/// The already elected Task owns these original host roles before its port
+/// exists. This is custody, never permission to execute an unbound callback.
+pub(crate) struct TaskHostCallOwner {
+    pub kind: TaskHostCallKind,
+    pub runtime: ActorRuntime<WorkerActor>,
+    pub actor: ActorId,
+    pub task: TaskIdentity,
+    pub pending: Arc<dyn TaskPendingNotice>,
+    pub health: Arc<ExecutionHealth>,
+}
+#[must_use = "The same unbound reported role, owner and payment require disposition"]
+pub(crate) struct TaskHostCallUnboundRefusal {
+    pub error: TaskHostCallError,
+    pub owner: TaskHostCallOwner,
+    pub original: ReportedWork,
+    pub payment: TaskHostCallPayment,
+}
+impl std::fmt::Debug for TaskHostCallUnboundRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskHostCallUnboundRefusal")
+            .field("error", &self.error)
+            .field("original", &self.original)
+            .finish_non_exhaustive()
+    }
+}
 /// Protocol fixtures explicitly admit finite zero-resource headers. Absence
 /// of a payment is never inferred to be production admission.
 pub(crate) enum TaskHostCallPayment {
     Paid(CapacityBundle),
     #[cfg(test)]
     ProtocolModel,
+}
+impl TaskHostCallPayment {
+    /// Split only the already paid Task inventory; this takes no new quota.
+    pub(super) fn split_from(
+        payer: &mut CapacityBundle,
+        #[cfg(test)] protocol_model: bool,
+    ) -> Result<Self, RuntimeError> {
+        #[cfg(test)]
+        if protocol_model {
+            return Ok(Self::ProtocolModel);
+        }
+        let resources = HOST_CALL_STORAGE
+            .resources()
+            .expect("fixed Task host-call storage");
+        payer.split_next(&resources).map(Self::Paid)
+    }
 }
 #[must_use = "Admission refusal retains the complete original binding, Work and payment"]
 pub(crate) struct TaskHostCallRefusal {
@@ -146,6 +190,7 @@ enum CallHandoff {
     Withdrawn,
 }
 struct State {
+    port: Option<Weak<TaskRuntimePort>>,
     authority: Option<ExitAuthority>,
     sender: Option<OwnedReturnSender<TaskHostCallOutcome>>,
     reader: OwnedReturnReader<TaskHostCallOutcome>,
@@ -164,7 +209,6 @@ struct Custody {
     task: TaskIdentity,
     scope: ScopeHandle,
     work: WorkId,
-    port: Weak<TaskRuntimePort>,
     pending: Arc<dyn TaskPendingNotice>,
     health: Arc<ExecutionHealth>,
     role: ExitRole,
@@ -192,8 +236,80 @@ impl TaskHostCall {
     pub(crate) fn from_admitted(
         binding: TaskHostCallBinding,
         original: ReportedWork,
-        mut payment: TaskHostCallPayment,
+        payment: TaskHostCallPayment,
     ) -> Result<Self, TaskHostCallRefusal> {
+        let error = if binding.port.identity() != binding.task {
+            Some(TaskHostCallError::WrongTask)
+        } else if !binding.port.publication().owned_by(original.work().scope()) {
+            Some(TaskHostCallError::WrongScope)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(TaskHostCallRefusal {
+                error,
+                binding,
+                original,
+                payment,
+            });
+        }
+        let TaskHostCallBinding {
+            kind,
+            runtime,
+            actor,
+            task,
+            port,
+            pending,
+            health,
+        } = binding;
+        let owner = TaskHostCallOwner {
+            kind,
+            runtime,
+            actor,
+            task,
+            pending,
+            health,
+        };
+        let call = match Self::from_unbound_admitted(owner, original, payment) {
+            Ok(call) => call,
+            Err(refusal) => {
+                let TaskHostCallOwner {
+                    kind,
+                    runtime,
+                    actor,
+                    task,
+                    pending,
+                    health,
+                } = refusal.owner;
+                return Err(TaskHostCallRefusal {
+                    error: refusal.error,
+                    binding: TaskHostCallBinding {
+                        kind,
+                        runtime,
+                        actor,
+                        task,
+                        port,
+                        pending,
+                        health,
+                    },
+                    original: refusal.original,
+                    payment: refusal.payment,
+                });
+            }
+        };
+        if let Err(error) = call.attach_port(&port) {
+            // Both original origins were validated before custody. A broken
+            // trusted composition may not unwind through its original owners.
+            std::mem::forget((error, call, port));
+            std::process::abort();
+        }
+        Ok(call)
+    }
+    pub(crate) fn from_unbound_admitted(
+        owner: TaskHostCallOwner,
+        original: ReportedWork,
+        mut payment: TaskHostCallPayment,
+    ) -> Result<Self, TaskHostCallUnboundRefusal> {
         let (work, capacity, report) = original.into_parts();
         let header = capacity.resources();
         let original = adopt_reported_work(work, capacity, report);
@@ -202,13 +318,9 @@ impl TaskHostCall {
                 return Err(TaskHostCallError::WrongStorage);
             }
 
-            if binding.port.identity() != binding.task {
-                return Err(TaskHostCallError::WrongTask);
-            }
-            if !binding
+            if !owner
                 .runtime
-                .owns_scope(binding.actor, original.work().scope())?
-                || !binding.port.publication().owned_by(original.work().scope())
+                .owns_scope(owner.actor, original.work().scope())?
             {
                 return Err(TaskHostCallError::WrongScope);
             }
@@ -229,9 +341,9 @@ impl TaskHostCall {
             Ok(())
         })();
         if let Err(error) = checked {
-            return Err(TaskHostCallRefusal {
+            return Err(TaskHostCallUnboundRefusal {
                 error,
-                binding,
+                owner,
                 original,
                 payment,
             });
@@ -243,9 +355,9 @@ impl TaskHostCall {
         let (sender, reader) = match report.claim_owned_return() {
             Ok(pair) => pair,
             Err(error) => {
-                return Err(TaskHostCallRefusal {
+                return Err(TaskHostCallUnboundRefusal {
                     error: TaskHostCallError::Runtime(error),
-                    binding,
+                    owner,
                     original,
                     payment,
                 });
@@ -258,19 +370,19 @@ impl TaskHostCall {
             TaskHostCallPayment::ProtocolModel => None,
         };
         let shared = Arc::new(Custody {
-            kind: binding.kind,
-            runtime: binding.runtime,
-            actor: binding.actor,
-            task: binding.task,
+            kind: owner.kind,
+            runtime: owner.runtime,
+            actor: owner.actor,
+            task: owner.task,
             scope,
             work,
-            port: Arc::downgrade(&binding.port),
-            pending: binding.pending,
-            health: binding.health,
+            pending: owner.pending,
+            health: owner.health,
             role,
             report,
             retirement,
             state: Mutex::new(State {
+                port: None,
                 authority: Some(authority),
                 sender: Some(sender),
                 reader,
@@ -289,6 +401,34 @@ impl TaskHostCall {
             .lock()
             .expect("original Task host-call retention") = Some(shared.clone());
         Ok(Self(shared))
+    }
+    /// Bind the actual private Task port once before exposing any view. The
+    /// weak address owns no execution capture; only a real host job takes one.
+    pub(crate) fn attach_port(&self, port: &Arc<TaskRuntimePort>) -> Result<(), TaskHostCallError> {
+        if port.identity() != self.0.task {
+            return Err(TaskHostCallError::WrongTask);
+        }
+        if !port.publication().owned_by(&self.0.scope) {
+            return Err(TaskHostCallError::WrongScope);
+        }
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .expect("original host-call port binding");
+        match state.handoff {
+            CallHandoff::Available => {}
+            CallHandoff::Withdrawn => return Err(TaskHostCallError::Withdrawn),
+            CallHandoff::Issued => return Err(TaskHostCallError::AlreadyIssued),
+            CallHandoff::AwaitingFailurePublication => {
+                return Err(TaskHostCallError::AlreadyCaptured);
+            }
+        }
+        if state.port.is_some() {
+            return Err(TaskHostCallError::PortAlreadyAttached);
+        }
+        state.port = Some(Arc::downgrade(port));
+        Ok(())
     }
     pub(crate) fn key(&self) -> (ScopeId, WorkId) {
         (self.0.scope.id(), self.0.work)
@@ -331,9 +471,15 @@ impl TaskHostCall {
         self.take_job(StartPermission::Normal(ticket.generation))
     }
     fn take_job(&self, start: StartPermission) -> Result<TaskHostCallJob, TaskHostCallError> {
-        let port = self
+        let original_port = self
             .0
+            .state
+            .lock()
+            .expect("original Task host-call port")
             .port
+            .clone()
+            .ok_or(TaskHostCallError::MissingPort)?;
+        let port = original_port
             .upgrade()
             .ok_or(TaskHostCallError::MissingPort)?;
         if port.publication().borrow().neutral_accepted().is_none() {

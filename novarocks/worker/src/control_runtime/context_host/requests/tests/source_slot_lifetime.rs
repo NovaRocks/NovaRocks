@@ -115,6 +115,10 @@ pub(super) fn finish_after_consuming_pair_detached(
     for mut original in detached {
         original.release().unwrap();
     }
+    crate::control_runtime::task::retire_unused_host_calls_for_test(
+        &resources.host_calls,
+        &f.ledger,
+    );
     resources.lifetime.body_exited().unwrap();
     resources.lifetime.captures_exited().unwrap();
     resources

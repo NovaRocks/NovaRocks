@@ -155,6 +155,10 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     let mut resources = host.into_resources();
     finish_source_routes(&f, &ingress);
     drop(ingress);
+    crate::control_runtime::task::retire_unused_host_calls_for_test(
+        &resources.host_calls,
+        &f.ledger,
+    );
     resources.lifetime.body_exited().unwrap();
     resources.lifetime.captures_exited().unwrap();
     let original_lifetime_exited = resources.lifetime.actual_exit_ready().unwrap();

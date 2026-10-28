@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Paid host-call components use the actual Context scope and failed-owner
-//! publication stage. This does not claim Task production-budget integration.
+//! Actual Task-bootstrap calls use their original paid roles and Context failure
+//! publication stage. The foreign-owner refusal separately funds its originals.
 
 use super::*;
 use crate::control_runtime::{
@@ -105,34 +105,14 @@ fn funder(f: &mut Harness, task: TaskIdentity, calls: usize) -> ContextMetadataR
     work.start().unwrap();
     ContextMetadataRole { work, capacity }
 }
-fn host_call(
-    f: &mut Harness,
-    task: TaskIdentity,
-    payer: &mut ContextMetadataRole,
-    kind: TaskHostCallKind,
-) -> TaskHostCall {
-    let scope = payer.work.scope().clone();
-    let admitted =
-        reserve_reported_role(&scope, payer.capacity.id(), WorkKind::Cleanup, None).unwrap();
-    let payment = payer
-        .capacity
-        .split_next(&HOST_CALL_STORAGE.resources().unwrap())
-        .unwrap();
-    let port = original_port(f, task);
-    TaskHostCall::from_admitted(
-        TaskHostCallBinding {
-            kind,
-            runtime: f.runtime.clone(),
-            actor: context_actor(),
-            task,
-            health: port.health(),
-            port,
-            pending: Arc::new(RpcTaskPending),
-        },
-        adopt_reported_work(admitted.work, admitted.capacity, admitted.report),
-        TaskHostCallPayment::Paid(payment),
-    )
-    .unwrap()
+fn original_call(f: &mut Harness, task: TaskIdentity, kind: TaskHostCallKind) -> TaskHostCall {
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .task(task)
+        .unwrap()
+        .host_call(kind)
+        .clone()
 }
 fn publish_failure(f: &mut Harness) {
     let unknown = crate::control_runtime::actors::tests::task(f.identity, 999);
@@ -224,12 +204,12 @@ impl ObserverGate {
 #[test]
 fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_refund() {
     let (mut f, task, preparation) = accepted_task_fixture();
-    let baseline = usage(&f.ledger);
-    let mut payer = funder(&mut f, task, 2);
-    let stop = host_call(&mut f, task, &mut payer, TaskHostCallKind::Stop);
-    let close = host_call(&mut f, task, &mut payer, TaskHostCallKind::RetireBorrowing);
+    // Both original calls and fees were actually admitted during Task bootstrap.
+    // These are observer aliases of that inventory, not replacement admissions.
     let paid = usage(&f.ledger);
-    assert_eq!(paid, [baseline[0] + 3, baseline[1] + 2, baseline[2] + 2]);
+    let stop = original_call(&mut f, task, TaskHostCallKind::Stop);
+    let close = original_call(&mut f, task, TaskHostCallKind::RetireBorrowing);
+    assert_eq!(usage(&f.ledger), paid);
     let port = original_port(&mut f, task);
     publish_failure(&mut f);
     let metadata_thread = thread::current().id();
@@ -309,8 +289,7 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
     }
     assert!(port.is_stopped());
     assert!(port.prepare_source_retirement().is_ok());
-    release_funder(&f, payer);
-    assert_eq!(usage(&f.ledger), baseline);
+    assert_eq!(usage(&f.ledger), [paid[0] - 2, paid[1] - 2, paid[2] - 2]);
     drop((port, stop, close));
     finish_accepted_task_fixture(f, task, preparation);
 }
@@ -318,7 +297,6 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
 struct PanicOriginals {
     _harness: Harness,
     _preparation: ContextMetadataRole,
-    _funder: ContextMetadataRole,
     drops: Arc<AtomicUsize>,
 }
 impl Drop for PanicOriginals {
@@ -330,8 +308,7 @@ impl Drop for PanicOriginals {
 #[test]
 fn observer_panic_keeps_the_original_payload_port_and_fee_in_unknown_custody() {
     let (mut f, task, preparation) = accepted_task_fixture();
-    let mut payer = funder(&mut f, task, 1);
-    let call = host_call(&mut f, task, &mut payer, TaskHostCallKind::Stop);
+    let call = original_call(&mut f, task, TaskHostCallKind::Stop);
     let ledger = f.ledger.clone();
     let held = usage(&ledger);
     let port = original_port(&mut f, task);
@@ -364,7 +341,6 @@ fn observer_panic_keeps_the_original_payload_port_and_fee_in_unknown_custody() {
     *keeper.lock().unwrap() = Some(PanicOriginals {
         _harness: f,
         _preparation: preparation,
-        _funder: payer,
         drops: payload_drops.clone(),
     });
     drop(port);
@@ -571,8 +547,7 @@ fn normal_stop_ticket(
 #[test]
 fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage() {
     let (mut f, task, preparation) = accepted_task_fixture();
-    let mut payer = funder(&mut f, task, 1);
-    let call = host_call(&mut f, task, &mut payer, TaskHostCallKind::Stop);
+    let call = original_call(&mut f, task, TaskHostCallKind::Stop);
     let key = call.key();
     let paid = usage(&f.ledger);
     let port = original_port(&mut f, task);
@@ -661,7 +636,6 @@ fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage()
         .retire_unclaimed()
         .unwrap();
     drop(subscription);
-    release_funder(&f, payer);
     drop((call, port));
     finish_accepted_task_fixture(f, task, preparation);
 }

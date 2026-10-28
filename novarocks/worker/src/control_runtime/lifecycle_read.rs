@@ -654,6 +654,7 @@ mod tests {
                 lifetime,
                 active,
                 port,
+                host_calls,
                 loader,
                 loading_events,
                 loading_return,
@@ -703,10 +704,14 @@ mod tests {
             assert!(causal.is_empty());
             assert!(self.host_port.replace(port).is_none());
             assert!(self.causal.replace(causal).is_none());
+            crate::control_runtime::task::retire_unused_host_calls_for_test(
+                &host_calls,
+                &self.ledger,
+            );
             assert_eq!(
                 self.scope.snapshot().unwrap().work,
-                original_work_count,
-                "moving the elected lifetime cannot create a substitute Work"
+                original_work_count - host_calls.len(),
+                "only the actual unused host-call headers exited while moving the lifetime"
             );
             assert_eq!(lifetime.observation().identity(), self.port().identity());
             (lifetime, active)

@@ -1149,6 +1149,10 @@ fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
             payment.release().unwrap();
         }
     }
+    crate::control_runtime::task::retire_unused_host_calls_for_test(
+        &resources.host_calls,
+        &f.ledger,
+    );
     resources.lifetime.body_exited().unwrap();
     resources.lifetime.captures_exited().unwrap();
     if let Some(open) = &mut resources.open_summary {

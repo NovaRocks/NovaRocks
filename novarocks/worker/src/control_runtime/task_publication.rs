@@ -589,6 +589,7 @@ mod tests {
                 mut lifetime,
                 mut active,
                 port: host_port,
+                host_calls,
                 loader,
                 loading_events,
                 loading_return,
@@ -648,6 +649,10 @@ mod tests {
                 self.ledger.reap_scope_ready(self.scope.id(), 64).unwrap();
                 capacity.release(&capacity.resources().unwrap()).unwrap();
             }
+            crate::control_runtime::task::retire_unused_host_calls_for_test(
+                &host_calls,
+                &self.ledger,
+            );
             lifetime.body_exited().unwrap();
             lifetime.captures_exited().unwrap();
             assert!(

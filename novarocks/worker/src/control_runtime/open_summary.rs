@@ -430,6 +430,10 @@ mod tests {
         let ingress = resources.port.ingress().clone();
         finish_source_routes(&f, &ingress);
         f.finish_jobs();
+        crate::control_runtime::task::retire_unused_host_calls_for_test(
+            &resources.host_calls,
+            &f.ledger,
+        );
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());
@@ -512,6 +516,12 @@ mod tests {
         let (mut resources, open) = admitted(&mut f);
         assert!(!open.is_closed());
         resources.open_summary = Some(open);
+        // Isolate the original open-summary gate: empty host-call retirement
+        // must not mask whether this still-live summary prevents read sealing.
+        crate::control_runtime::task::retire_unused_host_calls_for_test(
+            &resources.host_calls,
+            &f.ledger,
+        );
         assert!(matches!(
             resources.seal_read_observation(),
             Err(crate::control_runtime::lifecycle_read::TaskReadError::HostInventoryStillLive)

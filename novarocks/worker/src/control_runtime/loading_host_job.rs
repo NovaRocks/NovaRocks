@@ -289,6 +289,10 @@ mod tests {
         assert!(resources.loading_events.as_ref().unwrap().is_retired());
         let ingress = resources.port.ingress().clone();
         finish_source_routes(&f, &ingress);
+        crate::control_runtime::task::retire_unused_host_calls_for_test(
+            &resources.host_calls,
+            &f.ledger,
+        );
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());

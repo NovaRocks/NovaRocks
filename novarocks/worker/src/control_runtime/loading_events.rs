@@ -768,6 +768,10 @@ mod tests {
         }
         assert!(resources.source_partials.is_empty());
         assert!(resources.pending_preparation_adoption.is_none());
+        crate::control_runtime::task::retire_unused_host_calls_for_test(
+            &resources.host_calls,
+            &f.ledger,
+        );
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());
@@ -789,6 +793,10 @@ mod tests {
         assert!(resources.loader.is_none());
         assert!(resources.causal.is_empty());
         finish_source_routes(&f, resources.port.ingress());
+        crate::control_runtime::task::retire_unused_host_calls_for_test(
+            &resources.host_calls,
+            &f.ledger,
+        );
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());

@@ -1018,17 +1018,17 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         }
     }
 
-    // Source4 plus the Actor attachment use five original Scope slots. The
-    // loader/input reports use two, the first cut's Source2 use two, and only
-    // the second cut's first Source can fit in the tenth and final position.
-    let mut f = Fixture::with_policy_scope_slot_limit(4096, Some(10));
+    // Source4, the Actor attachment and two host reports use seven Scope
+    // slots. The loader/input reports use two, the first cut's Source2 use
+    // two, and only one second-cut Source fits in the twelfth final position.
+    let mut f = Fixture::with_policy_scope_slot_limit(4096, Some(12));
     let policy = f.policy.unwrap();
     let task = task(f.identity, 1);
     let context_headers = f.scope.snapshot().unwrap().work;
     let mut host = f.adopt_task_host(task, 2);
     let elected = f.scope.snapshot().unwrap();
-    assert_eq!(elected.storage, 5);
-    assert_eq!(elected.work, context_headers + 5);
+    assert_eq!(elected.storage, 7);
+    assert_eq!(elected.work, context_headers + 7);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     f.assert_storage_paid(policy.loading);
 
@@ -1066,7 +1066,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     };
     let (error, returned) = match host.begin_host_loader(payload) {
         Err(refused) => refused,
-        Ok(_) => panic!("the second Source2 must exceed the actual tenth Scope slot"),
+        Ok(_) => panic!("the second Source2 must exceed the actual twelfth Scope slot"),
     };
     assert!(matches!(
         error,
@@ -1091,7 +1091,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     f.assert_storage_paid(policy.loading);
     let refused = f.scope.snapshot().unwrap();
-    assert_eq!(refused.storage, 8);
+    assert_eq!(refused.storage, 10);
     assert_eq!(
         refused.work,
         elected.work + 5,
@@ -1123,6 +1123,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         mut lifetime,
         mut active,
         port: owned_port,
+        host_calls,
         loader,
         loading_events,
         loading_return,
@@ -1149,6 +1150,12 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
                     .unwrap(),
             )
             .unwrap()
+            .checked_sub(
+                crate::control_runtime::task_host_call::HOST_CALL_STORAGE
+                    .checked_mul(2)
+                    .unwrap()
+            )
+            .unwrap()
             .resources()
             .unwrap()
             .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
@@ -1164,7 +1171,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert!(pending_preparation_adoption.is_none());
     retire_source_partials(&f, &mut source_partials);
     assert_eq!(f.scope.snapshot().unwrap().work, elected.work + 2);
-    assert_eq!(f.scope.snapshot().unwrap().storage, 7);
+    assert_eq!(f.scope.snapshot().unwrap().storage, 9);
     let live_after_partial = policy
         .loading
         .checked_sub(crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE)
@@ -1224,7 +1231,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
             "a retired report is not a reaped Work header"
         );
     }
-    assert_eq!(f.scope.snapshot().unwrap().storage, 5);
+    assert_eq!(f.scope.snapshot().unwrap().storage, 7);
     assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 2).unwrap(), 2);
     assert!(
         retired
@@ -1264,6 +1271,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
 
     // This unit destroys an empty bank after its real original Source4 exit;
     // it does not forge Loaded/LoaderExited or any protocol read-seal fact.
+    crate::control_runtime::task::retire_unused_host_calls_for_test(&host_calls, &f.ledger);
     finish_source_routes(&f, port.ingress());
     assert_eq!(f.scope.snapshot().unwrap().storage, 1);
     assert_eq!(f.scope.snapshot().unwrap().work, context_headers + 1);
@@ -1297,6 +1305,12 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
             .checked_sub(
                 crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
                     .checked_mul(7)
+                    .unwrap(),
+            )
+            .unwrap()
+            .checked_sub(
+                crate::control_runtime::task_host_call::HOST_CALL_STORAGE
+                    .checked_mul(2)
                     .unwrap(),
             )
             .unwrap(),
@@ -2261,8 +2275,9 @@ fn exercise_fragment_roles_with_preparation(
     )
     .unwrap();
     let source4_headers = f.scope.snapshot().unwrap();
-    assert_eq!(source4_headers.work, loading_headers.work + 4);
-    assert_eq!(source4_headers.storage, loading_headers.storage + 4);
+    // The same loading admission now also retains its two host-only reports.
+    assert_eq!(source4_headers.work, loading_headers.work + 6);
+    assert_eq!(source4_headers.storage, loading_headers.storage + 6);
     f.assert_storage_paid(policy.loading);
     f.runtime.effect_completed(ticket).unwrap();
     f.drain(create);
@@ -3051,6 +3066,7 @@ fn exercise_fragment_roles_with_preparation(
         mut lifetime,
         mut active,
         port,
+        host_calls,
         loader,
         loading_events,
         loading_return,
@@ -3127,6 +3143,12 @@ fn exercise_fragment_roles_with_preparation(
                 .unwrap(),
         )
         .unwrap()
+        .checked_sub(
+            crate::control_runtime::task_host_call::HOST_CALL_STORAGE
+                .checked_mul(2)
+                .unwrap(),
+        )
+        .unwrap()
         .resources()
         .unwrap()
         .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
@@ -3134,7 +3156,7 @@ fn exercise_fragment_roles_with_preparation(
     assert_eq!(
         active.resources().unwrap(),
         expected_active,
-        "the original Task retains its remainder while Source4 owns its paid storage"
+        "the Task remainder excludes the original Source4 and two host-call payments"
     );
     let retained_profile = policy
         .accepted
@@ -3176,6 +3198,7 @@ fn exercise_fragment_roles_with_preparation(
             )
             .unwrap(),
     );
+    crate::control_runtime::task::retire_unused_host_calls_for_test(&host_calls, &f.ledger);
     lifetime.body_exited().unwrap();
     lifetime.captures_exited().unwrap();
     assert!(
@@ -3197,6 +3220,12 @@ fn exercise_fragment_roles_with_preparation(
     f.assert_storage_paid(
         policy
             .task_base
+            .checked_sub(
+                crate::control_runtime::task_host_call::HOST_CALL_STORAGE
+                    .checked_mul(2)
+                    .unwrap(),
+            )
+            .unwrap()
             .checked_sub(
                 crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
                     .checked_mul(detached_source_slots)
@@ -3994,3 +4023,6 @@ fn source_core_receipt_names_its_real_prefix_and_retirement_returns_both_reap_wi
         "the source receipt belongs to its real prefix before the later event commits"
     );
 }
+
+#[path = "tests/host_call_bootstrap.rs"]
+mod host_call_bootstrap;
