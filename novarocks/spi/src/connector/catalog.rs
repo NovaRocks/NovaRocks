@@ -220,6 +220,39 @@ fn invalid(subject: &str) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_local_backend_projection_preserves_only_the_data_reference() {
+        use crate::connector::NodeLocalCredentialReference;
+        let data = CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new("worker-source", "blue").unwrap(),
+            ),
+        )
+        .unwrap();
+        let metadata = CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreMetadata,
+            CredentialConsumerRole::Frontend,
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new("frontend-source", "blue").unwrap(),
+            ),
+        )
+        .unwrap();
+        let catalog = CatalogProperties::new(
+            handle(1),
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            3,
+            vec![],
+            vec![data.clone(), metadata],
+        )
+        .unwrap();
+        let execution = catalog.backend_execution_projection().unwrap();
+        assert_eq!(execution.credential_bindings(), &[data]);
+        assert_eq!(execution.handle(), catalog.handle());
+    }
+
     use crate::connector::{
         CatalogCredentialMode, ConnectorInstanceId, CredentialConsumerRole,
         StaticCredentialReference,

@@ -48,7 +48,8 @@ use futures::future::BoxFuture;
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
     ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
-    StaticCredentialReference, canonicalize_catalog_credential_bindings,
+    NodeLocalCredentialReference, StaticCredentialReference,
+    canonicalize_catalog_credential_bindings,
 };
 use novarocks_spi::connector::{
     ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
@@ -1564,6 +1565,20 @@ fn take_credential_binding(
                     .map_err(|error| invalid_credential_property(error.to_string()))?,
             )
         }
+        Some("node-local") => {
+            let name = name.as_deref().ok_or_else(|| {
+                invalid_credential_property("node-local catalog credential binding requires name")
+            })?;
+            let generation = generation.as_deref().ok_or_else(|| {
+                invalid_credential_property(
+                    "node-local catalog credential binding requires generation",
+                )
+            })?;
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new(name, generation)
+                    .map_err(|error| invalid_credential_property(error.to_string()))?,
+            )
+        }
         Some("vended") => {
             if name.is_some() || generation.is_some() {
                 return Err(invalid_credential_property(
@@ -1675,6 +1690,32 @@ fn materialization_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_catalog_extracts_node_local_sources_without_retyping_static() {
+        let properties = [
+            ("credential.object-store-data.consumer-role", "backend"),
+            ("credential.object-store-data.mode", "node-local"),
+            ("credential.object-store-data.name", "worker-source"),
+            ("credential.object-store-data.generation", "blue"),
+            ("warehouse", "s3://warehouse/"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let (bindings, provider) = extract_catalog_credential_bindings(properties).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].node_local_reference().unwrap().name(),
+            "worker-source"
+        );
+        assert!(bindings[0].static_reference().is_none());
+        assert_eq!(
+            provider,
+            vec![("warehouse".to_string(), "s3://warehouse/".to_string())]
+        );
+    }
+
     use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
@@ -2379,7 +2420,7 @@ mod tests {
             self.0.release();
         }
     }
-    impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver
+    impl novarocks_connector_iceberg::access_binding::IcebergCredentialResolver
         for DrainingControlResolver
     {
         fn resolve_object_store_static(
@@ -2450,8 +2491,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
             Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
         );
-        let access =
-            IcebergReadBinding::with_static_metadata_credential_resolver(fs, resolver.clone());
+        let access = IcebergReadBinding::with_metadata_credential_resolver(fs, resolver.clone());
         let role = Arc::new(IcebergControlRoleBindingFactory::new(
             IcebergMetadataResources::new(access, handle.clone()),
             std::num::NonZeroUsize::new(2).unwrap(),
@@ -2776,7 +2816,7 @@ mod tests {
     mod generation_expiry_ref {
         use super::*;
         use novarocks_connector_iceberg::access_binding::{
-            IcebergReadBinding, IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+            IcebergCredentialResolver, IcebergReadBinding, IcebergRestAuthMaterial,
         };
         use novarocks_connector_iceberg::{IcebergControlRoleBindingFactory, iceberg};
         use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
@@ -2796,7 +2836,7 @@ mod tests {
         use std::sync::{Condvar, atomic::AtomicBool};
 
         struct Identity;
-        impl IcebergStaticCredentialResolver for Identity {
+        impl IcebergCredentialResolver for Identity {
             fn resolve_object_store_static(
                 &self,
                 _: &StaticCredentialReference,
@@ -3196,10 +3236,8 @@ mod tests {
                 Arc::new(TokioFileIoRuntime::new(runtime.clone())),
                 Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
             );
-            let access = IcebergReadBinding::with_static_metadata_credential_resolver(
-                fs,
-                Arc::new(Identity),
-            );
+            let access =
+                IcebergReadBinding::with_metadata_credential_resolver(fs, Arc::new(Identity));
             let factory = Arc::new(IcebergControlRoleBindingFactory::new(
                 novarocks_connector_iceberg::resources::IcebergMetadataResources::new(
                     access,

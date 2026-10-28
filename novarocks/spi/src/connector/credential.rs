@@ -99,10 +99,38 @@ impl StaticCredentialReference {
     }
 }
 
+/// Immutable deployment identity for a role-local renewable credential source.
+///
+/// The source definition is fixed for this generation. Material obtained from
+/// that source may rotate without changing the catalog identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NodeLocalCredentialReference {
+    name: Arc<str>,
+    generation: Arc<str>,
+}
+
+impl NodeLocalCredentialReference {
+    pub fn try_new(name: &str, generation: &str) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            name: parse_reference_component("node-local credential name", name)?,
+            generation: parse_reference_component("node-local credential generation", generation)?,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CatalogCredentialMode {
     Static(StaticCredentialReference),
     Vended,
+    NodeLocal(NodeLocalCredentialReference),
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -127,11 +155,13 @@ impl CatalogCredentialBinding {
             ) | (
                 CatalogCredentialPurpose::ObjectStoreData,
                 CredentialConsumerRole::Backend,
-                CatalogCredentialMode::Static(_) | CatalogCredentialMode::Vended
+                CatalogCredentialMode::Static(_)
+                    | CatalogCredentialMode::Vended
+                    | CatalogCredentialMode::NodeLocal(_)
             ) | (
                 CatalogCredentialPurpose::ObjectStoreMetadata,
                 CredentialConsumerRole::Frontend,
-                CatalogCredentialMode::Static(_)
+                CatalogCredentialMode::Static(_) | CatalogCredentialMode::NodeLocal(_)
             ) | (
                 // Static only: this is a deployment-configured principal, not
                 // something a catalog vends.
@@ -167,7 +197,14 @@ impl CatalogCredentialBinding {
     pub fn static_reference(&self) -> Option<&StaticCredentialReference> {
         match &self.mode {
             CatalogCredentialMode::Static(reference) => Some(reference),
-            CatalogCredentialMode::Vended => None,
+            CatalogCredentialMode::Vended | CatalogCredentialMode::NodeLocal(_) => None,
+        }
+    }
+
+    pub fn node_local_reference(&self) -> Option<&NodeLocalCredentialReference> {
+        match &self.mode {
+            CatalogCredentialMode::NodeLocal(reference) => Some(reference),
+            CatalogCredentialMode::Static(_) | CatalogCredentialMode::Vended => None,
         }
     }
 }
@@ -246,6 +283,11 @@ pub fn canonical_catalog_credential_binding_bytes(
                 put_bytes(&mut output, reference.generation.as_bytes());
             }
             CatalogCredentialMode::Vended => output.push(1),
+            CatalogCredentialMode::NodeLocal(reference) => {
+                output.push(2);
+                put_bytes(&mut output, reference.name.as_bytes());
+                put_bytes(&mut output, reference.generation.as_bytes());
+            }
         }
     }
     Ok(output)
@@ -357,6 +399,11 @@ enum StorageAccessScope {
         consumer_role: CredentialConsumerRole,
         prefixes: Vec<StorageCredentialScopePrefix>,
     },
+    NodeLocal {
+        purpose: CatalogCredentialPurpose,
+        consumer_role: CredentialConsumerRole,
+        reference: NodeLocalCredentialReference,
+    },
     Uncredentialed {
         kind: CatalogUncredentialedStorageKind,
         authority: Option<Arc<str>>,
@@ -401,6 +448,13 @@ impl CatalogStorageAccessDomainInput {
                     reference,
                 }
             }
+            CatalogCredentialMode::NodeLocal(reference) if vended_prefixes.is_empty() => {
+                StorageAccessScope::NodeLocal {
+                    purpose,
+                    consumer_role,
+                    reference,
+                }
+            }
             CatalogCredentialMode::Vended if !vended_prefixes.is_empty() => {
                 StorageAccessScope::Vended {
                     purpose,
@@ -413,6 +467,11 @@ impl CatalogStorageAccessDomainInput {
             }
             CatalogCredentialMode::Vended => {
                 return Err(invalid("vended storage binding without prefix scope"));
+            }
+            CatalogCredentialMode::NodeLocal(_) => {
+                return Err(invalid(
+                    "node-local storage binding with vended prefix scope",
+                ));
             }
         };
 
@@ -520,6 +579,17 @@ impl CatalogStorageAccessDomainInput {
                 for prefix in prefixes {
                     hash_bytes(&mut digest, prefix.0.as_bytes());
                 }
+            }
+            StorageAccessScope::NodeLocal {
+                purpose,
+                consumer_role,
+                reference,
+            } => {
+                digest.update([4]);
+                digest.update([credential_purpose_discriminant(*purpose)]);
+                digest.update([consumer_role_discriminant(*consumer_role)]);
+                hash_bytes(&mut digest, reference.name.as_bytes());
+                hash_bytes(&mut digest, reference.generation.as_bytes());
             }
             StorageAccessScope::Uncredentialed { kind, authority } => {
                 digest.update([match kind {
@@ -661,6 +731,117 @@ fn exhausted(subject: &str) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node_local_data_binding(generation: &str) -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new("warehouse-reader", generation).unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn node_local_source_identity_is_separate_and_role_scoped() {
+        let reference = NodeLocalCredentialReference::try_new("warehouse-reader", "blue").unwrap();
+        for (purpose, role) in [
+            (
+                CatalogCredentialPurpose::ObjectStoreData,
+                CredentialConsumerRole::Backend,
+            ),
+            (
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Frontend,
+            ),
+        ] {
+            let binding = CatalogCredentialBinding::try_new(
+                purpose,
+                role,
+                CatalogCredentialMode::NodeLocal(reference.clone()),
+            )
+            .unwrap();
+            assert_eq!(binding.node_local_reference(), Some(&reference));
+            assert!(binding.static_reference().is_none());
+        }
+        for (purpose, role) in [
+            (
+                CatalogCredentialPurpose::CatalogControl,
+                CredentialConsumerRole::Frontend,
+            ),
+            (
+                CatalogCredentialPurpose::DataCredentialVending,
+                CredentialConsumerRole::Backend,
+            ),
+            (
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Backend,
+            ),
+            (
+                CatalogCredentialPurpose::ObjectStoreData,
+                CredentialConsumerRole::Frontend,
+            ),
+            (
+                CatalogCredentialPurpose::ObjectStoreData,
+                CredentialConsumerRole::FrontendAndBackend,
+            ),
+        ] {
+            assert!(
+                CatalogCredentialBinding::try_new(
+                    purpose,
+                    role,
+                    CatalogCredentialMode::NodeLocal(reference.clone()),
+                )
+                .is_err()
+            );
+        }
+        assert!(NodeLocalCredentialReference::try_new("", "blue").is_err());
+        assert!(NodeLocalCredentialReference::try_new("warehouse-reader", "").is_err());
+    }
+
+    #[test]
+    fn node_local_mode_and_generation_have_distinct_canonical_domains() {
+        let node = node_local_data_binding("blue");
+        let fixed = static_data_binding("blue");
+        let node_bytes = canonical_catalog_credential_binding_bytes(&[node.clone()]).unwrap();
+        let fixed_bytes = canonical_catalog_credential_binding_bytes(&[fixed.clone()]).unwrap();
+        let mode_offset = CREDENTIAL_BINDING_DOMAIN.len() + std::mem::size_of::<u32>() + 2;
+        assert_eq!(fixed_bytes[mode_offset], 0);
+        assert_eq!(node_bytes[mode_offset], 2);
+        assert_ne!(node_bytes, fixed_bytes);
+        let domain = |binding| {
+            CatalogStorageAccessDomainInput::try_new(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+                3,
+                vec![],
+                binding,
+                vec![],
+            )
+            .unwrap()
+            .derive_access_domain()
+        };
+        assert_ne!(domain(node.clone()), domain(fixed));
+        assert_ne!(
+            domain(node.clone()),
+            domain(node_local_data_binding("green"))
+        );
+        assert!(
+            CatalogStorageAccessDomainInput::try_new(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+                3,
+                vec![],
+                node,
+                vec![
+                    StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/table/")
+                        .unwrap()
+                ],
+            )
+            .is_err()
+        );
+    }
 
     fn static_reference(generation: &str) -> StaticCredentialReference {
         StaticCredentialReference::try_new("warehouse-reader", generation).unwrap()

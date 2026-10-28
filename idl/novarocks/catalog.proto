@@ -55,6 +55,13 @@ message StaticCredentialReference {
   string generation = 2;
 }
 
+// Identity of an immutable role-local source definition. Renewable material
+// remains with the process that signs an object-store request.
+message NodeLocalCredentialReference {
+  string name = 1;
+  string generation = 2;
+}
+
 message VendedCredential {}
 
 message CatalogCredentialBinding {
@@ -63,6 +70,7 @@ message CatalogCredentialBinding {
   oneof mode {
     StaticCredentialReference static_credential = 3;
     VendedCredential vended_credential = 4;
+    NodeLocalCredentialReference node_local_credential = 5;
   }
 }
 

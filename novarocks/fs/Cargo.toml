@@ -47,6 +47,9 @@ parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 # Provider-owned S3 signing uses this registry implementation directly;
 # StorageAuthority remains the only judge of credential validity.
 reqsign = { version = "0.16.5", default-features = false, features = ["services-aws"] }
+quick-xml = { version = "=0.37.5", features = ["serialize"] }
+reqsign-aliyun-oss = "=3.1.1"
+reqsign-core = "=3.3.2"
 reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 sha2.workspace = true
 tracing.workspace = true

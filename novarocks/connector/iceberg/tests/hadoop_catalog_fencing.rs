@@ -21,9 +21,7 @@ use std::process::Output;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use novarocks_connector_iceberg::access_binding::{
-    IcebergReadBinding, IcebergStaticCredentialResolver,
-};
+use novarocks_connector_iceberg::access_binding::{IcebergCredentialResolver, IcebergReadBinding};
 use novarocks_connector_iceberg::catalog_config::{
     IcebergCatalogConfiguration, parse_catalog_configuration_with_object_store_binding,
 };
@@ -617,7 +615,7 @@ fn read_request_context(deadline: Instant) -> ConnectorRequestContext {
 
 struct ChildCredentials(Option<ObjectStoreSecretMaterial>);
 
-impl IcebergStaticCredentialResolver for ChildCredentials {
+impl IcebergCredentialResolver for ChildCredentials {
     fn resolve_object_store_static(
         &self,
         _reference: &StaticCredentialReference,
@@ -696,7 +694,7 @@ fn child_control(
         Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
         Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
     );
-    let planning_binding = IcebergReadBinding::with_static_metadata_credential_resolver(
+    let planning_binding = IcebergReadBinding::with_metadata_credential_resolver(
         resources,
         Arc::new(ChildCredentials(
             config

@@ -18,7 +18,9 @@
 use std::{collections::BTreeMap, fmt};
 
 use novarocks_secret::SecretValue;
-use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+use novarocks_spi::connector::{
+    CatalogCredentialPurpose, NodeLocalCredentialReference, StaticCredentialReference,
+};
 use novarocks_types::ClusterRole;
 
 pub const MAX_ROLE_LOCAL_CREDENTIAL_ENTRIES: usize = 256;
@@ -182,9 +184,31 @@ impl fmt::Debug for CatalogCredentialMaterial {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CatalogCredentialKeyReference {
+    Static(StaticCredentialReference),
+    NodeLocal(NodeLocalCredentialReference),
+}
+
+impl CatalogCredentialKeyReference {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Static(reference) => reference.name(),
+            Self::NodeLocal(reference) => reference.name(),
+        }
+    }
+
+    pub fn generation(&self) -> &str {
+        match self {
+            Self::Static(reference) => reference.generation(),
+            Self::NodeLocal(reference) => reference.generation(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CatalogCredentialRegistryKey {
     purpose: CatalogCredentialPurpose,
-    reference: StaticCredentialReference,
+    reference: CatalogCredentialKeyReference,
 }
 
 impl CatalogCredentialRegistryKey {
@@ -192,22 +216,41 @@ impl CatalogCredentialRegistryKey {
         purpose: CatalogCredentialPurpose,
         reference: StaticCredentialReference,
     ) -> Self {
-        Self { purpose, reference }
+        Self {
+            purpose,
+            reference: CatalogCredentialKeyReference::Static(reference),
+        }
+    }
+
+    pub const fn new_node_local(
+        purpose: CatalogCredentialPurpose,
+        reference: NodeLocalCredentialReference,
+    ) -> Self {
+        Self {
+            purpose,
+            reference: CatalogCredentialKeyReference::NodeLocal(reference),
+        }
     }
 
     pub const fn purpose(&self) -> CatalogCredentialPurpose {
         self.purpose
     }
 
-    pub const fn reference(&self) -> &StaticCredentialReference {
+    pub const fn reference(&self) -> &CatalogCredentialKeyReference {
         &self.reference
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum CatalogCredentialDefinition {
+    Static(CatalogCredentialMaterial),
+    NodeLocal(novarocks_fs::AliyunEcsRamRoleConfig),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogCredentialRegistryEntry {
     key: CatalogCredentialRegistryKey,
-    material: CatalogCredentialMaterial,
+    definition: CatalogCredentialDefinition,
 }
 
 impl CatalogCredentialRegistryEntry {
@@ -245,7 +288,25 @@ impl CatalogCredentialRegistryEntry {
         }
         Ok(Self {
             key: CatalogCredentialRegistryKey::new(purpose, reference),
-            material,
+            definition: CatalogCredentialDefinition::Static(material),
+        })
+    }
+
+    pub fn try_new_node_local(
+        purpose: CatalogCredentialPurpose,
+        reference: NodeLocalCredentialReference,
+        config: novarocks_fs::AliyunEcsRamRoleConfig,
+    ) -> Result<Self, String> {
+        if !matches!(
+            purpose,
+            CatalogCredentialPurpose::ObjectStoreData
+                | CatalogCredentialPurpose::ObjectStoreMetadata
+        ) {
+            return Err("node-local credentials require an object-store purpose".to_string());
+        }
+        Ok(Self {
+            key: CatalogCredentialRegistryKey::new_node_local(purpose, reference),
+            definition: CatalogCredentialDefinition::NodeLocal(config),
         })
     }
 
@@ -253,17 +314,22 @@ impl CatalogCredentialRegistryEntry {
         &self.key
     }
 
-    pub const fn material(&self) -> &CatalogCredentialMaterial {
-        &self.material
+    pub const fn material(&self) -> Option<&CatalogCredentialMaterial> {
+        match &self.definition {
+            CatalogCredentialDefinition::Static(material) => Some(material),
+            CatalogCredentialDefinition::NodeLocal(_) => None,
+        }
     }
 }
 
-/// Immutable credential values owned by exactly one deployable application role.
+/// Immutable credential definitions owned by one deployable application role.
+/// Static definitions contain fixed material; node-local definitions contain
+/// only the renewable source configuration, never acquired material.
 #[derive(Clone, Eq, PartialEq)]
 // Design: ADR-0125 (docs/adr/ADR-0125-role-local-catalog-credentials-and-access-domains.md)
 pub struct CatalogCredentialRegistry {
     role: ClusterRole,
-    entries: BTreeMap<CatalogCredentialRegistryKey, CatalogCredentialMaterial>,
+    entries: BTreeMap<CatalogCredentialRegistryKey, CatalogCredentialDefinition>,
 }
 
 impl CatalogCredentialRegistry {
@@ -303,7 +369,10 @@ impl CatalogCredentialRegistry {
                     entry.key.reference.generation()
                 ));
             }
-            if resolved.insert(entry.key.clone(), entry.material).is_some() {
+            if resolved
+                .insert(entry.key.clone(), entry.definition)
+                .is_some()
+            {
                 return Err(format!(
                     "duplicate {:?} credential `{}` generation `{}`",
                     entry.key.purpose,
@@ -334,21 +403,56 @@ impl CatalogCredentialRegistry {
         self.entries.keys()
     }
 
+    pub fn resolve_node_local(
+        &self,
+        purpose: CatalogCredentialPurpose,
+        reference: &NodeLocalCredentialReference,
+    ) -> Option<&novarocks_fs::AliyunEcsRamRoleConfig> {
+        match self
+            .entries
+            .get(&CatalogCredentialRegistryKey::new_node_local(
+                purpose,
+                reference.clone(),
+            )) {
+            Some(CatalogCredentialDefinition::NodeLocal(config)) => Some(config),
+            Some(CatalogCredentialDefinition::Static(_)) | None => None,
+        }
+    }
+
     pub fn resolve(
         &self,
         purpose: CatalogCredentialPurpose,
         reference: &StaticCredentialReference,
     ) -> Option<&CatalogCredentialMaterial> {
-        self.entries.get(&CatalogCredentialRegistryKey::new(
+        match self.entries.get(&CatalogCredentialRegistryKey::new(
             purpose,
             reference.clone(),
-        ))
+        )) {
+            Some(CatalogCredentialDefinition::Static(material)) => Some(material),
+            Some(CatalogCredentialDefinition::NodeLocal(_)) | None => None,
+        }
     }
 }
 
-impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver
+impl novarocks_connector_iceberg::access_binding::IcebergCredentialResolver
     for CatalogCredentialRegistry
 {
+    fn resolve_node_local_object_store(
+        &self,
+        purpose: CatalogCredentialPurpose,
+        reference: &NodeLocalCredentialReference,
+    ) -> Result<novarocks_fs::AliyunEcsRamRoleConfig, novarocks_spi::connector::ConnectorError>
+    {
+        self.resolve_node_local(purpose, reference)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "role-local registry has no exact renewable object-store source binding",
+                )
+            })
+    }
+
     fn resolve_object_store_static(
         &self,
         reference: &StaticCredentialReference,
@@ -487,6 +591,145 @@ fn require_secret(subject: &str, value: &SecretValue) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn node_local_entry(
+        purpose: CatalogCredentialPurpose,
+        name: &str,
+        generation: &str,
+    ) -> CatalogCredentialRegistryEntry {
+        CatalogCredentialRegistryEntry::try_new_node_local(
+            purpose,
+            NodeLocalCredentialReference::try_new(name, generation).unwrap(),
+            novarocks_fs::AliyunEcsRamRoleConfig::try_new(
+                "novarocks-ecs",
+                vec!["s3://novarocks-ci/development/".to_string()],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn node_local_lookup_is_typed_purpose_and_generation_exact() {
+        use novarocks_connector_iceberg::access_binding::IcebergCredentialResolver;
+        let source = node_local_entry(
+            CatalogCredentialPurpose::ObjectStoreData,
+            "warehouse",
+            "blue",
+        );
+        let registry = CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![source]).unwrap();
+        let local = NodeLocalCredentialReference::try_new("warehouse", "blue").unwrap();
+        let config = registry
+            .resolve_node_local_object_store(CatalogCredentialPurpose::ObjectStoreData, &local)
+            .unwrap();
+        assert_eq!(config.role_name(), "novarocks-ecs");
+        assert!(
+            registry
+                .resolve_node_local(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    &NodeLocalCredentialReference::try_new("warehouse", "green").unwrap()
+                )
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve_node_local(CatalogCredentialPurpose::ObjectStoreMetadata, &local)
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    &reference("warehouse", "blue")
+                )
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve_object_store_static(&reference("warehouse", "blue"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn equal_static_and_node_local_names_never_alias_material() {
+        let local = node_local_entry(
+            CatalogCredentialPurpose::ObjectStoreData,
+            "warehouse",
+            "blue",
+        );
+        let fixed = CatalogCredentialRegistryEntry::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            reference("warehouse", "blue"),
+            s3("static-canary"),
+        )
+        .unwrap();
+        let registry =
+            CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![local, fixed]).unwrap();
+        assert_eq!(registry.len(), 2);
+        assert_eq!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    &reference("warehouse", "blue")
+                )
+                .unwrap()
+                .as_s3()
+                .unwrap()
+                .access_key_id()
+                .expose_secret(),
+            "static-canary"
+        );
+        assert_eq!(
+            registry
+                .resolve_node_local(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    &NodeLocalCredentialReference::try_new("warehouse", "blue").unwrap()
+                )
+                .unwrap()
+                .role_name(),
+            "novarocks-ecs"
+        );
+    }
+
+    #[test]
+    fn node_local_definitions_cannot_be_static_control_or_vending_material() {
+        let config = novarocks_fs::AliyunEcsRamRoleConfig::try_new(
+            "novarocks-ecs",
+            vec!["s3://novarocks-ci/".to_string()],
+        )
+        .unwrap();
+        let source = node_local_entry(CatalogCredentialPurpose::ObjectStoreData, "source", "blue");
+        assert!(source.material().is_none());
+        for purpose in [
+            CatalogCredentialPurpose::CatalogControl,
+            CatalogCredentialPurpose::DataCredentialVending,
+        ] {
+            assert!(
+                CatalogCredentialRegistryEntry::try_new_node_local(
+                    purpose,
+                    NodeLocalCredentialReference::try_new("source", "blue").unwrap(),
+                    config.clone(),
+                )
+                .is_err()
+            );
+        }
+        let metadata = node_local_entry(
+            CatalogCredentialPurpose::ObjectStoreMetadata,
+            "metadata",
+            "blue",
+        );
+        let data = node_local_entry(CatalogCredentialPurpose::ObjectStoreData, "data", "blue");
+        assert!(
+            CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![metadata.clone()]).is_ok()
+        );
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![metadata]).is_err());
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![data.clone()]).is_ok());
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![data.clone()]).is_err());
+        assert!(
+            CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![data.clone(), data]).is_err()
+        );
+    }
+
     fn reference(name: &str, generation: &str) -> StaticCredentialReference {
         StaticCredentialReference::try_new(name, generation).unwrap()
     }
@@ -510,7 +753,7 @@ mod tests {
 
     #[test]
     fn a_coordinator_resolver_refuses_the_vending_identity_rather_than_improvising() {
-        use novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver;
+        use novarocks_connector_iceberg::access_binding::IcebergCredentialResolver;
 
         // A coordinator cannot own this purpose at all, so its resolver has
         // nothing to return. Reporting Unsupported is what lets the authority
@@ -527,7 +770,7 @@ mod tests {
     #[test]
     fn an_execution_node_resolves_its_own_rest_identity_exactly() {
         use novarocks_connector_iceberg::access_binding::{
-            IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+            IcebergCredentialResolver, IcebergRestAuthMaterial,
         };
 
         let registry = CatalogCredentialRegistry::try_new(
@@ -587,7 +830,7 @@ mod tests {
     #[test]
     fn a_coordinator_resolves_its_catalog_control_identity_exactly() {
         use novarocks_connector_iceberg::access_binding::{
-            IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+            IcebergCredentialResolver, IcebergRestAuthMaterial,
         };
 
         let coordinator = CatalogCredentialRegistry::try_new(
@@ -635,7 +878,7 @@ mod tests {
 
     #[test]
     fn an_execution_node_refuses_the_catalog_control_identity() {
-        use novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver;
+        use novarocks_connector_iceberg::access_binding::IcebergCredentialResolver;
 
         // The execution node's own vending identity under the same reference
         // must not answer a control lookup either.
@@ -807,14 +1050,14 @@ mod tests {
         .unwrap();
 
         assert!(
-            novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver::resolve_object_store_metadata_static(
+            novarocks_connector_iceberg::access_binding::IcebergCredentialResolver::resolve_object_store_metadata_static(
                 &registry,
                 &reference,
             )
             .is_ok()
         );
         assert!(
-            novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver::resolve_object_store_static(
+            novarocks_connector_iceberg::access_binding::IcebergCredentialResolver::resolve_object_store_static(
                 &registry,
                 &reference,
             )

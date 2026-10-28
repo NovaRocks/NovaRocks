@@ -4055,7 +4055,10 @@ dependencies = [
  "orc-rust",
  "parquet",
  "percent-encoding",
+ "quick-xml 0.37.5",
  "reqsign",
+ "reqsign-aliyun-oss",
+ "reqsign-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -6310,6 +6313,23 @@ dependencies = [
  "sha1 0.10.6",
  "sha2 0.10.9",
  "tokio",
+]
+
+[[package]]
+name = "reqsign-aliyun-oss"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f2a76ce7588780351c0f68eb8feaba8d23a99b40655195edbf50bfbce2af09b"
+dependencies = [
+ "anyhow",
+ "form_urlencoded",
+ "http",
+ "log",
+ "percent-encoding",
+ "reqsign-core",
+ "rust-ini",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

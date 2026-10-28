@@ -175,6 +175,118 @@ impl S3RequestSigner {
         })
     }
 
+    /// ECS roles can have wider IAM rights than this deployment binding. Check
+    /// the actual SDK target on every signing path, before acquiring material.
+    fn authorize_node_local_target(
+        &self,
+        uri: &Uri,
+        headers: &http::HeaderMap,
+        body: Option<&Buffer>,
+    ) -> opendal::Result<()> {
+        let SigningMaterial::Authority(source) = &self.material else {
+            return Ok(());
+        };
+        let id = source.authority.id();
+        if !matches!(
+            id.capability(),
+            crate::storage_authority::AuthorityCapabilityPath::NodeLocalProvider { .. }
+        ) {
+            return Ok(());
+        }
+        let scope =
+            Url::parse(id.scope().as_str()).map_err(|_| invalid("invalid bound ECS scope"))?;
+        if scope.host_str() != Some(self.bucket.as_str()) {
+            return Err(scope_denied());
+        }
+        // FsLocation preserves literal key bytes; the SDK encodes them once.
+        // Decode only the emitted request, never the configured logical key.
+        let prefix = scope.path().as_bytes();
+        let check = |path: &[u8]| -> opendal::Result<()> {
+            if path.contains(&b'\\')
+                || path
+                    .split(|byte| *byte == b'/')
+                    .any(|part| matches!(part, b"." | b".."))
+            {
+                return Err(scope_denied());
+            }
+            if path.starts_with(prefix) {
+                Ok(())
+            } else {
+                Err(scope_denied())
+            }
+        };
+        let raw_path = if self.use_path_style {
+            uri.path()
+                .strip_prefix(&format!("/{}", self.bucket))
+                .filter(|path| path.is_empty() || path.starts_with('/'))
+                .ok_or_else(scope_denied)?
+        } else {
+            uri.path()
+        };
+        let path = percent_encoding::percent_decode_str(raw_path).collect::<Vec<_>>();
+        let query = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .collect::<Vec<_>>();
+        if path.is_empty() || path == b"/" {
+            if query.iter().any(|(key, _)| key == "delete") {
+                #[derive(serde::Deserialize)]
+                #[serde(rename = "Delete", deny_unknown_fields)]
+                struct Delete {
+                    #[serde(rename = "Quiet", default)]
+                    _quiet: Option<bool>,
+                    #[serde(rename = "Object", default)]
+                    objects: Vec<DeleteObject>,
+                }
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct DeleteObject {
+                    #[serde(rename = "Key")]
+                    key: String,
+                    #[serde(rename = "VersionId", default)]
+                    _version: Option<String>,
+                }
+                let body = body.ok_or_else(scope_denied)?.to_bytes();
+                let text = std::str::from_utf8(&body).map_err(|_| scope_denied())?;
+                let delete: Delete = quick_xml::de::from_str(text).map_err(|_| scope_denied())?;
+                if delete.objects.is_empty() {
+                    return Err(scope_denied());
+                }
+                for object in delete.objects {
+                    check(format!("/{}", object.key).as_bytes())?;
+                }
+            } else {
+                let prefixes = query
+                    .iter()
+                    .filter(|(key, _)| key == "prefix")
+                    .collect::<Vec<_>>();
+                if prefixes.len() > 1 {
+                    return Err(scope_denied());
+                }
+                let key_prefix = prefixes
+                    .first()
+                    .map(|(_, value)| value.as_ref())
+                    .unwrap_or("");
+                check(format!("/{key_prefix}").as_bytes())?;
+            }
+        } else {
+            check(&path)?;
+        }
+        if let Some(copy) = headers.get("x-amz-copy-source") {
+            let copy = copy.to_str().map_err(|_| scope_denied())?;
+            let copy = copy.split('?').next().unwrap_or_default();
+            let copy = percent_encoding::percent_decode_str(copy).collect::<Vec<_>>();
+            let bucket = format!("{}/", self.bucket);
+            let copy = copy.strip_prefix(b"/").unwrap_or(&copy);
+            let key = copy
+                .strip_prefix(bucket.as_bytes())
+                .ok_or_else(scope_denied)?;
+            let mut path = Vec::with_capacity(key.len() + 1);
+            path.push(b'/');
+            path.extend_from_slice(key);
+            check(&path)?;
+        }
+        Ok(())
+    }
+
     async fn credential_in(
         &self,
         request: Option<&novarocks_spi::connector::ConnectorRequestContext>,
@@ -200,6 +312,7 @@ impl S3RequestSigner {
         let selected = self.selected_request(request.uri())?;
         // Pure selected facts only. No admission has occurred in this slice.
         let _service_base = selected.service_base();
+        self.authorize_node_local_target(request.uri(), request.headers(), Some(request.body()))?;
         clear_signing_headers(request.headers_mut());
         let context = request
             .extensions()
@@ -221,6 +334,7 @@ impl S3RequestSigner {
         let mut request: Request<()> = original.into();
         let selected = self.selected_request(request.uri())?;
         let _service_base = selected.service_base();
+        self.authorize_node_local_target(request.uri(), request.headers(), None)?;
         clear_signing_headers(request.headers_mut());
         let credential = self.credential_in(None).await?;
         self.signer
@@ -238,6 +352,13 @@ impl S3RequestSigner {
 
 fn invalid(message: &'static str) -> Error {
     Error::new(ErrorKind::Unexpected, message).set_permanent()
+}
+fn scope_denied() -> Error {
+    Error::new(
+        ErrorKind::PermissionDenied,
+        "S3 request leaves its configured ECS scope",
+    )
+    .set_permanent()
 }
 fn clear_signing_headers(headers: &mut http::HeaderMap) {
     for name in [
@@ -749,6 +870,163 @@ mod tests {
             Some(SecretValue::new(format!("token-{suffix}"))),
             Instant::now() + Duration::from_secs(3600),
         ));
+    }
+
+    fn node_local_authority(scope: &str) -> Arc<StorageAuthority> {
+        use novarocks_spi::connector::{CatalogCredentialPurpose, NodeLocalCredentialReference};
+        Arc::new(StorageAuthority::new(
+            StorageAuthorityId::new(
+                authority_for_scope(scope).id().catalog().clone(),
+                StorageCredentialScopePrefix::try_from_normalized(scope).unwrap(),
+                AuthorityCapabilityPath::NodeLocalProvider {
+                    purpose: CatalogCredentialPurpose::ObjectStoreData,
+                    principal: NodeLocalCredentialReference::try_new("ecs", "v1").unwrap(),
+                    provider: crate::AliyunEcsRamRoleConfig::try_new(
+                        "role",
+                        vec![scope.to_owned()],
+                    )
+                    .unwrap(),
+                },
+            ),
+            Arc::new(NeverAcquires),
+            Arc::new(NeverAcquires),
+            RefreshPolicy::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn node_local_signer_refuses_every_escaped_target_before_acquisition_or_http() {
+        for path_style in [true, false] {
+            let scope = "s3://one/allowed/";
+            let authority = node_local_authority(scope);
+            let capture = CapturedHttp::default();
+            let (operator, signer) = sdk_operator(
+                &endpoint("one", "https://objects.example.test", path_style),
+                &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+                capture.clone(),
+            );
+            for error in [
+                operator.stat("outside/key").await.unwrap_err(),
+                operator.stat("allowed").await.unwrap_err(),
+                operator.stat("allowed/../outside/key").await.unwrap_err(),
+                operator.list("outside/").await.unwrap_err(),
+                operator.list("allowed-sibling/").await.unwrap_err(),
+                operator.write("outside/key", "data").await.unwrap_err(),
+                operator.delete("outside/key").await.unwrap_err(),
+                operator
+                    .presign_read("outside/key", Duration::from_secs(30))
+                    .await
+                    .unwrap_err(),
+                operator
+                    .copy("outside/key", "allowed/copied")
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{error}");
+            }
+            assert!(capture.requests.lock().unwrap().is_empty());
+            // Cover multipart and a mixed-key batch emitted at the bucket URL.
+            let base = if path_style {
+                "https://objects.example.test/one"
+            } else {
+                "https://one.objects.example.test"
+            };
+            for (target, body) in [
+                ("/outside/key?uploads", ""),
+                ("/allowed/../outside/key", ""),
+                ("/allowed/%2e%2e/outside/key", ""),
+                ("/allowed/%2E/outside/key", ""),
+                ("/allowed/%5c..%5coutside/key", ""),
+                ("/outside/key?uploadId=id&partNumber=1", ""),
+                (
+                    "/?delete",
+                    "<Delete><Quiet>true</Quiet><Object><Key>allowed/a</Key></Object><Object><Key>outside/b</Key></Object></Delete>",
+                ),
+            ] {
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{base}{target}"))
+                    .body(Buffer::from(body.to_owned()))
+                    .unwrap();
+                assert_eq!(
+                    signer.sign_header(&mut request).await.unwrap_err().kind(),
+                    ErrorKind::PermissionDenied
+                );
+            }
+            for target in ["/allowed/../outside", "/allowed/%2e%2e/outside", "/allowed"] {
+                let request = PresignedRequest::new(
+                    Method::GET,
+                    format!("{base}{target}").parse().unwrap(),
+                    http::HeaderMap::new(),
+                );
+                assert_eq!(
+                    signer
+                        .presign(request, Duration::from_secs(30))
+                        .await
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::PermissionDenied
+                );
+            }
+            // In-scope targets continue through the original signer and token.
+            install(&authority, "scoped");
+            operator.stat("allowed/key").await.unwrap();
+            operator
+                .presign_read("allowed/key", Duration::from_secs(30))
+                .await
+                .unwrap();
+            let uri: Uri = format!("{base}/?delete").parse().unwrap();
+            assert!(signer.authorize_node_local_target(&uri, &http::HeaderMap::new(), Some(&Buffer::from("<Delete><Quiet>true</Quiet><Object><Key>allowed/a&amp;b</Key></Object></Delete>"))).is_ok());
+            assert_eq!(capture.requests.lock().unwrap().len(), 1);
+            for copy_source in ["one/allowed/source", "/one/allowed/source"] {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-amz-copy-source", copy_source.parse().unwrap());
+                let uri: Uri = format!("{base}/allowed/target?uploadId=id&partNumber=1")
+                    .parse()
+                    .unwrap();
+                assert!(
+                    signer
+                        .authorize_node_local_target(&uri, &headers, None)
+                        .is_ok()
+                );
+            }
+            // The mock HTTP body does not implement CopyObject's XML result;
+            // observing its signed request proves the actual SDK header passed.
+            let _ = operator.copy("allowed/source", "allowed/target").await;
+            let requests = capture.requests.lock().unwrap();
+            assert!(requests.len() >= 2);
+            assert!(requests.iter().any(|(_, headers)| {
+                headers
+                    .get("x-amz-copy-source")
+                    .is_some_and(|value| value == "one/allowed/source")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn node_local_scope_preserves_the_original_literal_percent_key() {
+        let scope = "s3://one/allowed%20/";
+        let config =
+            crate::AliyunEcsRamRoleConfig::try_new("role", vec![scope.to_owned()]).unwrap();
+        assert!(config.scope_for_locations(&[format!("{scope}key")]).is_ok());
+        let authority = node_local_authority(scope);
+        install(&authority, "percent");
+        for path_style in [true, false] {
+            let capture = CapturedHttp::default();
+            let (operator, _) = sdk_operator(
+                &endpoint("one", "https://objects.example.test", path_style),
+                &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+                capture.clone(),
+            );
+            operator.stat("allowed%20/key").await.unwrap();
+            assert_eq!(
+                operator.stat("allowed /key").await.unwrap_err().kind(),
+                ErrorKind::PermissionDenied
+            );
+            let requests = capture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].0.path().contains("allowed%2520/key"));
+        }
     }
 
     #[tokio::test]

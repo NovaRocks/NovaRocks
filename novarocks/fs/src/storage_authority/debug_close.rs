@@ -433,6 +433,7 @@ fn identity_record(id: &StorageAuthorityId, key: &str) -> String {
         write!(&mut version, "{byte:02x}").expect("write to String");
     }
     let path = match id.capability() {
+        AuthorityCapabilityPath::NodeLocalProvider { .. } => "node-local-provider",
         AuthorityCapabilityPath::CredentialsEndpoint { .. } => "credentials-endpoint",
         AuthorityCapabilityPath::LoadTableDelegation { .. } => "load-table-delegation",
         AuthorityCapabilityPath::InProcessProvider(_) => "in-process-provider",

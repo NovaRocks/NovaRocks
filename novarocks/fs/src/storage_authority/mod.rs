@@ -40,8 +40,8 @@ use std::time::{Duration, Instant};
 
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{
-    CatalogHandle, CredentialRoutingContext, StaticCredentialReference,
-    StorageCredentialScopePrefix,
+    CatalogCredentialPurpose, CatalogHandle, CredentialRoutingContext,
+    NodeLocalCredentialReference, StaticCredentialReference, StorageCredentialScopePrefix,
 };
 use tokio::sync::watch;
 
@@ -81,6 +81,13 @@ pub use registry::{
 /// only; no routing header value reaches a diagnostic through this type.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum AuthorityCapabilityPath {
+    /// A deployment-bound provider used by this exact application role.
+    /// It is not a catalog-vended identity or an in-process catalog provider.
+    NodeLocalProvider {
+        purpose: CatalogCredentialPurpose,
+        principal: NodeLocalCredentialReference,
+        provider: crate::AliyunEcsRamRoleConfig,
+    },
     /// Renew through the credentials endpoint the server advertised. The URL is
     /// never constructed by the client from a canonical spec path.
     CredentialsEndpoint {
@@ -126,7 +133,9 @@ impl AuthorityCapabilityPath {
         match self {
             Self::CredentialsEndpoint { routing, .. }
             | Self::LoadTableDelegation { routing, .. } => Some(routing),
-            Self::InProcessProvider(_) | Self::SeededWithoutRenewal { .. } => None,
+            Self::NodeLocalProvider { .. }
+            | Self::InProcessProvider(_)
+            | Self::SeededWithoutRenewal { .. } => None,
         }
     }
 
@@ -137,7 +146,9 @@ impl AuthorityCapabilityPath {
         match self {
             Self::CredentialsEndpoint { principal, .. }
             | Self::LoadTableDelegation { principal, .. } => Some(principal),
-            Self::InProcessProvider(_) | Self::SeededWithoutRenewal { .. } => None,
+            Self::NodeLocalProvider { .. }
+            | Self::InProcessProvider(_)
+            | Self::SeededWithoutRenewal { .. } => None,
         }
     }
 }
@@ -297,6 +308,9 @@ impl Debug for AuthorityMaterial {
 /// jitter is exactly the failure the design forbids.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AcquisitionFailure {
+    /// This process cannot reach its explicitly configured instance metadata
+    /// origin. It is a deployment dependency, not a catalog failure.
+    MetadataUnreachable(String),
     /// Network jitter, timeout, or a retryable server answer. May back off and
     /// be attempted again.
     Transient(String),
@@ -314,7 +328,10 @@ pub enum AcquisitionFailure {
 
 impl AcquisitionFailure {
     const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transient(_) | Self::CatalogUnreachable(_))
+        matches!(
+            self,
+            Self::Transient(_) | Self::CatalogUnreachable(_) | Self::MetadataUnreachable(_)
+        )
     }
 
     /// Whether observing this failure closes the authority: a confirmed denial
@@ -329,6 +346,13 @@ impl AcquisitionFailure {
 
         let scope = id.scope().as_str();
         match self {
+            Self::MetadataUnreachable(detail) => FileError::authority(
+                FileErrorKind::Transient,
+                AuthorityFailureReason::MetadataUnreachable,
+                format!(
+                    "storage authority for {scope} could not reach instance metadata: {detail}"
+                ),
+            ),
             Self::Transient(detail) => FileError::authority(
                 FileErrorKind::Transient,
                 AuthorityFailureReason::TransientAcquisition,

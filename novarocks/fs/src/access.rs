@@ -1236,7 +1236,7 @@ pub struct ObjectStoreConfig {
 }
 
 /// Non-secret object-store configuration that participates in provider reuse.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ObjectStoreEndpointConfig {
     pub endpoint: String,
     pub enable_path_style_access: Option<bool>,
@@ -2043,7 +2043,7 @@ enum ObjectStoreCredentialProviderIdentity {
     /// Startup-composed material named by an exact static reference.
     Static(StaticCredentialReference),
     /// Identity derived from the authority that will sign the request.
-    Vended(StorageAuthorityId),
+    Authority(StorageAuthorityId),
 }
 
 /// What one object-store operator signs its requests with.
@@ -2069,7 +2069,7 @@ impl ObjectStoreCredentialSource {
                 ObjectStoreCredentialProviderIdentity::Static(reference.clone())
             }
             Self::Authority(authority) => {
-                ObjectStoreCredentialProviderIdentity::Vended(authority.id().clone())
+                ObjectStoreCredentialProviderIdentity::Authority(authority.id().clone())
             }
         }
     }

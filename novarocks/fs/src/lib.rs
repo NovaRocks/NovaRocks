@@ -33,6 +33,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 }
 
 mod access;
+mod aliyun_ecs_credentials;
 mod cache;
 mod catalog_properties;
 mod error;
@@ -64,6 +65,7 @@ pub use access::{
     ResolvedFsPath, is_object_store_location_parse_only, map_object_store_listing_error,
     parse_object_store_path_parse_only,
 };
+pub use aliyun_ecs_credentials::AliyunEcsRamRoleConfig;
 pub use cache::{
     BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,
     CacheOptions, DataCacheContext, DataCacheIoOptions, DataCacheManager, DataCacheMetricsRecorder,

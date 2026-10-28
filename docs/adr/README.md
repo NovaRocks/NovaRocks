@@ -236,6 +236,7 @@ code-anchors:
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
 - [ADR-0124](ADR-0124-native-compatibility-islands-and-ingress-admission.md) — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active；兼容材料由 ADR-0185 部分替代，exact-island 与 ingress 规则保留）
+- [ADR-0201](ADR-0201-role-local-node-credential-sources.md) — 节点身份为何使用独立 NodeLocal 来源、各角色本地取得并复用原 authority 续期，而不冒充 Static 或 Vended（active；部分替代 ADR-0151 的 NodeLocal principal 含义）
 - ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149；取得路径的含义由 ADR-0175 部分替代：两条路径都携带 FE 冻结的公开路由上下文、执行节点不建会话、vended 读取准入要求 BE 首次取得；消费侧续期与材料不跨进程仍有效）
 - [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；认证、路由、状态码与脱敏规则仍有效）
 

@@ -272,6 +272,39 @@ pub fn parse_catalog_configuration_with_object_store_binding(
     properties: &[(String, String)],
     injected_object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
+    parse_catalog_configuration_with_binding_facts(
+        catalog_name,
+        properties,
+        injected_object_store_config,
+        None,
+    )
+}
+
+/// Parse using only an already admitted endpoint. No credential material is
+/// acquired or copied merely to normalize a catalog or its warehouse identity.
+pub fn parse_catalog_configuration_with_object_store_endpoint_binding(
+    catalog_name: &str,
+    properties: &[(String, String)],
+    endpoint_binding: Option<&ObjectStoreEndpointConfig>,
+) -> Result<IcebergCatalogConfiguration, String> {
+    if let Some(endpoint) = endpoint_binding {
+        let supplied = object_store_endpoint_config_from_catalog_properties(properties)?;
+        if supplied
+            .as_ref()
+            .is_some_and(|supplied| supplied != endpoint)
+        {
+            return Err("catalog endpoint differs from its admitted object-store binding".into());
+        }
+    }
+    parse_catalog_configuration_with_binding_facts(catalog_name, properties, None, endpoint_binding)
+}
+
+fn parse_catalog_configuration_with_binding_facts(
+    catalog_name: &str,
+    properties: &[(String, String)],
+    injected_object_store_config: Option<&ObjectStoreConfig>,
+    endpoint_binding: Option<&ObjectStoreEndpointConfig>,
+) -> Result<IcebergCatalogConfiguration, String> {
     let properties = normalized_properties(properties);
     if let Some(kind) = properties.get("type")
         && !kind.eq_ignore_ascii_case("iceberg")
@@ -293,14 +326,17 @@ pub fn parse_catalog_configuration_with_object_store_binding(
     };
 
     match kind {
-        IcebergCatalogKind::Hadoop => {
-            parse_hadoop_configuration(catalog_name, properties, injected_object_store_config)
-        }
+        IcebergCatalogKind::Hadoop => parse_hadoop_configuration(
+            catalog_name,
+            properties,
+            injected_object_store_config,
+            endpoint_binding,
+        ),
         IcebergCatalogKind::Rest => {
-            parse_rest_configuration(properties, injected_object_store_config)
+            parse_rest_configuration(properties, injected_object_store_config, endpoint_binding)
         }
         IcebergCatalogKind::Hive => {
-            parse_hive_configuration(properties, injected_object_store_config)
+            parse_hive_configuration(properties, injected_object_store_config, endpoint_binding)
         }
     }
 }
@@ -309,6 +345,7 @@ fn parse_hadoop_configuration(
     catalog_name: &str,
     mut properties: HashMap<String, String>,
     injected_object_store_config: Option<&ObjectStoreConfig>,
+    endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let raw_warehouse = properties
         .get("iceberg.catalog.warehouse")
@@ -327,14 +364,17 @@ fn parse_hadoop_configuration(
         }
     };
     let (warehouse_uri, warehouse_path, object_store_config) = if is_object_store {
-        let object_store_config = resolve_object_store_config(
-            &properties,
-            injected_object_store_config,
-        )?
-        .ok_or_else(|| {
-            "object-store iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                .to_string()
-        })?;
+        let object_store_config = if endpoint_binding.is_some() {
+            None
+        } else {
+            Some(
+                resolve_object_store_config(&properties, injected_object_store_config)?
+                    .ok_or_else(|| {
+                        "object-store iceberg catalog requires an admitted object-store binding"
+                            .to_string()
+                    })?,
+            )
+        };
         // Authorization belongs to the role-local Iceberg access capability.
         // Configuration parsing must not construct an unscoped filesystem
         // operator from catalog properties.
@@ -343,7 +383,7 @@ fn parse_hadoop_configuration(
             .join(catalog_name);
         std::fs::create_dir_all(&cache_dir)
             .map_err(|error| format!("create iceberg cache dir failed: {error}"))?;
-        (raw_warehouse, cache_dir, Some(object_store_config))
+        (raw_warehouse, cache_dir, object_store_config)
     } else {
         let (warehouse_uri, warehouse_path) = normalize_warehouse_location(&raw_warehouse)?;
         std::fs::create_dir_all(&warehouse_path).map_err(|error| {
@@ -373,6 +413,7 @@ fn parse_hadoop_configuration(
 fn parse_rest_configuration(
     mut properties: HashMap<String, String>,
     injected_object_store_config: Option<&ObjectStoreConfig>,
+    endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     // Every REST configuration passes here, so a definition that would let a
     // property override the role's authentication never yields a
@@ -394,8 +435,11 @@ fn parse_rest_configuration(
         .or_else(|| properties.get("iceberg.catalog.warehouse"))
         .cloned()
         .unwrap_or_default();
-    let object_store_config =
-        resolve_object_store_config(&properties, injected_object_store_config)?;
+    let object_store_config = if endpoint_binding.is_some() {
+        None
+    } else {
+        resolve_object_store_config(&properties, injected_object_store_config)?
+    };
     properties.insert("type".to_string(), "iceberg".to_string());
     properties.insert("iceberg.catalog.type".to_string(), "rest".to_string());
     properties.insert("uri".to_string(), uri.clone());
@@ -419,6 +463,7 @@ fn parse_rest_configuration(
 fn parse_hive_configuration(
     mut properties: HashMap<String, String>,
     injected_object_store_config: Option<&ObjectStoreConfig>,
+    endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     for key in properties.keys() {
         let normalized = key.to_ascii_lowercase();
@@ -456,8 +501,11 @@ fn parse_hive_configuration(
         .or_else(|| properties.get("hive.metastore.warehouse.dir"))
         .cloned()
         .unwrap_or_default();
-    let object_store_config =
-        resolve_object_store_config(&properties, injected_object_store_config)?;
+    let object_store_config = if endpoint_binding.is_some() {
+        None
+    } else {
+        resolve_object_store_config(&properties, injected_object_store_config)?
+    };
     properties.insert("type".to_string(), "iceberg".to_string());
     properties.insert("iceberg.catalog.type".to_string(), "hive".to_string());
     properties.insert("hive.metastore.uris".to_string(), first_uri);
@@ -678,6 +726,44 @@ fn canonicalize_or_join(path: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admitted_endpoint_parsing_does_not_require_or_fabricate_secret_material() {
+        let properties = vec![
+            ("type".to_string(), "iceberg".to_string()),
+            ("iceberg.catalog.type".to_string(), "rest".to_string()),
+            ("uri".to_string(), "http://rest:8181".to_string()),
+            (
+                "aws.s3.endpoint".to_string(),
+                "https://s3.oss-cn-beijing-internal.aliyuncs.com".to_string(),
+            ),
+            ("aws.s3.region".to_string(), "cn-beijing".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "false".to_string(),
+            ),
+        ];
+        let endpoint = object_store_endpoint_config_from_catalog_properties(&properties)
+            .unwrap()
+            .unwrap();
+        let configuration = parse_catalog_configuration_with_object_store_endpoint_binding(
+            "node-local",
+            &properties,
+            Some(&endpoint),
+        )
+        .unwrap();
+        assert!(configuration.object_store_config.is_none());
+        let mut wrong_endpoint = endpoint.clone();
+        wrong_endpoint.region = Some("other-region".into());
+        assert!(
+            parse_catalog_configuration_with_object_store_endpoint_binding(
+                "node-local",
+                &properties,
+                Some(&wrong_endpoint)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn normalizes_rest_catalog_and_keeps_credentials_process_local() {

@@ -264,7 +264,7 @@ mod tests {
 
     struct RejectingStaticResolver;
 
-    impl crate::access_binding::IcebergStaticCredentialResolver for RejectingStaticResolver {
+    impl crate::access_binding::IcebergCredentialResolver for RejectingStaticResolver {
         fn resolve_object_store_static(
             &self,
             _reference: &novarocks_spi::connector::StaticCredentialReference,

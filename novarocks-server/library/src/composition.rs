@@ -1112,14 +1112,14 @@ fn compose_iceberg_access_template_from_resources(
     resources: FsAccessResources,
 ) -> anyhow::Result<IcebergReadBinding> {
     let resolver: std::sync::Arc<
-        dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
+        dyn novarocks_connector_iceberg::access_binding::IcebergCredentialResolver,
     > = std::sync::Arc::new(
         config
             .connector
             .credential_registry(ClusterRole::Be)
             .map_err(|error| anyhow::anyhow!("resolve BE catalog credentials: {error}"))?,
     );
-    Ok(IcebergReadBinding::with_static_credential_resolver(
+    Ok(IcebergReadBinding::with_credential_resolver(
         resources, resolver,
     ))
 }
@@ -1132,14 +1132,16 @@ pub(crate) fn compose_iceberg_metadata_access_template(
     resources: FsAccessResources,
 ) -> anyhow::Result<IcebergReadBinding> {
     let resolver: std::sync::Arc<
-        dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
+        dyn novarocks_connector_iceberg::access_binding::IcebergCredentialResolver,
     > = std::sync::Arc::new(
         config
             .connector
             .credential_registry(ClusterRole::Fe)
             .map_err(|error| anyhow::anyhow!("resolve FE metadata credentials: {error}"))?,
     );
-    Ok(IcebergReadBinding::with_static_metadata_credential_resolver(resources, resolver))
+    Ok(IcebergReadBinding::with_metadata_credential_resolver(
+        resources, resolver,
+    ))
 }
 
 /// The coordinator's Paimon file access: metadata reads on the process

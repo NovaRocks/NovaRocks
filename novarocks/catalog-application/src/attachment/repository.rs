@@ -23,7 +23,7 @@ use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
-    MAX_CATALOG_NON_SECRET_PROPERTIES, StaticCredentialReference,
+    MAX_CATALOG_NON_SECRET_PROPERTIES, NodeLocalCredentialReference, StaticCredentialReference,
     canonicalize_catalog_credential_bindings,
 };
 use novarocks_state_store_api::{
@@ -1145,6 +1145,11 @@ fn stored_binding_from(binding: &CatalogCredentialBinding) -> StoredCredentialBi
             Some(reference.generation().to_string()),
         ),
         CatalogCredentialMode::Vended => ("vended", None, None),
+        CatalogCredentialMode::NodeLocal(reference) => (
+            "node-local",
+            Some(reference.name().to_string()),
+            Some(reference.generation().to_string()),
+        ),
     };
     StoredCredentialBinding {
         purpose: match binding.purpose() {
@@ -1193,6 +1198,19 @@ fn binding_from_stored(
             })?;
             CatalogCredentialMode::Static(
                 StaticCredentialReference::try_new(name, generation)
+                    .map_err(|error| corruption(error.to_string()))?,
+            )
+        }
+        "node-local" => {
+            let name = stored
+                .name
+                .as_deref()
+                .ok_or_else(|| corruption("node-local catalog credential binding requires name"))?;
+            let generation = stored.generation.as_deref().ok_or_else(|| {
+                corruption("node-local catalog credential binding requires generation")
+            })?;
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new(name, generation)
                     .map_err(|error| corruption(error.to_string()))?,
             )
         }
@@ -1287,6 +1305,26 @@ mod tests {
     use novarocks_state_store_testkit::testing::InMemoryStateStore;
 
     use super::*;
+
+    #[test]
+    fn node_local_source_reference_survives_attachment_storage() {
+        let binding = CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new("worker-source", "blue").unwrap(),
+            ),
+        )
+        .unwrap();
+        let stored = stored_binding_from(&binding);
+        assert_eq!(stored.mode, "node-local");
+        assert_eq!(stored.name.as_deref(), Some("worker-source"));
+        assert_eq!(stored.generation.as_deref(), Some("blue"));
+        assert_eq!(binding_from_stored(stored).unwrap(), binding);
+        let mut invalid = stored_binding_from(&binding);
+        invalid.purpose = "data-credential-vending".into();
+        assert!(binding_from_stored(invalid).is_err());
+    }
 
     /// Test-only composition adapter. Product provider construction remains
     /// outside Catalog; these tests need only a contract-conforming store with

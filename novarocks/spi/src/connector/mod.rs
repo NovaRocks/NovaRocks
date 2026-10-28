@@ -123,8 +123,9 @@ pub use credential::{
     CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
     CredentialConsumerRole, MAX_CATALOG_CREDENTIAL_BINDINGS, MAX_CATALOG_NON_SECRET_PROPERTIES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES,
-    StaticCredentialReference, StorageAccessDomainId, StorageCredentialScopePrefix,
-    canonical_catalog_credential_binding_bytes, canonicalize_catalog_credential_bindings,
+    NodeLocalCredentialReference, StaticCredentialReference, StorageAccessDomainId,
+    StorageCredentialScopePrefix, canonical_catalog_credential_binding_bytes,
+    canonicalize_catalog_credential_bindings,
 };
 pub use credential_lease::{
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,

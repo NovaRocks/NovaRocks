@@ -23,7 +23,7 @@
 //! process-global credential/runtime lookup participates in this step.
 
 use crate::PROVIDER_ID;
-use crate::catalog_config::parse_catalog_configuration_with_object_store_binding;
+use crate::catalog_config::parse_catalog_configuration_with_object_store_endpoint_binding;
 use crate::catalog_control::IcebergCatalogControlState;
 use crate::catalog_control::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
 use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
@@ -155,7 +155,7 @@ impl IcebergConnectorFactory {
         let rest_access_delegation = rest_access_delegation_mode(catalog_properties, &properties)?;
         // Bind the FE metadata principal independently from the execution-data
         // declaration inspected above. A vended data binding chooses the
-        // attempt acquisition strategy; all FE FileIO uses this static
+        // attempt acquisition strategy; all FE FileIO uses this deployment-bound
         // generation-owned metadata binding. The same bind carries the
         // definition's CatalogControl reference, so the generation resolves
         // its coordinator control identity from this binding and from no
@@ -183,10 +183,12 @@ impl IcebergConnectorFactory {
                 })
                 .transpose()?
                 .flatten();
-        let configuration = parse_catalog_configuration_with_object_store_binding(
+        let configuration = parse_catalog_configuration_with_object_store_endpoint_binding(
             request.instance_id().as_str(),
             &properties,
-            object_store_config.as_ref().map(|binding| binding.config()),
+            object_store_config
+                .as_ref()
+                .map(|binding| binding.endpoint_config()),
         )
         .map_err(invalid)?
         .without_object_store_config();
@@ -1032,7 +1034,7 @@ mod tests {
     /// A coordinator resolver holding exactly one catalog-control identity.
     struct ControlIdentityResolver;
 
-    impl crate::access_binding::IcebergStaticCredentialResolver for ControlIdentityResolver {
+    impl crate::access_binding::IcebergCredentialResolver for ControlIdentityResolver {
         fn resolve_object_store_static(
             &self,
             _reference: &StaticCredentialReference,
@@ -1069,11 +1071,10 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let template =
-            crate::access_binding::IcebergReadBinding::with_static_metadata_credential_resolver(
-                resources,
-                Arc::new(ControlIdentityResolver),
-            );
+        let template = crate::access_binding::IcebergReadBinding::with_metadata_credential_resolver(
+            resources,
+            Arc::new(ControlIdentityResolver),
+        );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             template,
             runtime.handle().clone(),

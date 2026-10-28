@@ -165,6 +165,11 @@ impl PaimonRoleFileIoFactory for ServerPaimonRoleFileIoFactory {
             })?;
         let credential_reference = match object_store_binding.mode() {
             CatalogCredentialMode::Static(reference) => reference,
+            CatalogCredentialMode::NodeLocal(_) => {
+                return Err(unsupported(
+                    "Paimon filesystem catalogs do not support node-local credentials",
+                ));
+            }
             CatalogCredentialMode::Vended => {
                 return Err(unsupported(
                     "PAI-1 Paimon filesystem catalogs do not support vended credentials",
