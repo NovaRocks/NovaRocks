@@ -222,7 +222,7 @@ impl StorageNeed {
 /// Fixed Task inputs are actual one-shot lifecycle roles, not RPC op counts.
 /// A role with several observations uses its existing report position and a
 /// coalesced pending flag; it cannot enqueue an unbounded stream of copies.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(usize)]
 pub enum TaskLifecycleRole {
     InputLoaded,

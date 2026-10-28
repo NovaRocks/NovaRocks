@@ -596,6 +596,7 @@ mod tests {
                 preparation_remainder,
                 completion,
                 completion_action,
+                lifecycle_inputs,
                 open_summary,
                 causal,
             } = self.host.take().unwrap().into_resources();
@@ -607,6 +608,7 @@ mod tests {
             assert!(preparation_remainder.is_none());
             assert!(completion.is_none());
             assert!(completion_action.is_none());
+            assert!(lifecycle_inputs.is_empty());
             assert!(
                 open_summary.is_none(),
                 "this component issued no open-summary role"

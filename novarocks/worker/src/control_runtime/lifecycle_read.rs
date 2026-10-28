@@ -660,6 +660,7 @@ mod tests {
                 preparation_remainder,
                 completion,
                 completion_action,
+                lifecycle_inputs,
                 open_summary,
                 causal,
             } = self
@@ -667,6 +668,7 @@ mod tests {
                 .take()
                 .expect("one real elected lifetime")
                 .into_resources();
+            assert!(lifecycle_inputs.is_empty());
             assert!(
                 loader.is_none()
                     && loading_events.is_none()

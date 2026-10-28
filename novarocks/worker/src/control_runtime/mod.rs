@@ -45,6 +45,7 @@ pub(crate) mod task;
 pub(crate) mod task_publication;
 
 pub(crate) mod causal;
+pub(crate) mod causal_input;
 pub(crate) mod completion_action;
 pub(crate) mod failure;
 pub(crate) mod lifecycle_read;

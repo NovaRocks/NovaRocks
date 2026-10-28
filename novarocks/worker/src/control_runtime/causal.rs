@@ -20,7 +20,7 @@
 //! inputs to the common runtime. It never runs callbacks or source disposal.
 
 use super::actors::{ContextMessage, WorkerActor, WorkerMessage};
-use super::completion_action::CompletionActionCustody;
+use super::causal_input::CausalInputCustody;
 use super::failure::ScopePublicationsDrained;
 use super::loading::LoaderCustody;
 use super::loading_events::LoadingAuthorReturn;
@@ -243,7 +243,7 @@ struct Role {
     delivered: Option<Delivered>,
     // Reference the original custodian, not a copied consumption flag. Its
     // report must finish before this role can discard the exact event receipt.
-    completion_action: Option<CompletionActionCustody>,
+    input_author: Option<CausalInputCustody>,
     loader_exit: Option<LoaderCustody>,
 }
 
@@ -296,10 +296,7 @@ impl TaskCausalInbox {
             return Err(CausalError::WrongTask);
         }
         let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.delivered.is_some()
-            || role.completion_action.is_some()
-            || role.loader_exit.is_some()
-        {
+        if role.delivered.is_some() || role.input_author.is_some() || role.loader_exit.is_some() {
             return Err(CausalError::AlreadyAdmitted);
         }
         self.ingress.validate_input_author(cut, task, work)?;
@@ -446,7 +443,7 @@ impl TaskCausalInbox {
                     Role {
                         inputs,
                         delivered: None,
-                        completion_action: None,
+                        input_author: None,
                         loader_exit: None,
                     }
                 )
@@ -463,9 +460,9 @@ impl TaskCausalInbox {
             },
         ))
     }
-    pub(crate) fn bind_completion_action(
+    pub(crate) fn bind_input_author(
         &mut self,
-        action: CompletionActionCustody,
+        action: CausalInputCustody,
     ) -> Result<(), CausalError> {
         if action.task() != self.task {
             return Err(CausalError::WrongTask);
@@ -474,13 +471,10 @@ impl TaskCausalInbox {
             .roles
             .get_mut(&action.cut())
             .ok_or(CausalError::UnknownRole)?;
-        if role.completion_action.is_some()
-            || role.loader_exit.is_some()
-            || role.delivered.is_some()
-        {
+        if role.input_author.is_some() || role.loader_exit.is_some() || role.delivered.is_some() {
             return Err(CausalError::AlreadyAdmitted);
         }
-        role.completion_action = Some(action);
+        role.input_author = Some(action);
         Ok(())
     }
     /// The exit event receipt remains with the same actual loader until its
@@ -497,10 +491,7 @@ impl TaskCausalInbox {
         self.ingress
             .validate_input_author(cut, self.task, loader.work_id())?;
         let role = self.roles.get_mut(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.completion_action.is_some()
-            || role.loader_exit.is_some()
-            || role.delivered.is_some()
-        {
+        if role.input_author.is_some() || role.loader_exit.is_some() || role.delivered.is_some() {
             return Err(CausalError::AlreadyAdmitted);
         }
         role.loader_exit = Some(loader);
@@ -852,7 +843,7 @@ impl TaskCausalInbox {
     ) -> Result<RetiredCut, CausalRetirementRefusal> {
         let checked = (|| {
             let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-            if role.completion_action.as_ref().is_some_and(|action| {
+            if role.input_author.as_ref().is_some_and(|action| {
                 action.phase() != novarocks_control_runtime::exit_role::ExitRolePhase::Retired
             }) || role.loader_exit.as_ref().is_some_and(|loader| {
                 loader.phase() != novarocks_control_runtime::exit_role::ExitRolePhase::Retired

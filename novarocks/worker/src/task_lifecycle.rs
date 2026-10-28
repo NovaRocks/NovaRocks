@@ -28,6 +28,69 @@ use novarocks_execution_contract::{
 };
 use std::{future::Future, pin::Pin, sync::Arc};
 
+/// The dormant start's unique, already admitted Running input. Read handles
+/// and reporter clones cannot mint or duplicate this original authority.
+#[must_use = "Transfer Running once, or withdraw this original unused start role"]
+pub struct TaskStartPermit {
+    identity: TaskIdentity,
+    author: Option<crate::control_runtime::causal_input::InputAuthor>,
+}
+impl std::fmt::Debug for TaskStartPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskStartPermit")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Debug)]
+pub struct TaskStartHandoffError;
+impl std::fmt::Display for TaskStartHandoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the original Task Running input could not be handed off")
+    }
+}
+impl std::error::Error for TaskStartHandoffError {}
+impl novarocks_execution_contract::failure::FailureProjection for TaskStartHandoffError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::CausalInputUnresolved.reason(),
+        )
+    }
+}
+impl TaskStartPermit {
+    pub(crate) fn from_admitted_author(
+        author: crate::control_runtime::causal_input::InputAuthor,
+    ) -> Self {
+        Self {
+            identity: author.task(),
+            author: Some(author),
+        }
+    }
+    pub const fn identity(&self) -> TaskIdentity {
+        self.identity
+    }
+    /// Success transfers the input at the Task's original causal fence. It
+    /// does not claim that the Core has consumed it or published RUNNING.
+    pub fn handoff_running(mut self) -> Result<(), TaskStartHandoffError> {
+        self.author
+            .take()
+            .expect("one original dormant start input")
+            .publish(novarocks_worker_protocol::context::ContextInput::Running {
+                task: self.identity,
+            })
+            .map_err(|_retained| TaskStartHandoffError)
+    }
+}
+impl Drop for TaskStartPermit {
+    fn drop(&mut self) {
+        if let Some(author) = self.author.take() {
+            let _reported = author.withdraw();
+        }
+    }
+}
+
 /// A control intent has no originating failure source. A real failure enters
 /// through TaskConclusionPort::submit with its original ExecutionFailure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

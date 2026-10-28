@@ -121,6 +121,7 @@ pub(crate) enum WorkerFailureReason {
     SettlementCall = 166,
     CompletionWorkUnresolved = 167,
     ProtocolOwnerFailed = 168,
+    CausalInputUnresolved = 169,
 }
 impl WorkerFailureReason {
     pub(crate) const fn reason(self) -> FailureReason {

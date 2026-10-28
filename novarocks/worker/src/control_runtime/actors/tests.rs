@@ -1094,6 +1094,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         preparation_remainder,
         completion,
         completion_action,
+        lifecycle_inputs,
         open_summary,
         mut causal,
     } = host.into_resources();
@@ -1116,6 +1117,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert!(preparation_remainder.is_none());
     assert!(completion.is_none());
     assert!(completion_action.is_none());
+    assert!(lifecycle_inputs.is_empty());
     assert!(open_summary.is_none());
     assert!(!lifetime.actual_exit_ready().unwrap());
 
@@ -2004,6 +2006,13 @@ enum SettlementScenario {
     FailAfterBarrier,
 }
 fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementScenario) {
+    exercise_fragment_roles_with_start(task_stopped, settlement, false);
+}
+fn exercise_fragment_roles_with_start(
+    task_stopped: bool,
+    settlement: SettlementScenario,
+    start_role: bool,
+) {
     use crate::control_runtime::{
         effect_dispatch::EffectDispatch,
         preparation::PreparationOutcome,
@@ -2110,6 +2119,10 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
             .is_empty(),
         "loading cannot borrow post-Accepted input positions from another Task"
     );
+    assert!(matches!(
+        host.issue_start_permit(),
+        Err(TaskHostError::CompletionBeforeAccepted)
+    ));
     let registration = Arc::new(AtomicUsize::new(0));
     let (error, notice) =
         match host.issue_completion_roles(Box::new(Registered(registration.clone()))) {
@@ -2223,6 +2236,51 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
             self.notice.unused();
             self.calls.fetch_add(2, Ordering::SeqCst);
         }
+    }
+    if start_role {
+        let permit = host.issue_start_permit().unwrap();
+        assert_eq!(permit.identity(), task);
+        let issued = f.scope.snapshot().unwrap();
+        let cut = host
+            .lifecycle_input(TaskLifecycleRole::Running)
+            .unwrap()
+            .cut();
+        assert!(matches!(
+            host.issue_start_permit(),
+            Err(TaskHostError::LifecycleAlreadyIssued(
+                TaskLifecycleRole::Running
+            ))
+        ));
+        assert_eq!(f.scope.snapshot().unwrap(), issued);
+        // The dormant start is never called. Its unique typed permit owns
+        // this unused withdrawal, independently of the still-live preparation.
+        drop(permit);
+        assert!(host.observe_lifecycle_inputs().unwrap());
+        assert!(port.ingress().event_unused(cut).unwrap());
+        port.ingress().observe_cut_exit(cut, true, true).unwrap();
+        let retired = host
+            .causal()
+            .retire_after_exit(
+                cut,
+                crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
+            )
+            .unwrap();
+        dispose_retired_pair(&f, port.ingress(), retired);
+        f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
+        assert_eq!(
+            host.lifecycle_input(TaskLifecycleRole::Running)
+                .unwrap()
+                .phase(),
+            novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+        );
+        assert!(host.causal().is_empty());
+        assert!(
+            f.runtime
+                .role_inventory(actor(), None, 32)
+                .unwrap()
+                .is_empty()
+        );
+        f.assert_storage_paid(policy.task_base);
     }
     let before_source2 = f.scope.snapshot().unwrap();
     let (cut, notice) = host.admit_settlement_notice(1).unwrap();
@@ -2615,6 +2673,7 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         mut preparation_remainder,
         completion,
         completion_action,
+        lifecycle_inputs,
         open_summary,
         causal,
     } = host.into_resources();
@@ -2633,6 +2692,16 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         "this component issued no open-summary role"
     );
     assert!(causal.is_empty());
+    if start_role {
+        assert_eq!(lifecycle_inputs.len(), 1);
+        assert_eq!(
+            lifecycle_inputs[&TaskLifecycleRole::Running].phase(),
+            novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+        );
+    } else {
+        assert!(lifecycle_inputs.is_empty());
+    }
+    drop(lifecycle_inputs);
     drop(causal);
     drop(completion);
     drop(preparation);
@@ -2694,6 +2763,11 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         usize::from(settlement != SettlementScenario::Unused),
         "a reentrant executor cannot refresh or run the same original callback"
     );
+}
+
+#[test]
+fn an_accepted_start_issuer_holds_one_original_role_and_withdraws_only_its_unused_permit() {
+    exercise_fragment_roles_with_start(false, SettlementScenario::Unused, true);
 }
 
 #[test]

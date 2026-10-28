@@ -23,7 +23,8 @@ use super::{
     actors::{WorkerAction, WorkerActor},
     admitted_role::{dispose_unused_completion, reserve_reported_role},
     causal::{CausalAdmissionRefusal, CausalError, TaskCausalInbox},
-    completion_action::{CompletionActionCustody, CompletionActionError},
+    causal_input::{CausalInputBinding, CausalInputCustody, CausalInputError, InputAuthor},
+    completion_action::CompletionActionCustody,
     host_executor::{HostExecutorHandle, HostSubmitError},
     lifecycle_read::{TaskLifetime, TaskReadBinding, TaskReadError, TaskReadSnapshot},
     loading::{LoaderCustody, LoaderJob, LoadingSources, TaskCreatePayload},
@@ -39,6 +40,7 @@ use super::{
     },
     preparation_refusal::{HostPreparationRefusal, RefusalPosition},
 };
+use crate::control_runtime_policy::TaskLifecycleRole;
 use crate::{
     settlement::RegistrationNotice,
     task_completion_roles::{AdmittedCompletionRole, TaskCompletionRoles},
@@ -60,7 +62,7 @@ use novarocks_control_runtime_core::{
 use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
 use novarocks_execution_contract::{AdmittedFragmentRoles, QueryContextRef, TaskIdentity};
 use novarocks_worker_protocol::{context::ContextEffect, creation::PayloadId};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 pub(crate) struct TaskHostBinding {
     pub context: QueryContextRef,
@@ -84,11 +86,12 @@ pub(crate) enum TaskHostError {
     CompletionBeforeAccepted,
     CompletionAlreadyIssued,
     OpenSummaryAlreadyIssued,
+    LifecycleAlreadyIssued(TaskLifecycleRole),
     Driver(DriverError),
     Runtime(RuntimeError),
     AdmissionBindInvariant(RuntimeError),
     Causal(CausalError),
-    CompletionAction(CompletionActionError),
+    CompletionAction(CausalInputError),
     Preparation(PreparationAdoptionError),
 }
 impl From<RuntimeError> for TaskHostError {
@@ -119,6 +122,12 @@ impl std::fmt::Display for TaskHostError {
             }
             Self::OpenSummaryAlreadyIssued => {
                 f.write_str("the original Task open-summary input was already issued")
+            }
+            Self::LifecycleAlreadyIssued(role) => {
+                write!(
+                    f,
+                    "the Task's original {role:?} lifecycle input was already issued"
+                )
             }
             Self::Driver(error) => write!(f, "Task host responsibility transfer failed: {error}"),
             Self::Runtime(error) => write!(f, "Task host work admission failed: {error}"),
@@ -207,6 +216,7 @@ pub(crate) struct TaskHostResources {
     pub preparation_remainder: Option<CapacityBundle>,
     pub completion: Option<Arc<TaskCompletionRoles>>,
     pub completion_action: Option<CompletionActionCustody>,
+    pub lifecycle_inputs: BTreeMap<TaskLifecycleRole, CausalInputCustody>,
     pub open_summary: Option<TaskOpenSummaryInbox>,
     pub causal: TaskCausalInbox,
 }
@@ -245,6 +255,10 @@ impl TaskHostResources {
                 .completion_action
                 .as_ref()
                 .is_some_and(|role| role.phase() != ExitRolePhase::Retired)
+            || self
+                .lifecycle_inputs
+                .values()
+                .any(|input| input.phase() != ExitRolePhase::Retired)
         {
             return Err(TaskReadError::HostInventoryStillLive);
         }
@@ -403,6 +417,7 @@ pub(crate) struct TaskHostRecord {
     completion_action_issued: bool,
     settlement_notice_issued: bool,
     loader_issued: bool,
+    lifecycle_issued: [bool; TaskLifecycleRole::COUNT],
 }
 impl TaskHostRecord {
     /// Electing the Task and paying its active/loading storage happened in
@@ -505,6 +520,7 @@ impl TaskHostRecord {
                 preparation_remainder: None,
                 completion: None,
                 completion_action: None,
+                lifecycle_inputs: BTreeMap::new(),
                 open_summary: None,
                 causal: TaskCausalInbox::new(
                     runtime.clone(),
@@ -520,6 +536,7 @@ impl TaskHostRecord {
             completion_action_issued: false,
             settlement_notice_issued: false,
             loader_issued: false,
+            lifecycle_issued: [false; TaskLifecycleRole::COUNT],
         })
     }
     pub(crate) fn port(&self) -> Arc<TaskRuntimePort> {
@@ -961,6 +978,89 @@ impl TaskHostRecord {
         };
         self.resources.preparation_remainder = preparation.take_after_exit()?;
         Ok(self.resources.preparation_remainder.is_some())
+    }
+    /// Issue before the dormant runtime start captures this capability. Only
+    /// this owner can consume the original Running role's paid inventory.
+    pub(crate) fn issue_start_permit(&mut self) -> Result<crate::TaskStartPermit, TaskHostError> {
+        self.issue_lifecycle_author(TaskLifecycleRole::Running)
+            .map(crate::TaskStartPermit::from_admitted_author)
+    }
+    fn issue_lifecycle_author(
+        &mut self,
+        kind: TaskLifecycleRole,
+    ) -> Result<InputAuthor, TaskHostError> {
+        if self.resources.preparation.is_none() {
+            return Err(TaskHostError::CompletionBeforeAccepted);
+        }
+        if std::mem::replace(&mut self.lifecycle_issued[kind as usize], true) {
+            return Err(TaskHostError::LifecycleAlreadyIssued(kind));
+        }
+        let role = reserve_reported_role(
+            &self.scope,
+            self.resources.active.id(),
+            WorkKind::Cleanup,
+            Some(self.core_generation),
+        )?;
+        let sources = match reserve_source_roles::<2>(
+            &self.scope,
+            self.resources.active.id(),
+            self.core_generation,
+        ) {
+            Ok(sources) => sources,
+            Err(error) => {
+                dispose_unused_completion(role);
+                return Err(error.into());
+            }
+        };
+        let (cut, sender) = match self.resources.causal.admit_input(
+            role.work.id(),
+            1,
+            self.pending.clone(),
+            CutSourceAdmission::Fresh(sources),
+        ) {
+            Ok(admitted) => admitted,
+            Err(refusal) => {
+                let error = dispose_fresh_source_refusal(refusal);
+                dispose_unused_completion(role);
+                return Err(TaskHostError::Causal(error));
+            }
+        };
+        let (custody, author) = CausalInputCustody::from_admitted(
+            role,
+            &mut self.resources.causal,
+            cut,
+            sender,
+            CausalInputBinding {
+                task: self.task,
+                pending: self.pending.clone(),
+                health: self.health.clone(),
+                unresolved: novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Invariant,
+                    crate::failure_reason::WorkerFailureReason::CausalInputUnresolved.reason(),
+                ),
+            },
+        );
+        assert!(
+            self.resources
+                .lifecycle_inputs
+                .insert(kind, custody)
+                .is_none()
+        );
+        Ok(author)
+    }
+    /// Observe the same finite original roles. Physical author return and
+    /// consumption of its exact Core event remain independent report legs.
+    pub(crate) fn observe_lifecycle_inputs(&mut self) -> Result<bool, TaskHostError> {
+        let mut retired = true;
+        for input in self.resources.lifecycle_inputs.values() {
+            retired &= input
+                .observe_consumers(&mut self.resources.causal)
+                .map_err(TaskHostError::CompletionAction)?;
+        }
+        Ok(retired)
+    }
+    pub(crate) fn lifecycle_input(&self, kind: TaskLifecycleRole) -> Option<&CausalInputCustody> {
+        self.resources.lifecycle_inputs.get(&kind)
     }
     /// Called once before the dormant fragment captures any original callback.
     /// Each role consumes a header from the already paid Task storage; the
