@@ -2248,7 +2248,9 @@ mod tests {
         );
         let settled = Arc::new(Mutex::new(None));
         let result = settled.clone();
-        owner.on_settled(Box::new(move |snapshot| *result.lock().unwrap() = snapshot));
+        owner
+            .admit_barrier()
+            .register(Box::new(move |snapshot| *result.lock().unwrap() = snapshot));
         assert!(settled.lock().unwrap().is_none());
         assert!(owner.advance_one());
         let accepted = owner

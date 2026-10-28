@@ -1005,7 +1005,44 @@ pub struct EstablishQueryContext {
     initial_lease_valid_for: LeaseValidFor,
 }
 
+/// Owned transport fields before the application attaches source custody.
+/// Moving these fields performs no opaque getter, clone or destructor. The
+/// carrier itself grants no admission, execution or retirement authority.
+/// Consumers must supervise each external field independently during disposal.
+pub struct EstablishQueryContextParts {
+    pub envelope: OperationEnvelope,
+    pub context: QueryContextRef,
+    pub admission_ticket_id: AdmissionTicketId,
+    pub catalog_binding: Arc<dyn CodecOwnedContent>,
+    pub initial_runtime_filter: Arc<dyn CodecOwnedContent>,
+    pub query_options: Arc<dyn CodecOwnedContent>,
+    pub initial_credential: CredentialUpdate,
+    pub initial_lease_valid_for: LeaseValidFor,
+}
+
 impl EstablishQueryContext {
+    pub fn into_owned_parts(self) -> EstablishQueryContextParts {
+        let Self {
+            envelope,
+            context,
+            admission_ticket_id,
+            catalog_binding,
+            initial_runtime_filter,
+            query_options,
+            initial_credential,
+            initial_lease_valid_for,
+        } = self;
+        EstablishQueryContextParts {
+            envelope,
+            context,
+            admission_ticket_id,
+            catalog_binding,
+            initial_runtime_filter,
+            query_options,
+            initial_credential,
+            initial_lease_valid_for,
+        }
+    }
     pub fn new(
         operation_id: TaskOperationId,
         context: QueryContextRef,

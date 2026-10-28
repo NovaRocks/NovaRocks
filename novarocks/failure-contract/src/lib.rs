@@ -368,6 +368,15 @@ mod tests {
 
 mod shared_cause;
 pub use shared_cause::SharedFailureCause;
+mod source_retention;
+pub use source_retention::split_source_retention;
+
+/// An already admitted source's lifetime guard. Its issuer retains the actual
+/// source Work and report; this marker grants no capacity, registration or
+/// permission to start work. It has no callable entry point and is destroyed
+/// only after the canonical source node's original payload is destroyed.
+/// Independently shared resources inside that payload keep their own guards.
+pub trait SourceRetentionCapability: std::fmt::Debug + Send + Sync + 'static {}
 
 /// A producer declares an unmaskable outer failure channel. Per-row data
 /// errors do not implement this marker and keep their separate row channel.

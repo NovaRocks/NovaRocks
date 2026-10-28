@@ -139,7 +139,7 @@ fn pool_case(workers: usize) {
             .register(
                 aid(id),
                 scope.clone(),
-                slot(1),
+                slot(id),
                 Counter {
                     seen: vec![],
                     effect: false,
@@ -228,7 +228,7 @@ fn slow_host_destructor_keeps_its_work_but_does_not_occupy_the_only_poller() {
         .register(
             aid(2),
             second.clone(),
-            slot(1),
+            slot(2),
             Counter {
                 seen: vec![],
                 effect: false,

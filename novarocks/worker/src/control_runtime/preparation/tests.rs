@@ -71,15 +71,6 @@ fn input(drops: Arc<AtomicUsize>) -> TaskCreationInput {
         Box::new(Assignment(drops)),
     )
 }
-fn task_port(scope: &ScopeHandle, task: TaskIdentity) -> Arc<crate::task_port::TaskRuntimePort> {
-    Arc::new(crate::task_port::TaskRuntimePort::from_admitted(
-        task,
-        scope,
-        Arc::new(crate::task_proposal_ingress::TaskProposalIngress::new(4).unwrap()),
-        Arc::new(Pending),
-        Arc::new(ExecutionHealth::default()),
-    ))
-}
 struct Fixture {
     ledger: RuntimeLedger,
     scopes: Vec<ScopeHandle>,
@@ -113,15 +104,6 @@ impl Fixture {
         &self,
         scope: &ScopeHandle,
         n: u32,
-        input: TaskCreationInput,
-    ) -> (PreparationCustody, PreparationJob) {
-        let port = task_port(scope, identity(n));
-        self.admitted_for_port(scope, &port, input)
-    }
-    fn admitted_for_port(
-        &self,
-        scope: &ScopeHandle,
-        port: &Arc<crate::task_port::TaskRuntimePort>,
         input: TaskCreationInput,
     ) -> (PreparationCustody, PreparationJob) {
         let (work, capacity) = scope
@@ -162,9 +144,9 @@ impl Fixture {
         let reports = [report(), report()];
         PreparationCustody::from_admitted(
             PreparationBinding {
-                stop: port.stop_signal(),
+                stop: crate::task_port::TaskStopSignal::initial(identity(n)),
                 pending: Arc::new(Pending),
-                health: port.health(),
+                health: Arc::new(ExecutionHealth::default()),
             },
             work,
             capacity,

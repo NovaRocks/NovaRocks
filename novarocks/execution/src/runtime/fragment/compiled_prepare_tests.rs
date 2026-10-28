@@ -350,6 +350,79 @@ fn compiled_receiver_after_exchange_failure_preserves_primary_cleanup_and_contro
     assert_eq!(tracker.current(), 0);
 }
 
+#[test]
+fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition() {
+    use crate::runtime::task_control::test_support::Owner;
+    use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct FirstHostCall(AtomicUsize);
+    impl crate::runtime::fragment::io::FragmentCommitPort for FirstHostCall {
+        fn acquire(
+            &self,
+            _: UniqueId,
+        ) -> ExecutionResult<Box<dyn crate::runtime::fragment::io::FragmentCommitLease>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(novarocks_functions::KernelFailure::ResourceExhausted.into())
+        }
+    }
+    // No first-host-call refusal is allowed to hide a missing role/control
+    // error. Each malformed Task binding must fail at the submission boundary.
+    for scenario in 0..6 {
+        let owner = Owner::new();
+        let foreign = Owner::new();
+        let calls = Arc::new(FirstHostCall(AtomicUsize::new(0)));
+        let control = Arc::new(owner.view(TaskFailurePhase::Execution));
+        let mut context =
+            FragmentPrepareContext::default().with_fragment_commit_port(calls.clone());
+        context = match scenario {
+            0 => context
+                .with_result_identity(owner.identity())
+                .with_task_control(control),
+            1 => context
+                .with_result_identity(owner.identity())
+                .with_completion_roles(owner.admit_completion_roles()),
+            2 => context
+                .with_result_identity(owner.identity())
+                .with_task_control(Arc::new(foreign.view(TaskFailurePhase::Execution)))
+                .with_completion_roles(owner.admit_completion_roles()),
+            3 => context
+                .with_result_identity(owner.identity())
+                .with_task_control(control)
+                .with_completion_roles(foreign.admit_completion_roles()),
+            4 => context.with_task_control(control),
+            5 => context.with_completion_roles(owner.admit_completion_roles()),
+            _ => unreachable!(),
+        };
+        let submission = CompiledFragmentSubmission::try_new(
+            program(SeedMode::Input, false),
+            CompiledScanSources::new(),
+            instance(
+                UniqueId::new(201, 202),
+                1,
+                ExchangeInputAssignments::default(),
+            ),
+        )
+        .unwrap();
+        let error = refused(prepare_compiled_fragment(submission, context));
+        assert_eq!(
+            error.stage(),
+            FragmentLaunchStage::ValidateSubmission,
+            "scenario {scenario}"
+        );
+        assert_eq!(
+            error.kind(),
+            FragmentLaunchErrorKind::Binding,
+            "scenario {scenario}"
+        );
+        assert_eq!(
+            calls.0.load(Ordering::SeqCst),
+            0,
+            "scenario {scenario} reached host acquisition"
+        );
+        assert!(error.cleanup_diagnostics().is_empty());
+    }
+}
+
 // The Task-facing entry prepares a compiled program into the ordinary dormant
 // handle: its result rows reach the opened result session, computed only by
 // compiled roots.

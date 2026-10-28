@@ -33,7 +33,7 @@ pub enum TaskDiagnosticRole {
     Cleanup,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct InlineSafeDetail {
     bytes: [u8; MAX_DETAIL_BYTES],
     len: u16,
@@ -66,7 +66,7 @@ impl fmt::Debug for InlineSafeDetail {
 }
 
 /// Fixed-layout neutral facts. No original source or runtime owner is retained.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct TaskSecondaryDiagnostic {
     role: TaskDiagnosticRole,
     phase: TaskFailurePhase,
@@ -144,13 +144,40 @@ pub enum DiagnosticRecordOutcome {
 
 /// One local snapshot clones at most four cold records without allocating or
 /// pinning Task/runtime/source owners. Retirement/wire export remains separate.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskSecondaryDiagnosticsSnapshot {
     entries: [Option<Arc<TaskSecondaryDiagnostic>>; MAX_DIAGNOSTICS],
     len: u8,
     dropped: u64,
 }
 impl TaskSecondaryDiagnosticsSnapshot {
+    /// Copy only the Core's already safe neutral records. An invalid geometry
+    /// is rejected rather than truncated into a different observed history.
+    pub(crate) fn from_protocol(
+        diagnostics: &novarocks_worker_protocol::proposal_summary::Diagnostics,
+    ) -> Option<Self> {
+        if diagnostics.entries.len() > MAX_DIAGNOSTICS {
+            return None;
+        }
+        let mut entries = std::array::from_fn(|_| None);
+        for (slot, diagnostic) in entries.iter_mut().zip(&diagnostics.entries) {
+            *slot = Some(Arc::new(TaskSecondaryDiagnostic {
+                role: if diagnostic.cleanup {
+                    TaskDiagnosticRole::Cleanup
+                } else {
+                    TaskDiagnosticRole::LateFailure
+                },
+                phase: diagnostic.phase,
+                fact: diagnostic.fact,
+                detail: InlineSafeDetail::copy_safe(&diagnostic.detail),
+            }));
+        }
+        Some(Self {
+            entries,
+            len: diagnostics.entries.len() as u8,
+            dropped: diagnostics.dropped,
+        })
+    }
     pub fn entries(&self) -> impl ExactSizeIterator<Item = &TaskSecondaryDiagnostic> {
         self.entries[..usize::from(self.len)].iter().map(|entry| {
             entry

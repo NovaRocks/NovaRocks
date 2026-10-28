@@ -20,11 +20,14 @@
 use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
+    history::HistoryCapture,
+    lease::WorkRetirementObserver,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
     completion::{CompletionError, ConsumerKind},
+    history::HistoryFact,
     identity::{ConsumerId, DimensionId, Generation, WorkId},
     scope::{WorkAdmission, WorkKind},
 };
@@ -46,11 +49,17 @@ struct Fixture {
     owner: ConsumerId,
     observer: ConsumerId,
     work: WorkId,
+    retirement: WorkRetirementObserver,
+    history: HistoryCapture,
 }
 fn fixture() -> Fixture {
-    let ledger = RuntimeLedger::new(resources(1), 1, 1);
+    fixture_with_preobserved_body(false)
+}
+fn fixture_with_preobserved_body(body_exited: bool) -> Fixture {
+    let history = HistoryCapture::new(64);
+    let ledger = RuntimeLedger::with_history(resources(1), 1, 1, history.clone());
     let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-    let (work, capacity) = scope
+    let (mut work, capacity) = scope
         .reserve_next(
             generation(),
             resources(1),
@@ -80,7 +89,18 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let id = work.id();
-    let (role, authority) = ExitRole::from_admitted(work, capacity, report.clone());
+    let retirement = work.retirement_observer();
+    if body_exited {
+        work.body_exited().unwrap();
+    }
+    let (role, authority) = ExitRole::from_admitted(
+        novarocks_control_runtime::reported_work::ReportedWork::try_new(
+            work,
+            capacity,
+            report.clone(),
+        )
+        .unwrap(),
+    );
     Fixture {
         ledger,
         scope,
@@ -90,7 +110,35 @@ fn fixture() -> Fixture {
         owner,
         observer,
         work: id,
+        retirement,
+        history,
     }
+}
+#[test]
+fn a_reusable_position_waits_for_the_actual_reaper_after_role_and_report_retirement() {
+    let mut f = fixture();
+    assert!(!f.retirement.is_retired());
+    f.authority.take().unwrap().exited().unwrap();
+    f.report.consume(f.owner).unwrap();
+    f.report.consume(f.observer).unwrap();
+    assert!(f.role.try_retire().unwrap());
+    assert_eq!(f.role.phase(), ExitRolePhase::Retired);
+    assert_eq!(f.ledger.used(dimension()), 0);
+    assert!(
+        !f.retirement.is_retired(),
+        "returning capacity and report storage does not remove its Work header"
+    );
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 0).unwrap(), 0);
+    assert!(!f.retirement.is_retired());
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
+    assert!(f.retirement.is_retired());
+    f.scope.close_external().unwrap();
+    f.ledger.remove_scope(f.scope.id()).unwrap();
+    assert!(
+        f.retirement.is_retired(),
+        "the original bound identity remains retired after scope removal"
+    );
+    assert!(f.ledger.is_empty());
 }
 fn retire(f: &Fixture) {
     f.report.consume(f.owner).unwrap();
@@ -126,6 +174,218 @@ fn the_original_unused_holder_supplies_positive_exit_without_starting_a_body() {
     assert!(f.role.captures_exited());
     assert_eq!(f.ledger.used(dimension()), 1);
     retire(&f);
+}
+
+fn retire_revoked(f: &Fixture) {
+    assert_eq!(f.role.phase(), ExitRolePhase::Exited);
+    assert!(f.role.body_exited());
+    assert!(f.role.captures_exited());
+    assert!(f.role.actual_exit_ready().unwrap());
+    for consumer in [f.owner, f.observer] {
+        assert_eq!(
+            f.report.consume(consumer),
+            Err(RuntimeError::Completion(CompletionError::NotFilled)),
+            "a revoked unused report was never published to either consumer"
+        );
+    }
+    assert!(f.role.try_retire().unwrap());
+    assert_eq!(f.ledger.used(dimension()), 0);
+    assert!(!f.retirement.is_retired());
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
+    assert!(f.retirement.is_retired());
+    f.scope.close_external().unwrap();
+    f.ledger.remove_scope(f.scope.id()).unwrap();
+    assert!(f.ledger.is_empty());
+    let history = f.history.drain(64);
+    assert!(history.complete);
+    assert_eq!(history.remaining, 0);
+    assert!(history.entries.iter().any(|entry| matches!(
+        entry.fact,
+        HistoryFact::BodyExited { work, .. } if work == f.work
+    )));
+    assert!(history.entries.iter().any(|entry| matches!(
+        entry.fact,
+        HistoryFact::CapturesExited { work, .. } if work == f.work
+    )));
+    assert!(history.entries.iter().all(|entry| !matches!(
+        entry.fact,
+        HistoryFact::Started { .. }
+            | HistoryFact::SlotFilled { .. }
+            | HistoryFact::CompletionConsumed { .. }
+            | HistoryFact::SlotAbandoned { .. }
+    )));
+}
+
+#[test]
+fn unused_revocation_retires_the_original_report_without_fictitious_consumers() {
+    let mut f = fixture();
+    f.authority
+        .take()
+        .unwrap()
+        .revoke_unused_and_exit()
+        .unwrap();
+    retire_revoked(&f);
+}
+
+#[test]
+fn scope_failure_does_not_prevent_real_unused_holder_revocation_and_exit() {
+    let mut f = fixture();
+    f.scope.fail().unwrap();
+    f.authority
+        .take()
+        .unwrap()
+        .revoke_unused_and_exit()
+        .unwrap();
+    retire_revoked(&f);
+}
+
+#[test]
+fn started_authority_cannot_revoke_its_original_reserved_report_as_unused() {
+    let mut f = fixture();
+    f.authority.as_mut().unwrap().start().unwrap();
+    assert_eq!(
+        f.authority.take().unwrap().revoke_unused_and_exit(),
+        Err(ExitRoleError::InvalidPhase(ExitRolePhase::Started))
+    );
+    // Consuming a refused authority does not replace it or prove its exit.
+    assert_eq!(f.role.phase(), ExitRolePhase::Unresolved);
+    assert!(!f.role.body_exited());
+    assert!(!f.role.captures_exited());
+    assert!(!f.role.actual_exit_ready().unwrap());
+    assert!(!f.role.try_retire().unwrap());
+    assert_eq!(f.ledger.used(dimension()), 1);
+    assert_eq!(f.ledger.unresolved_work(), vec![(f.scope.id(), f.work)]);
+    // Reserved is preserved on rejection, rather than silently revoked.
+    f.report.fill().unwrap();
+}
+
+#[test]
+fn published_or_already_revoked_reports_refuse_unused_exit_and_keep_all_custody() {
+    for filled in [true, false] {
+        let mut f = fixture();
+        if filled {
+            f.report.fill().unwrap();
+        } else {
+            f.report.revoke_unused().unwrap();
+        }
+        assert_eq!(
+            f.authority.take().unwrap().revoke_unused_and_exit(),
+            Err(ExitRoleError::Runtime(RuntimeError::Completion(
+                CompletionError::InvalidRevocation
+            )))
+        );
+        assert_eq!(f.role.phase(), ExitRolePhase::Unresolved);
+        assert!(!f.role.body_exited());
+        assert!(!f.role.captures_exited());
+        assert!(!f.role.actual_exit_ready().unwrap());
+        assert!(!f.role.try_retire().unwrap());
+        assert_eq!(f.ledger.used(dimension()), 1);
+        assert_eq!(f.ledger.unresolved_work(), vec![(f.scope.id(), f.work)]);
+        assert_eq!(f.scope.snapshot().unwrap().work, 1);
+        assert_eq!(f.scope.snapshot().unwrap().storage, 1);
+        assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 0);
+    }
+}
+
+#[test]
+fn error_after_unused_report_revocation_retains_unknown_work_report_and_capacity() {
+    // Fault injection: the admission owner violated from_admitted's original
+    // role contract by supplying Work whose body observation already occurred.
+    let mut f = fixture_with_preobserved_body(true);
+    assert_eq!(
+        f.authority.take().unwrap().revoke_unused_and_exit(),
+        Err(ExitRoleError::Runtime(RuntimeError::Scope(
+            novarocks_control_runtime_core::scope::ScopeError::InvalidTransition
+        )))
+    );
+    assert_eq!(f.role.phase(), ExitRolePhase::Unresolved);
+    assert!(!f.role.body_exited());
+    assert!(!f.role.captures_exited());
+    assert!(!f.role.actual_exit_ready().unwrap());
+    assert!(!f.role.try_retire().unwrap());
+    assert_eq!(f.ledger.used(dimension()), 1);
+    assert_eq!(f.ledger.unresolved_work(), vec![(f.scope.id(), f.work)]);
+    assert_eq!(f.scope.snapshot().unwrap().work, 1);
+    assert_eq!(f.scope.snapshot().unwrap().storage, 1);
+    assert!(!f.report.try_retire().unwrap());
+    assert_eq!(
+        f.report.fill(),
+        Err(RuntimeError::Completion(CompletionError::AlreadyFilled)),
+        "a partially revoked report cannot be refilled or rolled back"
+    );
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 0);
+}
+
+#[test]
+fn unused_revocation_still_waits_for_real_derived_child_exit_and_reaping() {
+    for reaping_budget in [1, 2] {
+        let ledger = RuntimeLedger::new(resources(2), 2, 1);
+        let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
+        let (parent, capacity) = scope
+            .reserve_next(
+                generation(),
+                resources(1),
+                WorkKind::Cleanup,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Cleanup)
+            .unwrap();
+        let retirement = parent.retirement_observer();
+        let (mut child, mut child_capacity) = scope
+            .reserve_next(
+                generation(),
+                resources(1),
+                WorkKind::Cleanup,
+                WorkAdmission::Derived(parent.id()),
+            )
+            .unwrap()
+            .bind(WorkKind::Cleanup)
+            .unwrap();
+        child.start().unwrap();
+        let report = ReportSlot::reserve_next(
+            &scope,
+            generation(),
+            parent.id(),
+            2,
+            [
+                (ConsumerId::new(1).unwrap(), ConsumerKind::Observer),
+                (ConsumerId::new(2).unwrap(), ConsumerKind::Observer),
+            ],
+        )
+        .unwrap();
+        let (role, authority) = ExitRole::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                parent, capacity, report,
+            )
+            .unwrap(),
+        );
+        authority.revoke_unused_and_exit().unwrap();
+        assert!(!role.actual_exit_ready().unwrap());
+        assert!(!role.try_retire().unwrap());
+        assert_eq!(ledger.used(dimension()), 2);
+        child.body_exited().unwrap();
+        child.captures_exited().unwrap();
+        child_capacity.release(&resources(1)).unwrap();
+        assert!(!role.actual_exit_ready().unwrap());
+        assert!(!role.try_retire().unwrap());
+        assert_eq!(ledger.used(dimension()), 1);
+        assert_eq!(
+            ledger.reap_scope_ready(scope.id(), reaping_budget).unwrap(),
+            reaping_budget
+        );
+        assert!(role.actual_exit_ready().unwrap());
+        assert!(role.try_retire().unwrap());
+        assert_eq!(ledger.used(dimension()), 0);
+        assert_eq!(
+            ledger.reap_scope_ready(scope.id(), 1).unwrap(),
+            2 - reaping_budget
+        );
+        assert!(retirement.is_retired());
+        scope.close_external().unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    }
 }
 
 #[test]
@@ -237,7 +497,14 @@ fn body_and_report_exit_cannot_release_capacity_while_a_derived_child_is_live() 
             [(consumer, ConsumerKind::Observer)],
         )
         .unwrap();
-        let (role, authority) = ExitRole::from_admitted(parent, capacity, report.clone());
+        let (role, authority) = ExitRole::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                parent,
+                capacity,
+                report.clone(),
+            )
+            .unwrap(),
+        );
         authority.exited().unwrap();
         report.consume(consumer).unwrap();
         assert!(!role.try_retire().unwrap());

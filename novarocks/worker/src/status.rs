@@ -40,8 +40,8 @@ use novarocks_execution::runtime::{
     task_control::{TaskExecutionControl, TaskExecutionPort},
 };
 use novarocks_execution_contract::{
-    AcceptedTaskConclusion, ConclusionDecision, SettledContinuation, TaskConclusion,
-    TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
+    AcceptedTaskConclusion, ConclusionDecision, TaskConclusion, TaskConclusionPort,
+    TaskConclusionProposal, TaskFailurePhase,
 };
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,8 +57,8 @@ use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, Do
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
-    FinalTaskInfo, OperatorStatistics, TaskFailure, TaskOutputFacts, TaskResourceFacts, TaskState,
-    TaskStatus, TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
+    FinalTaskInfo, OperatorStatistics, TaskOutputFacts, TaskResourceFacts, TaskState, TaskStatus,
+    TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
 };
 use novarocks_execution_contract::task_execution::task_convergence::{
     TaskConvergenceReceipt, TaskConvergenceVersion,
@@ -1122,12 +1122,6 @@ impl TaskConclusionPort<ExecutionFailure> for TaskStatusOwner {
         let candidate = PreparedTaskConclusion::new(proposal);
         self.submit_prepared(candidate, false).publish();
     }
-    fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
-        // Every earlier input already adjudicated in its own transaction.
-        // Copy under the status lock; the continuation may reenter this owner.
-        let snapshot = self.accepted();
-        continuation(snapshot);
-    }
 }
 impl TaskStatusOwner {
     /// Owner-internal settled read: submission has completed its transaction.
@@ -1360,232 +1354,253 @@ const fn terminal_state_of(state: TaskState) -> Option<TaskState> {
     }
 }
 
-/// The lifecycle-writing handle of one task, held by its execution owner.
-#[derive(Clone, Debug)]
+/// The lifecycle-writing handle of one Task's original admitted roles. Clones
+/// share those positions and the one preissued completion exit notice.
+#[derive(Clone)]
 pub struct TaskStatusReporter {
-    owner: Arc<TaskStatusOwner>,
+    inner: Arc<ReporterBinding>,
 }
-
+struct ReporterBinding {
+    owner: Arc<dyn crate::task_lifecycle::TaskLifecyclePort>,
+    completion_exit: Mutex<Option<crate::task_lifecycle::CompletionExitNotice>>,
+}
+impl std::fmt::Debug for TaskStatusReporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskStatusReporter")
+            .field("identity", &self.identity())
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Debug)]
+pub struct CompletionExitAlreadyTaken;
+impl std::fmt::Display for CompletionExitAlreadyTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the Task's original completion exit notice was already transferred")
+    }
+}
+impl std::error::Error for CompletionExitAlreadyTaken {}
+impl novarocks_execution_contract::failure::FailureProjection for CompletionExitAlreadyTaken {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::CompletionDuplicate.reason(),
+        )
+    }
+}
 impl TaskStatusReporter {
-    pub const fn new(owner: Arc<TaskStatusOwner>) -> Self {
-        Self { owner }
+    pub fn from_admitted(
+        owner: Arc<dyn crate::task_lifecycle::TaskLifecyclePort>,
+        completion_exit: crate::task_lifecycle::CompletionExitNotice,
+    ) -> Result<
+        Self,
+        (
+            novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
+            crate::task_lifecycle::CompletionExitNotice,
+        ),
+    > {
+        if owner.identity() != completion_exit.identity() {
+            return Err((
+                novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
+                completion_exit,
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(ReporterBinding {
+                owner,
+                completion_exit: Mutex::new(Some(completion_exit)),
+            }),
+        })
     }
-
     pub fn identity(&self) -> TaskIdentity {
-        self.owner.identity()
+        self.inner.owner.identity()
     }
-
     pub fn current(&self) -> TaskStatus {
-        self.owner.current()
+        self.inner.owner.current()
     }
-
-    /// Submit the actual failure and complete termination on the winning cause.
-    /// Acceptance publishes its terminating version before terminal publication.
-    pub fn conclude_failure(
+    pub fn take_completion_exit_notice(
         &self,
-        cause: ExecutionFailure,
-        phase: TaskFailurePhase,
-    ) -> StatusAdvance {
-        self.owner.conclude_failure(cause, phase)
+    ) -> Result<crate::task_lifecycle::CompletionExitNotice, CompletionExitAlreadyTaken> {
+        self.inner
+            .completion_exit
+            .lock()
+            .expect("original completion exit authority")
+            .take()
+            .ok_or(CompletionExitAlreadyTaken)
     }
-
-    /// Record a prepared cleanup effect without competing for the conclusion.
-    /// Prepare by borrowing its real source before all enclosing lifecycle fences.
-    pub fn report_cleanup(&self, prepared: PreparedCleanupDiagnostic) -> DiagnosticRecordOutcome {
-        self.owner.report_cleanup(prepared)
+    /// The exact originating carrier transfers before its ordered finish fact.
+    /// A neutral TaskFailure cannot replace this actual source.
+    pub fn conclude_failure(&self, cause: ExecutionFailure, phase: TaskFailurePhase) {
+        self.inner
+            .owner
+            .submit(TaskConclusionProposal::Failed { cause, phase });
+        self.inner
+            .owner
+            .handoff(crate::task_lifecycle::TaskLifecycleEvent::FinishWithOutput { output: None });
     }
-
+    pub fn report_cleanup(&self, prepared: PreparedCleanupDiagnostic) {
+        self.inner.owner.handoff_cleanup(prepared);
+    }
     pub fn secondary_diagnostics(&self) -> TaskSecondaryDiagnosticsSnapshot {
-        self.owner.secondary_diagnostics()
+        self.inner.owner.secondary_diagnostics()
     }
-
-    pub fn running(&self) -> StatusAdvance {
-        self.owner
-            .advance(TaskState::Running, None, TaskOutputFacts::default())
+    pub fn running(&self) {
+        self.inner
+            .owner
+            .handoff(crate::task_lifecycle::TaskLifecycleEvent::Running);
     }
-
-    pub fn flushing(&self) -> StatusAdvance {
-        self.owner
-            .advance(TaskState::Flushing, None, TaskOutputFacts::default())
+    pub fn flushing(&self) {
+        self.inner
+            .owner
+            .handoff(crate::task_lifecycle::TaskLifecycleEvent::Flushing);
     }
-
-    /// Finishes the task. `FINISHED` is only constructible with a complete
-    /// output responsibility, so this cannot report success for a task that
-    /// still owes output.
-    pub fn finished(&self, output: TaskOutputFacts) -> StatusAdvance {
-        self.owner.conclude_success(output)
+    pub fn completion_intent(&self, completed_output: Option<TaskOutputFacts>) {
+        self.inner.owner.handoff(
+            crate::task_lifecycle::TaskLifecycleEvent::CompletionIntent { completed_output },
+        );
     }
-
-    pub fn canceling(&self, reason: CancelReason) -> StatusAdvance {
-        self.owner.advance(
-            TaskState::Canceling,
-            Some(TerminationDetail::Canceled(reason)),
-            TaskOutputFacts::default(),
-        )
+    pub fn finished(&self, output: TaskOutputFacts) {
+        self.completion_intent(Some(output));
     }
-
-    pub fn canceled(&self, reason: CancelReason) -> StatusAdvance {
-        self.canceled_with_output(reason, TaskOutputFacts::default())
+    pub fn conclude_success(&self, output: TaskOutputFacts) {
+        self.completion_intent(Some(output));
     }
-
-    /// Completes a normal stand-down while preserving whether the fragment
-    /// had already satisfied its output responsibility.
-    ///
-    /// The terminal remains `CANCELED` because the stand-down won the
-    /// lifecycle race. The output fact is independent evidence used by
-    /// consumers, such as the distributed-write commit gate, that must tell a
-    /// completed sink from one that stopped before publishing all of its
-    /// output.
-    pub fn canceled_with_output(
-        &self,
-        reason: CancelReason,
-        output: TaskOutputFacts,
-    ) -> StatusAdvance {
-        self.owner.advance(
-            TaskState::Canceled,
-            Some(TerminationDetail::Canceled(reason)),
+    pub fn canceling(&self, reason: CancelReason) {
+        self.inner
+            .owner
+            .submit(TaskConclusionProposal::Canceled(reason));
+    }
+    pub fn canceled(&self, reason: CancelReason) {
+        self.canceled_with_output(reason, TaskOutputFacts::default());
+    }
+    pub fn canceled_with_output(&self, reason: CancelReason, output: TaskOutputFacts) {
+        self.conclude_termination(
+            crate::task_lifecycle::TaskStopIntent::Canceled(reason),
             output,
-        )
+        );
     }
-
-    pub fn aborting(&self, cause: AbortCause) -> StatusAdvance {
-        self.owner.advance(
-            TaskState::Aborting,
-            Some(TerminationDetail::Aborted(cause)),
+    pub fn aborting(&self, cause: AbortCause) {
+        self.inner
+            .owner
+            .submit(TaskConclusionProposal::Aborted(cause));
+    }
+    pub fn aborted(&self, cause: AbortCause) {
+        self.conclude_termination(
+            crate::task_lifecycle::TaskStopIntent::Aborted(cause),
             TaskOutputFacts::default(),
-        )
+        );
     }
-
-    pub fn aborted(&self, cause: AbortCause) -> StatusAdvance {
-        self.owner.advance(
-            TaskState::Aborted,
-            Some(TerminationDetail::Aborted(cause)),
-            TaskOutputFacts::default(),
-        )
+    pub fn failing(&self, cause: ExecutionFailure, phase: TaskFailurePhase) {
+        self.inner
+            .owner
+            .submit(TaskConclusionProposal::Failed { cause, phase });
     }
-
-    pub fn failing(&self, failure: TaskFailure) -> StatusAdvance {
-        self.owner.advance(
-            TaskState::Failing,
-            Some(TerminationDetail::Failed(failure)),
-            TaskOutputFacts::default(),
-        )
+    pub fn failed(&self, cause: ExecutionFailure, phase: TaskFailurePhase) {
+        self.conclude_failure(cause, phase);
     }
-
-    pub fn failed(&self, failure: TaskFailure) -> StatusAdvance {
-        self.owner.advance(
-            TaskState::Failed,
-            Some(TerminationDetail::Failed(failure)),
-            TaskOutputFacts::default(),
-        )
-    }
-
-    /// Concludes the task on the termination that wins; see
-    /// [`TaskStatusOwner::conclude_termination`].
     pub fn conclude_termination(
         &self,
-        proposal: TerminationDetail,
+        intent: crate::task_lifecycle::TaskStopIntent,
         output: TaskOutputFacts,
-    ) -> StatusAdvance {
-        self.owner.conclude_termination(proposal, output)
+    ) {
+        match intent {
+            crate::task_lifecycle::TaskStopIntent::Canceled(reason) => self.canceling(reason),
+            crate::task_lifecycle::TaskStopIntent::Aborted(cause) => self.aborting(cause),
+        }
+        self.inner.owner.handoff(
+            crate::task_lifecycle::TaskLifecycleEvent::FinishWithOutput {
+                output: output.responsibility_complete().then_some(output),
+            },
+        );
     }
-
-    /// Finishes the task unless a termination already won; see
-    /// [`TaskStatusOwner::conclude_success`].
-    pub fn conclude_success(&self, output: TaskOutputFacts) -> StatusAdvance {
-        self.owner.conclude_success(output)
-    }
-
     pub fn advertise_dynamic_filters(
         &self,
         version: DomainVersion,
         domain_count: u32,
         payload: Arc<dyn CodecOwnedContent>,
-    ) -> StatusAdvance {
-        self.owner
-            .advertise_dynamic_filters(version, domain_count, payload)
+    ) {
+        self.inner
+            .owner
+            .handoff_dynamic_filters(version, domain_count, payload);
     }
-
-    pub fn record_operator_statistics(&self, statistics: Vec<OperatorStatistics>) {
-        self.owner.record_operator_statistics(statistics);
+    pub fn record_operator_statistics(&self, mut statistics: Vec<OperatorStatistics>) {
+        let truncated = statistics.len() > FINAL_TASK_INFO_MAX_OPERATORS;
+        statistics.truncate(FINAL_TASK_INFO_MAX_OPERATORS);
+        self.inner.owner.handoff(
+            crate::task_lifecycle::TaskLifecycleEvent::OperatorStatistics {
+                statistics,
+                truncated,
+            },
+        );
     }
-
-    /// Reports that this task's output buffers have drained.
     pub fn release_output(&self) {
-        self.owner.release_output();
+        self.inner
+            .owner
+            .handoff(crate::task_lifecycle::TaskLifecycleEvent::OutputReleased);
     }
-
-    /// Positive evidence that this task's executable work has physically
-    /// stopped on this Worker.
+    /// Independent physical producers may report these original facts. The
+    /// completion supervisor uses its separate unique exit notice instead.
     pub fn note_actual_stopped(&self) {
-        self.owner.note_actual_stopped();
+        self.inner
+            .owner
+            .handoff(crate::task_lifecycle::TaskLifecycleEvent::ActualStopped);
     }
-
-    /// Positive evidence that the stopped task's runtime-owned resources have
-    /// converged. Registry-owned ingress resources remain until retirement.
     pub fn note_resources_converged(&self) {
-        self.owner.note_resources_converged();
+        self.inner
+            .owner
+            .handoff(crate::task_lifecycle::TaskLifecycleEvent::ResourcesConverged);
     }
-
     pub fn convergence(&self) -> TaskConvergenceSnapshot {
-        self.owner.convergence()
+        self.inner.owner.convergence()
     }
-
-    /// The metric-only handle. It has no lifecycle method at all.
     pub fn metrics(&self) -> TaskMetricsSink {
         TaskMetricsSink {
-            owner: Arc::clone(&self.owner),
+            owner: self.inner.owner.clone(),
         }
     }
 }
 
-/// The metrics-writing handle of one task.
-///
-/// It can raise counters and nothing else: it cannot change a state, latch a
-/// terminal, freeze a final info, or release output responsibility.
-#[derive(Clone, Debug)]
+/// Counter-only view of the same original Task roles. It signs no new position.
+#[derive(Clone)]
 pub struct TaskMetricsSink {
-    owner: Arc<TaskStatusOwner>,
+    owner: Arc<dyn crate::task_lifecycle::TaskLifecyclePort>,
 }
-
+impl std::fmt::Debug for TaskMetricsSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskMetricsSink")
+            .field("identity", &self.owner.identity())
+            .finish_non_exhaustive()
+    }
+}
 impl TaskMetricsSink {
-    pub fn report(
-        &self,
-        resources: TaskResourceFacts,
-        writer: Option<TaskWriterFacts>,
-    ) -> StatusAdvance {
-        self.owner.report_metrics(resources, writer)
+    pub fn report(&self, resources: TaskResourceFacts, writer: Option<TaskWriterFacts>) {
+        self.owner
+            .handoff(crate::task_lifecycle::TaskLifecycleEvent::Metrics { resources, writer });
     }
 }
 
-/// The result-plane binding of one live root task.
-///
-/// It pairs the execution kernel's buffer key with the status owner that must
-/// hear about the drain, so a result poll cannot reach a buffer without also
-/// being able to report what reaching its end means.
-#[derive(Clone, Debug)]
+/// One original result operation owns its preadmitted drain request. A route
+/// lookup alone cannot manufacture an EOF proof or clone this request role.
+#[derive(Debug)]
 pub struct RootResultBinding {
     kernel_key: UniqueId,
-    status: Arc<TaskStatusOwner>,
+    drain: crate::task_lifecycle::TaskRootDrainPermit,
 }
-
 impl RootResultBinding {
-    pub const fn new(kernel_key: UniqueId, status: Arc<TaskStatusOwner>) -> Self {
-        Self { kernel_key, status }
+    pub const fn new(
+        kernel_key: UniqueId,
+        drain: crate::task_lifecycle::TaskRootDrainPermit,
+    ) -> Self {
+        Self { kernel_key, drain }
     }
-
-    /// The execution kernel's key for this task's result buffer.
     pub const fn kernel_key(&self) -> UniqueId {
         self.kernel_key
     }
-
     pub fn identity(&self) -> TaskIdentity {
-        self.status.identity()
+        self.drain.identity()
     }
-
-    /// Reports that this poll delivered the end-of-stream marker.
-    pub fn note_result_stream_drained(&self) -> StatusAdvance {
-        self.status.note_root_result_drained()
+    pub fn note_result_stream_drained(self) -> crate::task_lifecycle::TaskRootDrainFuture {
+        self.drain.submit()
     }
 }
 
@@ -1597,7 +1612,7 @@ impl RootResultBinding {
 /// than answered out of that task's buffer, which is what stops a mistaken or
 /// forged identity from draining an exchange producer's output as if it were
 /// the query's answer.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum RootResultRoute {
     /// This exact live task owns the query's client-visible result.
     Serve(RootResultBinding),
@@ -1691,6 +1706,7 @@ mod task_convergence_tests {
 
 #[cfg(test)]
 mod conclusion_tests {
+    use novarocks_execution_contract::TaskFailure;
     use novarocks_execution_contract::failure::FailureProjection;
 
     #[test]

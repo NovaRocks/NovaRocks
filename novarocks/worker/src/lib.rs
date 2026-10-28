@@ -81,6 +81,7 @@ mod task_creation_gate;
 mod task_diagnostics;
 mod task_domain_execution;
 mod task_execution_ports;
+mod task_lifecycle;
 mod task_port;
 mod task_preparation;
 mod task_proposal_ingress;
@@ -144,7 +145,8 @@ pub use drain::WorkerDrainState;
 pub use host::TestTaskUpdateConsumptionReservation;
 pub use host::{
     HostRejection, PreparationControlLoan, PreparedTaskInstallation, QueryContextHost,
-    ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
+    QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence, RunnableTask,
+    SharedFactsRequest, TaskExecutionHost,
 };
 pub use inbound_capability::{
     InboundFrameAdmission, InboundFrameClaim, InboundFrameDelivery, NormalClosedInbound,
@@ -177,12 +179,12 @@ pub use reliable_transport::{
 };
 pub use runtime_filter_error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 pub use status::{
-    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
-    TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
+    CompletionExitAlreadyTaken, METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute,
+    StatusAdvance, TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
 };
 pub use task_completion::{
     CompletionReservationError, TaskCompletionAction, TaskCompletionReservation,
-    TaskCompletionSignal, TaskCompletionSupervisor,
+    TaskCompletionSignal, TaskCompletionSlotRefusal, TaskCompletionSupervisor,
 };
 pub use task_creation_gate::{NoopTaskCreationGate, TaskCreationGate};
 pub use task_diagnostics::{
@@ -196,6 +198,11 @@ pub use task_domain_execution::{
 };
 pub use task_execution_ports::{
     TaskExecutionMetrics, TaskExecutionPorts, TaskProtocolObserver, TaskResultLifecycle,
+};
+pub use task_lifecycle::{
+    CompletionExitCapability, CompletionExitNotice, TaskLifecycleEvent, TaskLifecyclePort,
+    TaskRootDrainCapability, TaskRootDrainFuture, TaskRootDrainOutcome, TaskRootDrainPermit,
+    TaskStopIntent,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{

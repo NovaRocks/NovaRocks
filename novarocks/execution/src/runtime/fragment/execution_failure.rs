@@ -20,7 +20,11 @@
 use crate::exec::pipeline::operator::input_construction::ConstructionFailure;
 use novarocks_functions::{KernelDiagnostic, KernelFailure, RowDataError, Selection};
 use novarocks_local_program::ProgramExpressionRootSite;
-use std::{error::Error, fmt, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 pub type ExecutionResult<T> = Result<T, ExecutionFailure>;
 
@@ -123,11 +127,38 @@ pub struct ExecutionFailureContext {
     pub operation: PipelineOperation,
 }
 
+/// One shared Execution occurrence. Value-owned causes retain custody here;
+/// a shared domain cause retains it in its canonical source node instead, so
+/// an independently retained inner handle cannot leave its source unguarded.
+struct FailureOccurrence {
+    cause: ExecutionFailureCause,
+    retention: Mutex<Vec<Box<dyn novarocks_execution_contract::SourceRetentionCapability>>>,
+}
+impl FailureOccurrence {
+    fn new(cause: ExecutionFailureCause) -> Arc<Self> {
+        Arc::new(Self {
+            cause,
+            retention: Mutex::new(Vec::new()),
+        })
+    }
+}
+impl fmt::Debug for FailureOccurrence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.cause, f)
+    }
+}
+impl PartialEq for FailureOccurrence {
+    fn eq(&self, other: &Self) -> bool {
+        self.cause == other.cause
+    }
+}
+impl Eq for FailureOccurrence {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionFailure {
     // Rich source material is allocated only when a failure occurs. Clones
     // and added call-site context retain this same local occurrence identity.
-    cause: Arc<ExecutionFailureCause>,
+    cause: Arc<FailureOccurrence>,
     context: Option<ExecutionFailureContext>,
 }
 
@@ -137,15 +168,100 @@ impl ExecutionFailure {
         E: Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
     {
         Self {
-            cause: Arc::new(ExecutionFailureCause::Domain(
+            cause: FailureOccurrence::new(ExecutionFailureCause::Domain(
                 super::SharedDomainFailure::new(cause),
             )),
             context: None,
         }
     }
 
+    /// Attach one already funded source-capture obligation. This creates no
+    /// Work, callback or capacity. Shared domain handles attach to their
+    /// canonical node, including aliases made before this Execution wrapper.
+    /// Known Kernel, construction and metadata wrappers forward through their
+    /// explicit typed owners. Other causes retain their Execution occurrence;
+    /// their independent resource owners must still supervise shared captures.
+    /// Destruction remains supervised if the original source unwinds.
+    pub fn retain_source_lifetime(
+        &self,
+        custody: Box<dyn novarocks_execution_contract::SourceRetentionCapability>,
+    ) {
+        use crate::exec::chunk::CompiledSchemaRequestFailure as Schema;
+        use crate::runtime::preparation_memory::PreparationMemoryRefusal as Host;
+        use crate::runtime::preparation_metadata::PreparationMetadataFailure as Metadata;
+        use novarocks_type_contract::MetadataRequestError as Request;
+        let custody = match &self.cause.cause {
+            ExecutionFailureCause::Domain(source)
+            | ExecutionFailureCause::Construction(ConstructionFailure::Source(source))
+            | ExecutionFailureCause::PreparationMetadata(Metadata::SchemaRequest(
+                Schema::Projection(source),
+            )) => {
+                source.retain_source_lifetime(custody);
+                return;
+            }
+            ExecutionFailureCause::Kernel(source) => source.try_retain_source_lifetime(custody),
+            ExecutionFailureCause::Construction(ConstructionFailure::Control(source))
+            | ExecutionFailureCause::PreparationMetadata(
+                Metadata::SchemaRequest(Schema::Request(Request::Control(source)))
+                | Metadata::Request(Request::Control(source)),
+            ) => source.try_retain_source_lifetime(custody),
+            ExecutionFailureCause::Construction(ConstructionFailure::Caller(source)) => {
+                source.retain_source_lifetime(custody);
+                return;
+            }
+            ExecutionFailureCause::PreparationMetadata(Metadata::Host(Host::Interrupted(
+                source,
+            ))) => {
+                source.retain_source_lifetime(custody);
+                return;
+            }
+            ExecutionFailureCause::Construction(
+                ConstructionFailure::MissingOwner
+                | ConstructionFailure::Memory(_)
+                | ConstructionFailure::InvalidSource(_)
+                | ConstructionFailure::Resource(_),
+            )
+            | ExecutionFailureCause::PreparationMetadata(
+                Metadata::MissingCompiledSite
+                | Metadata::SchemaRequest(Schema::Request(
+                    Request::Arithmetic
+                    | Request::SourceModel(_)
+                    | Request::Metadata(_)
+                    | Request::ValueType(_),
+                ))
+                | Metadata::Request(
+                    Request::Arithmetic
+                    | Request::SourceModel(_)
+                    | Request::Metadata(_)
+                    | Request::ValueType(_),
+                )
+                | Metadata::Host(
+                    Host::MissingQueryMemory | Host::SharedShortage(_) | Host::Capacity(_),
+                ),
+            )
+            | ExecutionFailureCause::MemoryAccounting(_)
+            | ExecutionFailureCause::Connector(_)
+            | ExecutionFailureCause::Writer(_)
+            | ExecutionFailureCause::RuntimeFilter(_)
+            | ExecutionFailureCause::RuntimeScalarSource(_)
+            | ExecutionFailureCause::RuntimeScalarMemory(_)
+            | ExecutionFailureCause::InvocationData(_)
+            | ExecutionFailureCause::ScalarInvocationData(_)
+            | ExecutionFailureCause::WindowInvocationData(_)
+            | ExecutionFailureCause::RequiredRow(_) => Err(custody),
+        };
+        let Err(custody) = custody else {
+            return;
+        };
+        self.cause
+            .retention
+            .lock()
+            .expect("source lifetime custody")
+            .push(custody);
+    }
+
     pub fn cause(&self) -> &ExecutionFailureCause {
-        self.cause.as_ref()
+        &self.cause.cause
     }
     /// A repeated observation of one originating failure is distinct from two
     /// independent failures with equal facts or text. Identity is local only;
@@ -158,7 +274,7 @@ impl ExecutionFailure {
     }
 
     pub fn detail(&self) -> &str {
-        match self.cause.as_ref() {
+        match &self.cause.cause {
             ExecutionFailureCause::Domain(error) => error.detail(),
             ExecutionFailureCause::MemoryAccounting(error) => error.detail(),
             ExecutionFailureCause::Connector(error) => error.detail(),
@@ -275,7 +391,7 @@ impl ExecutionFailure {
 impl From<crate::runtime::preparation_metadata::PreparationMetadataFailure> for ExecutionFailure {
     fn from(error: crate::runtime::preparation_metadata::PreparationMetadataFailure) -> Self {
         Self {
-            cause: Arc::new(ExecutionFailureCause::PreparationMetadata(error)),
+            cause: FailureOccurrence::new(ExecutionFailureCause::PreparationMetadata(error)),
             context: None,
         }
     }
@@ -284,7 +400,7 @@ impl From<crate::runtime::preparation_metadata::PreparationMetadataFailure> for 
 impl From<super::connector_failure::ConnectorCallFailure> for ExecutionFailure {
     fn from(error: super::connector_failure::ConnectorCallFailure) -> Self {
         Self {
-            cause: Arc::new(ExecutionFailureCause::Connector(error)),
+            cause: FailureOccurrence::new(ExecutionFailureCause::Connector(error)),
             context: None,
         }
     }
@@ -292,7 +408,7 @@ impl From<super::connector_failure::ConnectorCallFailure> for ExecutionFailure {
 impl From<crate::exec::pipeline::writer_failure::WriterFailure> for ExecutionFailure {
     fn from(error: crate::exec::pipeline::writer_failure::WriterFailure) -> Self {
         Self {
-            cause: Arc::new(ExecutionFailureCause::Writer(error.into())),
+            cause: FailureOccurrence::new(ExecutionFailureCause::Writer(error.into())),
             context: None,
         }
     }
@@ -301,7 +417,7 @@ impl From<crate::exec::pipeline::writer_failure::WriterFailure> for ExecutionFai
 impl From<crate::runtime::mem_tracker::MemoryAccountingFailure> for ExecutionFailure {
     fn from(error: crate::runtime::mem_tracker::MemoryAccountingFailure) -> Self {
         Self {
-            cause: Arc::new(ExecutionFailureCause::MemoryAccounting(error)),
+            cause: FailureOccurrence::new(ExecutionFailureCause::MemoryAccounting(error)),
             context: None,
         }
     }
@@ -315,7 +431,7 @@ impl From<novarocks_functions::generate_series_core::SeriesError> for ExecutionF
 impl From<KernelFailure> for ExecutionFailure {
     fn from(error: KernelFailure) -> Self {
         Self {
-            cause: Arc::new(ExecutionFailureCause::Kernel(error)),
+            cause: FailureOccurrence::new(ExecutionFailureCause::Kernel(error)),
             context: None,
         }
     }
@@ -327,7 +443,7 @@ impl From<ConstructionFailure> for ExecutionFailure {
             // context, rather than burying its category under construction.
             ConstructionFailure::Caller(error) => *error,
             error => Self {
-                cause: Arc::new(ExecutionFailureCause::Construction(error)),
+                cause: FailureOccurrence::new(ExecutionFailureCause::Construction(error)),
                 context: None,
             },
         }
@@ -337,7 +453,7 @@ impl From<crate::runtime::exchange::ExchangeFailure> for ExecutionFailure {
     fn from(source: crate::runtime::exchange::ExchangeFailure) -> Self {
         match source {
             crate::runtime::exchange::ExchangeFailure::Source(source) => Self {
-                cause: Arc::new(ExecutionFailureCause::Domain(source)),
+                cause: FailureOccurrence::new(ExecutionFailureCause::Domain(source)),
                 context: None,
             },
             crate::runtime::exchange::ExchangeFailure::Execution(source) => source,
@@ -347,7 +463,7 @@ impl From<crate::runtime::exchange::ExchangeFailure> for ExecutionFailure {
 impl From<crate::runtime_filter::RuntimeFilterFailure> for ExecutionFailure {
     fn from(error: crate::runtime_filter::RuntimeFilterFailure) -> Self {
         Self {
-            cause: Arc::new(ExecutionFailureCause::RuntimeFilter(error)),
+            cause: FailureOccurrence::new(ExecutionFailureCause::RuntimeFilter(error)),
             context: None,
         }
     }
@@ -357,7 +473,7 @@ impl From<novarocks_functions::EvaluationFailure> for ExecutionFailure {
         match error {
             novarocks_functions::EvaluationFailure::Kernel(cause) => cause.into(),
             novarocks_functions::EvaluationFailure::InvocationData(cause) => Self {
-                cause: Arc::new(ExecutionFailureCause::InvocationData(cause)),
+                cause: FailureOccurrence::new(ExecutionFailureCause::InvocationData(cause)),
                 context: None,
             },
         }
@@ -368,7 +484,7 @@ impl From<novarocks_functions::ScalarInvocationFailure> for ExecutionFailure {
         match error {
             novarocks_functions::ScalarInvocationFailure::Kernel(cause) => cause.into(),
             novarocks_functions::ScalarInvocationFailure::Data(cause) => Self {
-                cause: Arc::new(ExecutionFailureCause::ScalarInvocationData(cause)),
+                cause: FailureOccurrence::new(ExecutionFailureCause::ScalarInvocationData(cause)),
                 context: None,
             },
         }
@@ -390,7 +506,7 @@ impl From<crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure> for Exe
             }
         };
         Self {
-            cause: Arc::new(cause),
+            cause: FailureOccurrence::new(cause),
             context: None,
         }
     }
@@ -400,7 +516,7 @@ impl From<novarocks_functions::WindowEvaluationFailure> for ExecutionFailure {
         match error {
             novarocks_functions::WindowEvaluationFailure::Kernel(cause) => cause.into(),
             novarocks_functions::WindowEvaluationFailure::InvocationData(cause) => Self {
-                cause: Arc::new(ExecutionFailureCause::WindowInvocationData(cause)),
+                cause: FailureOccurrence::new(ExecutionFailureCause::WindowInvocationData(cause)),
                 context: None,
             },
         }
@@ -409,7 +525,7 @@ impl From<novarocks_functions::WindowEvaluationFailure> for ExecutionFailure {
 impl From<RequiredExpressionRowError> for ExecutionFailure {
     fn from(error: RequiredExpressionRowError) -> Self {
         Self {
-            cause: Arc::new(ExecutionFailureCause::RequiredRow(error)),
+            cause: FailureOccurrence::new(ExecutionFailureCause::RequiredRow(error)),
             context: None,
         }
     }
@@ -423,7 +539,7 @@ impl fmt::Display for ExecutionFailure {
                 context.operator_ordinal, context.operation
             )?;
         }
-        match self.cause.as_ref() {
+        match &self.cause.cause {
             ExecutionFailureCause::Domain(error) => error.fmt(f),
             ExecutionFailureCause::MemoryAccounting(error) => error.fmt(f),
             ExecutionFailureCause::Connector(error) => error.fmt(f),
@@ -443,7 +559,7 @@ impl fmt::Display for ExecutionFailure {
 }
 impl Error for ExecutionFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self.cause.as_ref() {
+        match &self.cause.cause {
             ExecutionFailureCause::Domain(error) => Some(error),
             ExecutionFailureCause::MemoryAccounting(error) => Some(error),
             ExecutionFailureCause::Connector(error) => Some(error),
@@ -805,7 +921,7 @@ impl novarocks_failure_contract::FailureProjection for RequiredExpressionRowErro
 }
 impl novarocks_failure_contract::FailureProjection for ExecutionFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        self.cause.failure_fact()
+        self.cause.cause.failure_fact()
     }
 }
 impl novarocks_failure_contract::FailureProjection for ExecutionFailureCause {
@@ -921,5 +1037,290 @@ mod required_row_source_properties {
                 .source()
                 .expect("required root must keep its original row error");
         }
+    }
+}
+
+#[cfg(test)]
+mod source_retention_tests {
+    use super::*;
+    use novarocks_execution_contract::SourceRetentionCapability;
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    use std::{
+        num::NonZeroU16,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct Source {
+        drops: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+    }
+    impl fmt::Display for Source {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("source retention probe")
+        }
+    }
+    impl Error for Source {}
+    impl novarocks_failure_contract::OuterFailureProjection for Source {}
+    impl FailureProjection for Source {
+        fn failure_fact(&self) -> FailureFact {
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::EXECUTION, NonZeroU16::new(65000).unwrap()),
+            )
+        }
+    }
+    impl Drop for Source {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic_on_drop, "injected original source Drop panic");
+        }
+    }
+    #[derive(Debug)]
+    struct Retention {
+        source_drops: Arc<AtomicUsize>,
+        exits: Arc<AtomicUsize>,
+        unwound: Arc<AtomicBool>,
+    }
+    impl SourceRetentionCapability for Retention {}
+    impl Drop for Retention {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.source_drops.load(Ordering::SeqCst),
+                1,
+                "the original source must drop before any capture marker"
+            );
+            self.unwound
+                .store(std::thread::panicking(), Ordering::SeqCst);
+            self.exits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn typed_wrapper_aliases_keep_their_original_canonical_source_and_unwind_observation() {
+        use crate::exec::chunk::CompiledSchemaRequestFailure as Schema;
+        use crate::runtime::preparation_memory::PreparationMemoryRefusal as Host;
+        use crate::runtime::preparation_metadata::PreparationMetadataFailure as Metadata;
+        use novarocks_type_contract::{CompileControlError, MetadataRequestError};
+        for route in 0..9 {
+            for early in [false, true] {
+                for panic_on_drop in [false, true] {
+                    let source_drops = Arc::new(AtomicUsize::new(0));
+                    let exits = Arc::new(AtomicUsize::new(0));
+                    let unwound = Arc::new(AtomicBool::new(false));
+                    let source = Source {
+                        drops: source_drops.clone(),
+                        panic_on_drop,
+                    };
+                    let failure: ExecutionFailure = match route {
+                        0 => KernelFailure::from_domain(source).into(),
+                        1 => {
+                            KernelFailure::CompileControl(CompileControlError::from_domain(source))
+                                .into()
+                        }
+                        2 => ConstructionFailure::Source(super::super::SharedDomainFailure::new(
+                            source,
+                        ))
+                        .into(),
+                        3 => ConstructionFailure::Control(CompileControlError::from_domain(source))
+                            .into(),
+                        4 => Metadata::SchemaRequest(Schema::Projection(
+                            super::super::SharedDomainFailure::new(source),
+                        ))
+                        .into(),
+                        5 => Metadata::Request(MetadataRequestError::Control(
+                            CompileControlError::from_domain(source),
+                        ))
+                        .into(),
+                        6 => Metadata::SchemaRequest(Schema::Request(
+                            MetadataRequestError::Control(CompileControlError::from_domain(source)),
+                        ))
+                        .into(),
+                        7 => {
+                            Metadata::Host(Host::Interrupted(ExecutionFailure::from_domain(source)))
+                                .into()
+                        }
+                        8 => ConstructionFailure::Caller(Box::new(ExecutionFailure::from_domain(
+                            source,
+                        )))
+                        .into(),
+                        _ => unreachable!(),
+                    };
+                    // This is a typed inner alias, not an Execution occurrence
+                    // clone. It can outlive every outer ExecutionFailure.
+                    let alias = early.then(|| failure.cause().clone());
+                    failure.retain_source_lifetime(Box::new(Retention {
+                        source_drops: source_drops.clone(),
+                        exits: exits.clone(),
+                        unwound: unwound.clone(),
+                    }));
+                    let alias = alias.unwrap_or_else(|| failure.cause().clone());
+                    drop(failure);
+                    assert_eq!(source_drops.load(Ordering::SeqCst), 0, "route {route}");
+                    assert_eq!(exits.load(Ordering::SeqCst), 0, "route {route}");
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drop(alias);
+                    }));
+                    assert_eq!(result.is_err(), panic_on_drop, "route {route}");
+                    assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                    assert_eq!(exits.load(Ordering::SeqCst), 1);
+                    assert_eq!(unwound.load(Ordering::SeqCst), panic_on_drop);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_retention_includes_clones_created_before_and_after_admission() {
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let unwound = Arc::new(AtomicBool::new(false));
+        let failure = ExecutionFailure::from_domain(Source {
+            drops: source_drops.clone(),
+            panic_on_drop: false,
+        });
+        let early = failure.clone();
+        let original_address = failure.cause() as *const ExecutionFailureCause;
+        for _ in 0..2 {
+            failure.retain_source_lifetime(Box::new(Retention {
+                source_drops: source_drops.clone(),
+                exits: exits.clone(),
+                unwound: unwound.clone(),
+            }));
+        }
+        let late = failure.clone();
+        assert!(failure.same_occurrence(&early));
+        assert_eq!(failure, early);
+        assert_eq!(
+            original_address,
+            early.cause() as *const ExecutionFailureCause
+        );
+        assert_eq!(
+            original_address,
+            late.cause() as *const ExecutionFailureCause
+        );
+        drop(failure);
+        drop(late);
+        assert_eq!(
+            exits.load(Ordering::SeqCst),
+            0,
+            "an earlier clone still holds the shared original source"
+        );
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+        drop(early);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(exits.load(Ordering::SeqCst), 2);
+        assert!(!unwound.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_domain_handle_from_either_public_read_path_keeps_original_source_custody() {
+        for alias_before_admission in [false, true] {
+            for through_error_source in [false, true] {
+                let source_drops = Arc::new(AtomicUsize::new(0));
+                let exits = Arc::new(AtomicUsize::new(0));
+                let unwound = Arc::new(AtomicBool::new(false));
+                let failure = ExecutionFailure::from_domain(Source {
+                    drops: source_drops.clone(),
+                    panic_on_drop: false,
+                });
+                let inner = || {
+                    if through_error_source {
+                        failure
+                            .source()
+                            .unwrap()
+                            .downcast_ref::<super::super::SharedDomainFailure>()
+                            .unwrap()
+                            .clone()
+                    } else {
+                        let ExecutionFailureCause::Domain(inner) = failure.cause() else {
+                            panic!("original domain source");
+                        };
+                        inner.clone()
+                    }
+                };
+                let early = alias_before_admission.then(inner);
+                failure.retain_source_lifetime(Box::new(Retention {
+                    source_drops: source_drops.clone(),
+                    exits: exits.clone(),
+                    unwound: unwound.clone(),
+                }));
+                let alias = early.unwrap_or_else(inner);
+                let original_pointer = alias.downcast_ref::<Source>().unwrap() as *const Source;
+                drop(failure);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    exits.load(Ordering::SeqCst),
+                    0,
+                    "an independently retained inner handle still owns the original source"
+                );
+                assert_eq!(
+                    alias.downcast_ref::<Source>().unwrap() as *const Source,
+                    original_pointer
+                );
+                drop(alias);
+                assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(exits.load(Ordering::SeqCst), 1);
+                assert!(!unwound.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    #[test]
+    fn rewrapping_a_shared_domain_handle_preserves_its_original_source_custody() {
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let unwound = Arc::new(AtomicBool::new(false));
+        let original = super::super::SharedDomainFailure::new(Source {
+            drops: source_drops.clone(),
+            panic_on_drop: false,
+        });
+        let source_pointer = original.downcast_ref::<Source>().unwrap() as *const Source;
+        let failure = ExecutionFailure::from_domain(original.clone());
+        failure.retain_source_lifetime(Box::new(Retention {
+            source_drops: source_drops.clone(),
+            exits: exits.clone(),
+            unwound: unwound.clone(),
+        }));
+        let replacement = ExecutionFailure::from_domain(original.clone());
+        let ExecutionFailureCause::Domain(replacement_source) = replacement.cause() else {
+            panic!("rewrapped original domain source");
+        };
+        assert_eq!(replacement_source, &original);
+        assert_eq!(
+            replacement_source.downcast_ref::<Source>().unwrap() as *const Source,
+            source_pointer
+        );
+        drop(failure);
+        drop(original);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        drop(replacement);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        assert!(!unwound.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn a_panicking_original_source_reaches_its_capture_marker_during_unwind() {
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let unwound = Arc::new(AtomicBool::new(false));
+        let failure = ExecutionFailure::from_domain(Source {
+            drops: source_drops.clone(),
+            panic_on_drop: true,
+        });
+        failure.retain_source_lifetime(Box::new(Retention {
+            source_drops: source_drops.clone(),
+            exits: exits.clone(),
+            unwound: unwound.clone(),
+        }));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(failure))).is_err());
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        assert!(
+            unwound.load(Ordering::SeqCst),
+            "the host must observe unknown source exit rather than fabricate success"
+        );
     }
 }

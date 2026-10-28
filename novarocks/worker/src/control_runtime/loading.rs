@@ -23,7 +23,7 @@ use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
 };
-use novarocks_control_runtime_core::identity::ConsumerId;
+use novarocks_control_runtime_core::identity::{ConsumerId, ScopeId, WorkId};
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::{
     CreateTask, TaskCreationInput, TaskFailurePhase, TaskIdentity,
@@ -74,6 +74,8 @@ impl LoadingSources {
 }
 struct Custody {
     task: TaskIdentity,
+    work: WorkId,
+    scope: ScopeId,
     ingress_retained_bytes: usize,
     sources: Mutex<Option<LoadingSources>>,
     role: ExitRole,
@@ -115,17 +117,25 @@ impl LoaderCustody {
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
     ) -> (Self, LoaderJob) {
+        let work = admitted.work.id();
+        let scope = admitted.work.scope().id();
         let report = admitted.report.clone();
-        let (role, authority) =
-            ExitRole::from_admitted(admitted.work, admitted.capacity, admitted.report);
+        let (role, authority) = ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
+            admitted.work,
+            admitted.capacity,
+            admitted.report,
+        ));
         let input_report = input_admitted.report.clone();
-        let (input_role, input_authority) = ExitRole::from_admitted(
-            input_admitted.work,
-            input_admitted.capacity,
-            input_admitted.report,
-        );
+        let (input_role, input_authority) =
+            ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
+                input_admitted.work,
+                input_admitted.capacity,
+                input_admitted.report,
+            ));
         let custody = Arc::new(Custody {
             task: payload.request.identity(),
+            work,
+            scope,
             ingress_retained_bytes: payload.ingress_retained_bytes,
             sources: Mutex::new(Some(LoadingSources::new(payload.request, payload.input))),
             role,
@@ -154,11 +164,36 @@ impl LoaderCustody {
     pub(crate) fn cancel(&self) {
         self.0.canceled.store(true, Ordering::Release);
     }
+    pub(crate) fn identity(&self) -> TaskIdentity {
+        self.0.task
+    }
+    pub(crate) fn work_id(&self) -> WorkId {
+        self.0.work
+    }
+    pub(crate) fn scope_id(&self) -> ScopeId {
+        self.0.scope
+    }
+    pub(crate) fn owns_job(&self, job: &LoaderJob) -> bool {
+        Arc::ptr_eq(&self.0, &job.custody.0)
+    }
+    pub(crate) fn notify_pending(&self) {
+        self.0.pending.pending();
+    }
     pub(crate) fn report(&self) -> &ReportSlot {
         &self.0.report
     }
     pub(crate) fn phase(&self) -> ExitRolePhase {
         self.0.role.phase()
+    }
+    pub(crate) fn is_retired(&self) -> bool {
+        self.phase() == ExitRolePhase::Retired
+            && self.0.input_role.phase() == ExitRolePhase::Retired
+            && self
+                .0
+                .sources
+                .lock()
+                .expect("loader source transfer lock")
+                .is_none()
     }
     pub(crate) fn ready_for_exit(&self) -> Result<bool, ExitRoleError> {
         self.0.role.actual_exit_ready()

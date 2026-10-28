@@ -19,16 +19,19 @@
 //! The host records neutral effects; they do not claim Native/Execution wiring.
 use super::*;
 use crate::control_admission::Dimension;
+use crate::control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits, StorageNeed};
 use novarocks_control_runtime::{
     actor::ActorConfig,
+    completion::ReportSlot,
     driver::{ActorRuntime, DriverError},
     lease::{CapacityBundle, WorkLease},
     transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
+    completion::{ConsumerKind, Consumption},
     effect::EffectState,
-    identity::{ActorId, InputId, ReservationId},
+    identity::{ActorId, ConsumerId, InputId, ReservationId},
     mailbox::InputClass,
     scope::{WorkAdmission, WorkKind},
 };
@@ -42,12 +45,12 @@ use novarocks_types::{
 use novarocks_worker_protocol::{
     context::{ContextConfig, PhysicalFact, RequestResult},
     creation::{CreationCost, PayloadId},
-    lease::{InstalledLease, LeaseBounds},
+    lease::LeaseBounds,
 };
-fn generation() -> Generation {
+pub(in crate::control_runtime) fn generation() -> Generation {
     Generation::new(1).unwrap()
 }
-fn actor() -> ActorId {
+pub(in crate::control_runtime) fn actor() -> ActorId {
     ActorId::new(1).unwrap()
 }
 fn context() -> QueryContextRef {
@@ -57,7 +60,7 @@ fn context() -> QueryContextRef {
         BackendProcessId::new_v7(),
     )
 }
-fn task(c: QueryContextRef, n: u32) -> TaskIdentity {
+pub(in crate::control_runtime) fn task(c: QueryContextRef, n: u32) -> TaskIdentity {
     TaskIdentity::new(
         c.query_execution_id(),
         StageId::new(1).unwrap(),
@@ -65,11 +68,42 @@ fn task(c: QueryContextRef, n: u32) -> TaskIdentity {
         c.backend_process_id(),
     )
 }
-fn operation(n: u8) -> TaskOperationId {
+pub(in crate::control_runtime) fn operation(n: u8) -> TaskOperationId {
     let mut bytes = [n; 16];
     bytes[6] = 0x70;
     bytes[8] = 0x80;
     TaskOperationId::try_from_bytes(bytes).unwrap()
+}
+
+/// Explicit initial facts for standalone Task/Context runtime fixtures. The
+/// real Context bootstrap tests instead consume their actual Materialize ticket.
+pub(in crate::control_runtime) fn initial_establishment()
+-> novarocks_worker_protocol::context::ContextEstablishment {
+    use novarocks_execution_contract::{
+        AdmissionTicketId, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
+    };
+    novarocks_worker_protocol::context::ContextEstablishment {
+        operation: operation(1),
+        ticket: AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+        payload: PayloadId(1),
+        elected_at: MonotonicInstant::ORIGIN,
+        semantics: novarocks_worker_protocol::control::EstablishSemanticFacts {
+            catalog: ContentFingerprint::from_bytes([1; 16]),
+            shared_filter: ContentFingerprint::from_bytes([2; 16]),
+            query_options: ContentFingerprint::from_bytes([3; 16]),
+            credential_lease: CredentialLeaseId::new(1),
+            credential_epoch: CredentialEpoch::new(1).unwrap(),
+            initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+        },
+    }
+}
+/// Symbolic credential slot supplied by the metadata-only materialization
+/// fixture. Native resource creation and physical exit are separate tests.
+pub(in crate::control_runtime) fn initial_materialized()
+-> novarocks_worker_protocol::context::ContextMaterialized {
+    novarocks_worker_protocol::context::ContextMaterialized {
+        initial_credential_resource: 101,
+    }
 }
 
 #[test]
@@ -111,7 +145,7 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
         inbound_records: 1,
         inbound_bytes: 9,
     };
-    f.run(
+    let loading = f.run(
         ContextInput::Create {
             request: operation(1),
             task,
@@ -119,6 +153,15 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
         },
         Some(operation(1)),
     );
+    let source_parent = loading
+        .iter()
+        .find_map(|effect| match effect {
+            WorkerAction::Context(ContextEffect::LoadInput { reservation, .. }) => {
+                Some(*reservation)
+            }
+            _ => None,
+        })
+        .unwrap();
     let loaded = f.send(
         ContextInput::Loaded {
             task,
@@ -160,7 +203,7 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
     let port = crate::task_port::TaskRuntimePort::from_admitted(
         task,
         &f.scope,
-        Arc::new(crate::task_proposal_ingress::TaskProposalIngress::new(4).unwrap()),
+        paid_ingress(&f, task, source_parent, 4),
         Arc::new(Pending),
         Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
     );
@@ -220,39 +263,288 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
     assert_eq!(f.ledger.used(Dimension::InboundBytes.id()), 9);
     let resources = retained.resources().unwrap();
     retained.release(&resources).unwrap();
+    finish_source_routes(&f, port.ingress());
+    drop(port);
     f.finish();
 }
 fn empty() -> ResourceVector {
     ResourceVector::default()
 }
-struct Fixture {
-    ledger: RuntimeLedger,
-    scope: ScopeHandle,
-    runtime: ActorRuntime<WorkerActor>,
-    identity: QueryContextRef,
+fn source_role(
+    scope: &ScopeHandle,
+    parent: ReservationId,
+) -> crate::task_completion_roles::AdmittedCompletionRole {
+    let generation = scope.gates().unwrap().generation;
+    let admitted = scope
+        .reserve_child_next(generation, parent, empty(), WorkKind::Cleanup)
+        .unwrap();
+    let report = ReportSlot::reserve_next(
+        scope,
+        generation,
+        admitted.work_id(),
+        2,
+        [
+            (
+                ConsumerId::new(1).unwrap(),
+                ConsumerKind::Owner {
+                    scope: scope.id(),
+                    generation,
+                },
+            ),
+            (ConsumerId::new(2).unwrap(), ConsumerKind::Observer),
+        ],
+    )
+    .unwrap();
+    let (work, capacity) = admitted.bind(WorkKind::Cleanup).unwrap();
+    crate::task_completion_roles::AdmittedCompletionRole {
+        work,
+        capacity,
+        report,
+    }
+}
+fn paid_ingress(
+    fixture: &Fixture,
+    task: TaskIdentity,
+    parent: ReservationId,
+    cuts: usize,
+) -> std::sync::Arc<crate::task_proposal_ingress::TaskProposalIngress> {
+    std::sync::Arc::new(
+        crate::task_proposal_ingress::TaskProposalIngress::from_admitted(
+            task,
+            cuts,
+            std::array::from_fn(|_| source_role(&fixture.scope, parent)),
+            std::sync::Arc::new(CausalPending),
+            std::sync::Arc::new(
+                novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+            ),
+        )
+        .unwrap_or_else(|_| panic!("the original Task lifetime funded its four source positions")),
+    )
+}
+fn dispose_retired_pair(
+    fixture: &Fixture,
+    ingress: &crate::task_proposal_ingress::TaskProposalIngress,
+    retired: crate::task_proposal_ingress::RetiredCut,
+) {
+    let crate::task_proposal_ingress::RetiredCut { pair, funding } = retired;
+    let observations = ingress.owned_pair_inventory(&pair).unwrap();
+    if observations.iter().all(|observation| {
+        observation.phase == crate::control_runtime::source_positions::SourcePositionPhase::Retired
+    }) {
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.custody.reusable())
+        );
+        drop(pair);
+        drop(funding);
+        return;
+    }
+    for holder in ingress
+        .take_unused_owned_pair(&pair)
+        .unwrap()
+        .into_iter()
+        .flatten()
+    {
+        holder.exit();
+    }
+    for observation in ingress.owned_pair_inventory(&pair).unwrap() {
+        assert!(
+            observation.source.is_none(),
+            "used sources require their actual Core proof"
+        );
+        assert!(observation.custody.actual_exit_ready().unwrap());
+        assert!(observation.custody.try_retire().unwrap());
+    }
+    fixture
+        .ledger
+        .reap_scope_ready(fixture.scope.id(), 256)
+        .unwrap();
+    let witnesses = ingress
+        .prepare_owned_pair_reap(&pair)
+        .unwrap()
+        .map(|probe| probe.observe_reaped().unwrap());
+    ingress.release_owned_pair(&pair, witnesses).unwrap();
+    drop(pair);
+    // Funding can refer to a different still-live pair after seal rotation.
+    // Dropping these observers returns no reservation or inferred quota.
+    drop(funding);
+}
+fn dispose_unused_admission(
+    fixture: &Fixture,
+    task: TaskIdentity,
+    admission: crate::task_proposal_ingress::CutSourceAdmission,
+) {
+    let crate::task_proposal_ingress::CutSourceAdmission::Fresh(roles) = admission else {
+        panic!("this fixture reserved two original fresh source roles");
+    };
+    for role in roles {
+        let (custody, permit) =
+            crate::control_runtime::source_custody::SourceCustody::from_admitted(
+                task,
+                role,
+                std::sync::Arc::new(CausalPending),
+                std::sync::Arc::new(
+                    novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+                ),
+            );
+        drop(permit);
+        assert!(custody.actual_exit_ready().unwrap());
+        assert!(custody.try_retire().unwrap());
+        fixture
+            .ledger
+            .reap_scope_ready(fixture.scope.id(), 256)
+            .unwrap();
+        assert!(custody.reusable());
+    }
+}
+pub(in crate::control_runtime) fn finish_source_routes(
+    fixture: &Fixture,
+    ingress: &crate::task_proposal_ingress::TaskProposalIngress,
+) {
+    use crate::task_proposal_ingress::PairRoute;
+    ingress.seal_source_admission();
+    for route in [PairRoute::Open, PairRoute::ConsumingOpen] {
+        for holder in ingress
+            .take_unused_pair(route)
+            .unwrap()
+            .into_iter()
+            .flatten()
+        {
+            holder.exit();
+        }
+        for observation in ingress.pair_inventory(route).unwrap() {
+            assert!(
+                observation.source.is_none(),
+                "a retained source must be explicitly disposed first"
+            );
+            assert!(observation.custody.actual_exit_ready().unwrap());
+            assert!(observation.custody.try_retire().unwrap());
+        }
+        fixture
+            .ledger
+            .reap_scope_ready(fixture.scope.id(), 256)
+            .unwrap();
+        let witnesses = ingress
+            .prepare_pair_reap(route)
+            .unwrap()
+            .map(|probe| probe.observe_reaped().unwrap());
+        // The complete bank is about to be destroyed, not rearmed. Every
+        // original body, report and common Work header really retired first.
+        drop(witnesses);
+    }
+}
+const STORAGE_DIMENSIONS: [Dimension; 8] = [
+    Dimension::Inputs,
+    Dimension::Batches,
+    Dimension::Effects,
+    Dimension::Cuts,
+    Dimension::Replies,
+    Dimension::Completions,
+    Dimension::Captures,
+    Dimension::Work,
+];
+fn assert_bundle_storage(bundle: &CapacityBundle, expected: StorageNeed) {
+    let actual = bundle.resources().unwrap();
+    let expected = expected.resources().unwrap();
+    for dimension in STORAGE_DIMENSIONS {
+        assert_eq!(
+            actual.get(dimension.id()),
+            expected.get(dimension.id()),
+            "the original bundle must retain its exact {dimension:?} payment"
+        );
+    }
+}
+pub(in crate::control_runtime) struct Fixture {
+    pub(in crate::control_runtime) ledger: RuntimeLedger,
+    pub(in crate::control_runtime) scope: ScopeHandle,
+    pub(in crate::control_runtime) runtime: ActorRuntime<WorkerActor>,
+    pub(in crate::control_runtime) identity: QueryContextRef,
     roles: Vec<(WorkLease, CapacityBundle)>,
     jobs: BTreeMap<ReservationId, (WorkLease, CapacityBundle)>,
+    /// Only the fixed-Task funding fixture enables actual dims8..15 payment.
+    policy: Option<ControlRuntimePolicy>,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(in crate::control_runtime) fn new() -> Self {
         Self::with_byte_limits(100)
     }
-    fn with_byte_limits(bytes: u64) -> Self {
-        let ledger = RuntimeLedger::new(
-            ResourceVector::new([
-                (Dimension::ActiveTasks.id(), 2),
-                (Dimension::PreparingTasks.id(), 1),
-                (Dimension::PreparingBytes.id(), bytes),
-                (Dimension::InboundRecords.id(), 4),
-                (Dimension::InboundBytes.id(), bytes),
-                (Dimension::Tickets.id(), 1),
-                (Dimension::Contexts.id(), 1),
-            ])
-            .unwrap(),
-            32,
-            2,
-        );
-        let scope = ledger.open_scope_next(None, generation(), 32, 32).unwrap();
+    pub(in crate::control_runtime) fn with_byte_limits(bytes: u64) -> Self {
+        Self::with_admission_storage(bytes, None)
+    }
+    pub(in crate::control_runtime) fn with_policy_byte_limits(bytes: u64) -> Self {
+        Self::with_policy_scope_slot_limit(bytes, None)
+    }
+    fn with_policy_scope_slot_limit(bytes: u64, scope_slots: Option<usize>) -> Self {
+        let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
+            ordinary_running: 1,
+            ordinary_waiting: 0,
+            control_running: 1,
+            control_waiting: 0,
+            max_batch_items: 1,
+            root_read_holders: 1,
+        })
+        .unwrap();
+        Self::with_scope_slot_limit(bytes, Some(policy), scope_slots)
+    }
+    fn with_admission_storage(bytes: u64, policy: Option<ControlRuntimePolicy>) -> Self {
+        Self::with_scope_slot_limit(bytes, policy, None)
+    }
+    fn with_scope_slot_limit(
+        bytes: u64,
+        policy: Option<ControlRuntimePolicy>,
+        scope_slots: Option<usize>,
+    ) -> Self {
+        // A=1 for this fixed-Task funding slice. Shared request/root pools and
+        // production Service composition are deliberately not asserted here.
+        let task_limit = if policy.is_some() { 1 } else { 2 };
+        let limits = ResourceVector::new([
+            (Dimension::ActiveTasks.id(), task_limit),
+            (Dimension::PreparingTasks.id(), 1),
+            (Dimension::PreparingBytes.id(), bytes),
+            (Dimension::InboundRecords.id(), 4),
+            (Dimension::InboundBytes.id(), bytes),
+            (Dimension::Tickets.id(), 1),
+            (Dimension::Contexts.id(), 1),
+        ])
+        .unwrap();
+        let (limits, storage, work_headers, report_headers) = match policy {
+            Some(policy) => (
+                limits
+                    .checked_add(&policy.task_base.resources().unwrap())
+                    .unwrap(),
+                AdmissionStorage {
+                    loading: policy.loading.resources().unwrap(),
+                    accepted: policy.accepted.resources().unwrap(),
+                    context: empty(),
+                    ticket: empty(),
+                },
+                policy.task_base.work.checked_add(3).unwrap(),
+                policy.task_base.completions,
+            ),
+            None => (
+                limits,
+                AdmissionStorage {
+                    loading: empty(),
+                    accepted: empty(),
+                    context: empty(),
+                    ticket: empty(),
+                },
+                256,
+                256,
+            ),
+        };
+        // The three original supervisor/Step headers are context-unit owners,
+        // separate from the policy's Task lifetime and fixed Source inventory.
+        let ledger = RuntimeLedger::new(limits, work_headers, 2);
+        let scope = ledger
+            .open_scope_next(
+                None,
+                generation(),
+                work_headers,
+                scope_slots.unwrap_or(report_headers),
+            )
+            .unwrap();
         let mut roles = Vec::new();
         for kind in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step] {
             let (mut work, capacity) = scope
@@ -269,6 +561,7 @@ impl Fixture {
         let core = ContextCore::new(
             identity,
             generation(),
+            initial_establishment(),
             ContextConfig {
                 max_tasks: 4,
                 max_creation_waiters: 4,
@@ -279,24 +572,13 @@ impl Fixture {
                 lease_bounds: LeaseBounds::DEFAULT,
                 metric_publish_interval: Duration::from_millis(100),
             },
-            MonotonicInstant::ORIGIN,
-            InstalledLease::install_initial(
-                LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
-                LeaseBounds::DEFAULT,
-                MonotonicInstant::ORIGIN,
-            ),
         )
         .unwrap();
         let runtime = ActorRuntime::new(2);
         let bound = ContextActor::new(
             core,
             scope.clone(),
-            AdmissionStorage {
-                loading: empty(),
-                accepted: empty(),
-                context: empty(),
-                ticket: empty(),
-            },
+            storage,
             roles[1].0.id(),
             roles[2].0.id(),
         );
@@ -305,13 +587,16 @@ impl Fixture {
                 actor(),
                 scope.clone(),
                 WorkerActor::Context(Box::new(bound)),
-                ActorConfig {
-                    mailbox: [16, 16, 16, 1],
-                    max_batches: 49,
-                    max_effects_per_step: ContextCore::MAX_STEP_WORK,
-                    max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
-                    turn_budget: 64,
-                    max_step_work: ContextCore::MAX_STEP_WORK,
+                match policy {
+                    Some(policy) => policy.context_actor(1).unwrap(),
+                    None => ActorConfig {
+                        mailbox: [16, 16, 16, 1],
+                        max_batches: 49,
+                        max_effects_per_step: ContextCore::MAX_STEP_WORK,
+                        max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
+                        turn_budget: 64,
+                        max_step_work: ContextCore::MAX_STEP_WORK,
+                    },
                 },
                 &roles[0].0,
             )
@@ -323,13 +608,75 @@ impl Fixture {
             identity,
             roles,
             jobs: BTreeMap::new(),
+            policy,
         };
-        let input = fixture.send(ContextInput::Established, None, InputClass::Lifecycle, 2);
+        let input = fixture.send(
+            ContextInput::MaterializationFinished {
+                result: Ok(crate::control_runtime::actors::tests::initial_materialized()),
+            },
+            None,
+            InputClass::Lifecycle,
+            2,
+        );
         fixture.runtime.poll_one(Tick(1)).unwrap();
         fixture.drain(input);
         fixture
     }
-    fn send(
+    fn assert_storage_paid(&self, expected: StorageNeed) {
+        assert!(
+            self.policy.is_some(),
+            "empty-vector protocol fixtures prove no storage payment"
+        );
+        let resources = expected.resources().unwrap();
+        for dimension in STORAGE_DIMENSIONS {
+            assert_eq!(
+                self.ledger.used(dimension.id()),
+                resources.get(dimension.id()),
+                "actual fixed Task payment for {dimension:?}"
+            );
+        }
+    }
+    /// Elect the real Task through Create and transfer its original LoadInput
+    /// guard once. Shared component fixtures must not reserve a substitute Task.
+    pub(in crate::control_runtime) fn adopt_task_host(
+        &mut self,
+        task: TaskIdentity,
+        max_cuts: usize,
+    ) -> crate::control_runtime::task::TaskHostRecord {
+        use crate::control_runtime::task::{TaskHostBinding, TaskHostRecord};
+        let create = self.send(
+            ContextInput::Create {
+                request: operation(1),
+                task,
+                payload: PayloadId(1),
+            },
+            Some(operation(1)),
+            InputClass::Ordinary,
+            2,
+        );
+        self.runtime.poll_one(Tick(1)).unwrap();
+        let load = self.runtime.ready_effects(actor(), create, 15).unwrap()[0];
+        let ticket = self.runtime.take_effect(actor(), create, load).unwrap();
+        let host = TaskHostRecord::adopt_loading(
+            &self.runtime,
+            &ticket,
+            TaskHostBinding {
+                context: self.identity,
+                task_source: ActorId::new(2).unwrap(),
+                protocol_generation: generation(),
+                max_cuts,
+                pending: std::sync::Arc::new(CausalPending),
+                health: std::sync::Arc::new(
+                    novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+                ),
+            },
+        )
+        .unwrap();
+        self.runtime.effect_completed(ticket).unwrap();
+        self.drain(create);
+        host
+    }
+    pub(in crate::control_runtime) fn send(
         &self,
         command: ContextInput,
         request: Option<TaskOperationId>,
@@ -358,7 +705,7 @@ impl Fixture {
         self.runtime.poll_one(Tick(1)).unwrap();
         self.drain(input)
     }
-    fn drain(&mut self, input: InputId) -> Vec<WorkerAction> {
+    pub(in crate::control_runtime) fn drain(&mut self, input: InputId) -> Vec<WorkerAction> {
         self.drain_for(actor(), input)
     }
     fn drain_for(&mut self, target: ActorId, input: InputId) -> Vec<WorkerAction> {
@@ -432,13 +779,18 @@ impl Fixture {
         self.runtime.retire_input(target, input).unwrap();
         outputs
     }
-    fn finish(mut self) {
+    /// Dispose only the original jobs taken from real Core reservations.
+    /// Task lifetime join tests must observe this child exit before closing.
+    pub(in crate::control_runtime) fn finish_jobs(&mut self) {
         for (_, (mut work, mut capacity)) in std::mem::take(&mut self.jobs) {
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
             self.ledger.reap_scope_ready(work.scope().id(), 32).unwrap();
             capacity.release(&capacity.resources().unwrap()).unwrap();
         }
+    }
+    pub(in crate::control_runtime) fn finish(mut self) {
+        self.finish_jobs();
         for (mut work, mut capacity) in self.roles.drain(..) {
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
@@ -457,6 +809,427 @@ impl Fixture {
         assert!(self.ledger.is_empty());
     }
 }
+#[test]
+fn source_bootstrap_slot_refusal_returns_the_original_paid_unpublished_task_until_actual_exit() {
+    use crate::control_runtime::task::{TaskHostBinding, TaskHostError, TaskHostRecord};
+    use novarocks_control_runtime::transaction::RuntimeError;
+    use novarocks_control_runtime_core::scope::ScopeError;
+    use std::sync::Arc;
+
+    // One original Actor attachment plus three Source reports fit. Source4's
+    // fourth report fails without changing the actual Task funding policy.
+    let mut f = Fixture::with_policy_scope_slot_limit(100, Some(4));
+    let policy = f.policy.unwrap();
+    let task = task(f.identity, 1);
+    let original = f.scope.snapshot().unwrap();
+    assert_eq!(original.storage, 1);
+    assert_eq!(original.unresolved, 0);
+    f.assert_storage_paid(StorageNeed::default());
+    let create = f.send(
+        ContextInput::Create {
+            request: operation(1),
+            task,
+            payload: PayloadId(1),
+        },
+        Some(operation(1)),
+        InputClass::Ordinary,
+        2,
+    );
+    f.runtime.poll_one(Tick(1)).unwrap();
+    let action = f.runtime.ready_effects(actor(), create, 15).unwrap()[0];
+    let ticket = f.runtime.take_effect(actor(), create, action).unwrap();
+    let reservation = match ticket.effect {
+        WorkerAction::Context(ContextEffect::LoadInput { reservation, .. }) => reservation,
+        _ => panic!("the actual elected Task's LoadInput effect"),
+    };
+    let task_work = ticket.descriptor.work;
+    let elected = f.scope.snapshot().unwrap();
+    assert_eq!(elected.work, original.work + 1);
+    f.assert_storage_paid(policy.loading);
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    let refusal = TaskHostRecord::adopt_loading(
+        &f.runtime,
+        &ticket,
+        TaskHostBinding {
+            context: f.identity,
+            task_source: ActorId::new(2).unwrap(),
+            protocol_generation: generation(),
+            max_cuts: 1,
+            pending: Arc::new(CausalPending),
+            health: Arc::new(
+                novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+            ),
+        },
+    )
+    .err()
+    .expect("the actual fourth Source report exceeds this Scope's slot capacity");
+    assert!(matches!(
+        refusal.error,
+        TaskHostError::Runtime(RuntimeError::Scope(ScopeError::SlotCapacity))
+    ));
+    let mut unpublished = refusal
+        .unpublished
+        .expect("the bound original Task is returned, never dropped");
+    assert_eq!(unpublished.task, task);
+    assert_eq!(unpublished.lifetime.id(), task_work);
+    assert_eq!(unpublished.active.id(), reservation);
+    assert_eq!(
+        unpublished.active.resources().unwrap(),
+        policy
+            .loading
+            .resources()
+            .unwrap()
+            .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
+            .unwrap()
+    );
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    f.assert_storage_paid(policy.loading);
+    let partial = f.scope.snapshot().unwrap();
+    assert_eq!(
+        partial.storage, original.storage,
+        "only truly unused reports were revoked and retired"
+    );
+    assert_eq!(
+        partial.work,
+        elected.work + 3,
+        "three bound Source children await the actual common reaper"
+    );
+    assert_eq!(
+        partial.unresolved, 0,
+        "a recoverable bootstrap refusal is not Unknown Work"
+    );
+    assert!(f.ledger.unresolved_work().is_empty());
+    let observer = unpublished.lifetime.retirement_observer();
+    assert!(!observer.is_retired());
+    assert!(!unpublished.lifetime.actual_exit_ready().unwrap());
+    assert!(matches!(
+        f.runtime.take_step_reservation(&ticket, reservation),
+        Err(DriverError::UnknownReservation)
+    ));
+    f.runtime.effect_completed(ticket).unwrap();
+    f.drain(create);
+
+    // No input, loader callback, E, or host capture was ever attached. The
+    // successful partial Source roles exited via their real unused path;
+    // reaping those exact children still does not release the original payer.
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 3).unwrap(), 3);
+    assert_eq!(f.scope.snapshot().unwrap().work, elected.work);
+    assert!(!observer.is_retired());
+    f.assert_storage_paid(policy.loading);
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    unpublished.lifetime.body_exited().unwrap();
+    assert!(!unpublished.lifetime.actual_exit_ready().unwrap());
+    unpublished.lifetime.captures_exited().unwrap();
+    assert!(unpublished.lifetime.actual_exit_ready().unwrap());
+    assert!(!observer.is_retired());
+    f.assert_storage_paid(policy.loading);
+    let resources = unpublished.active.resources().unwrap();
+    unpublished.active.release(&resources).unwrap();
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 0);
+    f.assert_storage_paid(StorageNeed::default());
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
+    assert!(observer.is_retired());
+    assert_eq!(f.scope.snapshot().unwrap().work, original.work);
+    assert_eq!(f.scope.snapshot().unwrap().unresolved, 0);
+    drop(unpublished);
+    f.finish();
+}
+
+#[test]
+fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unused_original_roles()
+{
+    use crate::control_runtime::{
+        causal::{CausalError, CausalSourceRetirement},
+        loading::TaskCreatePayload,
+        task::{TaskHostError, TaskHostResources},
+    };
+    use novarocks_control_runtime::{exit_role::ExitRolePhase, transaction::RuntimeError};
+    use novarocks_control_runtime_core::scope::ScopeError;
+    use novarocks_execution_contract::{CreationContent, FrozenBytes, TaskCreationInput};
+    use std::{
+        any::Any,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Debug)]
+    struct Assignment {
+        reads: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl CreationContent for Assignment {
+        fn encoded_len(&self) -> usize {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            5
+        }
+        fn retained_bytes(&self) -> usize {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            7
+        }
+        fn into_stored(self: Box<Self>) -> Box<dyn Any + Send> {
+            self
+        }
+    }
+    impl Drop for Assignment {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Source4 plus the Actor attachment use five original Scope slots. The
+    // loader/input reports use two, the first cut's Source2 use two, and only
+    // the second cut's first Source can fit in the tenth and final position.
+    let mut f = Fixture::with_policy_scope_slot_limit(4096, Some(10));
+    let policy = f.policy.unwrap();
+    let task = task(f.identity, 1);
+    let context_headers = f.scope.snapshot().unwrap().work;
+    let mut host = f.adopt_task_host(task, 2);
+    let elected = f.scope.snapshot().unwrap();
+    assert_eq!(elected.storage, 5);
+    assert_eq!(elected.work, context_headers + 5);
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    f.assert_storage_paid(policy.loading);
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let assignment = Box::new(Assignment {
+        reads: reads.clone(),
+        drops: drops.clone(),
+    });
+    let assignment_pointer = std::ptr::from_ref(assignment.as_ref());
+    let frozen = FrozenBytes::freeze(bytes::Bytes::from(vec![3, 5, 7]));
+    let input = TaskCreationInput::new(frozen.clone(), assignment);
+    let descriptor = novarocks_execution_contract::TaskDescriptor::try_new(
+        task,
+        novarocks_types::UniqueId::new(1, 1),
+        std::num::NonZeroUsize::new(1).unwrap(),
+        vec![],
+        novarocks_execution_contract::ExchangeTopology::try_new(vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    let request = Arc::new(
+        novarocks_execution_contract::CreateTask::try_new(
+            operation(1),
+            f.identity,
+            descriptor,
+            vec![],
+        )
+        .unwrap(),
+    );
+    let payload = TaskCreatePayload {
+        id: PayloadId(1),
+        request: request.clone(),
+        input,
+        ingress_retained_bytes: 2,
+    };
+    let (error, returned) = match host.begin_host_loader(payload) {
+        Err(refused) => refused,
+        Ok(_) => panic!("the second Source2 must exceed the actual tenth Scope slot"),
+    };
+    assert!(matches!(
+        error,
+        TaskHostError::Runtime(RuntimeError::Scope(ScopeError::SlotCapacity))
+    ));
+    assert_eq!(returned.id, PayloadId(1));
+    assert_eq!(returned.ingress_retained_bytes, 2);
+    assert!(Arc::ptr_eq(&request, &returned.request));
+    assert!(
+        returned
+            .input
+            .static_fragment()
+            .shares_backing_with(&frozen)
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(host.loader().is_none());
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    f.assert_storage_paid(policy.loading);
+    let refused = f.scope.snapshot().unwrap();
+    assert_eq!(refused.storage, 7);
+    assert_eq!(
+        refused.work,
+        elected.work + 5,
+        "loader/input, the first Source2 and one partial Source await their actual reapers"
+    );
+    assert_eq!(refused.unresolved, 0);
+    assert!(f.ledger.unresolved_work().is_empty());
+    assert!(!f.runtime.snapshot(actor()).unwrap().failed);
+
+    let port = host.port();
+    let cuts = host.causal().cut_inventory(None, 2);
+    assert_eq!(cuts.len(), 1, "only the first original author was admitted");
+    let cut = cuts[0];
+    assert!(port.ingress().event_unused(cut).unwrap());
+    let funding = port.ingress().cut_funding(cut).unwrap();
+    for custody in &funding.custody {
+        assert_eq!(custody.phase(), ExitRolePhase::Admitted);
+        assert!(!custody.actual_exit_ready().unwrap());
+        assert!(!custody.reusable());
+    }
+    assert!(
+        !f.runtime
+            .role_inventory(actor(), None, 32)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The factory's unused loader/input and partial Source1 really exited.
+    // Their reports have retired; only the original common reaper can remove
+    // their three Work headers. The admitted first cut remains in this Task.
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 3).unwrap(), 3);
+    assert_eq!(f.scope.snapshot().unwrap().work, elected.work + 2);
+    assert_eq!(f.scope.snapshot().unwrap().storage, 7);
+    f.assert_storage_paid(policy.loading);
+    let TaskHostResources {
+        mut lifetime,
+        mut active,
+        port: owned_port,
+        loader,
+        loading_events,
+        loading_return,
+        pending_loading,
+        preparation,
+        preparation_remainder,
+        completion,
+        completion_action,
+        open_summary,
+        mut causal,
+    } = host.into_resources();
+    assert_eq!(
+        active.resources().unwrap(),
+        policy
+            .loading
+            .resources()
+            .unwrap()
+            .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
+            .unwrap(),
+        "the elected Task keeps one original loading payer"
+    );
+    assert!(Arc::ptr_eq(&port, &owned_port));
+    assert!(loader.is_none());
+    assert!(loading_events.is_none());
+    assert!(loading_return.is_none());
+    assert!(pending_loading.is_none());
+    assert!(preparation.is_none());
+    assert!(preparation_remainder.is_none());
+    assert!(completion.is_none());
+    assert!(completion_action.is_none());
+    assert!(open_summary.is_none());
+    assert!(!lifetime.actual_exit_ready().unwrap());
+
+    // This author was revoked unused before attaching any loader capture or
+    // effect. Its original loader/input Work headers were actually reaped
+    // above; record capture exit and observe the same unused paid role's
+    // actual effect exit separately from any Core acknowledgement.
+    port.ingress().observe_cut_exit(cut, true, false).unwrap();
+    assert!(causal.observe_effects_exited(cut).unwrap());
+    let retired = causal
+        .retire_after_exit(cut, CausalSourceRetirement::Unclaimed)
+        .unwrap();
+    assert!(causal.is_empty());
+    assert!(matches!(
+        causal.observe_effects_exited(cut),
+        Err(CausalError::UnknownRole)
+    ));
+    assert!(
+        f.runtime
+            .role_inventory(actor(), None, 32)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        retired.pair.positions(),
+        funding.keys.each_ref().map(|key| key.address())
+    );
+    for (original, returned) in funding.custody.iter().zip(&retired.funding.custody) {
+        assert_eq!(original.report().id(), returned.report().id());
+        assert_eq!(returned.phase(), ExitRolePhase::Admitted);
+    }
+    let unused = port
+        .ingress()
+        .take_unused_owned_pair(&retired.pair)
+        .unwrap();
+    assert!(unused.iter().all(Option::is_some));
+    for holder in unused.into_iter().flatten() {
+        holder.exit();
+    }
+    for custody in &retired.funding.custody {
+        assert!(custody.actual_exit_ready().unwrap());
+        assert!(custody.try_retire().unwrap());
+        assert_eq!(custody.phase(), ExitRolePhase::Retired);
+        assert!(
+            !custody.reusable(),
+            "a retired report is not a reaped Work header"
+        );
+    }
+    assert_eq!(f.scope.snapshot().unwrap().storage, 5);
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 2).unwrap(), 2);
+    assert!(
+        retired
+            .funding
+            .custody
+            .iter()
+            .all(|custody| custody.reusable())
+    );
+    assert!(funding.custody.iter().all(|custody| custody.reusable()));
+    let reaped = port
+        .ingress()
+        .prepare_owned_pair_reap(&retired.pair)
+        .unwrap()
+        .map(|probe| probe.observe_reaped().unwrap());
+    port.ingress()
+        .release_owned_pair(&retired.pair, reaped)
+        .unwrap();
+    drop(retired);
+    drop(funding);
+    drop(causal);
+    assert_eq!(f.scope.snapshot().unwrap().work, elected.work);
+    f.assert_storage_paid(policy.loading);
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+
+    // This unit destroys an empty bank after its real original Source4 exit;
+    // it does not forge Loaded/LoaderExited or any protocol read-seal fact.
+    finish_source_routes(&f, port.ingress());
+    assert_eq!(f.scope.snapshot().unwrap().storage, 1);
+    assert_eq!(f.scope.snapshot().unwrap().work, context_headers + 1);
+    assert!(!lifetime.actual_exit_ready().unwrap());
+    let TaskCreatePayload {
+        input,
+        request: returned_request,
+        ..
+    } = returned;
+    let (returned_frozen, assignment) = input.into_parts();
+    assert!(returned_frozen.shares_backing_with(&frozen));
+    let assignment = assignment.into_stored().downcast::<Assignment>().unwrap();
+    assert_eq!(std::ptr::from_ref(assignment.as_ref()), assignment_pointer);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(assignment);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(returned_frozen);
+    drop(frozen);
+    drop(returned_request);
+    drop(request);
+    drop(owned_port);
+    drop(port);
+    lifetime.body_exited().unwrap();
+    assert!(!lifetime.actual_exit_ready().unwrap());
+    lifetime.captures_exited().unwrap();
+    assert!(lifetime.actual_exit_ready().unwrap());
+    f.assert_storage_paid(policy.loading);
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    active.release(&active.resources().unwrap()).unwrap();
+    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 0);
+    f.assert_storage_paid(StorageNeed::default());
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
+    assert_eq!(f.scope.snapshot().unwrap().work, context_headers);
+    drop(lifetime);
+    drop(active);
+    f.finish();
+}
+
 #[test]
 fn actual_fair_delivery_uses_each_envelope_token_even_when_issuance_order_differs() {
     let mut f = Fixture::new();
@@ -844,7 +1617,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     );
     let ticket_id = AdmissionTicketId::try_from_bytes([4; 16]).unwrap();
     let send = |f: &mut Fixture, command, request: Option<TaskOperationId>| {
-        let materialized = matches!(&command, ControlInput::Materialized { .. });
+        let materialized = matches!(&command, ControlInput::EstablishmentDecided { .. });
         let input = f
             .runtime
             .reserve_input(target, ActorId::new(3).unwrap(), InputClass::Ordinary)
@@ -918,6 +1691,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         query_options: ContentFingerprint::from_bytes([3; 16]),
         credential_lease: CredentialLeaseId::new(1),
         credential_epoch: CredentialEpoch::new(1).unwrap(),
+        initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
     };
     send(
         &mut f,
@@ -927,8 +1701,6 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
             ticket: ticket_id,
             payload: PayloadId(2),
             semantics,
-            compared_payload: None,
-            same_credential: false,
             generation: generation(),
         },
         Some(operation(4)),
@@ -936,9 +1708,12 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     assert_eq!(f.ledger.used(Dimension::Contexts.id()), 1);
     send(
         &mut f,
-        ControlInput::Materialized {
+        ControlInput::EstablishmentDecided {
             context: next,
-            result: Ok(()),
+            decision: novarocks_worker_protocol::context::ContextEstablishmentDecision {
+                state: novarocks_execution_contract::QueryContextState::Active,
+                outcome: Ok(OperationOutcome::Accepted),
+            },
         },
         None,
     );
@@ -1274,7 +2049,13 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
             self
         }
     }
-    let mut f = Fixture::with_byte_limits(4096);
+    let mut f = Fixture::with_policy_byte_limits(4096);
+    let policy = f.policy.expect("actual fixed Task aggregate policy");
+    assert_eq!(
+        policy.loading.checked_add(policy.accepted).unwrap(),
+        policy.task_base
+    );
+    f.assert_storage_paid(StorageNeed::default());
     let task = task(f.identity, 1);
     let create = f.send(
         ContextInput::Create {
@@ -1295,6 +2076,8 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         .next()
         .unwrap();
     let ticket = f.runtime.take_effect(actor(), create, load).unwrap();
+    f.assert_storage_paid(policy.loading);
+    let loading_headers = f.scope.snapshot().unwrap();
     let mut host = TaskHostRecord::adopt_loading(
         &f.runtime,
         &ticket,
@@ -1310,11 +2093,15 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         },
     )
     .unwrap();
+    let source4_headers = f.scope.snapshot().unwrap();
+    assert_eq!(source4_headers.work, loading_headers.work + 4);
+    assert_eq!(source4_headers.storage, loading_headers.storage + 4);
+    f.assert_storage_paid(policy.loading);
     f.runtime.effect_completed(ticket).unwrap();
     f.drain(create);
     assert!(matches!(
         host.admit_settlement_notice(1),
-        Err(crate::control_runtime::causal::CausalError::BeforeAccepted)
+        Err(crate::control_runtime::task::TaskHostError::CompletionBeforeAccepted)
     ));
     assert!(
         f.runtime
@@ -1394,6 +2181,7 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         2,
     );
     f.runtime.poll_one(Tick(2)).unwrap();
+    f.assert_storage_paid(policy.task_base);
     let mut dispatch = EffectDispatch::new(actor(), 15);
     dispatch.index_committed(&f.runtime, 32).unwrap();
     let publication = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
@@ -1436,10 +2224,24 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
             self.calls.fetch_add(2, Ordering::SeqCst);
         }
     }
+    let before_source2 = f.scope.snapshot().unwrap();
     let (cut, notice) = host.admit_settlement_notice(1).unwrap();
+    let after_source2 = f.scope.snapshot().unwrap();
+    assert_eq!(after_source2.work, before_source2.work + 2);
+    assert_eq!(after_source2.storage, before_source2.storage + 2);
+    assert!(
+        port.ingress()
+            .cut_funding(cut)
+            .unwrap()
+            .custody
+            .iter()
+            .all(|role| role.phase()
+                == novarocks_control_runtime::exit_role::ExitRolePhase::Admitted)
+    );
+    f.assert_storage_paid(policy.task_base);
     assert!(matches!(
         host.admit_settlement_notice(1),
-        Err(crate::control_runtime::causal::CausalError::AlreadyAdmitted)
+        Err(crate::control_runtime::task::TaskHostError::CompletionAlreadyIssued)
     ));
     assert_eq!(
         f.runtime.role_inventory(actor(), None, 32).unwrap().len(),
@@ -1584,6 +2386,7 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
     assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), 0);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     assert_eq!(f.ledger.used(Dimension::InboundBytes.id()), inbound_bytes);
+    f.assert_storage_paid(policy.task_base);
     let completion = host.completion().unwrap().clone();
     assert!(
         !completion.try_retire(),
@@ -1755,11 +2558,23 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         port.ingress().consume_cut(cut, 0).unwrap();
     }
     assert!(
-        host.causal().retire_after_exit(cut).is_err(),
+        host.causal()
+            .retire_after_exit(
+                cut,
+                crate::control_runtime::causal::CausalSourceRetirement::Unclaimed
+            )
+            .is_err(),
         "input retirement cannot manufacture source/capture/effect exit"
     );
     port.ingress().observe_cut_exit(cut, true, true).unwrap();
-    host.causal().retire_after_exit(cut).unwrap();
+    let retired = host
+        .causal()
+        .retire_after_exit(
+            cut,
+            crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
+        )
+        .unwrap();
+    dispose_retired_pair(&f, port.ingress(), retired);
     assert!(host.causal().is_empty());
     for role in [
         TaskLifecycleRole::Finisher,
@@ -1793,23 +2608,86 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
         mut active,
         port,
         loader,
+        loading_events,
+        loading_return,
+        pending_loading,
         preparation,
         mut preparation_remainder,
         completion,
+        completion_action,
+        open_summary,
         causal,
     } = host.into_resources();
+    assert!(
+        loading_events.is_none(),
+        "this fixture used the loader component directly"
+    );
+    assert!(loading_return.is_none());
+    assert!(pending_loading.is_none());
+    assert!(
+        completion_action.is_none(),
+        "this fixture issued only original fragment roles"
+    );
+    assert!(
+        open_summary.is_none(),
+        "this component issued no open-summary role"
+    );
     assert!(causal.is_empty());
     drop(causal);
     drop(completion);
     drop(preparation);
     drop(loader);
-    drop(port);
+    let retained = preparation_remainder.as_mut().unwrap();
+    let expected_active = policy
+        .loading
+        .resources()
+        .unwrap()
+        .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
+        .unwrap();
+    assert_eq!(
+        active.resources().unwrap(),
+        expected_active,
+        "the same elected Task bundle retains loading Source4 storage"
+    );
+    assert_bundle_storage(retained, policy.accepted);
+    assert_eq!(
+        retained
+            .resources()
+            .unwrap()
+            .get(Dimension::PreparingTasks.id()),
+        0
+    );
+    assert_eq!(
+        retained
+            .resources()
+            .unwrap()
+            .get(Dimension::PreparingBytes.id()),
+        0
+    );
+    assert_eq!(
+        retained
+            .resources()
+            .unwrap()
+            .get(Dimension::InboundBytes.id()),
+        inbound_bytes
+    );
+    f.assert_storage_paid(policy.task_base);
     lifetime.body_exited().unwrap();
     lifetime.captures_exited().unwrap();
+    assert!(
+        !lifetime.actual_exit_ready().unwrap(),
+        "original Source4/cut2 children still prevent Task header retirement"
+    );
+    finish_source_routes(&f, port.ingress());
+    drop(port);
     f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
+    assert!(lifetime.actual_exit_ready().unwrap());
+    f.assert_storage_paid(policy.task_base);
     active.release(&active.resources().unwrap()).unwrap();
-    let retained = preparation_remainder.as_mut().unwrap();
+    f.assert_storage_paid(policy.accepted);
+    assert_bundle_storage(retained, policy.accepted);
     retained.release(&retained.resources().unwrap()).unwrap();
+    f.assert_storage_paid(StorageNeed::default());
     f.finish();
     assert_eq!(
         nested_dispatch.load(Ordering::SeqCst),
@@ -1851,6 +2729,7 @@ struct CausalHarness {
     task: TaskIdentity,
     ingress: std::sync::Arc<crate::task_proposal_ingress::TaskProposalIngress>,
     inbox: crate::control_runtime::causal::TaskCausalInbox,
+    source_parent: ReservationId,
 }
 struct CausalPending;
 impl crate::task_port::TaskPendingNotice for CausalPending {
@@ -1860,7 +2739,7 @@ impl CausalHarness {
     fn new(cuts: usize) -> Self {
         let mut fixture = Fixture::new();
         let task = task(fixture.identity, 1);
-        fixture.run(
+        let loading = fixture.run(
             ContextInput::Create {
                 request: operation(1),
                 task,
@@ -1868,6 +2747,15 @@ impl CausalHarness {
             },
             Some(operation(1)),
         );
+        let source_parent = loading
+            .iter()
+            .find_map(|effect| match effect {
+                WorkerAction::Context(ContextEffect::LoadInput { reservation, .. }) => {
+                    Some(*reservation)
+                }
+                _ => None,
+            })
+            .expect("the real Task lifetime was adopted from its LoadInput effect");
         fixture.run(
             ContextInput::Loaded {
                 task,
@@ -1881,9 +2769,7 @@ impl CausalHarness {
             },
             None,
         );
-        let ingress = std::sync::Arc::new(
-            crate::task_proposal_ingress::TaskProposalIngress::new(cuts).unwrap(),
-        );
+        let ingress = paid_ingress(&fixture, task, source_parent, cuts);
         let inbox = crate::control_runtime::causal::TaskCausalInbox::new(
             fixture.runtime.clone(),
             actor(),
@@ -1891,13 +2777,22 @@ impl CausalHarness {
             task,
             generation(),
             ingress.clone(),
+            std::sync::Arc::new(
+                novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+            ),
         );
         Self {
             fixture,
             task,
             ingress,
             inbox,
+            source_parent,
         }
+    }
+    fn admission(&self) -> crate::task_proposal_ingress::CutSourceAdmission {
+        crate::task_proposal_ingress::CutSourceAdmission::Fresh(std::array::from_fn(|_| {
+            source_role(&self.fixture.scope, self.source_parent)
+        }))
     }
     fn work(&mut self) -> WorkId {
         let (work, capacity) = self
@@ -1923,9 +2818,10 @@ impl CausalHarness {
         Box<dyn crate::settlement::RegistrationNotice>,
     ) {
         let work = self.work();
+        let admission = self.admission();
         let (cut, mut sender) = self
             .inbox
-            .admit_settlement(1, std::sync::Arc::new(CausalPending))
+            .admit_settlement(1, std::sync::Arc::new(CausalPending), admission)
             .unwrap();
         sender.bind_work(work);
         (cut, sender)
@@ -1939,14 +2835,26 @@ impl CausalHarness {
             self.inbox.observe_core(delivery.cut).unwrap(),
             Consumption::Consumed
         );
-        assert!(self.inbox.retire_after_exit(delivery.cut).is_err());
+        assert!(
+            self.inbox
+                .retire_after_exit(
+                    delivery.cut,
+                    crate::control_runtime::causal::CausalSourceRetirement::Unclaimed
+                )
+                .is_err()
+        );
         let mut result = Vec::new();
         if let Some(prefix) = delivery.prefix {
             result.extend(self.fixture.drain(prefix));
         }
         result.extend(self.fixture.drain(delivery.event));
         assert!(
-            self.inbox.retire_after_exit(delivery.cut).is_err(),
+            self.inbox
+                .retire_after_exit(
+                    delivery.cut,
+                    crate::control_runtime::causal::CausalSourceRetirement::Unclaimed
+                )
+                .is_err(),
             "Core consumption is not physical exit"
         );
         // The neutral test executor returned and disposed all of these values;
@@ -1955,14 +2863,97 @@ impl CausalHarness {
             .observe_cut_exit(delivery.cut, true, true)
             .unwrap();
         self.ingress.consume_cut(delivery.cut, 0).unwrap();
-        self.inbox.retire_after_exit(delivery.cut).unwrap();
+        let retired = self
+            .inbox
+            .retire_after_exit(
+                delivery.cut,
+                crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
+            )
+            .unwrap();
+        dispose_retired_pair(&self.fixture, &self.ingress, retired);
         result
     }
     fn finish(self) {
         assert!(self.inbox.is_empty());
         drop(self.inbox);
+        finish_source_routes(&self.fixture, &self.ingress);
+        drop(self.ingress);
         self.fixture.finish();
     }
+}
+
+#[test]
+fn lifecycle_event_report_cannot_use_its_prefix_as_its_own_core_receipt() {
+    use crate::control_runtime::causal::TaskCausalInbox;
+    use novarocks_control_runtime::driver::Clock;
+    use novarocks_control_runtime_core::completion::Consumption;
+    use novarocks_execution_contract::{CancelReason, TaskConclusionProposal};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct BetweenSteps {
+        inbox: Arc<Mutex<TaskCausalInbox>>,
+        cut: novarocks_worker_protocol::proposal_summary::CutId,
+        calls: AtomicUsize,
+    }
+    impl Clock for BetweenSteps {
+        fn now(&self) -> Tick {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 2 {
+                // Initial sample, prefix sample, then event sample. The real
+                // driver samples outside all locks, after removing the event
+                // but before executing its Core step. Keep production fairness.
+                let mut inbox = self.inbox.lock().unwrap();
+                assert_eq!(inbox.observe_core(self.cut).unwrap(), Consumption::Consumed);
+                assert!(
+                    !inbox.event_core_consumed(self.cut).unwrap(),
+                    "the committed summary is not the event's own Core receipt"
+                );
+            }
+            Tick(1)
+        }
+    }
+    let mut h = CausalHarness::new(1);
+    let work = h.work();
+    let admission = h.admission();
+    let (cut, sender) = h
+        .inbox
+        .admit_input(work, 1, std::sync::Arc::new(CausalPending), admission)
+        .unwrap();
+    drop(h.ingress.submit(TaskConclusionProposal::Canceled(
+        CancelReason::UpstreamNoLongerNeeded,
+    )));
+    sender
+        .send_input(ContextInput::Physical {
+            task: h.task,
+            fact: PhysicalFact::OutputReleased,
+        })
+        .unwrap();
+    let delivery = h.inbox.deliver_next().unwrap().unwrap();
+    assert!(delivery.prefix.is_some());
+    assert!(!h.inbox.event_core_consumed(cut).unwrap());
+    let inbox = Arc::new(Mutex::new(h.inbox));
+    let clock = BetweenSteps {
+        inbox: inbox.clone(),
+        cut,
+        calls: AtomicUsize::new(0),
+    };
+    h.fixture.runtime.poll_one_with_clock(&clock).unwrap();
+    assert_eq!(
+        clock.calls.load(Ordering::SeqCst),
+        3,
+        "the controlled intermediate observation really ran"
+    );
+    drop(clock);
+    h.inbox = Arc::try_unwrap(inbox)
+        .ok()
+        .expect("the original custodian returned")
+        .into_inner()
+        .unwrap();
+    assert!(h.inbox.event_core_consumed(cut).unwrap());
+    h.retire(delivery);
+    h.finish();
 }
 
 #[test]
@@ -2023,6 +3014,12 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
     use novarocks_control_runtime_core::completion::Consumption;
     use novarocks_execution_contract::{AbortCause, CancelReason, TaskConclusionProposal};
     let mut h = CausalHarness::new(2);
+    // Close and settlement are already admitted responsibilities. The actual
+    // Context stop commit must not be bypassed by fresh external admission.
+    let work = h.work();
+    let admission = h.admission();
+    let settlement_work = h.work();
+    let settlement_admission = h.admission();
     let mut closing = h.fixture.run(
         ContextInput::Abort {
             request: operation(2),
@@ -2047,10 +3044,9 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
         })
         .expect("the pure close owner emits this Task's finite causal role");
     assert_ne!(next, generation());
-    let work = h.work();
     let (close_cut, close) = h
         .inbox
-        .admit_close(next, work, 1, std::sync::Arc::new(CausalPending))
+        .admit_close(next, work, 1, std::sync::Arc::new(CausalPending), admission)
         .unwrap();
     h.ingress
         .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
@@ -2058,7 +3054,11 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
     let close = h.inbox.deliver_next().unwrap().unwrap();
     assert_eq!(close.cut, close_cut);
     assert!(close.prefix.is_some());
-    let (_, settle) = h.settlement();
+    let (_, mut settle) = h
+        .inbox
+        .admit_settlement(1, std::sync::Arc::new(CausalPending), settlement_admission)
+        .unwrap();
+    settle.bind_work(settlement_work);
     h.ingress.submit(TaskConclusionProposal::Canceled(
         CancelReason::UpstreamNoLongerNeeded,
     ));
@@ -2094,11 +3094,23 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
             .len(),
         2
     );
-    assert!(matches!(
-        h.inbox
-            .admit_settlement(1, std::sync::Arc::new(CausalPending)),
-        Err(CausalError::Cut(CutError::Full))
-    ));
+    let admission = h.admission();
+    let crate::task_proposal_ingress::CutSourceAdmission::Fresh(ref roles) = admission else {
+        unreachable!();
+    };
+    let original_work = roles.each_ref().map(|role| role.work.id());
+    let refusal = h
+        .inbox
+        .admit_settlement(1, std::sync::Arc::new(CausalPending), admission)
+        .err()
+        .expect("the one real cut is already reserved");
+    assert_eq!(refusal.error, CausalError::Cut(CutError::Full));
+    let crate::task_proposal_ingress::CutSourceAdmission::Fresh(ref roles) = refusal.admission
+    else {
+        panic!("refusal preserves the original paid roles");
+    };
+    assert_eq!(roles.each_ref().map(|role| role.work.id()), original_work);
+    dispose_unused_admission(&h.fixture, h.task, refusal.admission);
     assert_eq!(
         h.fixture
             .runtime
@@ -2109,7 +3121,14 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
         "a failed cut admission returns both unbound input positions"
     );
     sender.unused();
-    assert!(h.inbox.retire_after_exit(cut).is_err());
+    assert!(
+        h.inbox
+            .retire_after_exit(
+                cut,
+                crate::control_runtime::causal::CausalSourceRetirement::Unclaimed
+            )
+            .is_err()
+    );
     assert_eq!(
         h.fixture
             .runtime
@@ -2119,7 +3138,14 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
         2
     );
     h.ingress.observe_cut_exit(cut, true, true).unwrap();
-    h.inbox.retire_after_exit(cut).unwrap();
+    let retired = h
+        .inbox
+        .retire_after_exit(
+            cut,
+            crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
+        )
+        .unwrap();
+    dispose_retired_pair(&h.fixture, &h.ingress, retired);
     assert!(
         h.fixture
             .runtime
@@ -2162,6 +3188,247 @@ fn missing_actual_input_observation_cannot_be_reconstructed_from_a_retired_queue
     h.ingress.summary_consumed(Some(cut)).unwrap();
     h.ingress.observe_cut_exit(cut, true, true).unwrap();
     h.ingress.consume_cut(cut, 0).unwrap();
-    h.inbox.retire_after_exit(cut).unwrap();
+    let retired = h
+        .inbox
+        .retire_after_exit(
+            cut,
+            crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
+        )
+        .unwrap();
+    dispose_retired_pair(&h.fixture, &h.ingress, retired);
     h.finish();
+}
+
+#[test]
+fn a_runtime_input_refusal_returns_the_same_two_paid_source_roles() {
+    use crate::task_proposal_ingress::CutSourceAdmission;
+    let mut h = CausalHarness::new(1);
+    let mut occupied = Vec::new();
+    for _ in 0..16 {
+        occupied.push(
+            h.fixture
+                .runtime
+                .reserve_input(actor(), ActorId::new(7002).unwrap(), InputClass::Lifecycle)
+                .unwrap()
+                .into_role()
+                .unwrap_or_else(|_| panic!("original empty input role")),
+        );
+    }
+    let admission = h.admission();
+    let CutSourceAdmission::Fresh(ref roles) = admission else {
+        unreachable!()
+    };
+    let original = roles.each_ref().map(|role| role.work.id());
+    let refusal = h
+        .inbox
+        .admit_settlement(1, std::sync::Arc::new(CausalPending), admission)
+        .err()
+        .expect("all real lifecycle positions are already held");
+    assert!(matches!(
+        refusal.error,
+        crate::control_runtime::causal::CausalError::Driver(_)
+    ));
+    let CutSourceAdmission::Fresh(ref roles) = refusal.admission else {
+        panic!("runtime refusal preserves the original source roles");
+    };
+    assert_eq!(roles.each_ref().map(|role| role.work.id()), original);
+    dispose_unused_admission(&h.fixture, h.task, refusal.admission);
+    for role in &mut occupied {
+        role.close_after_exit().unwrap();
+    }
+    drop(occupied);
+    h.finish();
+}
+
+#[test]
+fn source_core_receipt_names_its_real_prefix_and_retirement_returns_both_reap_witnesses() {
+    use crate::control_runtime::causal::{CausalSourceRetirement, TaskCausalInbox};
+    use crate::task_proposal_ingress::PairRoute;
+    use novarocks_control_runtime::driver::Clock;
+    use novarocks_execution::runtime::fragment::ExecutionFailure;
+    use novarocks_execution_contract::{TaskConclusionProposal, TaskFailurePhase};
+    use novarocks_worker_protocol::proposal_summary::SourceId;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct OriginalSource(Arc<AtomicUsize>);
+    impl std::fmt::Display for OriginalSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("actual causal prefix source")
+        }
+    }
+    impl std::error::Error for OriginalSource {}
+    impl FailureProjection for OriginalSource {
+        fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+            use novarocks_execution_contract::failure::{
+                FailureClass, FailureFact, FailureReason, domain,
+            };
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(65001).unwrap()),
+            )
+        }
+    }
+    impl Drop for OriginalSource {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[derive(Debug, Eq, PartialEq)]
+    struct PrefixObservation {
+        cut: Consumption,
+        prefix: Option<InputId>,
+        source: Consumption,
+        event_consumed: bool,
+    }
+    struct BetweenSteps {
+        inbox: Arc<Mutex<TaskCausalInbox>>,
+        cut: novarocks_worker_protocol::proposal_summary::CutId,
+        source: SourceId,
+        calls: AtomicUsize,
+        observed: Mutex<Option<PrefixObservation>>,
+    }
+    impl Clock for BetweenSteps {
+        fn now(&self) -> Tick {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                let mut inbox = self.inbox.lock().unwrap();
+                *self.observed.lock().unwrap() = Some(PrefixObservation {
+                    cut: inbox.observe_core(self.cut).unwrap(),
+                    prefix: inbox.source_prefix_input(self.cut, self.source).unwrap(),
+                    source: inbox
+                        .source_core_consumption(self.cut, self.source)
+                        .unwrap(),
+                    event_consumed: inbox.event_core_consumed(self.cut).unwrap(),
+                });
+            }
+            Tick(1)
+        }
+    }
+
+    let mut h = CausalHarness::new(1);
+    let (cut, sender) = h.settlement();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let handoff = h.ingress.submit(TaskConclusionProposal::Failed {
+        cause: ExecutionFailure::from_domain(OriginalSource(drops.clone())),
+        phase: TaskFailurePhase::Execution,
+    });
+    assert!(handoff.transferred && handoff.discarded.is_none() && handoff.error.is_none());
+    sender.registered();
+    let source = h
+        .ingress
+        .pair_inventory(PairRoute::Cut(cut))
+        .unwrap()
+        .into_iter()
+        .find_map(|observation| observation.source)
+        .expect("the original candidate has its actual admitted SourceId");
+    let delivery = h.inbox.deliver_next().unwrap().unwrap();
+    let prefix = delivery
+        .prefix
+        .expect("a source-bearing summary always owns a prefix input");
+    assert_ne!(prefix, delivery.event);
+    assert_eq!(
+        h.inbox.source_prefix_input(cut, source).unwrap(),
+        Some(prefix)
+    );
+    assert_eq!(
+        h.inbox.source_core_consumption(cut, source).unwrap(),
+        Consumption::Pending
+    );
+    let inbox = Arc::new(Mutex::new(h.inbox));
+    let clock = BetweenSteps {
+        inbox: inbox.clone(),
+        cut,
+        source,
+        calls: AtomicUsize::new(0),
+        observed: Mutex::new(None),
+    };
+    h.fixture.runtime.poll_one_with_clock(&clock).unwrap();
+    assert_eq!(clock.calls.load(Ordering::SeqCst), 3);
+    let intermediate = clock.observed.lock().unwrap().take();
+    drop(clock);
+    h.inbox = Arc::try_unwrap(inbox)
+        .ok()
+        .expect("actual source proof returned")
+        .into_inner()
+        .unwrap();
+    // Both real Core steps completed. Keep their actual observations for
+    // cleanup, then assess the saved middle observation after all owners exit.
+    // A red rule must not strand the runtime's original Inbox during unwind.
+    h.inbox.observe_core(cut).unwrap();
+    let prefix_effects = h.fixture.drain(prefix);
+    assert!(prefix_effects.iter().any(|effect| matches!(effect,
+        WorkerAction::Context(ContextEffect::PublishConclusion { source: Some(actual), .. }) if *actual == source)));
+    h.fixture.drain(delivery.event);
+    // Only the actual Core effect names this retained source. Dispose it on
+    // this component's host stack, then consume reports using that saved proof.
+    let retained = h.ingress.take_source(source).unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(retained);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    for holder in h
+        .ingress
+        .take_unused_pair(PairRoute::Cut(cut))
+        .unwrap()
+        .into_iter()
+        .flatten()
+    {
+        holder.exit();
+    }
+    for observation in h.ingress.pair_inventory(PairRoute::Cut(cut)).unwrap() {
+        assert!(observation.custody.actual_exit_ready().unwrap());
+        if let Some(actual) = observation.source {
+            assert_eq!(
+                h.inbox.source_core_consumption(cut, actual).unwrap(),
+                Consumption::Consumed
+            );
+            observation
+                .custody
+                .report()
+                .consume(ConsumerId::new(1).unwrap())
+                .unwrap();
+            observation
+                .custody
+                .report()
+                .consume(ConsumerId::new(2).unwrap())
+                .unwrap();
+        }
+        assert!(observation.custody.try_retire().unwrap());
+    }
+    h.fixture
+        .ledger
+        .reap_scope_ready(h.fixture.scope.id(), 256)
+        .unwrap();
+    let reaped = h
+        .ingress
+        .prepare_pair_reap(PairRoute::Cut(cut))
+        .unwrap()
+        .map(|probe| probe.observe_reaped().unwrap());
+    let identities = format!("{reaped:?}");
+    let refused = h
+        .inbox
+        .retire_after_exit(cut, CausalSourceRetirement::Reaped(reaped))
+        .err()
+        .expect("cut capture/effect/consumer facts are still outstanding");
+    let CausalSourceRetirement::Reaped(ref same) = refused.retirement else {
+        panic!("refusal returns both original reap witnesses");
+    };
+    assert_eq!(format!("{same:?}"), identities);
+    h.ingress.observe_cut_exit(cut, true, true).unwrap();
+    h.ingress.consume_cut(cut, 0).unwrap();
+    let retired = h.inbox.retire_after_exit(cut, refused.retirement).unwrap();
+    dispose_retired_pair(&h.fixture, &h.ingress, retired);
+    h.finish();
+    assert_eq!(
+        intermediate,
+        Some(PrefixObservation {
+            cut: Consumption::Consumed,
+            prefix: Some(prefix),
+            source: Consumption::Consumed,
+            event_consumed: false,
+        }),
+        "the source receipt belongs to its real prefix before the later event commits"
+    );
 }

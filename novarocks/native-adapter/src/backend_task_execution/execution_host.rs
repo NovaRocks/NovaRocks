@@ -48,6 +48,7 @@ use super::prepared_owner::{
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -284,6 +285,125 @@ struct TaskRuntime {
     /// This task's metrics owner, retained so `submit_runnable` can hand it
     /// the status reporter that only exists once the task is runnable.
     operator_statistics: Arc<TaskOperatorStatisticsSink>,
+}
+
+/// The same original receiver captures, moved under the inbound writer fence.
+/// This is not Work admission or an exit receipt. The caller must retain it in
+/// the original, already admitted host cleanup Work and invoke its independent
+/// stages outside every dependency lock. Dropping an unconsumed capture keeps
+/// its original objects retained; it never silently releases a source, receiver
+/// or runtime. The production Service/Host trait connection remains separate.
+#[must_use = "the original supervised receiver cleanup Work must retain and dispose every capture"]
+pub struct NativeReceiverRetirement {
+    task: TaskIdentity,
+    runtime: ManuallyDrop<Option<Arc<TaskRuntime>>>,
+    retirement: ManuallyDrop<Option<ExchangeReceiverRetirement>>,
+    queues: ManuallyDrop<Option<Arc<SplitQueueRegistry<ReceivedReadSplit>>>>,
+}
+impl fmt::Debug for NativeReceiverRetirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeReceiverRetirement")
+            .field("task", &self.task)
+            .finish_non_exhaustive()
+    }
+}
+impl NativeReceiverRetirement {
+    pub fn identity(&self) -> TaskIdentity {
+        self.task
+    }
+
+    /// Runs actual stop observers. Only the original supervised host lane may
+    /// call this; the writer-fenced capture operation never invokes it.
+    pub fn request_stop(&self) {
+        self.runtime
+            .as_ref()
+            .expect("original receiver runtime capture")
+            .stop
+            .request_stop();
+    }
+
+    /// Wakes/disposes the original split queues on that same host lane.
+    pub fn close_split_queues(&self) {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("original receiver runtime capture");
+        self.queues
+            .as_ref()
+            .expect("original receiver queue capture")
+            .close_attempt(runtime.attempt);
+    }
+
+    /// Irreversibly neutralize the live construction signal and move its same
+    /// rich source to the caller. No source destructor or registration hook is
+    /// run here, and absence is not a source/Work-exit observation.
+    pub fn take_source_after_ingress(&mut self) -> Option<ExecutionFailure> {
+        self.retirement
+            .as_mut()?
+            .take_construction_stop()?
+            .close_after_ingress()
+    }
+
+    /// Move the original registration and any still-attached source together.
+    /// The caller supervises their independent destruction. Even if source
+    /// extraction was not called separately, registration transfer first
+    /// closes the real signal and cannot leave a resurrectable rich cache.
+    pub fn take_registration_after_ingress(
+        &mut self,
+    ) -> (Option<ExecutionFailure>, Option<ExchangeReceiverRetirement>) {
+        let mut retirement = self.retirement.take();
+        let source = retirement
+            .as_mut()
+            .and_then(|retirement| retirement.take_construction_stop())
+            .and_then(|owner| owner.close_after_ingress());
+        (source, retirement)
+    }
+
+    /// Dispose only this original map's runtime capture on the actual host
+    /// lane. Other metadata aliases may remain; this supplies no whole-exit
+    /// fact. A moved registration still owes its own supervised exit.
+    pub fn dispose_runtime_capture(&mut self) {
+        assert!(
+            self.retirement.is_none(),
+            "move the original receiver registration before runtime disposal"
+        );
+        drop(self.runtime.take());
+    }
+
+    pub fn dispose_queue_capture(&mut self) {
+        drop(self.queues.take());
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReceiverCaptureLock {
+    Tasks,
+    Retirement,
+}
+impl fmt::Display for ReceiverCaptureLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Tasks => "receiver capture task inventory is poisoned",
+            Self::Retirement => "receiver capture retirement inventory is poisoned",
+        })
+    }
+}
+impl std::error::Error for ReceiverCaptureLock {}
+impl novarocks_execution_contract::failure::FailureProjection for ReceiverCaptureLock {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let reason = match self {
+            Self::Tasks => NativePreparationReason::ReceiverTaskInventoryPoisoned,
+            Self::Retirement => NativePreparationReason::ReceiverRetirementInventoryPoisoned,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(
+                domain::NATIVE,
+                std::num::NonZeroU16::new(reason as u16).unwrap(),
+            ),
+        )
+    }
 }
 
 /// A failed preparation must wake any provider work before resources roll
@@ -558,7 +678,7 @@ impl NativeTaskExecutionHost {
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
         compiler: &dyn CompiledPackageCompiler,
-        preparation_scope: novarocks_worker::TaskPreparationContext<'_>,
+        mut preparation_scope: novarocks_worker::TaskPreparationContext<'_>,
         preparation_child: Arc<NativePreparationChild>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         let preparation_stop = preparation_scope.view();
@@ -763,6 +883,11 @@ impl NativeTaskExecutionHost {
             instance_input.backend_num,
         );
         let task_control = preparation_scope.runtime_control();
+        let completion_roles = preparation_scope.take_completion_roles().map_err(|cause| {
+            let cause =
+                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(cause);
+            HostRejection::from_failure(failure_category(&cause), cause)
+        })?;
         let kernel_control = Arc::clone(&task_control);
         let root_session = self.open_root_result_session(
             identity,
@@ -843,6 +968,7 @@ impl NativeTaskExecutionHost {
             .with_registration_owned_exchange_receivers()
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
             .with_task_control(task_control)
+            .with_completion_roles(completion_roles)
             .with_result_identity(identity)
             .with_edge_gates(Arc::clone(&edges));
         #[cfg(novarocks_dev_controls)]
@@ -946,6 +1072,74 @@ impl NativeTaskExecutionHost {
 
     fn task_runtime(&self, identity: TaskIdentity) -> Option<Arc<TaskRuntime>> {
         self.tasks.lock().expect(TASK_LOCK).get(&identity).cloned()
+    }
+
+    /// Capture only the original receiver metadata while the caller's real
+    /// inbound writer fence is held. A poisoned inventory remains installed;
+    /// neither a lock failure nor an absent field supplies exit evidence.
+    fn take_receiver_retirement(
+        &self,
+        descriptor: &TaskDescriptor,
+    ) -> Result<Option<NativeReceiverRetirement>, ReceiverCaptureLock> {
+        let mut tasks = self.tasks.lock().map_err(|_| ReceiverCaptureLock::Tasks)?;
+        let Some(runtime) = tasks.get(&descriptor.identity()).cloned() else {
+            return Ok(None);
+        };
+        // Until the last fallible lock succeeds, the map retains its original
+        // strong runtime. The temporary metadata loan cannot destroy it even
+        // when a poisoned-lock error unwinds this short capture operation.
+        let retirement = runtime
+            .exchange_retirement
+            .lock()
+            .map_err(|_| ReceiverCaptureLock::Retirement)?
+            .take();
+        let captured = NativeReceiverRetirement {
+            task: descriptor.identity(),
+            runtime: ManuallyDrop::new(Some(runtime)),
+            retirement: ManuallyDrop::new(retirement),
+            queues: ManuallyDrop::new(Some(self.split_queues.clone())),
+        };
+        // captured strongly owns the same runtime before the map's metadata
+        // reference is released. No last-reference Drop can run in this fence.
+        drop(tasks.remove(&descriptor.identity()));
+        Ok(Some(captured))
+    }
+
+    /// Withdraw ingress and move the same original captures under that exact
+    /// delivery writer fence. Execute their independent cleanup stages only
+    /// after this method returns, in the original admitted host cleanup Work.
+    /// This is not connected to the old synchronous Registry retirement path.
+    pub fn capture_receiver_after_removal(
+        &self,
+        descriptor: &TaskDescriptor,
+    ) -> Result<Option<NativeReceiverRetirement>, HostRejection> {
+        self.capabilities
+            .remove_with_capture(descriptor, || self.take_receiver_retirement(descriptor))
+            .map_err(host_failure)
+    }
+
+    /// Close using the actual receiver author's exact facts, preserving strict
+    /// MustDrain validation and the original normal-close retained reservation.
+    /// Invalid facts transfer no captures. A valid closure only moves metadata
+    /// under its writer fence; no receiver hook or opaque destructor runs there.
+    /// The Service must bind returned captures to its original cleanup Work;
+    /// this method supplies no work/source exit or Task-retirement proof.
+    pub fn capture_receiver_after_normal_close(
+        &self,
+        descriptor: &TaskDescriptor,
+        closes: Vec<novarocks_execution_contract::ExchangeStreamClose>,
+    ) -> Result<Option<NativeReceiverRetirement>, HostRejection> {
+        let mut captured = None;
+        self.capabilities
+            .close_normally_with_facts(descriptor, closes, || {
+                captured = Some(self.take_receiver_retirement(descriptor));
+            })?;
+        // The checked capability operation has returned, releasing both its
+        // writer fence and capability state lock. Only neutral error projection
+        // happens here; actual capture disposal remains the host's next phase.
+        captured
+            .expect("the checked normal close invoked its original capture once")
+            .map_err(host_failure)
     }
 
     /// Assembles the runtime inputs a typed connector scan needs.
@@ -1425,51 +1619,64 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let operator_statistics = Arc::clone(&runtime.operator_statistics);
         let completion_reporter = reporter.clone();
         let completion_runtime = Arc::clone(&runtime);
-        let completion = self
-            .completion_supervisor
-            .reserve_with_status(
-                identity,
-                kernel_key,
-                Box::new(move |fact| {
-                    let completion_worker = completion_worker
-                        .upgrade()
-                        .expect("an installed Task retains its runnable until actual completion");
-                    // Preserve the kernel's original removal/cancellation
-                    // disposition before any fact can make the task retire.
-                    // Only the inbound-close owner performs physical cleanup.
-                    if let Some(retirement) = completion_runtime
-                        .exchange_retirement
-                        .lock()
-                        .expect(DORMANT_LOCK)
-                        .as_mut()
-                    {
-                        retirement.record_terminal(fact);
-                    }
-                    // The sampling tick stops firing the moment the drivers
-                    // finish, so the last event-driven snapshot predates the
-                    // rows the operators counted on their way out. The
-                    // terminal fact carries the final frozen profile.
-                    if let Some(profile) = fact.profile() {
-                        operator_statistics.record_profile(profile);
-                    }
-                    report_terminal_with_root(
-                        &completion_reporter,
-                        sink_kind,
-                        root_channel.as_deref(),
-                        fact,
-                        completion_worker.stand_down(),
-                    );
-                    completion_worker.finish(
-                        (sink_kind == FragmentSinkKind::Result && root_channel.is_none())
-                            .then_some(&completion_reporter),
-                    );
-                    split_queues.close_attempt(attempt);
-                    queries.unregister_fragment_execution(execution, kernel_key);
-                    queries.finish_fragment(execution);
-                }),
-                Some(reporter.clone()),
-            )
+        let exit = reporter
+            .take_completion_exit_notice()
             .map_err(host_failure)?;
+        let mut completion = self
+            .completion_supervisor
+            .reserve_task_slot(identity, kernel_key, reporter.clone(), exit)
+            .map_err(|refusal| {
+                let (error, reporter, unused_exit) = refusal.into_task_parts();
+                // No action was attached. These captures remain under the
+                // original preparation invocation until their actual Drop.
+                drop(reporter);
+                drop(unused_exit);
+                host_failure(error)
+            })?;
+        completion
+            .bind_action(Box::new(move |fact| {
+                let completion_worker = completion_worker
+                    .upgrade()
+                    .expect("an installed Task retains its runnable until actual completion");
+                // Preserve the kernel's original removal/cancellation
+                // disposition before any fact can make the task retire.
+                // Only the inbound-close owner performs physical cleanup.
+                if let Some(retirement) = completion_runtime
+                    .exchange_retirement
+                    .lock()
+                    .expect(DORMANT_LOCK)
+                    .as_mut()
+                {
+                    retirement.record_terminal(fact);
+                }
+                // The sampling tick stops firing the moment the drivers
+                // finish, so the last event-driven snapshot predates the
+                // rows the operators counted on their way out. The
+                // terminal fact carries the final frozen profile.
+                if let Some(profile) = fact.profile() {
+                    operator_statistics.record_profile(profile);
+                }
+                report_terminal_with_root(
+                    &completion_reporter,
+                    sink_kind,
+                    root_channel.as_deref(),
+                    fact,
+                    completion_worker.stand_down(),
+                );
+                completion_worker.finish(
+                    (sink_kind == FragmentSinkKind::Result && root_channel.is_none())
+                        .then_some(&completion_reporter),
+                );
+                split_queues.close_attempt(attempt);
+                queries.unregister_fragment_execution(execution, kernel_key);
+                queries.finish_fragment(execution);
+            }))
+            .map_err(|(error, action)| {
+                // A refusal returns the original action without disposing it.
+                // Its actual Drop remains inside the preparation scope.
+                drop(action);
+                host_failure(error)
+            })?;
 
         // The Worker must make the Live record findable before any driver can
         // start or publish completion. The runnable owns this dormant start
@@ -1708,11 +1915,13 @@ enum StandDown {
 
 impl StandDown {
     /// The termination this stand-down proposes to the status owner.
-    const fn proposal(self) -> TerminationDetail {
+    const fn proposal(self) -> novarocks_worker::TaskStopIntent {
         match self {
-            Self::Cancel(reason) => TerminationDetail::Canceled(reason),
-            Self::Quiesce => TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
-            Self::Abort(cause) => TerminationDetail::Aborted(cause),
+            Self::Cancel(reason) => novarocks_worker::TaskStopIntent::Canceled(reason),
+            Self::Quiesce => {
+                novarocks_worker::TaskStopIntent::Canceled(CancelReason::UpstreamNoLongerNeeded)
+            }
+            Self::Abort(cause) => novarocks_worker::TaskStopIntent::Aborted(cause),
         }
     }
 
@@ -2112,7 +2321,7 @@ fn report_terminal_with_root(
             // is the result plane that publishes FINISHED.
             FragmentSinkKind::Result if root_channel.is_some() => {
                 if context_handoff {
-                    reporter.finished(TaskOutputFacts::new(true));
+                    reporter.completion_intent(Some(TaskOutputFacts::new(true)));
                     // This is responsibility handoff to Context, not free or
                     // a consumer acknowledgement. Retired tasks keep reading
                     // through the context-owned map.
@@ -2130,12 +2339,13 @@ fn report_terminal_with_root(
                 // pipeline never stopped producing at all.
                 debug!("root task reached FLUSHING; the result plane publishes FINISHED");
                 reporter.flushing();
+                reporter.completion_intent(None);
             }
             _ => {
                 // The Worker publishes a stand-down before it tells this
                 // runnable, so a completion in between still finds the task
                 // terminating and must complete that stand-down instead.
-                reporter.conclude_success(TaskOutputFacts::new(true));
+                reporter.completion_intent(Some(TaskOutputFacts::new(true)));
                 reporter.release_output();
             }
         },
@@ -2416,6 +2626,8 @@ enum NativePreparationReason {
     TestControl = 9620,
     RootIndex = 9621,
     PreparationTaskMismatch = 9622,
+    ReceiverTaskInventoryPoisoned = 9623,
+    ReceiverRetirementInventoryPoisoned = 9624,
 }
 #[derive(Debug)]
 struct NativePreparationContractFailure {
@@ -7458,7 +7670,11 @@ pub(crate) mod tests {
             *self.open.lock().unwrap() = true;
             self.changed.notify_all();
         }
-        fn cleanup_step(&self, _phase: u16) -> crate::root_producer_pool::RootCleanupProgress {
+        fn cleanup_step(
+            &self,
+            _phase: u16,
+            _predecessors: crate::root_producer_pool::RootCleanupPredecessors,
+        ) -> crate::root_producer_pool::RootCleanupProgress {
             crate::root_producer_pool::RootCleanupProgress::Exited
         }
     }

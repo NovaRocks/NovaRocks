@@ -27,6 +27,16 @@ import re
 from .model import UnitKey
 
 
+def native_stage_mode(stage):
+    """The native declaration owns extra cfg/tool modes, not stage-name parsing."""
+    # Preserve existing memory stage identities for older native declarations.
+    legacy = {"memory-model:loom": "loom", "memory-model:miri": "miri"}
+    mode = stage.get("mode", legacy.get(stage["name"], "default"))
+    if not isinstance(mode, str) or not mode:
+        raise ValueError("native stage mode must be a nonempty string")
+    return mode
+
+
 def _packages(metadata):
     if metadata.get("version") != 1:
         raise ValueError("expected cargo metadata format version 1")

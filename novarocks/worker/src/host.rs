@@ -37,37 +37,89 @@ use crate::RuntimeFilterReleaseObservation;
 use crate::TaskStatusReporter;
 use crate::root_result_channel::RootResultChannel;
 
-/// Actual preparation work borrows its accepted owner. Only this work scope
-/// may hand a controller to the installed runtime; immutable metadata receives
-/// the separate weak view and cannot acquire a reporting capability from it.
-#[derive(Clone, Copy)]
+/// One actual preparation body owns one original, finite fragment role set.
+/// Metadata gets only a weak stop view. Moving this context into the Native
+/// host cannot copy the finisher or sign another settlement registration.
 pub struct TaskPreparationContext<'a> {
-    owner: &'a Arc<crate::TaskStatusOwner>,
+    owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
+    children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
     cadence: std::time::Duration,
+    roles: Option<
+        novarocks_execution_contract::AdmittedFragmentRoles<
+            novarocks_execution::runtime::fragment::ExecutionFailure,
+        >,
+    >,
 }
 impl<'a> TaskPreparationContext<'a> {
-    pub(crate) fn new(
-        owner: &'a Arc<crate::TaskStatusOwner>,
+    pub(crate) fn from_admitted(
+        owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
+        children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
         cadence: std::time::Duration,
-    ) -> Self {
-        Self { owner, cadence }
+        roles: novarocks_execution_contract::AdmittedFragmentRoles<
+            novarocks_execution::runtime::fragment::ExecutionFailure,
+        >,
+    ) -> Result<Self, novarocks_execution::runtime::task_control::TaskControlIdentityMismatch> {
+        if roles.identity() != Some(owner.identity()) || children.identity() != owner.identity() {
+            return Err(novarocks_execution::runtime::task_control::TaskControlIdentityMismatch);
+        }
+        Ok(Self {
+            owner,
+            children,
+            cadence,
+            roles: Some(roles),
+        })
     }
-    /// Registers only the original child's exit metadata, before any runtime
-    /// commit. Immutable TaskPreparationView deliberately has no such method.
+    /// Registers before the provider child attaches kernel/root captures. The
+    /// original preparation owner continues to supervise rollback/adoption.
     pub fn register_child(
         &self,
         child: Arc<dyn crate::TaskPreparationChild>,
     ) -> Result<(), crate::TaskPreparationChildRegistrationFailure> {
-        self.owner.preparation_scope().register(child)
+        self.children.register(child)
     }
     pub fn view(&self) -> crate::TaskPreparationView {
-        crate::TaskPreparationView::from_owner(self.owner, self.cadence)
+        crate::TaskPreparationView::from_execution_port(&self.owner, self.cadence)
     }
     pub fn runtime_control(
         &self,
     ) -> Arc<novarocks_execution::runtime::task_control::TaskExecutionControl> {
-        self.owner
-            .execution_control(novarocks_execution_contract::TaskFailurePhase::Execution)
+        Arc::new(
+            novarocks_execution::runtime::task_control::TaskExecutionControl::new(
+                self.owner.identity(),
+                self.owner.clone(),
+                novarocks_execution_contract::TaskFailurePhase::Execution,
+            )
+            .expect("admitted preparation retains its exact Task port"),
+        )
+    }
+    /// The Native builder takes these original roles once, before the dormant
+    /// fragment binds callbacks. No control handle exposes a role factory.
+    pub fn take_completion_roles(
+        &mut self,
+    ) -> Result<
+        novarocks_execution_contract::AdmittedFragmentRoles<
+            novarocks_execution::runtime::fragment::ExecutionFailure,
+        >,
+        TaskCompletionRolesTaken,
+    > {
+        self.roles.take().ok_or(TaskCompletionRolesTaken)
+    }
+}
+#[derive(Debug)]
+pub struct TaskCompletionRolesTaken;
+impl std::fmt::Display for TaskCompletionRolesTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the original fragment completion roles were already transferred")
+    }
+}
+impl std::error::Error for TaskCompletionRolesTaken {}
+impl novarocks_execution_contract::failure::FailureProjection for TaskCompletionRolesTaken {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::CompletionWorkUnresolved.reason(),
+        )
     }
 }
 
@@ -633,6 +685,36 @@ pub trait QueryContextHost: Send + Sync {
     fn advance_shared_domain(
         &self,
         context: QueryContextRef,
+        domain: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+    ) -> Result<(), HostRejection>;
+}
+
+/// Allocates one actual host instance inside an admitted materialization job.
+/// The caller publishes the returned capability to its Context owner before
+/// invoking materialization. Release and updates must use that same capability.
+/// Allocation does not establish the Context or publish a protocol result.
+/// The factory allocates metadata only; I/O belongs to `materialize`. An error
+/// must leave no new unpublished instance behind.
+pub trait QueryContextHostFactory: Send + Sync {
+    fn create_instance(
+        self: Arc<Self>,
+        context: QueryContextRef,
+    ) -> Result<Arc<dyn QueryContextHostInstance>, HostRejection>;
+}
+
+/// The host resources of one Context incarnation. No operation resolves a
+/// Context key again: a delayed job retains its original instance, never a
+/// later occupant of the directory. The owning scope must retain this
+/// capability until all admitted calls and their reports have actually exited.
+pub trait QueryContextHostInstance: Send + Sync {
+    fn context(&self) -> QueryContextRef;
+
+    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection>;
+
+    fn release(&self) -> ReleasedContextEvidence;
+
+    fn advance_shared_domain(
+        &self,
         domain: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
     ) -> Result<(), HostRejection>;
 }

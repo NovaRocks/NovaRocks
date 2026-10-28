@@ -1403,7 +1403,8 @@ mod tests {
         let context = FragmentPrepareContext::default()
             .with_execution_runtime(test_execution_runtime())
             .with_task_control(control.clone())
-            .with_result_identity(identity);
+            .with_result_identity(identity)
+            .with_completion_roles(owner.admit_completion_roles());
         let dormant =
             crate::runtime::fragment::prepare_compiled_fragment(submission, context).unwrap();
         let original: ExecutionFailure =

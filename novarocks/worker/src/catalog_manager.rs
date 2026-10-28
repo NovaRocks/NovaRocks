@@ -551,7 +551,7 @@ impl<T> CatalogManager<T> {
     pub fn release_query(&self, query: QueryExecutionId) -> BTreeSet<CatalogHandle> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.query_reachability.remove(&query);
-        let removed = trim_unreachable_ready_entries(
+        let (removed, retired) = trim_unreachable_ready_entries(
             &mut state,
             self.config.max_retained_catalogs,
             &BTreeSet::new(),
@@ -562,6 +562,11 @@ impl<T> CatalogManager<T> {
             self.config.failed_retention,
             Instant::now(),
         );
+        // The original canonical nodes remain held by this call after map
+        // removal. Their provider destructors may run only outside the shared
+        // metadata lock; no queue or replacement runtime is created here.
+        drop(state);
+        drop(retired);
         removed
     }
 
@@ -582,7 +587,9 @@ impl<T> CatalogManager<T> {
             };
         }
         remove_unreachable_failed_entries(&mut state, reachable);
-        let handles = trim_unreachable_ready_entries(&mut state, 0, reachable);
+        let (handles, retired) = trim_unreachable_ready_entries(&mut state, 0, reachable);
+        drop(state);
+        drop(retired);
         CatalogPruneResult::Pruned { handles }
     }
 
@@ -801,7 +808,7 @@ fn trim_unreachable_ready_entries<T>(
     state: &mut CatalogManagerState<T>,
     retain_at_most: usize,
     protected: &BTreeSet<CatalogHandle>,
-) -> BTreeSet<CatalogHandle> {
+) -> (BTreeSet<CatalogHandle>, Vec<ReadyCandidate<T>>) {
     let live = all_query_handles(&state.query_reachability);
     let candidates = state
         .entries
@@ -819,17 +826,15 @@ fn trim_unreachable_ready_entries<T>(
     } else {
         candidates.len().min(excess)
     };
-    let candidates = candidates
-        .into_iter()
-        .take(remove_count)
-        .collect::<Vec<_>>();
     let mut removed = BTreeSet::new();
-    for candidate in candidates {
-        if remove_ready_candidate_if_current(state, &candidate) {
-            removed.insert(candidate.handle);
+    for candidate in candidates.iter().take(remove_count) {
+        if remove_ready_candidate_if_current(state, candidate) {
+            removed.insert(candidate.handle.clone());
         }
     }
-    removed
+    // Even a removed map entry still has this exact original Arc. Return all
+    // candidates so their final Drops cannot occur inside the caller's lock.
+    (removed, candidates)
 }
 
 /// A stale candidate is harmless: the current map entry must still be the
@@ -1522,5 +1527,111 @@ mod tests {
                 "catalog manager must retain at least one catalog"
             ))
         ));
+    }
+
+    struct BlockingRuntimeDrop {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        resume: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl Drop for BlockingRuntimeDrop {
+        fn drop(&mut self) {
+            if let Some(entered) = &self.entered {
+                entered.send(()).expect("observe actual final runtime Drop");
+                self.resume
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("release the original runtime destructor");
+            }
+        }
+    }
+    // Correctness only: an opaque final destructor may stall, but it cannot
+    // retain the manager's metadata lock. Always release and join both real
+    // threads before asserting, including the old implementation's failure.
+    fn check_runtime_drop_does_not_block_other_queries(prune: bool) {
+        use std::sync::{Mutex, mpsc};
+        let manager = Arc::new(
+            CatalogManager::try_new(CatalogManagerConfig {
+                max_retained_catalogs: 1,
+                ..CatalogManagerConfig::default()
+            })
+            .unwrap(),
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let runtime = manager
+            .ensure(query(1), properties(1), |_| {
+                Ok(BlockingRuntimeDrop {
+                    entered: Some(entered_tx),
+                    resume: Some(Mutex::new(resume_rx)),
+                })
+            })
+            .unwrap();
+        drop(runtime);
+        if prune {
+            // Retention keeps the original, now unleased entry until prune.
+            assert!(manager.release_query(query(1)).is_empty());
+        } else {
+            // A second live catalog makes the first release exceed the real
+            // configured bound without a special zero-retention test mode.
+            drop(
+                manager
+                    .ensure(query(2), properties(2), |_| {
+                        Ok(BlockingRuntimeDrop {
+                            entered: None,
+                            resume: None,
+                        })
+                    })
+                    .unwrap(),
+            );
+        }
+        let releasing = manager.clone();
+        let cleanup = thread::spawn(move || {
+            if prune {
+                match releasing.prune_unreachable(&BTreeSet::new()) {
+                    CatalogPruneResult::Pruned { handles } => handles,
+                    other => panic!("the original query is no longer live: {other:?}"),
+                }
+            } else {
+                releasing.release_query(query(1))
+            }
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let observing = manager.clone();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let observer = thread::spawn(move || {
+            let snapshot = observing.lease_snapshot();
+            observed_tx.send(snapshot).unwrap();
+        });
+        let observed_while_drop_blocked = observed_rx.recv_timeout(Duration::from_secs(5));
+        // Cleanup is deliberately unconditional even if either observation
+        // failed. A test timeout is never permission to leave a live worker.
+        let resumed = resume_tx.send(());
+        let removed = cleanup.join();
+        let observed_exit = observer.join();
+        assert!(
+            entered.is_ok(),
+            "the last opaque runtime holder actually entered Drop"
+        );
+        assert!(resumed.is_ok());
+        assert_eq!(
+            removed.unwrap(),
+            BTreeSet::from([properties(1).handle().clone()])
+        );
+        observed_exit.unwrap();
+        let snapshot = observed_while_drop_blocked.expect(
+            "another query's metadata access must progress while a provider destructor is stalled",
+        );
+        assert_eq!(snapshot.query_leases, usize::from(!prune));
+    }
+    #[test]
+    fn release_final_runtime_drop_does_not_hold_the_manager_lock() {
+        check_runtime_drop_does_not_block_other_queries(false);
+    }
+    #[test]
+    fn prune_final_runtime_drop_does_not_hold_the_manager_lock() {
+        check_runtime_drop_does_not_block_other_queries(true);
     }
 }

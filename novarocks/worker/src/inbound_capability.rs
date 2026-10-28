@@ -37,6 +37,9 @@ enum InboundCapabilityFailure {
     InvalidCloseFacts {
         task: TaskIdentity,
     },
+    ConflictingCloseFacts {
+        task: TaskIdentity,
+    },
     ReservationConflict {
         task: TaskIdentity,
     },
@@ -71,6 +74,12 @@ impl std::fmt::Display for InboundCapabilityFailure {
                 f,
                 "task {task} normal-close facts do not cover its exact frozen streams and delivery obligations"
             ),
+            Self::ConflictingCloseFacts { task } => {
+                write!(
+                    f,
+                    "task {task} normal-close facts conflict with its retained original record"
+                )
+            }
             Self::ReservationConflict { task } => write!(
                 f,
                 "normal-close reservation conflicts with accepted task {task}"
@@ -108,7 +117,7 @@ impl novarocks_execution_contract::failure::FailureProjection for InboundCapabil
         use crate::failure_reason::WorkerFailureReason as R;
         use novarocks_execution_contract::failure::*;
         let (reason, dimension, requested, committed, limit) = match self {
-            Self::InvalidCloseFacts { .. } => {
+            Self::InvalidCloseFacts { .. } | Self::ConflictingCloseFacts { .. } => {
                 return FailureFact::new(FailureClass::Invariant, R::InboundCloseContract.reason());
             }
             Self::RecordSize => {
@@ -791,6 +800,19 @@ impl TaskInboundCapabilities {
     /// Withdraws exactly this task's capability. Identity is re-checked so a
     /// stale rollback cannot evict a newer owner of the same kernel key.
     pub fn remove(&self, descriptor: &TaskDescriptor) {
+        self.remove_with_capture(descriptor, || ());
+    }
+
+    /// Move the original receiver capture while the same delivery writer
+    /// fence excludes every already-claimed synchronous push. `detach` may
+    /// only move ownership/metadata; callbacks, source destruction and actual
+    /// receiver cleanup belong to the supervised host after this returns.
+    /// No capability-state lock is held while moving the original capture.
+    pub fn remove_with_capture<T>(
+        &self,
+        descriptor: &TaskDescriptor,
+        detach: impl FnOnce() -> T,
+    ) -> T {
         let key = descriptor.fragment_instance_id();
         let gate = self
             .state
@@ -811,9 +833,15 @@ impl TaskInboundCapabilities {
             state.installed.remove(&key);
             state.delivery_gates.remove(&key);
         }
-        if let Some(bytes) = state.reserved.remove(&descriptor.identity()) {
+        let retained = state
+            .normally_closed
+            .get(&key)
+            .is_some_and(|record| record.destination == descriptor.identity());
+        if !retained && let Some(bytes) = state.reserved.remove(&descriptor.identity()) {
             state.reserved_bytes -= bytes;
         }
+        drop(state);
+        detach()
     }
 
     /// Existing DemandDriven retirement adapter. It records explicit withdrawal,
@@ -841,7 +869,8 @@ impl TaskInboundCapabilities {
             })
             .collect::<Vec<_>>();
         closes.sort_unstable_by_key(|close| close.stream);
-        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver);
+        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver)
+            .expect("the same legacy normal-close author repeats its original withdrawal facts");
     }
 
     /// Retain actual receiver-authored facts, covering every frozen stream once.
@@ -899,8 +928,7 @@ impl TaskInboundCapabilities {
                 }
             }
         }
-        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver);
-        Ok(())
+        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver)
     }
 
     /// Atomically replaces the installed capability while holding the existing
@@ -910,7 +938,7 @@ impl TaskInboundCapabilities {
         descriptor: &TaskDescriptor,
         closes: Box<[ExchangeStreamClose]>,
         retire_receiver: impl FnOnce(),
-    ) {
+    ) -> Result<(), HostRejection> {
         let key = descriptor.fragment_instance_id();
         let gate = self
             .state
@@ -922,6 +950,18 @@ impl TaskInboundCapabilities {
         let _retirement = gate
             .as_ref()
             .map(|gate| gate.write().expect("task inbound delivery gate"));
+        {
+            let state = self.state.lock().expect(CAPABILITY_LOCK);
+            if let Some(original) = state.normally_closed.get(&key)
+                && (original.destination != descriptor.identity() || original.closes != closes)
+            {
+                return Err(capability_rejection(
+                    InboundCapabilityFailure::ConflictingCloseFacts {
+                        task: descriptor.identity(),
+                    },
+                ));
+            }
+        }
         // No further push can begin for this destination while the receiver
         // route is removed; a pending delivery rechecks the final verdict.
         retire_receiver();
@@ -957,10 +997,15 @@ impl TaskInboundCapabilities {
             if held {
                 state.installed.remove(&key);
             }
-            if let Some(bytes) = state.reserved.remove(&descriptor.identity()) {
+            let retained = state
+                .normally_closed
+                .get(&key)
+                .is_some_and(|record| record.destination == descriptor.identity());
+            if !retained && let Some(bytes) = state.reserved.remove(&descriptor.identity()) {
                 state.reserved_bytes -= bytes;
             }
         }
+        Ok(())
     }
 }
 
@@ -1095,6 +1140,67 @@ mod tests {
         );
         capabilities.forget_context(context);
         capabilities.reserve_normal_close(&second).unwrap();
+    }
+
+    #[test]
+    fn retained_normal_close_keeps_original_facts_and_credit_across_replay_and_late_removal() {
+        use novarocks_execution_contract::{ExchangeCloseDisposition, ExchangeFrameSequence};
+        use std::cell::Cell;
+        let owner = TaskInboundCapabilities::with_limits(1, 4096);
+        let (first, source) = descriptor(111, UniqueId::new(11, 12));
+        let (second, _) = descriptor(211, UniqueId::new(13, 14));
+        let bytes = TaskInboundCapabilities::record_bytes(&first).unwrap();
+        owner.install(Arc::new(first.clone())).unwrap();
+        let callbacks = Cell::new(0);
+        owner.close_normally(&first, || callbacks.set(callbacks.get() + 1));
+        let InboundFrameClaim::NormallyClosed(original) =
+            claim(&owner, first.fragment_instance_id(), source, 0, 1)
+        else {
+            panic!("the original exact normal-close record remains visible");
+        };
+        let original = original.close();
+        owner
+            .close_normally_with_facts(&first, vec![original], || {
+                callbacks.set(callbacks.get() + 1);
+            })
+            .unwrap();
+        assert_eq!(callbacks.get(), 2);
+        assert_eq!(owner.state.lock().unwrap().reserved_bytes, bytes);
+        assert!(owner.reserve_normal_close(&second).is_err());
+
+        owner.remove(&first);
+        assert_eq!(owner.state.lock().unwrap().reserved_bytes, bytes);
+        assert!(owner.reserve_normal_close(&second).is_err());
+        let mut conflicting = original;
+        conflicting.disposition = ExchangeCloseDisposition::Consumed {
+            final_sequence: ExchangeFrameSequence::FIRST,
+        };
+        assert!(
+            owner
+                .close_normally_with_facts(&first, vec![conflicting], || {
+                    callbacks.set(callbacks.get() + 1);
+                })
+                .is_err(),
+            "a replay cannot replace the original receiver-authored close fact"
+        );
+        assert_eq!(callbacks.get(), 2, "refusal precedes metadata detachment");
+        let InboundFrameClaim::NormallyClosed(retained) =
+            claim(&owner, first.fragment_instance_id(), source, 0, 1)
+        else {
+            panic!("a conflicting replay cannot erase the original record");
+        };
+        assert_eq!(retained.close(), original);
+        assert_eq!(owner.state.lock().unwrap().reserved_bytes, bytes);
+        assert!(owner.reserve_normal_close(&second).is_err());
+
+        owner.forget_context(QueryContextRef::new(
+            first.identity().query_execution_id(),
+            FrontendProcessId::new_v7(),
+            first.identity().backend_process_id(),
+        ));
+        owner.reserve_normal_close(&second).unwrap();
+        owner.remove(&second);
+        assert_eq!(owner.state.lock().unwrap().reserved_bytes, 0);
     }
 
     #[test]
@@ -1521,6 +1627,54 @@ mod tests {
                 .is_err()
         );
         assert!(!delivered);
+    }
+
+    #[test]
+    fn abnormal_retirement_moves_the_original_capture_and_destroys_it_after_both_fences() {
+        use std::sync::{
+            RwLock,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Capture {
+            owner: Arc<TaskInboundCapabilities>,
+            gate: Arc<RwLock<()>>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                assert!(self.gate.try_write().is_ok(), "delivery writer exited");
+                assert!(
+                    self.owner.state.try_lock().is_ok(),
+                    "capability lock exited"
+                );
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (descriptor, _) = descriptor(911, UniqueId::new(93, 94));
+        let owner = TaskInboundCapabilities::new();
+        owner.install(Arc::new(descriptor.clone())).unwrap();
+        let gate =
+            owner.state.lock().unwrap().delivery_gates[&descriptor.fragment_instance_id()].clone();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let original = Box::new(Capture {
+            owner: owner.clone(),
+            gate: gate.clone(),
+            drops: drops.clone(),
+        });
+        let identity = std::ptr::from_ref(original.as_ref());
+        let detached = owner.remove_with_capture(&descriptor, || {
+            assert!(
+                gate.try_write().is_err(),
+                "same writer fence orders the move"
+            );
+            assert_eq!(owner.len(), 0, "no process lock encloses the move");
+            original
+        });
+        assert_eq!(std::ptr::from_ref(detached.as_ref()), identity);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.state.lock().unwrap().reserved_bytes, 0);
+        drop(detached);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

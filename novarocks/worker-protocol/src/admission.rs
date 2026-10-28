@@ -225,7 +225,7 @@ impl fmt::Display for AdmissionTicketRedemptionRejection {
 impl std::error::Error for AdmissionTicketRedemptionRejection {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AcquisitionIdentity {
+pub(crate) struct AcquisitionIdentity {
     context: QueryContextRef,
     valid_for: LeaseValidFor,
     compatibility: NativeCompatibilityId,

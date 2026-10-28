@@ -135,8 +135,13 @@ impl TaskCompletionRoles {
         );
         let bind = |input: AdmittedCompletionRole| {
             let report = input.report.clone();
-            let (role, authority) =
-                ExitRole::from_admitted(input.work, input.capacity, input.report);
+            let (role, authority) = ExitRole::from_admitted(
+                crate::control_runtime::admitted_role::adopt_reported_work(
+                    input.work,
+                    input.capacity,
+                    input.report,
+                ),
+            );
             let capability = Box::new(Work {
                 identity,
                 authority: Some(authority),
@@ -264,6 +269,9 @@ impl TaskCompletionRoles {
                     .expect("original completion custody retirement");
             }
         }
+        self.is_retired()
+    }
+    pub(crate) fn is_retired(&self) -> bool {
         self.settlement.phase() == SettlementPhase::Retired
             && self
                 .originals

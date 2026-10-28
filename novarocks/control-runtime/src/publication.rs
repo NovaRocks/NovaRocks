@@ -19,13 +19,25 @@
 //! the scope-failure gate; host I/O happens only after commit returns.
 
 use crate::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     transaction::ScopeHandle,
 };
 
 pub struct PublishedSnapshot<T> {
     pub(crate) owner: ScopeHandle,
     pub(crate) value: Arc<Mutex<Arc<T>>>,
+}
+/// A short read of the actual cell without cloning its possibly rich owner.
+/// Copy only known neutral values while borrowed; never invoke host callbacks,
+/// retain this guard across a wait, or destroy an opaque source under it.
+pub struct SnapshotBorrow<'a, T> {
+    value: MutexGuard<'a, Arc<T>>,
+}
+impl<T> std::ops::Deref for SnapshotBorrow<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
 }
 impl<T> Clone for PublishedSnapshot<T> {
     fn clone(&self) -> Self {
@@ -48,6 +60,11 @@ impl<T> PublishedSnapshot<T> {
     /// domain callback participates in the read.
     pub fn read(&self) -> Arc<T> {
         self.value.lock().expect("published snapshot lock").clone()
+    }
+    pub fn borrow(&self) -> SnapshotBorrow<'_, T> {
+        SnapshotBorrow {
+            value: self.value.lock().expect("published snapshot lock"),
+        }
     }
 }
 #[derive(Clone, Copy, Eq, PartialEq)]

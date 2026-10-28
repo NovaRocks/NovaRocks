@@ -64,6 +64,21 @@ pub enum HistoryFact {
     SlotRetired {
         slot: SlotId,
     },
+    ReturnClaimed {
+        slot: SlotId,
+    },
+    ReturnFilled {
+        slot: SlotId,
+    },
+    ReturnTaken {
+        slot: SlotId,
+    },
+    ReturnRevokedUnused {
+        slot: SlotId,
+    },
+    ReturnUnknown {
+        slot: SlotId,
+    },
     Admitted {
         scope: ScopeId,
         work: WorkId,

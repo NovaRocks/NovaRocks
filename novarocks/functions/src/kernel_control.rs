@@ -45,6 +45,15 @@ impl KernelSourceFailure {
     pub fn detail(&self) -> &str {
         self.0.detail()
     }
+    /// Keep one admitted guard on this direct canonical source node, including
+    /// aliases made before attachment. Its opaque payload's independently
+    /// shared child resources remain their original owners' responsibility.
+    pub fn retain_source_lifetime(
+        &self,
+        custody: Box<dyn novarocks_failure_contract::SourceRetentionCapability>,
+    ) {
+        self.0.retain_source_lifetime(custody);
+    }
 }
 impl fmt::Display for KernelSourceFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -149,6 +158,29 @@ impl fmt::Display for KernelFailure {
     }
 }
 impl KernelFailure {
+    /// Forward an already admitted guard through the known typed source
+    /// owners. Value-only failures return the same guard to their original
+    /// enclosing owner. No source projection, Work or capacity is created.
+    pub fn try_retain_source_lifetime(
+        &self,
+        custody: Box<dyn novarocks_failure_contract::SourceRetentionCapability>,
+    ) -> Result<(), Box<dyn novarocks_failure_contract::SourceRetentionCapability>> {
+        match self {
+            Self::Source(source) => {
+                source.retain_source_lifetime(custody);
+                Ok(())
+            }
+            Self::CompileControl(source) => source.try_retain_source_lifetime(custody),
+            Self::Capacity(_)
+            | Self::Cancelled
+            | Self::DeadlineExceeded
+            | Self::ResourceExhausted
+            | Self::InvalidProgram(_)
+            | Self::Internal(_)
+            | Self::Operational(_)
+            | Self::InstanceFailed => Err(custody),
+        }
+    }
     // Only RowDataError's checked admission calls this. A non-Data source is
     // unmaskable; avoid reprojecting or replacing its actual occurrence.
     pub(crate) fn rejected_row_source(
@@ -387,5 +419,186 @@ mod compile_source_tests {
             cause = error.source();
         }
         assert_eq!(original, Some(&control));
+    }
+}
+
+#[cfg(test)]
+mod source_retention_tests {
+    use super::{KernelCapacityRefusal, KernelDiagnostic, KernelFailure, KernelSourceFailure};
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause,
+        SourceRetentionCapability, domain,
+    };
+    use novarocks_type_contract::CompileControlError;
+    use std::{
+        error::Error,
+        fmt,
+        num::NonZeroU16,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Debug, Default)]
+    struct Observations {
+        sources: AtomicUsize,
+        projections: AtomicUsize,
+        renderings: AtomicUsize,
+        guards: AtomicUsize,
+        sources_at_guard_exit: AtomicUsize,
+        unknown: AtomicBool,
+    }
+    #[derive(Debug)]
+    struct Original {
+        observations: Arc<Observations>,
+        panic_on_drop: bool,
+    }
+    impl fmt::Display for Original {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.observations.renderings.fetch_add(1, Ordering::SeqCst);
+            f.write_str("original typed kernel source")
+        }
+    }
+    impl Error for Original {}
+    impl FailureProjection for Original {
+        fn failure_fact(&self) -> FailureFact {
+            self.observations.projections.fetch_add(1, Ordering::SeqCst);
+            FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(domain::KERNEL, NonZeroU16::new(408).unwrap()),
+            )
+        }
+    }
+    impl Drop for Original {
+        fn drop(&mut self) {
+            self.observations.sources.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic_on_drop, "original kernel source destructor");
+        }
+    }
+    #[derive(Debug)]
+    struct Guard(Arc<Observations>);
+    impl SourceRetentionCapability for Guard {}
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0
+                .sources_at_guard_exit
+                .store(self.0.sources.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.0
+                .unknown
+                .store(std::thread::panicking(), Ordering::SeqCst);
+            self.0.guards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn failure(shared: SharedFailureCause, compile: bool) -> KernelFailure {
+        if compile {
+            KernelFailure::CompileControl(CompileControlError::Source(shared))
+        } else {
+            KernelFailure::Source(KernelSourceFailure(shared))
+        }
+    }
+    fn inner(failure: &KernelFailure) -> &SharedFailureCause {
+        match failure {
+            KernelFailure::Source(source) => &source.0,
+            KernelFailure::CompileControl(CompileControlError::Source(source)) => source,
+            _ => panic!("the fixture supplies a real typed shared source"),
+        }
+    }
+
+    #[test]
+    fn typed_source_retention_follows_original_kernel_and_compile_nodes() {
+        for compile in [false, true] {
+            let observed = Arc::new(Observations::default());
+            let failure = failure(
+                SharedFailureCause::new(Original {
+                    observations: observed.clone(),
+                    panic_on_drop: false,
+                }),
+                compile,
+            );
+            // Keep the actual inner node before the outer typed owner receives
+            // custody, including KernelSourceFailure's private canonical node.
+            let early = inner(&failure).clone();
+            let original = early.downcast_ref::<Original>().unwrap() as *const Original;
+            let fact = failure.failure_fact();
+            failure
+                .try_retain_source_lifetime(Box::new(Guard(observed.clone())))
+                .unwrap();
+            let late = inner(&failure).clone();
+            assert_eq!(
+                late.downcast_ref::<Original>().unwrap() as *const _,
+                original
+            );
+            assert_eq!(failure.failure_fact(), fact);
+            assert_eq!(late.detail(), "original typed kernel source");
+            assert_eq!(observed.projections.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.renderings.load(Ordering::SeqCst), 1);
+            drop(failure);
+            drop(early);
+            assert_eq!(observed.sources.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.guards.load(Ordering::SeqCst), 0);
+            drop(late);
+            assert_eq!(observed.sources.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.guards.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.sources_at_guard_exit.load(Ordering::SeqCst), 1);
+            assert!(!observed.unknown.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn typed_source_retention_preserves_source_unwind() {
+        for compile in [false, true] {
+            let observed = Arc::new(Observations::default());
+            let failure = failure(
+                SharedFailureCause::new(Original {
+                    observations: observed.clone(),
+                    panic_on_drop: true,
+                }),
+                compile,
+            );
+            let early = inner(&failure).clone();
+            failure
+                .try_retain_source_lifetime(Box::new(Guard(observed.clone())))
+                .unwrap();
+            drop(failure);
+            assert_eq!(observed.guards.load(Ordering::SeqCst), 0);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(early)));
+            assert!(result.is_err());
+            assert_eq!(observed.sources.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.guards.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.sources_at_guard_exit.load(Ordering::SeqCst), 1);
+            assert!(observed.unknown.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn value_failures_return_the_same_unused_guard() {
+        let reason = FailureReason::new(domain::KERNEL, NonZeroU16::new(409).unwrap());
+        for failure in [
+            KernelFailure::Capacity(KernelCapacityRefusal::new(reason, 3, 2, 1)),
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("invalid")),
+            KernelFailure::Internal(KernelDiagnostic::new("internal")),
+            KernelFailure::Operational(KernelDiagnostic::new("operational")),
+            KernelFailure::InstanceFailed,
+            KernelFailure::CompileControl(CompileControlError::Cancelled),
+            KernelFailure::CompileControl(CompileControlError::DeadlineExceeded),
+            KernelFailure::CompileControl(CompileControlError::ResourceExhausted),
+        ] {
+            let observed = Arc::new(Observations::default());
+            let guard: Box<dyn SourceRetentionCapability> = Box::new(Guard(observed.clone()));
+            let original = &*guard as *const dyn SourceRetentionCapability as *const ();
+            let returned = failure.try_retain_source_lifetime(guard).unwrap_err();
+            assert_eq!(
+                &*returned as *const dyn SourceRetentionCapability as *const (),
+                original
+            );
+            drop(failure);
+            assert_eq!(observed.guards.load(Ordering::SeqCst), 0);
+            drop(returned);
+            assert_eq!(observed.guards.load(Ordering::SeqCst), 1);
+        }
     }
 }

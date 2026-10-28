@@ -307,6 +307,37 @@ fn prepare_compiled_fragment_in(
         &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
     >,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {
+    // Validate the complete Task capability binding before acquiring a sink,
+    // opening a result session or allowing any execution capture to attach.
+    let control_error = match (context.result_identity, context.task_control.as_ref()) {
+        (Some(identity), Some(control)) if identity == control.identity() => None,
+        (None, None) => None,
+        (Some(_), None) => Some(crate::runtime::fragment::ExecutionFailure::from_domain(
+            crate::runtime::task_control::MissingTaskExecutionControl,
+        )),
+        _ => Some(crate::runtime::fragment::ExecutionFailure::from_domain(
+            crate::runtime::task_control::TaskControlIdentityMismatch,
+        )),
+    };
+    if let Some(error) = control_error {
+        return Err(FragmentLaunchError::from_failure(
+            FragmentLaunchStage::ValidateSubmission,
+            FragmentLaunchErrorKind::Binding,
+            error,
+        ));
+    }
+    if context.result_identity.is_some() && context.completion_roles.is_none() {
+        return Err(FragmentLaunchError::from_failure(
+            FragmentLaunchStage::ValidateSubmission,
+            FragmentLaunchErrorKind::Binding,
+            FragmentBindingError::new(
+                FragmentBindingTarget::Instance,
+                FragmentBindingErrorKind::InvalidAssignment,
+                "Task preparation requires its pre-admitted original completion roles",
+            )
+            .into(),
+        ));
+    }
     if context
         .completion_roles
         .as_ref()
@@ -550,15 +581,14 @@ fn prepare_compiled_fragment_in(
                 context.completion_roles = Some(roles);
                 prepared.admit_local_completion_driver(driver);
             }
-            let (settlement, publisher_work) = if let Some(roles) = context.completion_roles.take()
-            {
-                let (finisher, wall_time, publisher) = roles.into_parts();
-                let (permit, work) = finisher.into_parts();
-                prepared.admit_completion_work(work, wall_time);
-                (Some(permit), Some(publisher))
-            } else {
-                (None, None)
-            };
+            let roles = context
+                .completion_roles
+                .take()
+                .expect("validated Task roles or the original taskless admission");
+            let (finisher, wall_time, publisher) = roles.into_parts();
+            let (permit, work) = finisher.into_parts();
+            prepared.admit_completion_work(work, wall_time);
+            let (settlement, publisher_work) = (permit, publisher);
             Ok(DormantFragmentHandle {
                 prepared,
                 resources,

@@ -53,7 +53,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
@@ -93,7 +96,8 @@ use novarocks_worker::runtime_filter::domain::BackendParticipantIdentity;
 use novarocks_worker::{
     CatalogManager, CatalogManagerError, CatalogPruneResult,
     ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextCredentialSlot,
-    QueryContextHost, ReleasedContextEvidence, SharedFactsRequest, TaskStatusReporter,
+    QueryContextHost, QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence,
+    SharedFactsRequest, TaskStatusReporter,
 };
 
 type RuntimeFilterParticipantInstaller = dyn Fn(
@@ -131,6 +135,7 @@ struct ContextFacts {
 
 /// Everything one query context installed on this backend.
 struct InstalledContext {
+    instance_owned: bool,
     credentials: Arc<QueryContextCredentialSlot>,
     facts: Mutex<ContextFacts>,
 }
@@ -155,8 +160,16 @@ impl novarocks_type_contract::PureCompileControl for ContextTypeConstructionCont
 impl InstalledContext {
     fn establishing() -> Self {
         Self {
+            instance_owned: false,
             credentials: Arc::new(QueryContextCredentialSlot::new()),
             facts: Mutex::new(ContextFacts::default()),
+        }
+    }
+
+    fn instance_owned() -> Self {
+        Self {
+            instance_owned: true,
+            ..Self::establishing()
         }
     }
 
@@ -165,6 +178,7 @@ impl InstalledContext {
     /// See [`NativeQueryContextHost::release`] for why this exists.
     fn released() -> Self {
         Self {
+            instance_owned: false,
             credentials: Arc::new(QueryContextCredentialSlot::new()),
             facts: Mutex::new(ContextFacts {
                 released: true,
@@ -452,12 +466,14 @@ impl NativeQueryContextHost {
     }
 
     pub fn context_for_execution(&self, execution: QueryExecutionId) -> Option<QueryContextRef> {
-        self.contexts
+        let contexts = self
+            .contexts
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .by_execution
-            .get(&execution)
-            .copied()
+            .unwrap_or_else(|error| error.into_inner());
+        let context = *contexts.by_execution.get(&execution)?;
+        // A capability-owned released row still fences successor allocation,
+        // but it is no longer a task-visible installed Context.
+        (!contexts.get(context)?.is_released()).then_some(context)
     }
 
     /// Observe the exact context's facts without holding the registry lock.
@@ -493,6 +509,7 @@ impl NativeQueryContextHost {
         context: QueryContextRef,
         installed: &InstalledContext,
     ) -> ReleasedContextEvidence {
+        installed.credentials.close();
         let participant = {
             let mut facts = installed
                 .facts
@@ -506,7 +523,6 @@ impl NativeQueryContextHost {
             facts.feedback = None;
             facts.participant.take()
         };
-        installed.credentials.clear();
         let evidence = match participant {
             Some(participant) => {
                 let evidence = seal_runtime_filter_evidence(context, &participant);
@@ -833,10 +849,144 @@ impl NativeQueryContextHost {
             .unwrap_or_else(|error| error.into_inner());
         if contexts
             .get(context)
-            .is_some_and(|installed| installed.is_released())
+            .is_some_and(|installed| !installed.instance_owned && installed.is_released())
         {
             contexts.remove(context);
         }
+    }
+}
+
+/// The one admitted Context incarnation. Directory retention follows this
+/// capability, including every actual in-flight call clone held by its owner.
+struct NativeQueryContextInstance {
+    host: Arc<NativeQueryContextHost>,
+    context: QueryContextRef,
+    installed: Arc<InstalledContext>,
+    materialization_started: AtomicBool,
+    release_started: AtomicBool,
+    release_completed: AtomicBool,
+}
+
+impl QueryContextHostFactory for NativeQueryContextHost {
+    fn create_instance(
+        self: Arc<Self>,
+        context: QueryContextRef,
+    ) -> Result<Arc<dyn QueryContextHostInstance>, HostRejection> {
+        let installed = {
+            let mut contexts = self
+                .contexts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if contexts.get(context).is_some() {
+                return Err(context_facts_rejection(
+                    ContextFactsFailure::AlreadyMaterialized,
+                ));
+            }
+            if contexts
+                .by_execution
+                .contains_key(&context.query_execution_id())
+            {
+                return Err(context_facts_rejection(
+                    ContextFactsFailure::ExecutionAlreadyInstalled(context.query_execution_id()),
+                ));
+            }
+            let installed = Arc::new(InstalledContext::instance_owned());
+            contexts.insert(context, Arc::clone(&installed));
+            installed
+        };
+        Ok(Arc::new(NativeQueryContextInstance {
+            host: self,
+            context,
+            installed,
+            materialization_started: AtomicBool::new(false),
+            release_started: AtomicBool::new(false),
+            release_completed: AtomicBool::new(false),
+        }))
+    }
+}
+
+impl QueryContextHostInstance for NativeQueryContextInstance {
+    fn context(&self) -> QueryContextRef {
+        self.context
+    }
+
+    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+        if request.context() != self.context {
+            return Err(context_facts_rejection(
+                ContextFactsFailure::WrongInstanceContext {
+                    expected: self.context,
+                    actual: request.context(),
+                },
+            ));
+        }
+        self.host.still_establishing(&self.installed)?;
+        if self.materialization_started.swap(true, Ordering::AcqRel) {
+            return Err(context_facts_rejection(
+                ContextFactsFailure::AlreadyMaterialized,
+            ));
+        }
+        let result = (|| {
+            let options_fingerprint = request.query_options().fingerprint();
+            let catalogs = catalog_bindings(request.catalog_binding().as_ref())?;
+            let contribution = runtime_filter_install(request.initial_runtime_filter().as_ref())?;
+            let options = query_options(request.query_options().as_ref())?;
+            let material = credential_material(request.initial_credential())?;
+            self.host.still_establishing(&self.installed)?;
+            self.host.install_shared_facts(
+                self.context,
+                &self.installed,
+                catalogs,
+                contribution,
+                options,
+                options_fingerprint,
+                material,
+            )
+        })();
+        if result.is_err() {
+            // R may already have run while M was installing. Repeat only this
+            // same instance's rollback; no successor can occupy its directory
+            // until the last actual capability owner has exited.
+            drop(self.host.tear_down(self.context, &self.installed));
+        }
+        result
+    }
+
+    fn release(&self) -> ReleasedContextEvidence {
+        if self.release_started.swap(true, Ordering::AcqRel) {
+            if !self.release_completed.load(Ordering::Acquire) {
+                // Concurrent re-entry or a panicking first release has no
+                // positive exit evidence. This API cannot report Unknown.
+                std::process::abort();
+            }
+            return ReleasedContextEvidence::none();
+        }
+        let evidence = self.host.tear_down(self.context, &self.installed);
+        self.release_completed.store(true, Ordering::Release);
+        evidence
+    }
+
+    fn advance_shared_domain(
+        &self,
+        domain: &QueryContextDomainUpdate,
+    ) -> Result<(), HostRejection> {
+        self.host
+            .apply_shared_domain(self.context, &self.installed, domain)
+    }
+}
+
+impl Drop for NativeQueryContextInstance {
+    fn drop(&mut self) {
+        if self.release_completed.load(Ordering::Acquire) {
+            // Drop supplies no release, report, or physical-exit proof. The
+            // Worker scope must retain every actual call/report capability.
+            self.host
+                .contexts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove_if_same(self.context, &self.installed);
+        }
+        // An unreleased owner leaves its original row retained. Never run
+        // foreign cleanup or silently permit replacement from an opaque Drop.
     }
 }
 
@@ -901,7 +1051,22 @@ impl QueryContextHost for NativeQueryContextHost {
                 .contexts
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            if contexts
+                .by_execution
+                .get(&context.query_execution_id())
+                .and_then(|owner| contexts.get(*owner))
+                .is_some_and(|owner| owner.instance_owned)
+            {
+                return Err(context_facts_rejection(
+                    ContextFactsFailure::InstanceCapabilityRequired,
+                ));
+            }
             match contexts.get(context) {
+                Some(existing) if existing.instance_owned => {
+                    return Err(context_facts_rejection(
+                        ContextFactsFailure::InstanceCapabilityRequired,
+                    ));
+                }
                 Some(existing) if existing.is_released() => {
                     // The owner released this context before its facts were
                     // installed. Consume the marker and refuse: installing now
@@ -962,6 +1127,19 @@ impl QueryContextHost for NativeQueryContextHost {
                 .contexts
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            if contexts
+                .get(context)
+                .is_some_and(|owner| owner.instance_owned)
+                || contexts
+                    .by_execution
+                    .get(&context.query_execution_id())
+                    .and_then(|owner| contexts.get(*owner))
+                    .is_some_and(|owner| owner.instance_owned)
+            {
+                // This temporary legacy API cannot return a typed refusal.
+                // Never turn a key-only call into false release evidence.
+                std::process::abort();
+            }
             match contexts.remove(context) {
                 Some(installed) => installed,
                 None => {
@@ -999,6 +1177,23 @@ impl QueryContextHost for NativeQueryContextHost {
         domain: &QueryContextDomainUpdate,
     ) -> Result<(), HostRejection> {
         let installed = self.active_context(context)?;
+        if installed.instance_owned {
+            return Err(context_facts_rejection(
+                ContextFactsFailure::InstanceCapabilityRequired,
+            ));
+        }
+        self.apply_shared_domain(context, &installed, domain)
+    }
+}
+
+impl NativeQueryContextHost {
+    fn apply_shared_domain(
+        &self,
+        context: QueryContextRef,
+        installed: &InstalledContext,
+        domain: &QueryContextDomainUpdate,
+    ) -> Result<(), HostRejection> {
+        self.still_establishing(installed)?;
         match domain {
             // The catalog domain is a scalar: a new version replaces the whole
             // binding. This backend can add a query's catalog leases but can
@@ -1010,7 +1205,7 @@ impl QueryContextHost for NativeQueryContextHost {
             )),
             QueryContextDomainUpdate::SharedDynamicFilter { payload, .. } => {
                 let contribution = runtime_filter_install(payload.as_ref())?;
-                let Some(decoded) = self.decode_contribution(context, &installed, contribution)?
+                let Some(decoded) = self.decode_contribution(context, installed, contribution)?
                 else {
                     // An advance exists to carry a change. "Install nothing"
                     // either says the participant should be removed, which a
@@ -1035,7 +1230,7 @@ impl QueryContextHost for NativeQueryContextHost {
                 let participant =
                     (self.runtime_filter_installer)(context.query_execution_id(), decoded)
                         .map_err(runtime_filter_rejection)?;
-                self.adopt_participant(context, &installed, participant)
+                self.adopt_participant(context, installed, participant)
             }
             QueryContextDomainUpdate::Credential(update) => {
                 // One atomic whole-table replace. The owner already classified
@@ -1266,6 +1461,12 @@ enum ContextFactsFailure {
     Unavailable(QueryContextRef),
     Released,
     AlreadyMaterialized,
+    InstanceCapabilityRequired,
+    WrongInstanceContext {
+        expected: QueryContextRef,
+        actual: QueryContextRef,
+    },
+    ExecutionAlreadyInstalled(QueryExecutionId),
     InstallWithoutParticipant,
     CatalogReplacementUnsupported,
     EmptyFilterAdvance,
@@ -1282,6 +1483,9 @@ impl fmt::Display for ContextFactsFailure {
             Self::Unavailable(context) => write!(f, "query context {context} holds no shared facts"),
             Self::Released => f.write_str("the query context released its shared facts"),
             Self::AlreadyMaterialized => f.write_str("query context shared facts are already materialized"),
+            Self::InstanceCapabilityRequired => f.write_str("query context operation requires its original host instance capability"),
+            Self::WrongInstanceContext { expected, actual } => write!(f, "host instance for {expected} cannot materialize {actual}"),
+            Self::ExecutionAlreadyInstalled(execution) => write!(f, "query execution {execution:?} already has a host instance"),
             Self::InstallWithoutParticipant => f.write_str("runtime filter contribution names no participant but carries an install"),
             Self::CatalogReplacementUnsupported => f.write_str("a catalog binding replacement cannot be applied because catalog leases are released only for a whole query"),
             Self::EmptyFilterAdvance => f.write_str("a shared dynamic filter advance carries no participant install"),
@@ -1307,6 +1511,9 @@ impl novarocks_execution_contract::failure::FailureProjection for ContextFactsFa
                 ));
             }
             Self::AlreadyMaterialized => (FailureClass::Invariant, 9003),
+            Self::InstanceCapabilityRequired => (FailureClass::Invariant, 9013),
+            Self::WrongInstanceContext { .. } => (FailureClass::Invariant, 9014),
+            Self::ExecutionAlreadyInstalled(_) => (FailureClass::Invariant, 9015),
             Self::InstallWithoutParticipant => (FailureClass::Invariant, 9004),
             Self::CatalogReplacementUnsupported => (FailureClass::Invariant, 9005),
             Self::EmptyFilterAdvance => (FailureClass::Invariant, 9006),
@@ -1333,6 +1540,9 @@ fn context_facts_rejection(source: ContextFactsFailure) -> HostRejection {
         | ContextFactsFailure::EmptyFilterAdvance
         | ContextFactsFailure::SealedParticipant => TaskFailureCategory::Protocol,
         ContextFactsFailure::AlreadyMaterialized
+        | ContextFactsFailure::InstanceCapabilityRequired
+        | ContextFactsFailure::WrongInstanceContext { .. }
+        | ContextFactsFailure::ExecutionAlreadyInstalled(_)
         | ContextFactsFailure::QueryOptionsMissing
         | ContextFactsFailure::FilterCarrier(_) => TaskFailureCategory::Internal,
         ContextFactsFailure::Unavailable(_)
@@ -1703,9 +1913,11 @@ mod tests {
         NativeRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
     };
     use novarocks_native_adapter::task_shared_facts::release_runtime_filter_telemetry;
-    use novarocks_worker::QueryContextHost;
     use novarocks_worker::{
         CatalogManager, ConnectorExecutionRoleBindingFactorySet, ProcessMonotonicClock,
+    };
+    use novarocks_worker::{
+        HostRejection, QueryContextHost, QueryContextHostFactory, QueryContextHostInstance,
     };
     use novarocks_worker::{
         METRIC_PUBLISH_MIN_INTERVAL, SharedFactsRequest, TaskStatusOwner, TaskStatusReporter,
@@ -2051,6 +2263,241 @@ mod tests {
     }
 
     // ----------------------------------------------------------------- tests
+
+    fn materialize_instance(
+        instance: &Arc<dyn QueryContextHostInstance>,
+        context: QueryContextRef,
+        catalogs: Vec<CatalogProperties>,
+        credential: &CredentialUpdate,
+    ) -> Result<(), HostRejection> {
+        let catalog = catalog_payload(catalogs);
+        let filter = filter_payload(no_contribution());
+        let options = query_options_payload();
+        instance.materialize(SharedFactsRequest::new(
+            context, &catalog, &filter, &options, credential,
+        ))
+    }
+
+    #[test]
+    fn an_instance_is_registered_once_and_release_before_materialization_cannot_reopen_it() {
+        let fixture = Fixture::new();
+        let identity = context(91_001);
+        let instance = fixture.host.clone().create_instance(identity).unwrap();
+        assert_eq!(instance.context(), identity);
+        assert!(fixture.host.clone().create_instance(identity).is_err());
+        let other_reference = QueryContextRef::new(
+            identity.query_execution_id(),
+            FrontendProcessId::new_v7(),
+            identity.backend_process_id(),
+        );
+        assert!(
+            fixture
+                .host
+                .clone()
+                .create_instance(other_reference)
+                .is_err()
+        );
+        let wrong = materialize_instance(&instance, context(91_002), vec![], &empty_credential());
+        assert!(wrong.is_err());
+        assert_eq!(fixture.query_leases(), 0);
+        drop(instance.release());
+        let late = materialize_instance(&instance, identity, vec![], &empty_credential());
+        assert!(late.is_err());
+        assert!(
+            instance
+                .advance_shared_domain(&QueryContextDomainUpdate::Credential(credential(
+                    2,
+                    ANNOUNCED_SCOPE,
+                    live_until()
+                ),))
+                .is_err()
+        );
+        assert!(fixture.host.clone().create_instance(identity).is_err());
+        assert!(
+            fixture
+                .host
+                .contexts
+                .lock()
+                .unwrap()
+                .get(identity)
+                .is_some()
+        );
+        drop(instance.release());
+        drop(instance);
+        assert!(
+            fixture
+                .host
+                .contexts
+                .lock()
+                .unwrap()
+                .get(identity)
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .host
+                .context_for_execution(identity.query_execution_id()),
+            None
+        );
+        let successor = fixture.host.clone().create_instance(identity).unwrap();
+        drop(successor.release());
+        drop(successor);
+    }
+
+    #[test]
+    fn the_actual_instance_rotates_and_closes_its_original_slot_without_key_fallback() {
+        let fixture = Fixture::new();
+        let identity = context(91_003);
+        let instance = fixture.host.clone().create_instance(identity).unwrap();
+        materialize_instance(
+            &instance,
+            identity,
+            vec![catalog_properties()],
+            &credential(1, ANNOUNCED_SCOPE, live_until()),
+        )
+        .unwrap();
+        let original = fixture.host.active_context(identity).unwrap();
+        let resolver = fixture.host.storage_resolver_for_context(identity).unwrap();
+        assert!(
+            resolver
+                .resolve_vended_s3(&storage_request("s3://bucket/a/file.parquet"))
+                .is_ok()
+        );
+        instance
+            .advance_shared_domain(&QueryContextDomainUpdate::Credential(credential(
+                2,
+                "s3://bucket/b",
+                live_until(),
+            )))
+            .unwrap();
+        assert_eq!(original.credentials.installed_epoch(lease_id(1)), Some(2));
+        assert!(
+            resolver
+                .resolve_vended_s3(&storage_request("s3://bucket/a/file.parquet"))
+                .is_err()
+        );
+        assert!(
+            resolver
+                .resolve_vended_s3(&storage_request("s3://bucket/b/file.parquet"))
+                .is_ok()
+        );
+        assert!(
+            fixture
+                .host
+                .advance_shared_domain(
+                    identity,
+                    &QueryContextDomainUpdate::Credential(credential(
+                        3,
+                        ANNOUNCED_SCOPE,
+                        live_until()
+                    ),)
+                )
+                .is_err()
+        );
+        assert!(
+            fixture
+                .establish(identity, vec![], no_contribution(), &empty_credential())
+                .is_err()
+        );
+        assert_eq!(original.credentials.installed_epoch(lease_id(1)), Some(2));
+        drop(instance.release());
+        assert_eq!(fixture.query_leases(), 0);
+        assert_eq!(original.credentials.installed_lease_count(), 0);
+        assert!(
+            resolver
+                .resolve_vended_s3(&storage_request("s3://bucket/b/file.parquet"))
+                .is_err()
+        );
+        assert!(
+            instance
+                .advance_shared_domain(&QueryContextDomainUpdate::Credential(credential(
+                    3,
+                    ANNOUNCED_SCOPE,
+                    live_until()
+                ),))
+                .is_err()
+        );
+        assert!(fixture.host.clone().create_instance(identity).is_err());
+        drop(instance.release());
+        drop(instance);
+        let successor = fixture.host.clone().create_instance(identity).unwrap();
+        materialize_instance(
+            &successor,
+            identity,
+            vec![catalog_properties()],
+            &credential(1, ANNOUNCED_SCOPE, live_until()),
+        )
+        .unwrap();
+        let installed = fixture.host.active_context(identity).unwrap();
+        assert!(!Arc::ptr_eq(&original, &installed));
+        assert_eq!(installed.credentials.installed_epoch(lease_id(1)), Some(1));
+        assert!(
+            resolver
+                .resolve_vended_s3(&storage_request("s3://bucket/b/file.parquet"))
+                .is_err()
+        );
+        drop(successor.release());
+        drop(successor);
+        assert_eq!(fixture.query_leases(), 0);
+    }
+
+    #[test]
+    fn an_inflight_materialization_keeps_its_released_instance_until_the_actual_call_clone_exits() {
+        let fixture = Fixture::new();
+        let identity = context(91_004);
+        let instance = fixture.host.clone().create_instance(identity).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let proceed = Arc::new(Barrier::new(2));
+        *fixture.catalog_factory.entered.lock().unwrap() = Some(entered.clone());
+        *fixture.catalog_factory.proceed.lock().unwrap() = Some(proceed.clone());
+        let running_instance = instance.clone();
+        let materialization = std::thread::spawn(move || {
+            materialize_instance(
+                &running_instance,
+                identity,
+                vec![catalog_properties()],
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
+            )
+        });
+        entered.wait();
+        let original = fixture.host.active_context(identity).unwrap();
+        drop(instance.release());
+        drop(instance);
+        // The actual M call owns the remaining capability. A released row is
+        // not a released identity while its external rollback may still run.
+        let retained = fixture
+            .host
+            .contexts
+            .lock()
+            .unwrap()
+            .get(identity)
+            .is_some_and(|current| Arc::ptr_eq(current, &original));
+        let replacement_refused = fixture.host.clone().create_instance(identity).is_err();
+        let closed = original.credentials.installed_lease_count() == 0;
+        proceed.wait();
+        let materialized = materialization.join().unwrap();
+        let old_leases_released = fixture.query_leases() == 0;
+        *fixture.catalog_factory.entered.lock().unwrap() = None;
+        *fixture.catalog_factory.proceed.lock().unwrap() = None;
+        let successor = fixture.host.clone().create_instance(identity).unwrap();
+        materialize_instance(
+            &successor,
+            identity,
+            vec![catalog_properties()],
+            &empty_credential(),
+        )
+        .unwrap();
+        let successor_leases = fixture.query_leases();
+        drop(successor.release());
+        drop(successor);
+        assert!(retained);
+        assert!(replacement_refused);
+        assert!(closed);
+        assert!(materialized.is_err());
+        assert!(old_leases_released);
+        assert_eq!(successor_leases, 1);
+        assert_eq!(fixture.query_leases(), 0);
+    }
 
     #[test]
     fn an_admitted_context_has_its_original_resources_before_its_first_task() {

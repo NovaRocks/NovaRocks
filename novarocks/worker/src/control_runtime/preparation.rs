@@ -39,7 +39,7 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::{
-    TaskCreationInput, TaskFailurePhase, TaskIdentity,
+    QueryContextRef, TaskCreationInput, TaskFailurePhase, TaskIdentity,
     failure::{FailureClass, FailureFact},
 };
 use std::{
@@ -79,6 +79,9 @@ struct Custody {
     pending: Arc<dyn TaskPendingNotice>,
     health: Arc<ExecutionHealth>,
     retained: Mutex<Option<Arc<Self>>>,
+    // The original host child registration stays in this preparation owner
+    // until actual rollback/adoption callback and metadata capture exit.
+    host_children: Mutex<Option<Arc<crate::task_preparation::TaskPreparationScope>>>,
 }
 
 /// This loan can derive only from the actual still-counted original work.
@@ -90,6 +93,12 @@ pub(crate) struct PreparationParent {
     work: WorkId,
 }
 impl PreparationParent {
+    pub(crate) fn from_admitted(work: &WorkLease) -> Self {
+        Self {
+            scope: work.scope().clone(),
+            work: work.id(),
+        }
+    }
     pub(crate) fn derive(&self, kind: WorkKind) -> Result<StepGuard, RuntimeError> {
         let generation = self.scope.gates()?.generation;
         self.scope.reserve_next(
@@ -255,10 +264,7 @@ impl PreparationCustody {
             ),
         ])
         .expect("fixed preparation release dimensions");
-        let parent = PreparationParent {
-            scope: work.scope().clone(),
-            work: work.id(),
-        };
+        let parent = PreparationParent::from_admitted(&work);
         let [body_report, exit_report] = reports;
         let custody = Arc::new(Custody {
             task: binding.stop.identity(),
@@ -283,6 +289,7 @@ impl PreparationCustody {
             pending: binding.pending,
             health: binding.health,
             retained: Mutex::new(None),
+            host_children: Mutex::new(None),
         });
         *custody.retained.lock().expect("preparation retention lock") = Some(custody.clone());
         let owner = Self(custody);
@@ -300,6 +307,67 @@ impl PreparationCustody {
     }
     pub(crate) fn exit_report(&self) -> &ReportSlot {
         &self.0.exit_report
+    }
+    pub(crate) fn bind_host_children(
+        &self,
+        children: Arc<crate::task_preparation::TaskPreparationScope>,
+    ) {
+        assert_eq!(
+            children.identity(),
+            self.0.task,
+            "exact host preparation identity"
+        );
+        let mut holder = self
+            .0
+            .host_children
+            .lock()
+            .expect("preparation host child holder");
+        assert!(holder.is_none(), "one original host child registration");
+        *holder = Some(children);
+    }
+    pub(crate) fn host_children(
+        &self,
+    ) -> Option<Arc<crate::task_preparation::TaskPreparationScope>> {
+        self.0
+            .host_children
+            .lock()
+            .expect("preparation host child holder")
+            .clone()
+    }
+    /// The live host owns this transition after actual installation and its
+    /// ordered Installed publication. Provider adoption transfers runtime
+    /// custody; only the original preparation metadata holder exits here.
+    /// The caller's commit action runs outside every runtime/custody lock.
+    pub(crate) fn adopt_host_runtime<F: FnOnce()>(&self, commit: F) -> Result<bool, F> {
+        let Some(children) = self.host_children() else {
+            return Err(commit);
+        };
+        if !children.adopt_runtime() {
+            return Err(commit);
+        }
+        children.start_runtime(commit)
+    }
+    /// Real rejection/stand-down cleanup, including an original child that
+    /// never became runnable. Pending or unknown child exit retains P/bytes;
+    /// a canceled Task or the return from install_receiver cannot replace it.
+    pub(crate) fn rollback_host_runtime(
+        &self,
+        remove_inbound: impl FnOnce(),
+        remove_receiver: impl FnOnce(),
+    ) -> bool {
+        let Some(children) = self.host_children() else {
+            return false;
+        };
+        children.request_rollback();
+        children.cleanup(
+            crate::task_preparation::PreparationCleanup::Inbound,
+            remove_inbound,
+        );
+        children.cleanup(
+            crate::task_preparation::PreparationCleanup::Receiver,
+            remove_receiver,
+        );
+        children.rollback_exited()
     }
     fn take_input(&self) -> Option<TaskCreationInput> {
         self.0
@@ -371,6 +439,14 @@ impl PreparationCustody {
     /// The physical worker can already be reused. Children, input unwind and
     /// independent report consumers can still prevent whole exit/charge reuse.
     pub(crate) fn publish_whole_exit(&self) -> Result<bool, RuntimeError> {
+        // The foreign provider was already driven by the host, outside these
+        // locks. Body return alone cannot retire a registered dormant kernel.
+        if self
+            .host_children()
+            .is_some_and(|child| !child.host_captures_exited())
+        {
+            return Ok(false);
+        }
         let mut state = self.0.state.lock().expect("preparation custody lock");
         if state.exit_published {
             return Ok(true);
@@ -518,9 +594,20 @@ impl Drop for PreparationJob {
     }
 }
 
+/// Fairness is scheduling metadata, never a Scope capability or Work identity.
+/// An ingress RPC has its own paid source scope but shares the Context's
+/// physical-worker limit with every other RPC for that exact Context.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum HostFairnessGroup {
+    Scope(ScopeId),
+    Context(QueryContextRef),
+}
 pub(crate) trait QueuedPreparation: Send + 'static {
     /// Read-only metadata, called before taking the queue lock.
     fn queue_key(&self) -> (ScopeId, WorkId);
+    fn fairness_group(&self, scope: ScopeId) -> HostFairnessGroup {
+        HostFairnessGroup::Scope(scope)
+    }
 }
 impl QueuedPreparation for PreparationJob {
     fn queue_key(&self) -> (ScopeId, WorkId) {
@@ -529,9 +616,15 @@ impl QueuedPreparation for PreparationJob {
 }
 
 struct QueueState<J: QueuedPreparation> {
-    fair: FairWorkQueue,
-    jobs: BTreeMap<Key, ManuallyDrop<J>>,
+    fair: FairWorkQueue<HostFairnessGroup, Key>,
+    jobs: BTreeMap<Key, QueuedJob<J>>,
     running: usize,
+}
+struct QueuedJob<J> {
+    group: HostFairnessGroup,
+    // The fixed membership header remains while a body runs. This prevents
+    // resubmission of its real owner key under a different fairness group.
+    original: Option<ManuallyDrop<J>>,
 }
 struct Queue<J: QueuedPreparation = PreparationJob> {
     state: Mutex<QueueState<J>>,
@@ -545,6 +638,7 @@ impl<J: QueuedPreparation> Clone for PreparationQueue<J> {
 }
 pub(crate) struct RunningPreparation<J: QueuedPreparation = PreparationJob> {
     queue: PreparationQueue<J>,
+    group: HostFairnessGroup,
     key: Key,
     job: Option<J>,
 }
@@ -560,14 +654,41 @@ impl<J: QueuedPreparation> PreparationQueue<J> {
             workers,
         }))
     }
+    /// True only when neither queued jobs nor actual running bodies remain.
+    pub(super) fn is_empty(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .expect("preparation queue lock")
+            .fair
+            .is_empty()
+    }
     pub(crate) fn enqueue(&self, job: J) -> Result<(), (FairQueueError, J)> {
         let key = job.queue_key();
+        let group = job.fairness_group(key.0);
         let mut state = self.0.state.lock().expect("preparation queue lock");
-        if let Err(error) = state.fair.enqueue(key.0, key.1) {
+        // A caller cannot enqueue the same actual owner under another group.
+        // Membership remains unique across the entire physical queue.
+        if state.jobs.contains_key(&key) {
+            drop(state);
+            return Err((FairQueueError::DuplicateWork, job));
+        }
+        if let Err(error) = state.fair.enqueue(group, key) {
             drop(state);
             return Err((error, job));
         }
-        assert!(state.jobs.insert(key, ManuallyDrop::new(job)).is_none());
+        assert!(
+            state
+                .jobs
+                .insert(
+                    key,
+                    QueuedJob {
+                        group,
+                        original: Some(ManuallyDrop::new(job)),
+                    }
+                )
+                .is_none()
+        );
         Ok(())
     }
     pub(crate) fn pop(&self) -> Option<RunningPreparation<J>> {
@@ -575,15 +696,19 @@ impl<J: QueuedPreparation> PreparationQueue<J> {
         if state.running == self.0.workers {
             return None;
         }
-        let key = state.fair.pop()?;
+        let (group, key) = state.fair.pop()?;
         let job = state
             .jobs
-            .remove(&key)
-            .expect("original queued preparation");
+            .get_mut(&key)
+            .expect("original queued preparation")
+            .original
+            .take()
+            .expect("one original queued body");
         state.running += 1;
         drop(state);
         Some(RunningPreparation {
             queue: self.clone(),
+            group,
             key,
             job: Some(ManuallyDrop::into_inner(job)),
         })
@@ -591,13 +716,21 @@ impl<J: QueuedPreparation> PreparationQueue<J> {
     /// The caller disposes the returned original on a host cleanup executor.
     pub(crate) fn cancel(&self, scope: ScopeId, work: WorkId) -> Result<J, FairQueueError> {
         let mut state = self.0.state.lock().expect("preparation queue lock");
-        state.fair.remove_queued(scope, work)?;
+        let key = (scope, work);
+        let group = state
+            .jobs
+            .get(&key)
+            .ok_or(FairQueueError::UnknownWork)?
+            .group;
+        state.fair.remove_queued(group, key)?;
         let job = state
             .jobs
             .remove(&(scope, work))
             .expect("original canceled job");
         drop(state);
-        Ok(ManuallyDrop::into_inner(job))
+        Ok(ManuallyDrop::into_inner(
+            job.original.expect("original canceled body"),
+        ))
     }
 }
 impl<J: QueuedPreparation> RunningPreparation<J> {
@@ -625,8 +758,13 @@ impl<J: QueuedPreparation> Drop for RunningPreparation<J> {
             let mut state = self.queue.0.state.lock().expect("preparation queue lock");
             state
                 .fair
-                .finish(self.key.0, self.key.1)
+                .finish(self.group, self.key)
                 .expect("actual running preparation body slot");
+            let member = state
+                .jobs
+                .remove(&self.key)
+                .expect("original running membership");
+            assert!(member.original.is_none());
             state.running -= 1;
         }
         drop(job);
@@ -638,7 +776,9 @@ impl<J: QueuedPreparation> Drop for Queue<J> {
         let jobs =
             std::mem::take(&mut self.state.get_mut().expect("exclusive queue teardown").jobs);
         for job in jobs.into_values() {
-            drop(ManuallyDrop::into_inner(job));
+            if let Some(original) = job.original {
+                drop(ManuallyDrop::into_inner(original));
+            }
         }
     }
 }

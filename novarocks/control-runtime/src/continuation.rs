@@ -21,6 +21,7 @@
 use crate::{
     completion::ReportSlot,
     lease::{CapacityBundle, WorkLease},
+    reported_work::ReportedWork,
     sync::{Arc, AtomicBool, Mutex, Ordering},
     transaction::RuntimeError,
 };
@@ -181,12 +182,9 @@ impl<T: Send + 'static> Drop for RegistrationToken<T> {
 impl<T: Send + 'static> ContinuationSlot<T> {
     /// Takes the original admitted work, matching capacity bundle and report.
     /// It never signs work, allocates report credit or admits a replacement role.
-    /// The caller must supply all three artifacts from that same admitted role.
-    pub fn from_admitted(
-        work: WorkLease,
-        capacity: CapacityBundle,
-        report: ReportSlot,
-    ) -> (Self, RegistrationToken<T>) {
+    /// The carrier has validated all three original bindings before custody.
+    pub fn from_admitted(reported: ReportedWork) -> (Self, RegistrationToken<T>) {
+        let (work, capacity, report) = reported.into_parts();
         let custody = Arc::new(Custody {
             state: Mutex::new(State {
                 phase: ContinuationPhase::AwaitingRegistration,

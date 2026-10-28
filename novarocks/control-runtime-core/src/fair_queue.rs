@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bounded context-fair work, with at most one running item per context.
+//! Bounded group-fair work, with at most one running item per queue.
+//! Fairness keys are independent of the original owner-qualified job keys.
 
 use crate::identity::{ScopeId, WorkId};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FairQueueError {
@@ -30,39 +34,54 @@ pub enum FairQueueError {
     ContextCapacity,
     OrderExhausted,
 }
-#[derive(Debug, Default)]
-struct ContextQueue {
-    head: Option<WorkId>,
-    tail: Option<WorkId>,
+#[derive(Debug)]
+struct GroupQueue<W> {
+    head: Option<W>,
+    tail: Option<W>,
     queued: usize,
-    running: Option<WorkId>,
+    running: Option<W>,
     ready_order: Option<u64>,
 }
+impl<W> Default for GroupQueue<W> {
+    fn default() -> Self {
+        Self {
+            head: None,
+            tail: None,
+            queued: 0,
+            running: None,
+            ready_order: None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug)]
-struct WorkNode {
-    previous: Option<WorkId>,
-    next: Option<WorkId>,
+struct WorkNode<W> {
+    previous: Option<W>,
+    next: Option<W>,
     running: bool,
 }
+/// A finite FIFO per complete fairness group, independent of job ownership.
+/// Membership is unique by `(G, W)`, preserving scope-local WorkIds in the
+/// default API. When a group covers multiple scopes, W retains the original
+/// owner-qualified job identity. Keys are neutral deterministic values.
 #[derive(Debug)]
-pub struct FairWorkQueue {
-    max_contexts: usize,
+pub struct FairWorkQueue<G = ScopeId, W = WorkId> {
+    max_groups: usize,
     max_work: usize,
-    per_context: usize,
-    contexts: BTreeMap<ScopeId, ContextQueue>,
-    ready: BTreeSet<(u64, ScopeId)>,
-    // Work identities are minted independently by each scope. Global queue
-    // membership must retain the complete owner identity, also for removal.
-    work: BTreeMap<(ScopeId, WorkId), WorkNode>,
+    per_group: usize,
+    groups: BTreeMap<G, GroupQueue<W>>,
+    ready: BTreeSet<(u64, G)>,
+    // Default WorkIds are local to their ScopeId queue. Callers with another
+    // fairness key retain the complete original owner identity in W instead.
+    work: BTreeMap<(G, W), WorkNode<W>>,
     next_order: u64,
 }
-impl FairWorkQueue {
-    pub fn new(max_contexts: usize, max_work: usize, per_context: usize) -> Self {
+impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
+    pub fn new(max_groups: usize, max_work: usize, per_group: usize) -> Self {
         Self {
-            max_contexts,
+            max_groups,
             max_work,
-            per_context,
-            contexts: BTreeMap::new(),
+            per_group,
+            groups: BTreeMap::new(),
             ready: BTreeSet::new(),
             work: BTreeMap::new(),
             next_order: 1,
@@ -74,26 +93,26 @@ impl FairWorkQueue {
     pub fn is_empty(&self) -> bool {
         self.work.is_empty()
     }
-    pub fn enqueue(&mut self, scope: ScopeId, work: WorkId) -> Result<(), FairQueueError> {
-        if self.work.contains_key(&(scope, work)) {
+    pub fn enqueue(&mut self, group: G, work: W) -> Result<(), FairQueueError> {
+        if self.work.contains_key(&(group, work)) {
             return Err(FairQueueError::DuplicateWork);
         }
         if self.work.len() >= self.max_work {
             return Err(FairQueueError::Full);
         }
-        if !self.contexts.contains_key(&scope) && self.contexts.len() >= self.max_contexts {
+        if !self.groups.contains_key(&group) && self.groups.len() >= self.max_groups {
             return Err(FairQueueError::ContextCapacity);
         }
-        if let Some(context) = self.contexts.get(&scope) {
-            if context.queued + usize::from(context.running.is_some()) >= self.per_context {
+        if let Some(queue) = self.groups.get(&group) {
+            if queue.queued + usize::from(queue.running.is_some()) >= self.per_group {
                 return Err(FairQueueError::ContextFull);
             }
-        } else if self.per_context == 0 {
+        } else if self.per_group == 0 {
             return Err(FairQueueError::ContextFull);
         }
         let ready = self
-            .contexts
-            .get(&scope)
+            .groups
+            .get(&group)
             .is_none_or(|c| c.running.is_none() && c.ready_order.is_none());
         let next_order = if ready {
             self.next_order
@@ -102,10 +121,10 @@ impl FairWorkQueue {
         } else {
             self.next_order
         };
-        let context = self.contexts.entry(scope).or_default();
-        let previous = context.tail;
+        let queue = self.groups.entry(group).or_default();
+        let previous = queue.tail;
         self.work.insert(
-            (scope, work),
+            (group, work),
             WorkNode {
                 previous,
                 next: None,
@@ -114,118 +133,112 @@ impl FairWorkQueue {
         );
         if let Some(tail) = previous {
             self.work
-                .get_mut(&(scope, tail))
+                .get_mut(&(group, tail))
                 .expect("queued tail exists")
                 .next = Some(work);
         } else {
-            context.head = Some(work);
+            queue.head = Some(work);
         }
-        context.tail = Some(work);
-        context.queued += 1;
+        queue.tail = Some(work);
+        queue.queued += 1;
         if ready {
-            context.ready_order = Some(self.next_order);
-            self.ready.insert((self.next_order, scope));
+            queue.ready_order = Some(self.next_order);
+            self.ready.insert((self.next_order, group));
             self.next_order = next_order;
         }
         Ok(())
     }
-    pub fn pop(&mut self) -> Option<(ScopeId, WorkId)> {
-        let (order, scope) = self.ready.pop_first()?;
-        let context = self
-            .contexts
-            .get_mut(&scope)
-            .expect("eligible context exists");
-        assert_eq!(context.ready_order, Some(order));
-        assert!(context.running.is_none(), "one running item per context");
-        context.ready_order = None;
-        let work = context.head.expect("eligible context has queued work");
-        let node = self.work.get_mut(&(scope, work)).expect("head work exists");
+    pub fn pop(&mut self) -> Option<(G, W)> {
+        let (order, group) = self.ready.pop_first()?;
+        let queue = self.groups.get_mut(&group).expect("eligible group exists");
+        assert_eq!(queue.ready_order, Some(order));
+        assert!(queue.running.is_none(), "one running item per group");
+        queue.ready_order = None;
+        let work = queue.head.expect("eligible group has queued work");
+        let node = self.work.get_mut(&(group, work)).expect("head work exists");
         node.running = true;
         let next = node.next;
         node.next = None;
-        context.head = next;
-        context.queued -= 1;
+        queue.head = next;
+        queue.queued -= 1;
         if let Some(next) = next {
             self.work
-                .get_mut(&(scope, next))
+                .get_mut(&(group, next))
                 .expect("next work exists")
                 .previous = None;
         } else {
-            context.tail = None;
+            queue.tail = None;
         }
-        context.running = Some(work);
-        Some((scope, work))
+        queue.running = Some(work);
+        Some((group, work))
     }
     /// Body exit returns the worker slot; the resource lease may remain live.
-    pub fn finish(&mut self, scope: ScopeId, work: WorkId) -> Result<(), FairQueueError> {
-        let context = self
-            .contexts
-            .get(&scope)
-            .ok_or(FairQueueError::UnknownWork)?;
-        if context.running != Some(work) {
+    pub fn finish(&mut self, group: G, work: W) -> Result<(), FairQueueError> {
+        let queue = self.groups.get(&group).ok_or(FairQueueError::UnknownWork)?;
+        if queue.running != Some(work) {
             return Err(FairQueueError::WrongRunningWork);
         }
-        let next_order = if context.queued > 0 {
+        let next_order = if queue.queued > 0 {
             self.next_order
                 .checked_add(1)
                 .ok_or(FairQueueError::OrderExhausted)?
         } else {
             self.next_order
         };
-        let context = self.contexts.get_mut(&scope).expect("validated context");
-        context.running = None;
-        self.work.remove(&(scope, work));
-        if context.queued > 0 {
-            context.ready_order = Some(self.next_order);
-            self.ready.insert((self.next_order, scope));
+        let queue = self.groups.get_mut(&group).expect("validated group");
+        queue.running = None;
+        self.work.remove(&(group, work));
+        if queue.queued > 0 {
+            queue.ready_order = Some(self.next_order);
+            self.ready.insert((self.next_order, group));
             self.next_order = next_order;
         } else {
-            self.contexts.remove(&scope);
+            self.groups.remove(&group);
         }
         Ok(())
     }
-    /// Indexed cancellation avoids scanning sibling contexts or queued work.
-    pub fn remove_queued(&mut self, scope: ScopeId, work: WorkId) -> Result<(), FairQueueError> {
+    /// Indexed cancellation avoids scanning sibling groups or queued work.
+    pub fn remove_queued(&mut self, group: G, work: W) -> Result<(), FairQueueError> {
         let node = self
             .work
-            .get(&(scope, work))
+            .get(&(group, work))
             .copied()
             .ok_or(FairQueueError::UnknownWork)?;
         if node.running {
             return Err(FairQueueError::UnknownWork);
         }
-        let context = self.contexts.get_mut(&scope).expect("work retains context");
+        let queue = self.groups.get_mut(&group).expect("work retains group");
         match node.previous {
             Some(previous) => {
                 self.work
-                    .get_mut(&(scope, previous))
+                    .get_mut(&(group, previous))
                     .expect("previous exists")
                     .next = node.next
             }
-            None => context.head = node.next,
+            None => queue.head = node.next,
         }
         match node.next {
             Some(next) => {
                 self.work
-                    .get_mut(&(scope, next))
+                    .get_mut(&(group, next))
                     .expect("next exists")
                     .previous = node.previous
             }
-            None => context.tail = node.previous,
+            None => queue.tail = node.previous,
         }
-        context.queued -= 1;
-        self.work.remove(&(scope, work));
-        if context.queued == 0 {
-            if let Some(order) = context.ready_order.take() {
-                self.ready.remove(&(order, scope));
+        queue.queued -= 1;
+        self.work.remove(&(group, work));
+        if queue.queued == 0 {
+            if let Some(order) = queue.ready_order.take() {
+                self.ready.remove(&(order, group));
             }
-            if context.running.is_none() {
-                self.contexts.remove(&scope);
+            if queue.running.is_none() {
+                self.groups.remove(&group);
             }
         }
         Ok(())
     }
-    pub fn running(&self, scope: ScopeId) -> Option<WorkId> {
-        self.contexts.get(&scope).and_then(|c| c.running)
+    pub fn running(&self, group: G) -> Option<W> {
+        self.groups.get(&group).and_then(|c| c.running)
     }
 }

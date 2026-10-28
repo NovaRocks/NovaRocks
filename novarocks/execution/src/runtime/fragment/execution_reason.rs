@@ -456,6 +456,8 @@ pub(crate) enum ExecutionReason {
     // Driver start/retirement scopes already allocate 615..=638.
     SettlementContinuationPanicked = 639,
     CompletionWorkUnresolved = 640,
+    TaskExecutionOwnerRetired = 641,
+    ReceiverConstructionClosed = 642,
 }
 impl ExecutionReason {
     pub(crate) const fn code(self) -> NonZeroU16 {

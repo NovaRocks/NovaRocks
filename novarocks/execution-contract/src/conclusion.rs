@@ -128,12 +128,39 @@ pub enum TaskConclusionProposal<C> {
     },
 }
 
+// Shared source nodes must retain their custody independently of any Execution
+// wrapper. The neutral marker lives with those nodes, below role contracts.
+pub use novarocks_failure_contract::SourceRetentionCapability;
+
+/// One original local source and its inseparable, already funded custody.
+/// This is deliberately not Clone and cannot yield a bare owned cause.
+///
+/// Field order is part of the exit contract: destroy the original carrier
+/// before its custody marker. If carrier destruction unwinds, the issuer's
+/// marker observes that unresolved exit during its own destruction; this
+/// contract layer neither samples the environment nor manufactures an exit.
+#[derive(Debug)]
+pub struct RetainedTaskSource<C> {
+    cause: C,
+    custody: Box<dyn SourceRetentionCapability>,
+}
+impl<C> RetainedTaskSource<C> {
+    pub fn new(cause: C, custody: Box<dyn SourceRetentionCapability>) -> Self {
+        Self { cause, custody }
+    }
+    pub const fn cause(&self) -> &C {
+        &self.cause
+    }
+}
+
 /// Immutable local receipt. Only `neutral` crosses a role boundary. Sharing
 /// this value never clones a rich source or the bounded wire diagnostic.
 #[derive(Debug)]
 pub struct AcceptedTaskConclusion<C> {
     neutral: AcceptedConclusion,
     originating_failure: Option<C>,
+    // Keep last: the original source carrier must finish destruction first.
+    _source_custody: Option<Box<dyn SourceRetentionCapability>>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConclusionSourceError {
@@ -165,6 +192,39 @@ impl<C> AcceptedTaskConclusion<C> {
     where
         C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
     {
+        Self::validate_source(&neutral, originating_failure.as_ref())?;
+        Ok(Self {
+            neutral,
+            originating_failure,
+            _source_custody: None,
+        })
+    }
+    /// Transfer the same original source and its marker together. Validation
+    /// borrows both; every refusal returns their unchanged original custody.
+    pub fn from_retained_source(
+        neutral: AcceptedConclusion,
+        source: RetainedTaskSource<C>,
+    ) -> Result<Self, (ConclusionSourceError, RetainedTaskSource<C>)>
+    where
+        C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
+    {
+        if let Err(error) = Self::validate_source(&neutral, Some(source.cause())) {
+            return Err((error, source));
+        }
+        let RetainedTaskSource { cause, custody } = source;
+        Ok(Self {
+            neutral,
+            originating_failure: Some(cause),
+            _source_custody: Some(custody),
+        })
+    }
+    fn validate_source(
+        neutral: &AcceptedConclusion,
+        originating_failure: Option<&C>,
+    ) -> Result<(), ConclusionSourceError>
+    where
+        C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
+    {
         let failed = matches!(
             neutral.conclusion(),
             TaskConclusion::Terminated(TerminationDetail::Failed(_))
@@ -174,15 +234,12 @@ impl<C> AcceptedTaskConclusion<C> {
             (false, true) => return Err(ConclusionSourceError::UnexpectedOriginatingFailure),
             _ => {}
         }
-        if originating_failure.as_ref().is_some_and(|source| {
+        if originating_failure.is_some_and(|source| {
             source.failure_fact().evidence() == crate::failure::FailureEvidence::StopObservation
         }) {
             return Err(ConclusionSourceError::StopObservationIsNotOriginating);
         }
-        Ok(Self {
-            neutral,
-            originating_failure,
-        })
+        Ok(())
     }
     pub const fn neutral(&self) -> &AcceptedConclusion {
         &self.neutral
@@ -316,8 +373,6 @@ where
     /// Transfers one proposal; its published effect may become visible later.
     fn submit(&self, proposed: TaskConclusionProposal<C>);
     fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<C>>>;
-    /// Registers a nonblocking barrier continuation without waiting for it.
-    fn on_settled(&self, continuation: SettledContinuation<C>);
 }
 
 #[cfg(test)]
@@ -469,6 +524,172 @@ mod source_ownership_tests {
             ),
             SafeDetail::truncating("originating local failure"),
         )))
+    }
+    type DropEvents = Arc<std::sync::Mutex<Vec<(&'static str, bool)>>>;
+    #[derive(Debug)]
+    struct RetainedOrigin {
+        identity: Arc<()>,
+        events: DropEvents,
+        observed_stop: bool,
+        panic_on_drop: bool,
+    }
+    impl std::fmt::Display for RetainedOrigin {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original retained source")
+        }
+    }
+    impl std::error::Error for RetainedOrigin {}
+    impl crate::failure::FailureProjection for RetainedOrigin {
+        fn failure_fact(&self) -> crate::failure::FailureFact {
+            let reason = crate::failure::FailureReason::new(
+                crate::failure::domain::EXECUTION,
+                std::num::NonZeroU16::new(65002).unwrap(),
+            );
+            if self.observed_stop {
+                crate::failure::FailureFact::stop_observation(reason)
+            } else {
+                crate::failure::FailureFact::new(crate::failure::FailureClass::Data, reason)
+            }
+        }
+    }
+    impl Drop for RetainedOrigin {
+        fn drop(&mut self) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(("cause", std::thread::panicking()));
+            assert!(!self.panic_on_drop, "controlled original source Drop panic");
+        }
+    }
+    /// This probe observes Rust field destruction only. It signs no Work,
+    /// capacity, Task conclusion, exit report or production authority.
+    #[derive(Debug)]
+    struct RetentionProbe(DropEvents);
+    impl SourceRetentionCapability for RetentionProbe {}
+    impl Drop for RetentionProbe {
+        fn drop(&mut self) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(("custody", std::thread::panicking()));
+        }
+    }
+    fn retained_source(
+        events: &DropEvents,
+        observed_stop: bool,
+        panic_on_drop: bool,
+    ) -> RetainedTaskSource<RetainedOrigin> {
+        RetainedTaskSource::new(
+            RetainedOrigin {
+                identity: Arc::new(()),
+                events: events.clone(),
+                observed_stop,
+                panic_on_drop,
+            },
+            Box::new(RetentionProbe(events.clone())),
+        )
+    }
+    #[test]
+    fn retained_carrier_disposes_the_original_cause_before_its_custody() {
+        let events = DropEvents::default();
+        let source = retained_source(&events, false, false);
+        assert!(std::ptr::eq(source.cause(), &source.cause));
+        assert!(events.lock().unwrap().is_empty());
+        drop(source);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [("cause", false), ("custody", false)]
+        );
+    }
+    #[test]
+    fn retained_source_refusal_returns_the_same_cause_and_marker_without_disposal() {
+        for observed_stop in [false, true] {
+            let events = DropEvents::default();
+            let source = retained_source(&events, observed_stop, false);
+            let cause_identity = Arc::as_ptr(&source.cause().identity);
+            let marker_address = &*source.custody as *const dyn SourceRetentionCapability;
+            let neutral = receipt(if observed_stop {
+                failed()
+            } else {
+                TaskConclusion::Succeeded
+            });
+            let (error, returned) =
+                AcceptedTaskConclusion::from_retained_source(neutral, source).unwrap_err();
+            assert_eq!(
+                error,
+                if observed_stop {
+                    ConclusionSourceError::StopObservationIsNotOriginating
+                } else {
+                    ConclusionSourceError::UnexpectedOriginatingFailure
+                }
+            );
+            assert_eq!(Arc::as_ptr(&returned.cause().identity), cause_identity);
+            assert!(std::ptr::eq(&*returned.custody, marker_address));
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "refusal transfers original custody back"
+            );
+            drop(returned);
+            assert_eq!(
+                *events.lock().unwrap(),
+                [("cause", false), ("custody", false)]
+            );
+        }
+    }
+    #[test]
+    fn accepted_receipt_aliases_keep_the_original_retained_source_until_the_last_drop() {
+        let events = DropEvents::default();
+        let source = retained_source(&events, false, false);
+        let cause_identity = Arc::as_ptr(&source.cause().identity);
+        let marker_address = &*source.custody as *const dyn SourceRetentionCapability;
+        let neutral = receipt(failed());
+        let accepted = Arc::new(
+            AcceptedTaskConclusion::from_retained_source(neutral.clone(), source).unwrap(),
+        );
+        assert_eq!(accepted.neutral(), &neutral);
+        assert_eq!(
+            Arc::as_ptr(&accepted.originating_failure().unwrap().identity),
+            cause_identity
+        );
+        assert!(std::ptr::eq(
+            &**accepted._source_custody.as_ref().unwrap(),
+            marker_address
+        ));
+        let alias = accepted.clone();
+        assert!(std::ptr::eq(
+            accepted.originating_failure().unwrap(),
+            alias.originating_failure().unwrap()
+        ));
+        drop(accepted);
+        assert!(events.lock().unwrap().is_empty());
+        drop(alias);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [("cause", false), ("custody", false)]
+        );
+    }
+    #[test]
+    fn custody_observes_unwind_when_the_original_carrier_drop_panics() {
+        for accepted in [false, true] {
+            let events = DropEvents::default();
+            let source = retained_source(&events, false, true);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if accepted {
+                    drop(
+                        AcceptedTaskConclusion::from_retained_source(receipt(failed()), source)
+                            .unwrap(),
+                    );
+                } else {
+                    drop(source);
+                }
+            }));
+            assert!(result.is_err());
+            assert_eq!(
+                *events.lock().unwrap(),
+                [("cause", false), ("custody", true)],
+                "unwinding marker destruction is unresolved, never positive source exit"
+            );
+        }
     }
     struct CapabilityProbe {
         registered: Arc<AtomicUsize>,

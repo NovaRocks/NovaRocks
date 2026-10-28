@@ -61,6 +61,10 @@ pub struct TaskRecord {
     pub actual_stopped: bool,
     pub runtime_actual_stopped_received: bool,
     pub runtime_resources_converged_received: bool,
+    /// Successful production is an intent, not an accepted result. The
+    /// original completion work must actually exit before this can become a
+    /// success proposal, and output responsibility remains independent.
+    pub completion_success_pending: bool,
     pub preparation_exit_holds: [bool; 4],
     pub output_released: bool,
     pub output: TaskOutputFacts,
@@ -110,6 +114,7 @@ impl TaskRecord {
             actual_stopped: false,
             runtime_actual_stopped_received: false,
             runtime_resources_converged_received: false,
+            completion_success_pending: false,
             preparation_exit_holds: [false; 4],
             output_released: false,
             output: TaskOutputFacts::new(false),

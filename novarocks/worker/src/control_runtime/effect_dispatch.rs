@@ -37,15 +37,26 @@ pub(crate) struct EffectRef {
     pub input: InputId,
     pub action: ActionId,
 }
+
+#[cfg(test)]
+mod tests;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum LaneKey {
     Task(TaskIdentity),
     Route(QueryContextRef),
+    ControlMetadata,
+    ContextMetadata,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Release {
+    Started,
+    Published,
+    Completed,
 }
 #[derive(Clone, Copy)]
 struct Entry {
     effect: EffectRef,
-    publication: bool,
+    release: Release,
 }
 #[derive(Default)]
 struct Lane {
@@ -96,6 +107,8 @@ pub(crate) struct IndexedBatches {
 
 pub(crate) struct EffectDispatch {
     actor: ActorId,
+    completion_runtime: Option<ActorRuntime<WorkerActor>>,
+    control: bool,
     after: Option<BatchId>,
     lanes: BTreeMap<LaneKey, Lane>,
     ready: VecDeque<Ready>,
@@ -108,6 +121,8 @@ impl EffectDispatch {
         assert!(limit > 0, "effect routing positions are prepaid");
         Self {
             actor,
+            completion_runtime: None,
+            control: false,
             after: None,
             lanes: BTreeMap::new(),
             ready: VecDeque::new(),
@@ -115,24 +130,79 @@ impl EffectDispatch {
             limit,
         }
     }
-    fn classify(action: &WorkerAction) -> Option<(LaneKey, bool)> {
+    /// The root serializes only its metadata transitions. Starting a host I/O
+    /// transfers the original ticket and releases this ordering position; its
+    /// real body/capture exit remains independently owned by that host job.
+    pub(crate) fn control(
+        runtime: ActorRuntime<WorkerActor>,
+        actor: ActorId,
+        limit: usize,
+    ) -> Self {
+        let mut dispatch = Self::new(actor, limit);
+        dispatch.completion_runtime = Some(runtime);
+        dispatch.control = true;
+        dispatch
+    }
+    /// Context-to-Control metadata keeps the producing actor's order across
+    /// batches. Completion means the next owner accepted the neutral handoff;
+    /// it never waits for a reply from that owner or for a host I/O body.
+    pub(crate) fn context(
+        runtime: ActorRuntime<WorkerActor>,
+        actor: ActorId,
+        limit: usize,
+    ) -> Self {
+        let mut dispatch = Self::new(actor, limit);
+        dispatch.completion_runtime = Some(runtime);
+        dispatch
+    }
+    fn classify(&self, action: &WorkerAction) -> Option<(LaneKey, Release)> {
+        if self.control {
+            let release = match action {
+                WorkerAction::Control {
+                    effect: ControlEffect::Route { .. },
+                    ..
+                } => Release::Published,
+                WorkerAction::Control {
+                    effect:
+                        ControlEffect::AdmissionReply { .. }
+                        | ControlEffect::DomainFailureReply { .. }
+                        | ControlEffect::Reply { .. }
+                        | ControlEffect::WakeInternal
+                        | ControlEffect::RouteEstablish { .. }
+                        | ControlEffect::CancelEstablishRoute { .. }
+                        | ControlEffect::RetireReservation(_),
+                    ..
+                }
+                | WorkerAction::ControlReply(_) => Release::Completed,
+                WorkerAction::Control { .. } => Release::Started,
+                _ => return None,
+            };
+            return Some((LaneKey::ControlMetadata, release));
+        }
         match action {
+            WorkerAction::Context(
+                ContextEffect::EstablishProbed { .. }
+                | ContextEffect::EstablishmentDecided { .. }
+                | ContextEffect::RetainContext { .. },
+            ) => Some((LaneKey::ContextMetadata, Release::Completed)),
             WorkerAction::Context(
                 ContextEffect::PublishTask { task, .. }
                 | ContextEffect::PublishMetrics { task, .. }
                 | ContextEffect::PublishTaskConvergence { task, .. }
+                | ContextEffect::SummaryConsumed { task, .. }
                 | ContextEffect::PublishConclusion { task, .. }
+                | ContextEffect::RetireTask { task, .. }
                 | ContextEffect::SettlementBarrier { task, .. },
-            ) => Some((LaneKey::Task(*task), true)),
+            ) => Some((LaneKey::Task(*task), Release::Published)),
             // Only the preceding publications gate dispatch. The original
             // started stop job retains its own actual exit/capture liability.
-            WorkerAction::Context(
-                ContextEffect::StopTask { task, .. } | ContextEffect::RetireTask { task, .. },
-            ) => Some((LaneKey::Task(*task), false)),
+            WorkerAction::Context(ContextEffect::StopTask { task, .. }) => {
+                Some((LaneKey::Task(*task), Release::Started))
+            }
             WorkerAction::Control {
                 effect: ControlEffect::Route { context, .. },
                 ..
-            } => Some((LaneKey::Route(*context), true)),
+            } => Some((LaneKey::Route(*context), Release::Published)),
             _ => None,
         }
     }
@@ -141,6 +211,7 @@ impl EffectDispatch {
         runtime: &ActorRuntime<WorkerActor>,
         budget: usize,
     ) -> Result<IndexedBatches, DispatchError> {
+        let runtime = self.completion_runtime.as_ref().unwrap_or(runtime).clone();
         if runtime.snapshot(self.actor)?.failed {
             return Err(DispatchError::OwnerFailed);
         }
@@ -175,15 +246,12 @@ impl EffectDispatch {
                     input,
                     action: descriptor.id,
                 };
-                if let Some((key, publication)) = Self::classify(&metadata) {
+                if let Some((key, release)) = self.classify(&metadata) {
                     let lane = self.lanes.entry(key).or_default();
                     if lane.entries.is_empty() {
                         self.ready.push_back(Ready::Lane(key));
                     }
-                    lane.entries.push_back(Entry {
-                        effect,
-                        publication,
-                    });
+                    lane.entries.push_back(Entry { effect, release });
                 } else {
                     self.ready.push_back(Ready::Direct(effect));
                 }
@@ -200,6 +268,7 @@ impl EffectDispatch {
         runtime: &ActorRuntime<WorkerActor>,
         budget: usize,
     ) -> Result<Option<EffectTicket<WorkerAction>>, DispatchError> {
+        let runtime = self.completion_runtime.as_ref().unwrap_or(runtime).clone();
         if runtime.snapshot(self.actor)?.failed {
             return Err(DispatchError::OwnerFailed);
         }
@@ -208,7 +277,7 @@ impl EffectDispatch {
             let entry = match ready {
                 Ready::Direct(effect) => Entry {
                     effect,
-                    publication: false,
+                    release: Release::Started,
                 },
                 Ready::Lane(key) => {
                     let lane = self.lanes.get(&key).expect("queued publication lane");
@@ -229,7 +298,7 @@ impl EffectDispatch {
                 };
             match ready {
                 Ready::Direct(_) => self.indexed -= 1,
-                Ready::Lane(key) if entry.publication => {
+                Ready::Lane(key) if entry.release != Release::Started => {
                     self.lanes.get_mut(&key).unwrap().in_flight = Some(entry.effect);
                 }
                 Ready::Lane(key) => self.pop_lane(key, entry.effect),
@@ -259,7 +328,8 @@ impl EffectDispatch {
         runtime: &ActorRuntime<WorkerActor>,
         ticket: &EffectTicket<WorkerAction>,
     ) -> Result<(), DispatchError> {
-        let Some((key, true)) = Self::classify(&ticket.effect) else {
+        let runtime = self.completion_runtime.as_ref().unwrap_or(runtime).clone();
+        let Some((key, Release::Published)) = self.classify(&ticket.effect) else {
             return Err(DispatchError::InvalidPublication);
         };
         if ticket.actor != self.actor {
@@ -297,6 +367,41 @@ impl EffectDispatch {
                     effect.action,
                 )?;
             }
+        }
+        self.pop_lane(key, effect);
+        Ok(())
+    }
+    /// A synchronous metadata owner calls this after actual handoff completion,
+    /// before retiring that input. An absent record is never a completion fact.
+    pub(crate) fn completion_observed(&mut self, effect: EffectRef) -> Result<(), DispatchError> {
+        let runtime = self
+            .completion_runtime
+            .as_ref()
+            .ok_or(DispatchError::MissingMetadata)?;
+        let key = if self.control {
+            LaneKey::ControlMetadata
+        } else {
+            LaneKey::ContextMetadata
+        };
+        let lane = self.lanes.get(&key).ok_or(DispatchError::MissingMetadata)?;
+        if lane.in_flight != Some(effect)
+            || lane
+                .entries
+                .front()
+                .is_none_or(|head| head.release != Release::Completed)
+        {
+            return Err(DispatchError::InvalidPublication);
+        }
+        let actual = runtime.effect_inventory(
+            self.actor,
+            effect.input,
+            ActionId::new(effect.action.get() - 1),
+            1,
+        )?;
+        if actual.first().is_none_or(|(descriptor, state)| {
+            descriptor.id != effect.action || *state != EffectState::Completed
+        }) {
+            return Err(DispatchError::InvalidPublication);
         }
         self.pop_lane(key, effect);
         Ok(())

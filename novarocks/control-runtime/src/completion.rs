@@ -19,17 +19,49 @@
 
 use crate::transaction::{LedgerState, RuntimeError, RuntimeLedger, ScopeHandle};
 use novarocks_control_runtime_core::{
-    completion::{CompletionSlot, ConsumerKind},
+    completion::{CompletionSlot, ConsumerKind, ReturnState},
     history::HistoryFact,
     identity::{ConsumerId, Generation, SlotId, WorkId},
 };
 
 #[derive(Clone)]
 pub struct ReportSlot {
-    runtime: RuntimeLedger,
-    id: SlotId,
+    pub(crate) runtime: RuntimeLedger,
+    pub(crate) id: SlotId,
 }
 impl ReportSlot {
+    /// Numeric slot identities from another ledger grant no authority here.
+    pub fn same_slot(&self, other: &Self) -> bool {
+        self.id == other.id && crate::sync::Arc::ptr_eq(&self.runtime.shared, &other.runtime.shared)
+    }
+    /// Observe the original pure payload state without granting either end
+    /// another claim, take, producer exit or consumer acknowledgement.
+    pub fn owned_return_state(&self) -> Result<ReturnState, RuntimeError> {
+        Ok(self
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock")
+            .slots
+            .get(&self.id)
+            .ok_or(RuntimeError::UnknownSlot)?
+            .return_state())
+    }
+    /// Claim this original paid report's payload exactly once, before its
+    /// bound producer starts or captures exit. Cloning the report grants no
+    /// second claim. Scope close/failure does not revoke original ownership.
+    pub fn claim_owned_return<T: Send + 'static>(
+        &self,
+    ) -> Result<
+        (
+            crate::owned_return::OwnedReturnSender<T>,
+            crate::owned_return::OwnedReturnReader<T>,
+        ),
+        RuntimeError,
+    > {
+        crate::owned_return::claim(self.clone())
+    }
     pub fn reserve(
         scope: &ScopeHandle,
         id: SlotId,
@@ -157,6 +189,25 @@ impl ReportSlot {
     }
     pub const fn id(&self) -> SlotId {
         self.id
+    }
+    /// Observe this original report's consumer leg. Reading metadata grants
+    /// no publication, consumption, producer exit or retirement authority.
+    pub fn consumption(
+        &self,
+        consumer: novarocks_control_runtime_core::identity::ConsumerId,
+    ) -> Result<novarocks_control_runtime_core::completion::Consumption, RuntimeError> {
+        self.runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock")
+            .slots
+            .get(&self.id)
+            .ok_or(RuntimeError::UnknownSlot)?
+            .consumption(consumer)
+            .ok_or(RuntimeError::Completion(
+                novarocks_control_runtime_core::completion::CompletionError::UnknownConsumer,
+            ))
     }
     pub fn fill(&self) -> Result<(), RuntimeError> {
         let mut state = self

@@ -67,8 +67,14 @@ fn one_dispatch_claim_serializes_input_refresh_and_reentrant_invocation() {
             [(observer, ConsumerKind::Observer)],
         )
         .unwrap();
-        let (slot, token) =
-            ContinuationSlot::<usize>::from_admitted(work, capacity, report.clone());
+        let (slot, token) = ContinuationSlot::<usize>::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                work,
+                capacity,
+                report.clone(),
+            )
+            .unwrap(),
+        );
         let winner = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
         let original = slot.clone();
@@ -156,7 +162,14 @@ fn delayed_continuation_start_and_scope_failure_share_the_actual_generation_gate
             ],
         )
         .unwrap();
-        let (slot, token) = ContinuationSlot::<()>::from_admitted(work, capacity, report.clone());
+        let (slot, token) = ContinuationSlot::<()>::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                work,
+                capacity,
+                report.clone(),
+            )
+            .unwrap(),
+        );
         token
             .register(Box::new(|_| {}))
             .unwrap_or_else(|_| panic!("one original registration"));
@@ -231,7 +244,14 @@ fn actual_invocation_and_owner_abandonment_preserve_the_other_consumer() {
             ],
         )
         .unwrap();
-        let (slot, token) = ContinuationSlot::<()>::from_admitted(work, capacity, report.clone());
+        let (slot, token) = ContinuationSlot::<()>::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                work,
+                capacity,
+                report.clone(),
+            )
+            .unwrap(),
+        );
         token
             .register(Box::new(|_| {}))
             .unwrap_or_else(|_| panic!("unique registration"));
@@ -276,7 +296,10 @@ fn dropping_registration_authority_and_actual_unused_exit_are_separate_observati
             .bind(WorkKind::Settlement)
             .unwrap();
         let report = ReportSlot::reserve_next(&scope, generation, work.id(), 0, []).unwrap();
-        let (slot, token) = ContinuationSlot::<()>::from_admitted(work, capacity, report);
+        let (slot, token) = ContinuationSlot::<()>::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(work, capacity, report)
+                .unwrap(),
+        );
         let revoke = thread::spawn(move || drop(token));
         let exiting = slot.clone();
         let exit = thread::spawn(move || exiting.unused_role_exited());

@@ -70,6 +70,22 @@ impl CompileControlError {
     pub fn from_domain<E: novarocks_failure_contract::OuterFailureProjection>(cause: E) -> Self {
         Self::Source(novarocks_failure_contract::SharedFailureCause::new(cause))
     }
+    /// Attach an already admitted guard to this owner's direct shared source
+    /// node. Value-only refusals return the same guard for their caller's
+    /// original value owner. This grants no capacity and does not inspect
+    /// independently shared resources inside an opaque source payload.
+    pub fn try_retain_source_lifetime(
+        &self,
+        custody: Box<dyn novarocks_failure_contract::SourceRetentionCapability>,
+    ) -> Result<(), Box<dyn novarocks_failure_contract::SourceRetentionCapability>> {
+        match self {
+            Self::Source(source) => {
+                source.retain_source_lifetime(custody);
+                Ok(())
+            }
+            Self::Cancelled | Self::DeadlineExceeded | Self::ResourceExhausted => Err(custody),
+        }
+    }
 }
 impl fmt::Display for CompileControlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -495,6 +511,158 @@ mod first_cause_tests {
                 });
             assert_eq!(result, Err(original.clone()));
             assert_eq!(*control.trace.lock().unwrap(), [0, units]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_retention_tests {
+    use super::CompileControlError;
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause,
+        SourceRetentionCapability, domain,
+    };
+    use std::{
+        error::Error,
+        fmt,
+        num::NonZeroU16,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Debug, Default)]
+    struct Observations {
+        sources: AtomicUsize,
+        projections: AtomicUsize,
+        renderings: AtomicUsize,
+        guards: AtomicUsize,
+        sources_at_guard_exit: AtomicUsize,
+        unknown: AtomicBool,
+    }
+    #[derive(Debug)]
+    struct Original {
+        observations: Arc<Observations>,
+        panic_on_drop: bool,
+    }
+    impl fmt::Display for Original {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.observations.renderings.fetch_add(1, Ordering::SeqCst);
+            f.write_str("original compile source")
+        }
+    }
+    impl Error for Original {}
+    impl FailureProjection for Original {
+        fn failure_fact(&self) -> FailureFact {
+            self.observations.projections.fetch_add(1, Ordering::SeqCst);
+            FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(domain::KERNEL, NonZeroU16::new(407).unwrap()),
+            )
+        }
+    }
+    impl Drop for Original {
+        fn drop(&mut self) {
+            self.observations.sources.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic_on_drop, "original compile source destructor");
+        }
+    }
+    #[derive(Debug)]
+    struct Guard(Arc<Observations>);
+    impl SourceRetentionCapability for Guard {}
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0
+                .sources_at_guard_exit
+                .store(self.0.sources.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.0
+                .unknown
+                .store(std::thread::panicking(), Ordering::SeqCst);
+            self.0.guards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn shared_source_retention_follows_early_and_late_inner_aliases() {
+        let observed = Arc::new(Observations::default());
+        let shared = SharedFailureCause::new(Original {
+            observations: observed.clone(),
+            panic_on_drop: false,
+        });
+        let original = shared.downcast_ref::<Original>().unwrap() as *const Original;
+        let early = shared.clone();
+        let control = CompileControlError::Source(shared);
+        let fact = control.failure_fact();
+        control
+            .try_retain_source_lifetime(Box::new(Guard(observed.clone())))
+            .unwrap();
+        let late = control
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            late.downcast_ref::<Original>().unwrap() as *const _,
+            original
+        );
+        assert_eq!(control.failure_fact(), fact);
+        assert_eq!(control.detail(), "original compile source");
+        assert_eq!(observed.projections.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.renderings.load(Ordering::SeqCst), 1);
+        drop(control);
+        drop(early);
+        assert_eq!(observed.sources.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.guards.load(Ordering::SeqCst), 0);
+        drop(late);
+        assert_eq!(observed.sources.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.guards.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.sources_at_guard_exit.load(Ordering::SeqCst), 1);
+        assert!(!observed.unknown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn source_drop_unwind_reaches_retention_guard() {
+        let observed = Arc::new(Observations::default());
+        let shared = SharedFailureCause::new(Original {
+            observations: observed.clone(),
+            panic_on_drop: true,
+        });
+        let early = shared.clone();
+        let control = CompileControlError::Source(shared);
+        control
+            .try_retain_source_lifetime(Box::new(Guard(observed.clone())))
+            .unwrap();
+        drop(control);
+        assert_eq!(observed.guards.load(Ordering::SeqCst), 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(early)));
+        assert!(result.is_err());
+        assert_eq!(observed.sources.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.guards.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.sources_at_guard_exit.load(Ordering::SeqCst), 1);
+        assert!(observed.unknown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn value_refusals_return_the_same_unused_guard() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let observed = Arc::new(Observations::default());
+            let guard: Box<dyn SourceRetentionCapability> = Box::new(Guard(observed.clone()));
+            let original = &*guard as *const dyn SourceRetentionCapability as *const ();
+            let returned = control.try_retain_source_lifetime(guard).unwrap_err();
+            assert_eq!(
+                &*returned as *const dyn SourceRetentionCapability as *const (),
+                original
+            );
+            drop(control);
+            assert_eq!(observed.guards.load(Ordering::SeqCst), 0);
+            drop(returned);
+            assert_eq!(observed.guards.load(Ordering::SeqCst), 1);
         }
     }
 }

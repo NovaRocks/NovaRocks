@@ -143,18 +143,28 @@ struct CreationProgress {
 /// upgrades the owner only while an operation is actually using it.
 #[derive(Clone)]
 pub struct TaskPreparationView {
-    owner: Weak<TaskStatusOwner>,
+    owner: Weak<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
     identity: TaskIdentity,
     cadence: std::time::Duration,
 }
 
 impl TaskPreparationView {
-    pub(crate) fn from_owner(owner: &Arc<TaskStatusOwner>, cadence: std::time::Duration) -> Self {
+    pub(crate) fn from_execution_port(
+        owner: &Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
+        cadence: std::time::Duration,
+    ) -> Self {
         Self {
             owner: Arc::downgrade(owner),
             identity: owner.identity(),
             cadence,
         }
+    }
+    // Existing direct-host fixtures keep their actual acceptance owner alive;
+    // this view carries only a weak execution port and no role issuer.
+    pub(crate) fn from_owner(owner: &Arc<TaskStatusOwner>, cadence: std::time::Duration) -> Self {
+        let port: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort> =
+            owner.clone();
+        Self::from_execution_port(&port, cadence)
     }
 
     pub const fn identity(&self) -> TaskIdentity {
@@ -164,7 +174,12 @@ impl TaskPreparationView {
         crate::PreparationControlLoan::from_view(self)
     }
 
-    pub(crate) fn control(&self) -> (Option<Arc<TaskStatusOwner>>, std::time::Duration) {
+    pub(crate) fn control(
+        &self,
+    ) -> (
+        Option<Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>>,
+        std::time::Duration,
+    ) {
         (self.owner.upgrade(), self.cadence)
     }
 }

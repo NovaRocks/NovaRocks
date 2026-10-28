@@ -26,6 +26,8 @@ pub mod driver;
 pub mod exit_role;
 pub mod lease;
 pub mod notify;
+pub mod owned_return;
+pub mod reported_work;
 pub mod resource;
 pub mod shutdown;
 pub mod sync;

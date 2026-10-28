@@ -18,7 +18,7 @@
 //! Production pollers and deterministic drivers execute the same bounded turn.
 
 use crate::{
-    actor::{Actor, ActorConfig, StepContext, StepEnvelope},
+    actor::{Actor, ActorConfig, ActorFailurePolicy, StepContext, StepEnvelope},
     notify::Notify,
     sync::{Arc, Mutex},
     transaction::{RuntimeError, ScopeHandle},
@@ -60,9 +60,12 @@ pub enum DriverError {
     IdentityExhausted,
     InvalidConfig,
     PublicationTargetMismatch,
+    EffectTicketOriginMismatch,
     ReplyAlreadyCommitted,
     UnknownRole,
     RoleBusy,
+    InputAuthorMismatch,
+    InputAuthorInactive,
     FailurePublicationRequired,
     FailurePublicationAlreadyClaimed,
     FailureWorkInactive,
@@ -101,6 +104,15 @@ impl std::fmt::Display for DriverError {
     }
 }
 impl std::error::Error for DriverError {}
+
+/// Qualified state of one actor's original builtin timer source. Closing the
+/// source never consumes an already filled Tick or observes any Work exit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimerSourceState {
+    Open,
+    ClosedPending(InputId),
+    ClosedDrained,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputPhase {
@@ -166,22 +178,73 @@ struct Inbox<A: Actor> {
     generation: Generation,
     failed: bool,
     timer_input: Option<InputId>,
+    // Monotonic source closure; an already filled Tick retains its input.
+    timer_closed: bool,
     failure: Option<ManuallyDrop<Box<dyn Any + Send>>>,
     last_progress: Tick,
     failure_publication: Option<FailurePublicationRecord>,
     failure_action_watermark: u64,
 }
 impl<A: Actor> Inbox<A> {
+    /// The single paid-role fill algorithm shared by direct and effect-backed
+    /// handoff. The caller holds this inbox and qualifies the scope failure gate.
+    fn fill_role(
+        &mut self,
+        role_id: InputRoleId,
+        scope_failed: bool,
+        value: A::Input,
+    ) -> Result<InputId, (DriverError, A::Input)> {
+        if self.sealed {
+            return Err((DriverError::Closed, value));
+        }
+        if self.failed || scope_failed {
+            return Err((DriverError::ActorFailed, value));
+        }
+        let Some(role) = self.roles.get(&role_id) else {
+            return Err((DriverError::UnknownRole, value));
+        };
+        if role.in_flight.is_some() {
+            return Err((DriverError::RoleBusy, value));
+        }
+        let (source, class) = (role.source, role.class);
+        let Some(next) = self.next_input.checked_add(1) else {
+            return Err((DriverError::IdentityExhausted, value));
+        };
+        let input = InputId::new(next).expect("incremented role input id");
+        if let Err(error) = self.mailbox.push(class, source, input) {
+            return Err((error.into(), value));
+        }
+        self.next_input = next;
+        self.inputs.insert(
+            input,
+            InputRecord {
+                source,
+                class,
+                phase: InputPhase::Filled,
+                role: Some(role_id),
+            },
+        );
+        self.payloads.insert(input, value);
+        self.roles
+            .get_mut(&role_id)
+            .expect("idle role retains its paid position")
+            .in_flight = Some(input);
+        Ok(input)
+    }
+    fn next_batch_ordinal(&self) -> Result<BatchId, DriverError> {
+        let next = self
+            .next_batch
+            .checked_add(1)
+            .ok_or(DriverError::IdentityExhausted)?;
+        Ok(BatchId::new(next).expect("incremented committed batch ordinal"))
+    }
     fn commit_batch(
         &mut self,
         input: InputId,
         mut batch: StepEnvelope<A::Effect>,
     ) -> Result<(), DriverError> {
-        let next = self
-            .next_batch
-            .checked_add(1)
-            .ok_or(DriverError::IdentityExhausted)?;
-        let ordinal = BatchId::new(next).expect("incremented committed batch ordinal");
+        let ordinal = self.next_batch_ordinal()?;
+        let next = ordinal.get();
         assert!(batch.ordinal.is_none(), "one atomic batch commitment");
         batch.ordinal = Some(ordinal);
         assert!(
@@ -214,11 +277,14 @@ impl<A: Actor> Drop for Inbox<A> {
     }
 }
 struct ActorCell<A: Actor> {
+    // Fresh for every registration, including reuse of the same public ActorId.
+    origin: Arc<()>,
     id: ActorId,
     scope: ScopeHandle,
     attachment: SlotId,
     config: ActorConfig,
     failure_work: Option<WorkId>,
+    failure_policy: ActorFailurePolicy,
     core: Mutex<Option<A>>,
     inbox: Mutex<Inbox<A>>,
 }
@@ -319,50 +385,22 @@ impl<A: Actor> InputRole<A> {
             Ok(gates) => gates.failed,
             Err(error) => return Err((error.into(), value)),
         };
-        if inbox.failed || scope_failed {
-            return Err((DriverError::ActorFailed, value));
+        let result = inbox.fill_role(self.role, scope_failed, value);
+        if result.is_ok() {
+            self.runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .ready
+                .notify(self.actor)
+                .expect("live role owns its actor");
         }
-        let Some(role) = inbox.roles.get(&self.role) else {
-            return Err((DriverError::UnknownRole, value));
-        };
-        if role.in_flight.is_some() {
-            return Err((DriverError::RoleBusy, value));
-        }
-        let (source, class) = (role.source, role.class);
-        let Some(next) = inbox.next_input.checked_add(1) else {
-            return Err((DriverError::IdentityExhausted, value));
-        };
-        let input = InputId::new(next).expect("incremented role input id");
-        if let Err(error) = inbox.mailbox.push(class, source, input) {
-            return Err((error.into(), value));
-        }
-        inbox.next_input = next;
-        inbox.inputs.insert(
-            input,
-            InputRecord {
-                source,
-                class,
-                phase: InputPhase::Filled,
-                role: Some(self.role),
-            },
-        );
-        inbox.payloads.insert(input, value);
-        inbox
-            .roles
-            .get_mut(&self.role)
-            .expect("idle role retains its paid position")
-            .in_flight = Some(input);
-        self.runtime
-            .shared
-            .state
-            .lock()
-            .expect("runtime scheduler lock")
-            .ready
-            .notify(self.actor)
-            .expect("live role owns its actor");
         drop(inbox);
-        self.runtime.shared.changed.notify();
-        Ok(input)
+        if result.is_ok() {
+            self.runtime.shared.changed.notify();
+        }
+        result
     }
     /// Positive exit from the role owner. Only idle roles can close, and the
     /// caller has already observed all role holder/capture and report exits.
@@ -511,17 +549,82 @@ impl<A: Actor> InputPermit<A> {
     }
 }
 
-/// An exclusive effect dispatch ticket. It grants no new work or capacity.
-/// `descriptor.work` must name an already admitted WorkLease; a host still
-/// calls WorkLease::start immediately before executing its body. The ticket is
-/// neither physical-start nor physical-exit evidence.
+/// Read-only neutral metadata carried by one original dispatch ticket.
+/// Constructing this view does not grant dispatch or publication authority.
 #[derive(Debug)]
-pub struct EffectTicket<E> {
+pub struct EffectTicketView<E> {
     pub effect: E,
     pub actor: ActorId,
     pub input: InputId,
     pub generation: Generation,
     pub descriptor: EffectDescriptor,
+}
+/// An exclusive effect dispatch ticket from one actual actor incarnation.
+/// It grants no new work or capacity. `descriptor.work` names an already
+/// admitted WorkLease; the host still starts that lease before running its body.
+/// The ticket is neither physical-start nor physical-exit evidence.
+///
+/// Authority fields and the neutral effect are readable, but cannot be replaced:
+/// ```compile_fail
+/// use novarocks_control_runtime::driver::EffectTicket;
+/// fn replace_effect(mut ticket: EffectTicket<u64>) {
+///     ticket.effect = 99;
+/// }
+/// ```
+/// ```compile_fail
+/// use novarocks_control_runtime::driver::EffectTicket;
+/// use novarocks_control_runtime_core::identity::ActorId;
+/// fn redirect(mut ticket: EffectTicket<u64>, actor: ActorId) {
+///     ticket.actor = actor;
+/// }
+/// ```
+/// ```compile_fail
+/// use novarocks_control_runtime::driver::EffectTicket;
+/// use novarocks_control_runtime_core::identity::ActionId;
+/// fn redirect_action(mut ticket: EffectTicket<u64>, action: ActionId) {
+///     ticket.descriptor.id = action;
+/// }
+/// ```
+/// ```compile_fail
+/// use novarocks_control_runtime::driver::EffectTicket;
+/// fn duplicate(ticket: &EffectTicket<u64>) -> EffectTicket<u64> {
+///     ticket.clone()
+/// }
+/// ```
+/// A metadata view cannot be converted into a new ticket:
+/// ```compile_fail
+/// use novarocks_control_runtime::driver::{EffectTicket, EffectTicketView};
+/// fn forge(view: EffectTicketView<u64>) -> EffectTicket<u64> {
+///     EffectTicket { view, origin: std::sync::Arc::new(()) }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct EffectTicket<E> {
+    view: EffectTicketView<E>,
+    origin: Arc<()>,
+}
+impl<E> std::ops::Deref for EffectTicket<E> {
+    type Target = EffectTicketView<E>;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+/// A refused completion preserves the original exclusive dispatch authority.
+/// Debug reports only runtime metadata, never the neutral effect payload.
+pub struct EffectCompletionRefusal<E> {
+    pub error: DriverError,
+    pub ticket: EffectTicket<E>,
+}
+impl<E> std::fmt::Debug for EffectCompletionRefusal<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EffectCompletionRefusal")
+            .field("error", &self.error)
+            .field("actor", &self.ticket.actor)
+            .field("input", &self.ticket.input)
+            .field("generation", &self.ticket.generation)
+            .field("action", &self.ticket.descriptor.id)
+            .finish()
+    }
 }
 /// Exclusive publication authority within one actual failure supervision job.
 /// It signs no work and never reads the failed core. Each commit touches one
@@ -724,6 +827,11 @@ pub struct ActorSnapshot {
 }
 
 impl<A: Actor> ActorRuntime<A> {
+    /// Compares the actual runtime instance only. This grants no work,
+    /// capacity, input, or permission to pass a current admission gate.
+    pub fn same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
     pub fn new(max_actors: usize) -> Self {
         Self::build(max_actors, None)
     }
@@ -764,8 +872,15 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
     ) -> Result<(), (DriverError, A)> {
-        self.register_inner(id, scope, (Some(attachment), None), actor, config)
-            .map(|_| ())
+        self.register_inner(
+            id,
+            scope,
+            (Some(attachment), None),
+            actor,
+            config,
+            ActorFailurePolicy::IsolateScope,
+        )
+        .map(|_| ())
     }
     /// Production composition chooses and binds actor storage in one ledger
     /// transaction; no externally allocated slot can be overtaken before bind.
@@ -776,11 +891,20 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
     ) -> Result<SlotId, (DriverError, A)> {
-        self.register_inner(id, scope, (None, None), actor, config)
+        self.register_inner(
+            id,
+            scope,
+            (None, None),
+            actor,
+            config,
+            ActorFailurePolicy::IsolateScope,
+        )
     }
     /// Bind the original failure-cleanup role outside the actor's mutable
     /// state. Its pure failure hook receives only the role identity, even if
     /// handle panics halfway through mutating every protocol field.
+    /// This already admitted authority can attach during external drain;
+    /// failed scopes, exited supervisors and a closed actor runtime refuse it.
     pub fn register_supervised_next(
         &self,
         id: ActorId,
@@ -788,6 +912,27 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
         failure_work: &crate::lease::WorkLease,
+    ) -> Result<SlotId, (DriverError, A)> {
+        self.register_supervised_next_with_policy(
+            id,
+            scope,
+            actor,
+            config,
+            failure_work,
+            ActorFailurePolicy::IsolateScope,
+        )
+    }
+    /// The same original supervisor validation applies to both policies. The
+    /// policy is retained in immutable runtime metadata, never read from a
+    /// Core after panic. Ordinary input results do not invoke this policy.
+    pub fn register_supervised_next_with_policy(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        failure_work: &crate::lease::WorkLease,
+        failure_policy: ActorFailurePolicy,
     ) -> Result<SlotId, (DriverError, A)> {
         if scope.id() != failure_work.scope().id()
             || !Arc::ptr_eq(&scope.runtime.shared, &failure_work.scope().runtime.shared)
@@ -808,6 +953,8 @@ impl<A: Actor> ActorRuntime<A> {
                 .is_some_and(|work| {
                     work.kind == WorkKind::Cleanup
                         && !work.unbound_guard
+                        && !work.body_exited
+                        && !work.captures_exited
                         && matches!(
                             work.phase,
                             WorkPhase::Admitted | WorkPhase::Queued | WorkPhase::Started
@@ -817,7 +964,14 @@ impl<A: Actor> ActorRuntime<A> {
         if !valid {
             return Err((DriverError::FailureWorkInactive, actor));
         }
-        self.register_inner(id, scope, (None, Some(failure_work.id())), actor, config)
+        self.register_inner(
+            id,
+            scope,
+            (None, Some(failure_work.id())),
+            actor,
+            config,
+            failure_policy,
+        )
     }
     fn register_inner(
         &self,
@@ -826,6 +980,7 @@ impl<A: Actor> ActorRuntime<A> {
         binding: (Option<SlotId>, Option<WorkId>),
         actor: A,
         config: ActorConfig,
+        failure_policy: ActorFailurePolicy,
     ) -> Result<SlotId, (DriverError, A)> {
         let config = match config.validate() {
             Ok(c) => c,
@@ -842,7 +997,10 @@ impl<A: Actor> ActorRuntime<A> {
                 Ok(()) => slot,
                 Err(error) => return Err((error.into(), actor)),
             },
-            None => match scope.attach_actor_next() {
+            None => match failure_work.map_or_else(
+                || scope.attach_actor_next(),
+                |work| scope.attach_admitted_actor_next(work),
+            ) {
                 Ok(slot) => slot,
                 Err(error) => return Err((error.into(), actor)),
             },
@@ -875,11 +1033,13 @@ impl<A: Actor> ActorRuntime<A> {
         state.actors.insert(
             id,
             Arc::new(ActorCell {
+                origin: Arc::new(()),
                 id,
                 scope,
                 attachment,
                 config,
                 failure_work,
+                failure_policy,
                 core: Mutex::new(Some(actor)),
                 inbox: Mutex::new(Inbox {
                     external_open: true,
@@ -896,6 +1056,7 @@ impl<A: Actor> ActorRuntime<A> {
                     generation,
                     failed: false,
                     timer_input: None,
+                    timer_closed: false,
                     failure: None,
                     last_progress: Tick(0),
                     failure_publication: None,
@@ -912,24 +1073,84 @@ impl<A: Actor> ActorRuntime<A> {
         source: ActorId,
         class: InputClass,
     ) -> Result<InputPermit<A>, DriverError> {
+        self.reserve_input_position(actor, source, class, None)
+    }
+    /// Reserve a neutral input for an already admitted holder in this actor's
+    /// exact scope. External closure cannot discard that holder's drain work.
+    /// The caller has funded its input/batch/capture inventory before binding
+    /// the holder. This does not admit Work, acquire capacity or start a body.
+    /// Failed/sealed actors and exited or unresolved authors still refuse it.
+    pub fn reserve_admitted_input(
+        &self,
+        actor: ActorId,
+        source: ActorId,
+        class: InputClass,
+        author: &crate::lease::WorkLease,
+    ) -> Result<InputPermit<A>, DriverError> {
+        self.reserve_input_position(actor, source, class, Some(author))
+    }
+    fn reserve_input_position(
+        &self,
+        actor: ActorId,
+        source: ActorId,
+        class: InputClass,
+        author: Option<&crate::lease::WorkLease>,
+    ) -> Result<InputPermit<A>, DriverError> {
         if class == InputClass::Timer {
             return Err(DriverError::InvalidConfig);
         }
         let node = self.node(actor)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        if !self
-            .shared
-            .state
-            .lock()
-            .expect("runtime scheduler lock")
-            .open
-        {
-            return Err(DriverError::Closed);
-        }
+        // Keep the actual author check and position insertion in one order
+        // with scope failure. Lock order is the existing inbox -> ledger order;
+        // no callback, payload construction or Work admission runs here.
+        let author_state = if let Some(author) = author {
+            if author.scope().id() != node.scope.id()
+                || !Arc::ptr_eq(&author.scope().runtime.shared, &node.scope.runtime.shared)
+            {
+                return Err(DriverError::InputAuthorMismatch);
+            }
+            let state = node
+                .scope
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime ledger lock");
+            let scope = state
+                .scopes
+                .get(&node.scope.id())
+                .ok_or(DriverError::InputAuthorInactive)?;
+            if scope.failed() {
+                return Err(DriverError::ActorFailed);
+            }
+            let work = scope
+                .work(author.id())
+                .ok_or(DriverError::InputAuthorInactive)?;
+            if work.unbound_guard
+                || work.body_exited
+                || work.captures_exited
+                || state.unresolved.contains(&(node.scope.id(), author.id()))
+            {
+                return Err(DriverError::InputAuthorInactive);
+            }
+            Some(state)
+        } else {
+            if !self
+                .shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .open
+            {
+                return Err(DriverError::Closed);
+            }
+            None
+        };
         if inbox.failed {
             return Err(DriverError::ActorFailed);
         }
-        if !inbox.external_open || inbox.sealed {
+        if inbox.sealed || author.is_none() && !inbox.external_open {
             return Err(DriverError::Closed);
         }
         if inbox.counts[class.index()] >= node.config.mailbox[class.index()] {
@@ -950,6 +1171,7 @@ impl<A: Actor> ActorRuntime<A> {
             },
         );
         inbox.counts[class.index()] += 1;
+        drop(author_state);
         Ok(InputPermit {
             runtime: self.clone(),
             actor,
@@ -979,6 +1201,50 @@ impl<A: Actor> ActorRuntime<A> {
         self.shared.changed.notify();
         Ok(())
     }
+    /// Monotonically withdraw future builtin timer production for this actor.
+    /// Existing filled Tick custody remains until actual `retire_input`.
+    /// Persistent prepaid input roles and ordinary input drain are unaffected.
+    pub fn close_timer_source(&self, actor: ActorId) -> Result<TimerSourceState, DriverError> {
+        let node = self.node(actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        inbox.timer_closed = true;
+        let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+        if state
+            .actors
+            .get(&actor)
+            .is_some_and(|current| Arc::ptr_eq(current, &node))
+        {
+            state.timers.cancel(actor);
+            if inbox.timer_input.is_none() {
+                // A selected but not yet filled position can be withdrawn:
+                // the same inbox gate prevents its later delivery. A real
+                // filled Tick is never acknowledged by source closure.
+                state.timers.acknowledge_tick(actor);
+            }
+        }
+        let observed = Self::timer_state(&inbox);
+        drop(state);
+        drop(inbox);
+        self.shared.changed.notify();
+        Ok(observed)
+    }
+    /// A current source-qualified read, not an actor/Work retirement proof.
+    /// ClosedDrained cannot be followed by another builtin fill or rearm on
+    /// this same actor incarnation. Other input sources still own their legs.
+    pub fn timer_source_state(&self, actor: ActorId) -> Result<TimerSourceState, DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        Ok(Self::timer_state(&inbox))
+    }
+    fn timer_state(inbox: &Inbox<A>) -> TimerSourceState {
+        if !inbox.timer_closed {
+            TimerSourceState::Open
+        } else if let Some(input) = inbox.timer_input {
+            TimerSourceState::ClosedPending(input)
+        } else {
+            TimerSourceState::ClosedDrained
+        }
+    }
     /// After all actual input/role/effect holders have retired, seal timer and
     /// mailbox ingress before the host exits its last housekeeping leases.
     /// Work remains counted and remove_actor still independently requires join.
@@ -998,6 +1264,7 @@ impl<A: Actor> ActorRuntime<A> {
             return Err(SchedulerError::Busy.into());
         }
         inbox.sealed = true;
+        inbox.timer_closed = true;
         state.timers.cancel(actor);
         state.timers.acknowledge_tick(actor);
         drop(state);
@@ -1051,7 +1318,7 @@ impl<A: Actor> ActorRuntime<A> {
             let actor = node.id;
             let timer_value = A::timer_input(now);
             let mut inbox = node.inbox.lock().expect("actor inbox lock");
-            if inbox.failed || inbox.sealed {
+            if inbox.failed || inbox.sealed || inbox.timer_closed {
                 let mut state = self.shared.state.lock().expect("runtime scheduler lock");
                 if state
                     .actors
@@ -1199,13 +1466,55 @@ impl<A: Actor> ActorRuntime<A> {
             let deadline = match result {
                 Ok(deadline) => {
                     let batch = step.finish();
+                    let stop_producing = batch.stop_producing;
                     let mut inbox = node.inbox.lock().expect("actor inbox lock");
-                    inbox.commit_batch(input.input, batch)?;
+                    // Preflight every fallible batch boundary before changing
+                    // the scope gate. The same inbox stays locked through commit.
+                    let ordinal = inbox.next_batch_ordinal()?;
+                    assert!(batch.ordinal.is_none(), "one atomic batch commitment");
+                    assert!(
+                        !inbox.batches.contains_key(&input.input),
+                        "one batch per input occurrence"
+                    );
+                    assert!(
+                        !inbox.batch_order.contains_key(&ordinal),
+                        "one committed batch ordinal"
+                    );
+                    inbox.inputs.get(&input.input).expect("consumed input");
+                    // Only an explicit directive needs this ledger transaction.
+                    // No host lock, callback or rich object enters the gate.
+                    let mut ledger = stop_producing.then(|| {
+                        node.scope
+                            .runtime
+                            .shared
+                            .state
+                            .lock()
+                            .expect("runtime ledger lock")
+                    });
+                    if let Some(ledger) = &ledger {
+                        ledger
+                            .scopes
+                            .get(&node.scope.id())
+                            .expect("registered actor retains its original scope");
+                    }
+                    inbox
+                        .commit_batch(input.input, batch)
+                        .expect("preflighted atomic batch commitment");
                     inbox
                         .inputs
                         .get_mut(&input.input)
                         .expect("consumed input")
                         .phase = InputPhase::Committed;
+                    if let Some(ledger) = &mut ledger {
+                        ledger
+                            .scopes
+                            .get_mut(&node.scope.id())
+                            .expect("registered actor retains its original scope")
+                            .request_stop();
+                        node.scope.runtime.shared.record(HistoryFact::ScopeStopped {
+                            scope: node.scope.id(),
+                        });
+                    }
                     inbox.last_progress = now;
                     self.shared.record(HistoryFact::InputConsumed {
                         actor: node.id,
@@ -1215,9 +1524,23 @@ impl<A: Actor> ActorRuntime<A> {
                         scope: node.scope.id(),
                         input: input.input,
                     });
+                    drop(ledger);
+                    drop(inbox);
+                    if stop_producing {
+                        node.scope.runtime.shared.changed.notify();
+                    }
                     deadline
                 }
                 Err(payload) => {
+                    if node.failure_policy == ActorFailurePolicy::ProcessFailStop {
+                        // Preserve the original panic, all uncommitted step
+                        // reservations/effects and the original Core in its
+                        // cell. Never inspect that Core, unwind its captures,
+                        // or publish a normal scope-failure receipt.
+                        std::mem::forget(payload);
+                        std::mem::forget(step);
+                        std::process::abort();
+                    }
                     // The failed pure state stays in its cell until the host removes it.
                     let mut inbox = node.inbox.lock().expect("actor inbox lock");
                     let generation = node.scope.fail()?;
@@ -1266,10 +1589,18 @@ impl<A: Actor> ActorRuntime<A> {
                     None
                 }
             };
+            // A Core turn may have started before source closure. Observe
+            // its returned deadline under the same inbox -> scheduler gate,
+            // so neither this turn nor a later one can reopen the source.
+            let inbox = node.inbox.lock().expect("actor inbox lock");
             let mut state = self.shared.state.lock().expect("runtime scheduler lock");
             state.effect_ready.notify(node.id)?;
-            if let Some(deadline) = deadline {
-                state.timers.set(node.id, deadline)?;
+            if !inbox.timer_closed && !inbox.failed && !inbox.sealed {
+                if let Some(deadline) = deadline {
+                    state.timers.set(node.id, deadline)?;
+                } else {
+                    state.timers.cancel(node.id);
+                }
             } else {
                 state.timers.cancel(node.id);
             }
@@ -1375,17 +1706,170 @@ impl<A: Actor> ActorRuntime<A> {
             .remove(&action)
             .expect("pending batch action owns its neutral payload");
         Ok(EffectTicket {
-            effect,
-            actor,
-            input,
-            generation,
-            descriptor: batch
-                .state
-                .record(action)
-                .expect("started action")
-                .descriptor()
-                .clone(),
+            view: EffectTicketView {
+                effect,
+                actor,
+                input,
+                generation,
+                descriptor: batch
+                    .state
+                    .record(action)
+                    .expect("started action")
+                    .descriptor()
+                    .clone(),
+            },
+            origin: node.origin.clone(),
         })
+    }
+    /// Read-only validation of this original ticket's current publication
+    /// authority. It neither runs the effect nor creates work or capacity.
+    /// Late external facts and completion use their separate origin-only gate.
+    pub fn validate_effect_ticket(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+    ) -> Result<(), DriverError> {
+        let node = self.node(ticket.actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let ledger = node
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        self.validate_publication(&node, &inbox, &ledger, ticket, &node.scope)
+    }
+    /// Atomically qualifies the original effect's current publication authority
+    /// and fills an already paid role in this same runtime and ledger. No Work,
+    /// capacity or target admission is created; the ticket remains with its caller.
+    /// Source failure and target fill share the original ledger transaction.
+    pub fn fill_from_effect(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+        target: &InputRole<A>,
+        value: A::Input,
+    ) -> Result<InputId, (DriverError, A::Input)> {
+        if !self.same_runtime(&target.runtime) {
+            return Err((DriverError::PublicationTargetMismatch, value));
+        }
+        if !target.active {
+            return Err((DriverError::UnknownRole, value));
+        }
+        let source_node = match self.node(ticket.actor) {
+            Ok(node) => node,
+            Err(error) => return Err((error, value)),
+        };
+        let target_node = if ticket.actor == target.actor {
+            source_node.clone()
+        } else {
+            match self.node(target.actor) {
+                Ok(node) => node,
+                Err(error) => return Err((error, value)),
+            }
+        };
+        if !Arc::ptr_eq(
+            &source_node.scope.runtime.shared,
+            &target_node.scope.runtime.shared,
+        ) {
+            return Err((DriverError::PublicationTargetMismatch, value));
+        }
+        // Every two-inbox operation uses ActorId order. The same-actor case
+        // borrows its one inbox twice immutably only for validation.
+        let result = if ticket.actor == target.actor {
+            let mut inbox = source_node.inbox.lock().expect("actor inbox lock");
+            let ledger = source_node
+                .scope
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime ledger lock");
+            match self.validate_effect_forwarding(
+                ticket,
+                (&source_node, &inbox),
+                (&target_node, &inbox, target.role),
+                &ledger,
+            ) {
+                Ok(failed) => inbox.fill_role(target.role, failed, value),
+                Err(error) => Err((error, value)),
+            }
+        } else if ticket.actor < target.actor {
+            let source = source_node.inbox.lock().expect("source actor inbox lock");
+            let mut destination = target_node.inbox.lock().expect("target actor inbox lock");
+            self.fill_effect_target_locked(
+                ticket,
+                (&source_node, &source),
+                (&target_node, &mut destination, target.role),
+                value,
+            )
+        } else {
+            let mut destination = target_node.inbox.lock().expect("target actor inbox lock");
+            let source = source_node.inbox.lock().expect("source actor inbox lock");
+            self.fill_effect_target_locked(
+                ticket,
+                (&source_node, &source),
+                (&target_node, &mut destination, target.role),
+                value,
+            )
+        };
+        if result.is_ok() {
+            self.shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .ready
+                .notify(target.actor)
+                .expect("live role owns its actor");
+            self.shared.changed.notify();
+        }
+        result
+    }
+    fn fill_effect_target_locked(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+        source: (&ActorCell<A>, &Inbox<A>),
+        target: (&ActorCell<A>, &mut Inbox<A>, InputRoleId),
+        value: A::Input,
+    ) -> Result<InputId, (DriverError, A::Input)> {
+        let ledger = source
+            .0
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        match self.validate_effect_forwarding(
+            ticket,
+            source,
+            (target.0, target.1, target.2),
+            &ledger,
+        ) {
+            Ok(failed) => target.1.fill_role(target.2, failed, value),
+            Err(error) => Err((error, value)),
+        }
+    }
+    fn validate_effect_forwarding(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+        source: (&ActorCell<A>, &Inbox<A>),
+        target: (&ActorCell<A>, &Inbox<A>, InputRoleId),
+        ledger: &crate::transaction::LedgerState,
+    ) -> Result<bool, DriverError> {
+        self.validate_publication(source.0, source.1, ledger, ticket, &source.0.scope)?;
+        let role = target
+            .1
+            .roles
+            .get(&target.2)
+            .ok_or(DriverError::UnknownRole)?;
+        if role.source != ticket.actor {
+            return Err(DriverError::InputAuthorMismatch);
+        }
+        Ok(ledger
+            .scopes
+            .get(&target.0.scope.id())
+            .ok_or(RuntimeError::UnknownScope)?
+            .failed())
     }
     /// Move the original still-unbound reservation into its actual host job.
     /// Starting the exact committed effect and taking its guard share the
@@ -1396,6 +1880,7 @@ impl<A: Actor> ActorRuntime<A> {
         reservation: ReservationId,
     ) -> Result<crate::lease::StepGuard, DriverError> {
         let node = self.node(ticket.actor)?;
+        Self::validate_ticket_origin(&node, ticket)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         let ledger = node
             .scope
@@ -1510,6 +1995,7 @@ impl<A: Actor> ActorRuntime<A> {
         ticket: &EffectTicket<A::Effect>,
     ) -> Result<FailurePublicationSession<A>, DriverError> {
         let node = self.node(ticket.actor)?;
+        Self::validate_ticket_origin(&node, ticket)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         let ledger = node
             .scope
@@ -1556,6 +2042,15 @@ impl<A: Actor> ActorRuntime<A> {
             work: ticket.descriptor.work,
         })
     }
+    fn validate_ticket_origin(
+        node: &ActorCell<A>,
+        ticket: &EffectTicket<A::Effect>,
+    ) -> Result<(), DriverError> {
+        if !Arc::ptr_eq(&node.origin, &ticket.origin) {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        Ok(())
+    }
     fn validate_publication(
         &self,
         node: &ActorCell<A>,
@@ -1564,6 +2059,7 @@ impl<A: Actor> ActorRuntime<A> {
         ticket: &EffectTicket<A::Effect>,
         target: &ScopeHandle,
     ) -> Result<(), DriverError> {
+        Self::validate_ticket_origin(node, ticket)?;
         if node.scope.id() != target.id()
             || !Arc::ptr_eq(&node.scope.runtime.shared, &target.runtime.shared)
         {
@@ -1723,6 +2219,7 @@ impl<A: Actor> ActorRuntime<A> {
         ticket: &EffectTicket<A::Effect>,
     ) -> Result<(), DriverError> {
         let node = self.node(ticket.actor)?;
+        Self::validate_ticket_origin(&node, ticket)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         inbox
             .batches
@@ -1745,24 +2242,34 @@ impl<A: Actor> ActorRuntime<A> {
         self.shared.changed.notify();
         Ok(())
     }
-    pub fn effect_completed(&self, ticket: EffectTicket<A::Effect>) -> Result<(), DriverError> {
-        self.node(ticket.actor)?
-            .inbox
-            .lock()
-            .expect("actor inbox lock")
-            .batches
-            .get_mut(&ticket.input)
-            .ok_or(DriverError::UnknownInput)?
-            .state
-            .complete(ticket.descriptor.id)?;
-        self.shared
-            .state
-            .lock()
-            .expect("runtime scheduler lock")
-            .effect_ready
-            .notify(ticket.actor)?;
-        self.shared.changed.notify();
-        Ok(())
+    pub fn effect_completed(
+        &self,
+        ticket: EffectTicket<A::Effect>,
+    ) -> Result<(), EffectCompletionRefusal<A::Effect>> {
+        let complete = || -> Result<(), DriverError> {
+            let node = self.node(ticket.actor)?;
+            Self::validate_ticket_origin(&node, &ticket)?;
+            let mut inbox = node.inbox.lock().expect("actor inbox lock");
+            inbox
+                .batches
+                .get_mut(&ticket.input)
+                .ok_or(DriverError::UnknownInput)?
+                .state
+                .complete(ticket.descriptor.id)?;
+            self.shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .effect_ready
+                .notify(ticket.actor)?;
+            drop(inbox);
+            self.shared.changed.notify();
+            Ok(())
+        };
+        match complete() {
+            Ok(()) => Ok(()),
+            Err(error) => Err(EffectCompletionRefusal { error, ticket }),
+        }
     }
     /// The caller acknowledges the exact declared predecessor condition, after its real publication or completion fact.
     pub fn acknowledge_dependency(
@@ -2114,6 +2621,7 @@ impl<A: Actor> ActorRuntime<A> {
         // for the inbox lock. It must observe the seal after removal as well.
         inbox.external_open = false;
         inbox.sealed = true;
+        inbox.timer_closed = true;
         state.ready.unregister(actor)?;
         state.effect_ready.unregister(actor)?;
         state.timers.cancel(actor);
@@ -2141,6 +2649,13 @@ impl<A: Actor> ActorRuntime<A> {
     }
     pub fn wait_after(&self, observed: u64) {
         self.shared.changed.wait_after(observed);
+    }
+    /// Wait for a possible host/scheduler change or the caller's real deadline.
+    /// Preserve the version sampled before checking the caller's predicate;
+    /// a wake supplies no completion or deadline fact by itself.
+    #[cfg(not(loom))]
+    pub fn wait_after_timeout(&self, observed: u64, timeout: std::time::Duration) {
+        self.shared.changed.wait_after_timeout(observed, timeout);
     }
     pub fn notify_pollers(&self) {
         self.shared.changed.notify();
@@ -2277,6 +2792,123 @@ impl<A: Actor> Drop for PollerPool<A> {
         assert!(
             self.stopped,
             "control poller pool requires explicit drained shutdown and joins"
+        );
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod effect_ticket_incarnation_tests {
+    use super::*;
+    use crate::transaction::RuntimeLedger;
+    use novarocks_control_runtime_core::{
+        capacity::ResourceVector, identity::ScopeId, scope::WorkAdmission,
+    };
+
+    #[derive(Debug)]
+    struct OneEffect(WorkId);
+    impl Actor for OneEffect {
+        type Input = ();
+        type Effect = ();
+        fn timer_input(_now: Tick) {}
+        fn handle(
+            &mut self,
+            _now: Tick,
+            _input: InputEnvelope,
+            _value: (),
+            step: &mut StepContext<'_, ()>,
+        ) {
+            step.effect(
+                EffectDescriptor {
+                    id: ActionId::new(1).unwrap(),
+                    work: self.0,
+                    kind: EffectKind::Publication,
+                    dependencies: vec![],
+                },
+                (),
+            )
+            .unwrap();
+        }
+        fn next_deadline(&self) -> Option<Tick> {
+            None
+        }
+        fn owner_failed(
+            _scope: ScopeId,
+            _generation: Generation,
+            _input: InputEnvelope,
+            _step: &mut StepContext<'_, ()>,
+        ) {
+        }
+    }
+    #[test]
+    fn actual_actor_re_registration_mints_a_fresh_ticket_incarnation() {
+        let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap(), 8, 8);
+        let runtime = ActorRuntime::new(1);
+        let actor = ActorId::new(1).unwrap();
+        let generation = Generation::new(1).unwrap();
+        let mut previous: Option<Arc<()>> = None;
+        let mut fresh = true;
+        for _ in 0..2 {
+            let scope = ledger.open_scope_next(None, generation, 4, 4).unwrap();
+            let (mut work, mut capacity) = scope
+                .reserve_next(
+                    generation,
+                    ResourceVector::new([]).unwrap(),
+                    WorkKind::Business,
+                    WorkAdmission::External,
+                )
+                .unwrap()
+                .bind(WorkKind::Business)
+                .unwrap();
+            work.start().unwrap();
+            runtime
+                .register_next(
+                    actor,
+                    scope.clone(),
+                    OneEffect(work.id()),
+                    ActorConfig {
+                        mailbox: [1; 4],
+                        max_batches: 1,
+                        max_effects_per_step: 1,
+                        max_dependencies_per_effect: 1,
+                        turn_budget: 8,
+                        max_step_work: 1,
+                    },
+                )
+                .unwrap();
+            let input = runtime
+                .reserve_input(actor, actor, InputClass::Ordinary)
+                .unwrap()
+                .fill(())
+                .unwrap();
+            runtime.poll_one(Tick(1)).unwrap();
+            let ticket = runtime
+                .take_effect(actor, input, ActionId::new(1).unwrap())
+                .unwrap();
+            if let Some(previous) = &previous {
+                fresh &= !Arc::ptr_eq(previous, &ticket.origin);
+            }
+            // This retained marker is only metadata. The exclusive ticket is
+            // consumed before input retirement or actor removal can succeed.
+            previous = Some(ticket.origin.clone());
+            runtime.validate_effect_ticket(&ticket).unwrap();
+            runtime.effect_completed(ticket).unwrap();
+            runtime.retire_input(actor, input).unwrap();
+            scope.close_external().unwrap();
+            work.body_exited().unwrap();
+            work.captures_exited().unwrap();
+            ledger.reap_scope_ready(scope.id(), 1).unwrap();
+            while let Some(ready) = runtime.claim_effect_actor() {
+                runtime.release_effect_actor(ready, false).unwrap();
+            }
+            runtime.remove_actor(actor).unwrap();
+            capacity.release(&capacity.resources().unwrap()).unwrap();
+            ledger.remove_scope(scope.id()).unwrap();
+        }
+        assert!(runtime.is_empty());
+        assert!(ledger.is_empty());
+        assert!(
+            fresh,
+            "the same public ActorId cannot inherit an old ticket origin"
         );
     }
 }

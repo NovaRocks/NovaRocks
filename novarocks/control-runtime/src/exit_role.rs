@@ -22,9 +22,11 @@
 use crate::{
     completion::ReportSlot,
     lease::{CapacityBundle, WorkLease},
+    reported_work::ReportedWork,
     sync::{Arc, Mutex},
-    transaction::RuntimeError,
+    transaction::{RuntimeError, ScopeHandle},
 };
+use novarocks_control_runtime_core::{identity::Generation, scope::WorkKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExitRolePhase {
@@ -91,14 +93,13 @@ impl std::fmt::Debug for ExitAuthority {
     }
 }
 impl ExitRole {
-    /// Takes the original matching WorkLease, capacity and reserved exit
-    /// report. The admission owner supplies all three from the same role;
-    /// this constructor allocates no credit and signs no new responsibility.
-    pub fn from_admitted(
-        work: WorkLease,
-        capacity: CapacityBundle,
-        report: ReportSlot,
-    ) -> (Self, ExitAuthority) {
+    /// Takes the carrier's original WorkLease, capacity and reserved report.
+    /// Its binding was validated before custody or unique authority exists.
+    /// Old admitted roles remain valid after stop/failure; identity is not a
+    /// current gate.
+    /// This constructor allocates no credit or replacement responsibility.
+    pub fn from_admitted(reported: ReportedWork) -> (Self, ExitAuthority) {
+        let (work, capacity, report) = reported.into_parts();
         let custody = Arc::new(Custody {
             state: Mutex::new(State {
                 phase: ExitRolePhase::Admitted,
@@ -208,6 +209,61 @@ impl ExitRole {
     }
 }
 impl ExitAuthority {
+    /// Derives an actual child scope from this original active holder. The
+    /// caller already pays its finite parent-link/root storage; this performs
+    /// no new capacity reservation beyond the existing zero-resource bootstrap.
+    /// The original parent Work/capacity/report never leave their custody.
+    ///
+    /// This is general derivation authority, not a one-child factory: an
+    /// application with one paid child position must enforce its own issuance.
+    /// Cloned observation handles do not gain this authority:
+    /// ```compile_fail
+    /// use novarocks_control_runtime::exit_role::ExitRole;
+    /// use novarocks_control_runtime_core::{identity::Generation, scope::WorkKind};
+    /// fn observer(role: ExitRole, generation: Generation) {
+    ///     role.open_child_scope_with_root(generation, 1, 0, WorkKind::Business);
+    /// }
+    /// ```
+    /// Positive exit consumes the unique authority before further derivation:
+    /// ```compile_fail
+    /// use novarocks_control_runtime::exit_role::ExitAuthority;
+    /// use novarocks_control_runtime_core::{identity::Generation, scope::WorkKind};
+    /// fn after_exit(mut authority: ExitAuthority, generation: Generation) {
+    ///     authority.exited().unwrap();
+    ///     authority.open_child_scope_with_root(generation, 1, 0, WorkKind::Business);
+    /// }
+    /// ```
+    pub fn open_child_scope_with_root(
+        &mut self,
+        generation: Generation,
+        max_work: usize,
+        max_slots: usize,
+        kind: WorkKind,
+    ) -> Result<(ScopeHandle, crate::lease::StepGuard), ExitRoleError> {
+        let state = self
+            .role
+            .0
+            .state
+            .lock()
+            .expect("original role custody lock");
+        if !self.active
+            || !matches!(
+                state.phase,
+                ExitRolePhase::Admitted | ExitRolePhase::Started
+            )
+        {
+            return Err(ExitRoleError::InvalidPhase(state.phase));
+        }
+        let work = state.work.as_ref().expect("active original role work");
+        // Same state -> ledger lock order as start/exited/retirement. The
+        // ledger transaction admits and publishes its real parent link/root
+        // atomically; no callback or application policy executes here.
+        work.scope()
+            .runtime
+            .open_child_scope_with_root(work, generation, max_work, max_slots, kind)
+            .map_err(Into::into)
+    }
+
     /// Starts only the original admitted work. A refused start changes no exit
     /// evidence, so the holder can still positively exit a never-run role.
     pub fn start(&mut self) -> Result<(), ExitRoleError> {
@@ -223,6 +279,69 @@ impl ExitAuthority {
         state.work.as_mut().expect("original role work").start()?;
         state.phase = ExitRolePhase::Started;
         Ok(())
+    }
+    /// The original never-started holder and all of its captures have actually
+    /// exited without publishing a report. Revoke that reserved report rather
+    /// than inventing consumption by any of its declared consumers. Children
+    /// and the common reaper still retain their independent retirement duties.
+    pub fn revoke_unused_and_exit(self) -> Result<(), ExitRoleError> {
+        self.exit_without_publication(false)
+    }
+    /// The original holder's body and captures actually exited without
+    /// publishing its plain report, even if its body had already started.
+    /// Withdraw that unpublished report without acknowledging any consumer.
+    /// An owned return payload and actual children keep their independent
+    /// retirement gates; taking a return alone is never proof of this exit.
+    pub fn withdraw_unpublished_and_exit(self) -> Result<(), ExitRoleError> {
+        self.exit_without_publication(true)
+    }
+    fn exit_without_publication(mut self, allow_started: bool) -> Result<(), ExitRoleError> {
+        let mut state = self
+            .role
+            .0
+            .state
+            .lock()
+            .expect("original role custody lock");
+        if !self.active
+            || !(state.phase == ExitRolePhase::Admitted
+                || allow_started && state.phase == ExitRolePhase::Started)
+        {
+            return Err(ExitRoleError::InvalidPhase(state.phase));
+        }
+        let observation = (|| -> Result<(), RuntimeError> {
+            // Revoke first: a filled report must refuse before publishing any
+            // new body/capture observation. Partial progress is never undone.
+            self.role.0.report.revoke_unused()?;
+            state
+                .work
+                .as_mut()
+                .expect("original role work")
+                .body_exited()?;
+            state.body_exited = true;
+            state
+                .work
+                .as_mut()
+                .expect("original role work")
+                .captures_exited()?;
+            state.captures_exited = true;
+            self.role.0.report.body_exited()?;
+            self.role.0.report.captures_exited()?;
+            Ok(())
+        })();
+        self.active = false;
+        state.phase = if observation.is_ok() {
+            ExitRolePhase::Exited
+        } else {
+            ExitRolePhase::Unresolved
+        };
+        if observation.is_err() {
+            state
+                .work
+                .as_ref()
+                .expect("original role work")
+                .mark_unresolved();
+        }
+        observation.map_err(Into::into)
     }
     /// Positive proof from the original holder after its actual call and all
     /// captures have exited, or after a never-started unused holder truly exits.

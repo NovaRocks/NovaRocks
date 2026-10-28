@@ -529,6 +529,9 @@ pub struct QueryContextDomains {
     credential: Option<CredentialState>,
 }
 impl QueryContextDomains {
+    pub const fn credential(&self) -> Option<CredentialState> {
+        self.credential
+    }
     pub fn install_initial(
         catalog: ContentFingerprint,
         filter: ContentFingerprint,

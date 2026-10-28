@@ -21,29 +21,40 @@
 
 use super::{
     actors::{WorkerAction, WorkerActor},
-    causal::{CausalError, TaskCausalInbox},
+    admitted_role::{dispose_unused_completion, reserve_reported_role},
+    causal::{CausalAdmissionRefusal, CausalError, TaskCausalInbox},
+    completion_action::{CompletionActionCustody, CompletionActionError},
+    host_executor::{HostExecutorHandle, HostSubmitError},
+    lifecycle_read::{TaskLifetime, TaskReadBinding, TaskReadError, TaskReadSnapshot},
     loading::{LoaderCustody, LoaderJob, LoadingSources, TaskCreatePayload},
+    loading_events::{
+        LoadingAuthorReturn, LoadingEventError, LoadingEventJob, LoadingEventOutcome,
+        LoadingEvents, LoadingJobReturned,
+    },
+    loading_host_job::LoadingHostJob,
+    open_summary::TaskOpenSummaryInbox,
     preparation::{
         PreparationAdoptionError, PreparationBinding, PreparationCustody, PreparationJob,
         PreparationOutcome, PreparationParent, QueuedPreparation, RunningPreparation,
     },
+    preparation_refusal::{HostPreparationRefusal, RefusalPosition},
 };
 use crate::{
     settlement::RegistrationNotice,
     task_completion_roles::{AdmittedCompletionRole, TaskCompletionRoles},
     task_port::{TaskPendingNotice, TaskRuntimePort},
-    task_proposal_ingress::TaskProposalIngress,
+    task_proposal_ingress::{CutSourceAdmission, TaskProposalIngress},
 };
 use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::{ActorRuntime, DriverError, EffectTicket},
     lease::{CapacityBundle, WorkLease},
+    owned_return::{OwnedReturnReader, OwnedReturnSender},
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
-    completion::ConsumerKind,
-    identity::{ActorId, ConsumerId, Generation, ReservationId},
+    identity::{ActorId, Generation, ReservationId},
     scope::WorkKind,
 };
 use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
@@ -72,8 +83,12 @@ pub(crate) enum TaskHostError {
     InputNotReady,
     CompletionBeforeAccepted,
     CompletionAlreadyIssued,
+    OpenSummaryAlreadyIssued,
     Driver(DriverError),
     Runtime(RuntimeError),
+    AdmissionBindInvariant(RuntimeError),
+    Causal(CausalError),
+    CompletionAction(CompletionActionError),
     Preparation(PreparationAdoptionError),
 }
 impl From<RuntimeError> for TaskHostError {
@@ -102,25 +117,139 @@ impl std::fmt::Display for TaskHostError {
             Self::CompletionAlreadyIssued => {
                 f.write_str("original fragment completion roles were already issued")
             }
+            Self::OpenSummaryAlreadyIssued => {
+                f.write_str("the original Task open-summary input was already issued")
+            }
             Self::Driver(error) => write!(f, "Task host responsibility transfer failed: {error}"),
             Self::Runtime(error) => write!(f, "Task host work admission failed: {error}"),
+            Self::AdmissionBindInvariant(error) => {
+                write!(
+                    f,
+                    "committed Task admission binding invariant failed: {error}"
+                )
+            }
+            Self::Causal(error) => write!(f, "Task host causal admission failed: {error:?}"),
+            Self::CompletionAction(error) => {
+                write!(
+                    f,
+                    "Task host completion report observation failed: {error:?}"
+                )
+            }
             Self::Preparation(error) => write!(f, "Task host preparation transfer failed: {error}"),
         }
     }
 }
 impl std::error::Error for TaskHostError {}
 
+/// A real elected Task whose source/port metadata could not finish bootstrap.
+/// No loader, input or host callback was attached. The same admission remains
+/// owned until its unused children really retire and its original holder exits.
+#[must_use = "The failure owner must retain and dispose the original unpublished Task"]
+pub(crate) struct UnpublishedTask {
+    pub task: TaskIdentity,
+    pub lifetime: WorkLease,
+    pub active: CapacityBundle,
+}
+pub(crate) struct TaskAdoptionRefusal {
+    pub error: TaskHostError,
+    pub unpublished: Option<Box<UnpublishedTask>>,
+}
+impl From<TaskHostError> for TaskAdoptionRefusal {
+    fn from(error: TaskHostError) -> Self {
+        Self {
+            error,
+            unpublished: None,
+        }
+    }
+}
+impl std::fmt::Debug for TaskAdoptionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskAdoptionRefusal")
+            .field("error", &self.error)
+            .field("retains_original_admission", &self.unpublished.is_some())
+            .finish()
+    }
+}
+impl std::fmt::Display for TaskAdoptionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// These are alternative actual ownership stages, not copied obligation rows.
+pub(crate) enum TaskHostOwner {
+    Ready(Box<TaskHostRecord>),
+    Initializing(Box<TaskHostRecord>),
+    Unpublished(Box<UnpublishedTask>),
+}
+
+/// Submission is physical queue ownership, never a loader or Task exit fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoadingSubmission {
+    NoPendingJob,
+    Submitted,
+    Pending(HostSubmitError),
+}
+
 /// This is the original resource inventory, not a copied obligation ledger.
 /// Taking it moves custody to a host teardown job; it proves no physical exit.
 pub(crate) struct TaskHostResources {
-    pub lifetime: WorkLease,
+    pub lifetime: TaskLifetime,
     pub active: CapacityBundle,
     pub port: Arc<TaskRuntimePort>,
     pub loader: Option<LoaderCustody>,
+    pub loading_events: Option<LoadingEvents>,
+    pub loading_return: Option<OwnedReturnReader<LoadingJobReturned>>,
+    /// The same already-admitted job stays here if the physical queue refuses
+    /// it. There is one position per elected Task, not another scheduling queue.
+    pub pending_loading: Option<LoadingHostJob>,
     pub preparation: Option<PreparationCustody>,
     pub preparation_remainder: Option<CapacityBundle>,
     pub completion: Option<Arc<TaskCompletionRoles>>,
+    pub completion_action: Option<CompletionActionCustody>,
+    pub open_summary: Option<TaskOpenSummaryInbox>,
     pub causal: TaskCausalInbox,
+}
+impl TaskHostResources {
+    /// The custodian has disposed actual payloads and retired each independent
+    /// report/input position. Transfer read authority only from that inventory;
+    /// a Task terminal or a stopped execution borrow gate is insufficient.
+    pub(crate) fn seal_read_observation(&self) -> Result<Arc<TaskReadSnapshot>, TaskReadError> {
+        use novarocks_control_runtime::exit_role::ExitRolePhase;
+        if !self.causal.is_empty()
+            || self.pending_loading.is_some()
+            || self
+                .open_summary
+                .as_ref()
+                .is_some_and(|open| !open.is_closed())
+            || self
+                .loader
+                .as_ref()
+                .is_some_and(|loader| !loader.is_retired())
+            || self
+                .loading_events
+                .as_ref()
+                .is_some_and(|events| !events.is_retired())
+            || self.loading_return.as_ref().is_some_and(|reader| {
+                !matches!(reader.state(), Ok(
+                    novarocks_control_runtime_core::completion::ReturnState::Taken
+                    | novarocks_control_runtime_core::completion::ReturnState::RevokedUnused
+                ))
+            })
+            || (self.preparation.is_some() && self.preparation_remainder.is_none())
+            || self
+                .completion
+                .as_ref()
+                .is_some_and(|roles| !roles.is_retired())
+            || self
+                .completion_action
+                .as_ref()
+                .is_some_and(|role| role.phase() != ExitRolePhase::Retired)
+        {
+            return Err(TaskReadError::HostInventoryStillLive);
+        }
+        self.lifetime.seal_after_exit()
+    }
 }
 
 /// The original request is a real preparation capture, not retained Task
@@ -130,8 +259,74 @@ pub(crate) struct TaskHostResources {
 pub(crate) struct TaskPreparationJob {
     job: Option<PreparationJob>,
     request: Option<Arc<novarocks_execution_contract::CreateTask>>,
+    host: Option<HostPreparationBinding>,
+}
+struct HostPreparationBinding {
+    port: Arc<TaskRuntimePort>,
+    children: Arc<crate::task_preparation::TaskPreparationScope>,
+    cadence: std::time::Duration,
+    roles: AdmittedFragmentRoles<ExecutionFailure>,
+    pending: Arc<dyn TaskPendingNotice>,
+    health: Arc<ExecutionHealth>,
+}
+pub(crate) enum HostInstallationOutcome {
+    Installed(crate::PreparedTaskInstallation),
+    Refused(HostPreparationRefusal),
+    WorkRefused(RuntimeError),
 }
 impl TaskPreparationJob {
+    /// The real Native preparation entry consumes the same queued input and
+    /// original role set. It cannot construct a Task authority or reissue a
+    /// finisher from a cloned control handle.
+    pub(crate) fn install_receiver(
+        mut self,
+        host: &dyn crate::TaskExecutionHost,
+    ) -> PreparationOutcome<HostInstallationOutcome> {
+        let binding = self
+            .host
+            .take()
+            .expect("actual host preparation was bound before enqueue");
+        let children = binding.children.clone();
+        let outcome = self.run(move |request, input, parent| {
+            // A host error may itself retain the input it consumed. Admit its
+            // original capture child before the foreign call, so moving that
+            // error out of this body cannot make P/bytes look released.
+            let refusal = match RefusalPosition::reserve(&parent) {
+                Ok(position) => position,
+                Err(error) => {
+                    drop(input);
+                    return HostInstallationOutcome::WorkRefused(error);
+                }
+            };
+            let port = binding.port.execution_port();
+            let preparation = crate::TaskPreparationContext::from_admitted(
+                port,
+                &binding.children,
+                binding.cadence,
+                binding.roles,
+            )
+            .expect("original admitted role and child identities match the Task");
+            let installed = host
+                .install_receiver(request.descriptor(), input, preparation)
+                .and_then(|installation| {
+                    installation.validate_task(request.descriptor())?;
+                    Ok(installation)
+                });
+            match installed {
+                Ok(installation) => HostInstallationOutcome::Installed(installation),
+                Err(rejection) => HostInstallationOutcome::Refused(refusal.retain(
+                    rejection,
+                    request.identity(),
+                    binding.pending,
+                    binding.health,
+                )),
+            }
+        });
+        // This is only the actual preparation call/capture boundary. Its
+        // registered provider child still owes separate rollback/adoption.
+        children.body_exited();
+        outcome
+    }
     pub(crate) fn run<T>(
         mut self,
         host: impl FnOnce(
@@ -162,6 +357,12 @@ impl QueuedPreparation for TaskPreparationJob {
     }
 }
 impl RunningPreparation<TaskPreparationJob> {
+    pub(crate) fn install_receiver(
+        self,
+        host: &dyn crate::TaskExecutionHost,
+    ) -> PreparationOutcome<HostInstallationOutcome> {
+        self.run_body(|job| job.install_receiver(host))
+    }
     pub(crate) fn run<T>(
         self,
         host: impl FnOnce(
@@ -174,8 +375,19 @@ impl RunningPreparation<TaskPreparationJob> {
     }
 }
 
+enum LoadingReturnMode {
+    Host,
+    #[cfg(test)]
+    Component,
+}
+type LoadingAdmission = (
+    LoadingEventJob,
+    Option<OwnedReturnSender<LoadingJobReturned>>,
+);
 pub(crate) struct TaskHostRecord {
     task: TaskIdentity,
+    actor: ActorId,
+    task_source: ActorId,
     context: QueryContextRef,
     payload: PayloadId,
     scope: ScopeHandle,
@@ -188,6 +400,7 @@ pub(crate) struct TaskHostRecord {
     // One original fragment factory, including a failed partial admission.
     // Replaying a request or cloning the port never reissues these positions.
     completion_issued: bool,
+    completion_action_issued: bool,
     settlement_notice_issued: bool,
     loader_issued: bool,
 }
@@ -198,25 +411,70 @@ impl TaskHostRecord {
         runtime: &ActorRuntime<WorkerActor>,
         ticket: &EffectTicket<WorkerAction>,
         binding: TaskHostBinding,
-    ) -> Result<Self, TaskHostError> {
+    ) -> Result<Self, TaskAdoptionRefusal> {
         let (task, payload, reservation) = match &ticket.effect {
             WorkerAction::Context(ContextEffect::LoadInput {
                 task,
                 payload,
                 reservation,
             }) => (*task, *payload, *reservation),
-            _ => return Err(TaskHostError::WrongEffect),
+            _ => return Err(TaskHostError::WrongEffect.into()),
         };
         task.verify_query_context(binding.context)
             .map_err(|_| TaskHostError::WrongTaskOrPayload)?;
-        let ingress = Arc::new(
-            TaskProposalIngress::new(binding.max_cuts).ok_or(TaskHostError::InvalidGeometry)?,
-        );
+        binding
+            .max_cuts
+            .checked_add(2)
+            .and_then(|segments| segments.checked_mul(2))
+            .ok_or(TaskHostError::InvalidGeometry)?;
         let guard = runtime
             .take_step_reservation(ticket, reservation)
             .map_err(TaskHostError::Driver)?;
         let scope = guard.scope().clone();
-        let (lifetime, active) = guard.bind(WorkKind::Business)?;
+        // Admission already committed in the Core step. Bind performs no new
+        // capacity/gate decision; a structural refusal is a shared runtime
+        // invariant failure, never an ordinary Task loading refusal.
+        let (lifetime, active) = guard
+            .bind(WorkKind::Business)
+            .map_err(TaskHostError::AdmissionBindInvariant)?;
+        // These are the elected Task's four already paid base positions.
+        // Their parent is the original Task lifetime, not a short preparation
+        // or settlement role whose join could depend on the retained source.
+        let sources = match reserve_source_roles::<4>(&scope, active.id(), ticket.generation) {
+            Ok(sources) => sources,
+            Err(error) => {
+                return Err(TaskAdoptionRefusal {
+                    error: TaskHostError::Runtime(error),
+                    unpublished: Some(Box::new(UnpublishedTask {
+                        task,
+                        lifetime,
+                        active,
+                    })),
+                });
+            }
+        };
+        let ingress = match TaskProposalIngress::from_admitted(
+            task,
+            binding.max_cuts,
+            sources,
+            binding.pending.clone(),
+            binding.health.clone(),
+        ) {
+            Ok(ingress) => Arc::new(ingress),
+            Err((_error, sources)) => {
+                for source in sources {
+                    dispose_unused_completion(source);
+                }
+                return Err(TaskAdoptionRefusal {
+                    error: TaskHostError::InvalidGeometry,
+                    unpublished: Some(Box::new(UnpublishedTask {
+                        task,
+                        lifetime,
+                        active,
+                    })),
+                });
+            }
+        };
         let port = Arc::new(TaskRuntimePort::from_admitted(
             task,
             &scope,
@@ -224,22 +482,30 @@ impl TaskHostRecord {
             binding.pending.clone(),
             binding.health.clone(),
         ));
+        let lifetime = TaskLifetime::from_admitted(lifetime, &port);
         Ok(Self {
             task,
+            actor: ticket.actor,
+            task_source: binding.task_source,
             context: binding.context,
             payload,
             scope,
             core_generation: ticket.generation,
             pending: binding.pending,
-            health: binding.health,
+            health: binding.health.clone(),
             resources: TaskHostResources {
                 lifetime,
                 active,
                 port,
                 loader: None,
+                loading_events: None,
+                loading_return: None,
+                pending_loading: None,
                 preparation: None,
                 preparation_remainder: None,
                 completion: None,
+                completion_action: None,
+                open_summary: None,
                 causal: TaskCausalInbox::new(
                     runtime.clone(),
                     ticket.actor,
@@ -247,15 +513,60 @@ impl TaskHostRecord {
                     task,
                     binding.protocol_generation,
                     ingress,
+                    binding.health,
                 ),
             },
             completion_issued: false,
+            completion_action_issued: false,
             settlement_notice_issued: false,
             loader_issued: false,
         })
     }
     pub(crate) fn port(&self) -> Arc<TaskRuntimePort> {
         self.resources.port.clone()
+    }
+    /// Attach the Task's fixed loading-paid producer position before exposing
+    /// the original port or loader job. Notifications never reissue this role.
+    pub(crate) fn admit_open_summary(
+        &mut self,
+        runtime: &ActorRuntime<WorkerActor>,
+    ) -> Result<(), TaskHostError> {
+        if self.resources.open_summary.is_some() {
+            return Err(TaskHostError::OpenSummaryAlreadyIssued);
+        }
+        let permit = runtime
+            .reserve_input(
+                self.actor,
+                self.task_source,
+                novarocks_control_runtime_core::mailbox::InputClass::Lifecycle,
+            )
+            .map_err(TaskHostError::Driver)?;
+        let role = match permit.into_role() {
+            Ok(role) => role,
+            Err((error, permit)) => {
+                // No payload or capture was attached. Revoke the exact unused
+                // position, including when scope failure won this race.
+                permit.revoke_unused().map_err(TaskHostError::Driver)?;
+                return Err(TaskHostError::Driver(error));
+            }
+        };
+        let open = TaskOpenSummaryInbox::from_admitted(
+            runtime.clone(),
+            self.actor,
+            self.task,
+            self.resources.lifetime.id(),
+            self.resources.port.ingress().clone(),
+            role,
+        )
+        .unwrap_or_else(|_| panic!("the original freshly converted Task input role is idle"));
+        self.resources.open_summary = Some(open);
+        Ok(())
+    }
+    pub(crate) fn open_summary_mut(&mut self) -> Option<&mut TaskOpenSummaryInbox> {
+        self.resources.open_summary.as_mut()
+    }
+    pub(crate) fn observation(&self) -> Arc<TaskReadBinding> {
+        self.resources.lifetime.observation()
     }
     pub(crate) fn admit_settlement_notice(
         &mut self,
@@ -265,36 +576,67 @@ impl TaskHostRecord {
             novarocks_worker_protocol::proposal_summary::CutId,
             Box<dyn RegistrationNotice>,
         ),
-        CausalError,
+        TaskHostError,
     > {
         if self.resources.preparation.is_none() {
-            return Err(CausalError::BeforeAccepted);
+            return Err(TaskHostError::CompletionBeforeAccepted);
         }
         if self.settlement_notice_issued {
-            return Err(CausalError::AlreadyAdmitted);
+            return Err(TaskHostError::CompletionAlreadyIssued);
         }
+        let sources = reserve_source_roles::<2>(
+            &self.scope,
+            self.resources.active.id(),
+            self.core_generation,
+        )?;
         let admitted = self
             .resources
             .causal
-            .admit_settlement(consumers, self.pending.clone())?;
+            .admit_settlement(
+                consumers,
+                self.pending.clone(),
+                CutSourceAdmission::Fresh(sources),
+            )
+            .map_err(|refusal| TaskHostError::Causal(dispose_fresh_source_refusal(refusal)))?;
         self.settlement_notice_issued = true;
         Ok(admitted)
     }
     pub(crate) fn causal(&mut self) -> &mut TaskCausalInbox {
         &mut self.resources.causal
     }
+    /// Component fixtures can test the loader itself without attaching the
+    /// production causal wrapper. Host composition uses begin_causal_loader.
+    #[cfg(test)]
     pub(crate) fn begin_loader(
         &mut self,
         payload: TaskCreatePayload,
     ) -> Result<LoaderJob, (TaskHostError, TaskCreatePayload)> {
+        let (loader, input) = match self.reserve_loader_roles(&payload) {
+            Ok(roles) => roles,
+            Err(error) => return Err((error, payload)),
+        };
+        let (custody, job) = LoaderCustody::from_admitted(
+            payload,
+            loader,
+            input,
+            self.pending.clone(),
+            self.health.clone(),
+        );
+        self.resources.loader = Some(custody);
+        Ok(job)
+    }
+    fn reserve_loader_roles(
+        &mut self,
+        payload: &TaskCreatePayload,
+    ) -> Result<(AdmittedCompletionRole, AdmittedCompletionRole), TaskHostError> {
         if payload.id != self.payload
             || payload.request.identity() != self.task
             || payload.request.context() != self.context
         {
-            return Err((TaskHostError::WrongTaskOrPayload, payload));
+            return Err(TaskHostError::WrongTaskOrPayload);
         }
         if self.loader_issued {
-            return Err((TaskHostError::LoaderAlreadyIssued, payload));
+            return Err(TaskHostError::LoaderAlreadyIssued);
         }
         self.loader_issued = true;
         let loader = match reserve_reported_role(
@@ -304,7 +646,7 @@ impl TaskHostRecord {
             Some(self.core_generation),
         ) {
             Ok(loader) => loader,
-            Err(error) => return Err((TaskHostError::Runtime(error), payload)),
+            Err(error) => return Err(TaskHostError::Runtime(error)),
         };
         // The input holder exists before the loader captures its graph. It is
         // a cleanup child, so a delayed destructor also keeps loader whole-exit
@@ -315,9 +657,150 @@ impl TaskHostRecord {
                 Ok(input) => input,
                 Err(error) => {
                     dispose_unused_completion(loader);
-                    return Err((TaskHostError::Runtime(error), payload));
+                    return Err(TaskHostError::Runtime(error));
                 }
             };
+        Ok((loader, input))
+    }
+    /// Issue both already-paid loading authors before the first getter can
+    /// execute. The same input and job transfer only after every original
+    /// position has attached; partial refusal retains its unused cut inventory
+    /// in this Task and returns the exact unborrowed payload to its custodian.
+    #[cfg(test)]
+    pub(crate) fn begin_causal_loader(
+        &mut self,
+        payload: TaskCreatePayload,
+    ) -> Result<LoadingEventJob, (TaskHostError, TaskCreatePayload)> {
+        self.begin_loading_admission(payload, LoadingReturnMode::Component)
+            .map(|(job, sender)| {
+                assert!(
+                    sender.is_none(),
+                    "component fixture issued no return sender"
+                );
+                job
+            })
+    }
+    pub(crate) fn begin_host_loader(
+        &mut self,
+        payload: TaskCreatePayload,
+    ) -> Result<LoadingHostJob, (TaskHostError, TaskCreatePayload)> {
+        let (job, sender) = self.begin_loading_admission(payload, LoadingReturnMode::Host)?;
+        let Some(sender) = sender else {
+            std::mem::forget(job);
+            std::process::abort();
+        };
+        match LoadingHostJob::from_admitted(job, sender) {
+            Ok(job) => Ok(job),
+            Err(refusal) => {
+                std::mem::forget(refusal);
+                std::process::abort();
+            }
+        }
+    }
+    /// Install the original job in its Task inventory before attempting the
+    /// physical handoff. A closed/full executor returns that exact job here;
+    /// it does not refund admission, run a getter, or acknowledge a capture.
+    pub(crate) fn submit_loading(
+        &mut self,
+        payload: TaskCreatePayload,
+        executor: &HostExecutorHandle<LoadingHostJob>,
+    ) -> Result<LoadingSubmission, (TaskHostError, TaskCreatePayload)> {
+        let job = self.begin_host_loader(payload)?;
+        assert!(self.resources.pending_loading.is_none());
+        self.resources.pending_loading = Some(job);
+        Ok(self.retry_loading_submission(executor))
+    }
+    /// Address one actual Task when its paid ready position is scheduled.
+    /// Callers must not spin on Pending or infer progress from an empty slot:
+    /// the original report reader observes the independent physical return.
+    pub(crate) fn retry_loading_submission(
+        &mut self,
+        executor: &HostExecutorHandle<LoadingHostJob>,
+    ) -> LoadingSubmission {
+        let Some(job) = self.resources.pending_loading.take() else {
+            return LoadingSubmission::NoPendingJob;
+        };
+        match executor.try_submit(job) {
+            Ok(()) => LoadingSubmission::Submitted,
+            Err((reason, original)) => {
+                self.resources.pending_loading = Some(original);
+                LoadingSubmission::Pending(reason)
+            }
+        }
+    }
+    fn begin_loading_admission(
+        &mut self,
+        payload: TaskCreatePayload,
+        mode: LoadingReturnMode,
+    ) -> Result<LoadingAdmission, (TaskHostError, TaskCreatePayload)> {
+        let (loader, input) = match self.reserve_loader_roles(&payload) {
+            Ok(roles) => roles,
+            Err(error) => return Err((error, payload)),
+        };
+        // The original report position exists before payload capture. Claim
+        // its one owned return now, rather than requesting any storage when
+        // the real host call completes. Direct component jobs are test-only.
+        let mut ports = match mode {
+            LoadingReturnMode::Host => {
+                match loader.report.claim_owned_return::<LoadingJobReturned>() {
+                    Ok(ports) => Some(ports),
+                    Err(error) => {
+                        // This is a fresh bound/queued producer, reserved
+                        // report and first claim, before payload capture.
+                        // Close/failure cannot reject it. Shared corruption
+                        // must not unwind this poller or pretend unused exit.
+                        std::mem::forget((error, input, loader, payload));
+                        std::process::abort();
+                    }
+                }
+            }
+            #[cfg(test)]
+            LoadingReturnMode::Component => None,
+        };
+        let mut authors = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let result = reserve_source_roles::<2>(
+                &self.scope,
+                self.resources.active.id(),
+                self.core_generation,
+            )
+            .map_err(TaskHostError::Runtime)
+            .and_then(|sources| {
+                self.resources
+                    .causal
+                    .admit_input(
+                        loader.work.id(),
+                        1,
+                        self.pending.clone(),
+                        CutSourceAdmission::Fresh(sources),
+                    )
+                    .map_err(|refusal| TaskHostError::Causal(dispose_fresh_source_refusal(refusal)))
+            });
+            match result {
+                Ok(author) => authors.push(author),
+                Err(error) => {
+                    for (_, sender) in authors {
+                        sender.unused();
+                    }
+                    if let Some((sender, reader)) = ports.take() {
+                        // This cell never held a value or crossed a host
+                        // capture boundary. A refusal here is shared metadata
+                        // corruption; do not unwind opaque input on a poller.
+                        if let Err(refusal) = sender.revoke_unused() {
+                            std::mem::forget(refusal);
+                            std::process::abort();
+                        }
+                        drop(reader);
+                    }
+                    dispose_unused_completion(input);
+                    dispose_unused_completion(loader);
+                    return Err((error, payload));
+                }
+            }
+        }
+        let exited = authors.pop().expect("the original LoaderExited author");
+        let loaded = authors.pop().expect("the original InputLoaded author");
+        let exit_cut = exited.0;
         let (custody, job) = LoaderCustody::from_admitted(
             payload,
             loader,
@@ -325,8 +808,96 @@ impl TaskHostRecord {
             self.pending.clone(),
             self.health.clone(),
         );
+        let events = LoadingEvents::from_admitted(
+            self.task,
+            custody.clone(),
+            loaded,
+            exited,
+            &self.resources.causal,
+        );
+        self.resources
+            .causal
+            .hold_loader_exit(exit_cut, custody.clone())
+            .expect("the original loader retains its own exit event receipt");
+        let job = events
+            .wrap_job(job)
+            .unwrap_or_else(|_| panic!("the original loader job attaches once to its own authors"));
         self.resources.loader = Some(custody);
-        Ok(job)
+        self.resources.loading_events = Some(events);
+        let sender = ports.map(|(sender, reader)| {
+            self.resources.loading_return = Some(reader);
+            sender
+        });
+        Ok((job, sender))
+    }
+    pub(crate) fn take_loading_return(
+        &mut self,
+    ) -> Result<Option<LoadingJobReturned>, TaskHostError> {
+        match self.resources.loading_return.as_mut() {
+            Some(reader) => reader.try_take().map_err(TaskHostError::Runtime),
+            None => Ok(None),
+        }
+    }
+    /// Returning a physical job supplies the original author receipt; routing
+    /// IDs alone cannot apply it to another Task or a replacement custodian.
+    pub(crate) fn observe_loading_author_return(
+        &mut self,
+        receipt: LoadingAuthorReturn,
+    ) -> Result<(), (TaskHostError, LoadingAuthorReturn)> {
+        if !self
+            .resources
+            .loading_events
+            .as_ref()
+            .is_some_and(|events| receipt.belongs_to(events))
+        {
+            return Err((TaskHostError::WrongTaskOrPayload, receipt));
+        }
+        self.resources
+            .causal
+            .observe_author_return(receipt)
+            .map_err(|(error, receipt)| (TaskHostError::Causal(error), receipt))
+    }
+    /// Fault outcomes carry their original owner even when no positive author
+    /// return was issued. They cannot be routed by numeric Task IDs alone.
+    pub(crate) fn observe_loading_job_return(
+        &mut self,
+        returned: LoadingJobReturned,
+    ) -> Result<LoadingEventOutcome, (TaskHostError, LoadingJobReturned)> {
+        if !self
+            .resources
+            .loading_events
+            .as_ref()
+            .is_some_and(|events| returned.belongs_to(events))
+        {
+            return Err((TaskHostError::WrongTaskOrPayload, returned));
+        }
+        returned.try_observe_with(|receipt| self.observe_loading_author_return(receipt))
+    }
+    /// The send/install/notification call returns before this receipt can be
+    /// observed. Preserve it independently of subsequent report failures.
+    pub(crate) fn publish_loading_exit(
+        &mut self,
+    ) -> Result<Option<LoadingAuthorReturn>, LoadingEventError> {
+        match self.resources.loading_events.as_ref() {
+            Some(events) => events.publish_ready_exit(),
+            None => Ok(None),
+        }
+    }
+    pub(crate) fn observe_loading_exit_report(&mut self) -> Result<bool, LoadingEventError> {
+        match self.resources.loading_events.as_ref() {
+            Some(events) => events.observe_exit_report(&mut self.resources.causal),
+            None => Ok(false),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_loading_exit(&mut self) -> Result<bool, LoadingEventError> {
+        if let Some(receipt) = self.publish_loading_exit()? {
+            self.observe_loading_author_return(receipt)
+                .unwrap_or_else(|(error, _receipt)| {
+                    panic!("the actual loading publisher belongs to its original Task: {error}")
+                });
+        }
+        self.observe_loading_exit_report()
     }
     pub(crate) fn loader(&self) -> Option<&LoaderCustody> {
         self.resources.loader.as_ref()
@@ -373,6 +944,7 @@ impl TaskHostRecord {
         let job = TaskPreparationJob {
             job: Some(job),
             request: Some(request),
+            host: None,
         };
         loader.input_transferred();
         Ok(job)
@@ -445,6 +1017,113 @@ impl TaskHostRecord {
     pub(crate) fn completion(&self) -> Option<&Arc<TaskCompletionRoles>> {
         self.resources.completion.as_ref()
     }
+    /// The Worker terminal action is a separate real holder from Execution's
+    /// terminal notifier. Reserve its original Work/report and causal input
+    /// before constructing the reporter/action captures, exactly once per Task.
+    pub(crate) fn issue_completion_exit_notice(
+        &mut self,
+    ) -> Result<crate::CompletionExitNotice, TaskHostError> {
+        if self.resources.preparation.is_none() {
+            return Err(TaskHostError::CompletionBeforeAccepted);
+        }
+        if self.completion_action_issued {
+            return Err(TaskHostError::CompletionAlreadyIssued);
+        }
+        self.completion_action_issued = true;
+        let role = reserve_reported_role(
+            &self.scope,
+            self.resources.active.id(),
+            WorkKind::Cleanup,
+            Some(self.core_generation),
+        )?;
+        let sources = match reserve_source_roles::<2>(
+            &self.scope,
+            self.resources.active.id(),
+            self.core_generation,
+        ) {
+            Ok(sources) => sources,
+            Err(error) => {
+                dispose_unused_completion(role);
+                return Err(error.into());
+            }
+        };
+        let (cut, sender) = match self.resources.causal.admit_input(
+            role.work.id(),
+            1,
+            self.pending.clone(),
+            CutSourceAdmission::Fresh(sources),
+        ) {
+            Ok(admitted) => admitted,
+            Err(refusal) => {
+                let error = dispose_fresh_source_refusal(refusal);
+                dispose_unused_completion(role);
+                return Err(TaskHostError::Causal(error));
+            }
+        };
+        let (custody, notice) = CompletionActionCustody::from_admitted(
+            self.task,
+            role,
+            &mut self.resources.causal,
+            cut,
+            sender,
+            self.pending.clone(),
+            self.health.clone(),
+        );
+        self.resources.completion_action = Some(custody);
+        Ok(notice)
+    }
+    pub(crate) fn completion_action(&self) -> Option<&CompletionActionCustody> {
+        self.resources.completion_action.as_ref()
+    }
+    /// Consume only this original action's proven report legs, before the
+    /// corresponding runtime inputs retire. Source storage remains with its
+    /// original aggregate payer until the Task's full inventory converges.
+    pub(crate) fn observe_completion_action(&mut self) -> Result<bool, TaskHostError> {
+        let Some(action) = self.resources.completion_action.as_ref() else {
+            return Ok(true);
+        };
+        action
+            .observe_consumers(&mut self.resources.causal)
+            .map_err(TaskHostError::CompletionAction)
+    }
+    /// Bind before giving the original job to its actual fair host queue. The
+    /// preparation custodian, rather than a detached runtime alias, retains
+    /// provider-child cleanup until real adoption/rollback finishes.
+    pub(crate) fn bind_host_preparation(
+        &self,
+        job: &mut TaskPreparationJob,
+        roles: AdmittedFragmentRoles<ExecutionFailure>,
+        cadence: std::time::Duration,
+    ) -> Result<(), AdmittedFragmentRoles<ExecutionFailure>> {
+        if roles.identity() != Some(self.task)
+            || job.host.is_some()
+            || !job
+                .request
+                .as_ref()
+                .is_some_and(|request| request.identity() == self.task)
+        {
+            return Err(roles);
+        }
+        let preparation = self
+            .resources
+            .preparation
+            .as_ref()
+            .expect("Accepted preparation exists");
+        let children = Arc::new(crate::task_preparation::TaskPreparationScope::new(
+            self.task,
+            self.health.clone(),
+        ));
+        preparation.bind_host_children(children.clone());
+        job.host = Some(HostPreparationBinding {
+            port: self.resources.port.clone(),
+            children,
+            cadence,
+            roles,
+            pending: self.pending.clone(),
+            health: self.health.clone(),
+        });
+        Ok(())
+    }
     /// Host ownership transfer only. The receiving cleanup job must dispose
     /// opaque sources/captures and observe real body/children/report exits
     /// before releasing these bundles; Core terminal is no substitute.
@@ -453,64 +1132,42 @@ impl TaskHostRecord {
     }
 }
 
-fn reserve_reported_role(
+fn reserve_source_roles<const N: usize>(
     scope: &ScopeHandle,
     parent: ReservationId,
-    kind: WorkKind,
-    core_generation: Option<Generation>,
-) -> Result<AdmittedCompletionRole, RuntimeError> {
-    let generation = scope.gates()?.generation;
-    let guard = scope.reserve_child_next(generation, parent, ResourceVector::default(), kind)?;
-    let mut consumers = Vec::with_capacity(2);
-    if let Some(core_generation) = core_generation {
-        consumers.push((
-            ConsumerId::new(1).unwrap(),
-            ConsumerKind::Owner {
-                scope: scope.id(),
-                generation: core_generation,
-            },
-        ));
-    }
-    consumers.push((ConsumerId::new(2).unwrap(), ConsumerKind::Observer));
-    let report = ReportSlot::reserve_next(scope, generation, guard.work_id(), 2, consumers)?;
-    let (work, capacity) = match guard.bind(kind) {
-        Ok(bound) => bound,
-        Err(error) => {
-            revoke_report(&report);
-            return Err(error);
+    core_generation: Generation,
+) -> Result<[AdmittedCompletionRole; N], RuntimeError> {
+    let mut roles = Vec::with_capacity(N);
+    for _ in 0..N {
+        match reserve_reported_role(scope, parent, WorkKind::Cleanup, Some(core_generation)) {
+            Ok(role) => roles.push(role),
+            Err(error) => {
+                for role in roles {
+                    dispose_unused_completion(role);
+                }
+                return Err(error);
+            }
         }
+    }
+    Ok(roles
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("the original source role arity is fixed")))
+}
+fn dispose_fresh_source_refusal(refusal: CausalAdmissionRefusal) -> CausalError {
+    let CutSourceAdmission::Fresh(roles) = refusal.admission else {
+        unreachable!("Task host receives the same original fresh source admission")
     };
-    Ok(AdmittedCompletionRole {
-        work,
-        capacity,
-        report,
-    })
-}
-fn revoke_report(report: &ReportSlot) {
-    report.revoke_unused().expect("unbound original report");
-    report.body_exited().expect("unbound report producer exit");
-    report
-        .captures_exited()
-        .expect("unbound report has no captures");
-    assert!(report.try_retire().expect("unbound report retirement"));
-}
-fn dispose_unused_completion(mut role: AdmittedCompletionRole) {
-    // No capability/capture was handed to the fragment factory. This exact
-    // unused holder exits now; shared bounded reaping handles its parent link.
-    revoke_report(&role.report);
-    role.work.body_exited().expect("unused original role body");
-    role.work
-        .captures_exited()
-        .expect("unused original role captures");
-    role.capacity
-        .release(&ResourceVector::default())
-        .expect("zero-resource original header release");
+    for role in roles {
+        dispose_unused_completion(role);
+    }
+    refusal.error
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use novarocks_control_runtime::{exit_role::ExitRole, transaction::RuntimeLedger};
+    use novarocks_control_runtime_core::identity::ConsumerId;
     use novarocks_control_runtime_core::{
         identity::{DimensionId, Generation},
         scope::WorkAdmission,
@@ -543,7 +1200,12 @@ mod tests {
             .expect(
                 "old Core consumer is abandoned, including cleanup headers issued after failure",
             );
-        let (role, mut authority) = ExitRole::from_admitted(role.work, role.capacity, role.report);
+        let (role, mut authority) =
+            ExitRole::from_admitted(crate::control_runtime::admitted_role::adopt_reported_work(
+                role.work,
+                role.capacity,
+                role.report,
+            ));
         authority.start().unwrap();
         authority.exited().unwrap();
         assert!(

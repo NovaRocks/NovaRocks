@@ -41,18 +41,22 @@ use crate::HostRejection;
 /// The announced scopes of one Worker query context.
 #[derive(Default)]
 pub struct QueryContextCredentialSlot {
-    leases: RwLock<BTreeMap<CredentialLeaseId, CredentialLeaseDescriptor>>,
+    state: RwLock<CredentialSlotState>,
+}
+
+#[derive(Default)]
+struct CredentialSlotState {
+    closed: bool,
+    leases: BTreeMap<CredentialLeaseId, CredentialLeaseDescriptor>,
 }
 
 impl fmt::Debug for QueryContextCredentialSlot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let leases = self
-            .leases
-            .read()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
         formatter
             .debug_struct("QueryContextCredentialSlot")
-            .field("lease_count", &leases.len())
+            .field("closed", &state.closed)
+            .field("lease_count", &state.leases.len())
             .finish()
     }
 }
@@ -65,7 +69,9 @@ impl QueryContextCredentialSlot {
     /// Replaces every announced scope with one fully decoded rotation.
     ///
     /// A refusal leaves the prior table intact, so an invalid rotation cannot
-    /// turn a still-live context into an empty credential authority.
+    /// turn a still-live context into an empty credential authority. Closing
+    /// and this final replacement share one lock; a closed instance cannot
+    /// accept a rotation, even when validation began before closure.
     pub fn install(&self, announced: &[CredentialLeaseDescriptor]) -> Result<(), HostRejection> {
         let mut installed = BTreeMap::new();
         for lease in announced {
@@ -78,20 +84,46 @@ impl QueryContextCredentialSlot {
                 ));
             }
         }
-        *self
-            .leases
+        let mut state = self
+            .state
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = installed;
+            .unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            drop(state);
+            return Err(HostRejection::from_domain(
+                TaskFailureCategory::Protocol,
+                ClosedCredentialSlot,
+            ));
+        }
+        let previous = std::mem::replace(&mut state.leases, installed);
+        drop(state);
+        drop(previous);
         Ok(())
     }
 
-    /// Drops every announced scope.  Release and failed-establish unwind are
-    /// both idempotent and no other owner can retain the announcement.
+    /// Drops every announced scope without changing this instance's admission
+    /// state. An open slot may install again; a closed slot stays closed.
     pub fn clear(&self) {
-        self.leases
+        let mut state = self
+            .state
             .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::mem::take(&mut state.leases);
+        drop(state);
+        drop(previous);
+    }
+
+    /// Permanently closes this instance and withdraws all announcements.
+    /// Repeated closure is idempotent; neither clear nor install reopens it.
+    pub fn close(&self) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        let previous = std::mem::take(&mut state.leases);
+        drop(state);
+        drop(previous);
     }
 
     /// Resolves one process-local vended S3 target by exact catalog owner,
@@ -106,13 +138,13 @@ impl QueryContextCredentialSlot {
         &self,
         request: &StorageAccessRequest,
     ) -> Result<ResolvedVendedS3Access, ConnectorError> {
-        let leases = self
-            .leases
-            .read()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(vended_storage_access_denied());
+        }
         let mut selected: Option<(&CredentialLeaseDescriptor, &StorageCredentialScopePrefix)> =
             None;
-        for lease in leases.values() {
+        for lease in state.leases.values() {
             if lease.provider() != CredentialLeaseProvider::S3 || lease.owner() != request.owner() {
                 continue;
             }
@@ -141,17 +173,19 @@ impl QueryContextCredentialSlot {
     }
 
     pub fn installed_epoch(&self, lease_id: CredentialLeaseId) -> Option<u64> {
-        self.leases
+        self.state
             .read()
             .unwrap_or_else(|error| error.into_inner())
+            .leases
             .get(&lease_id)
             .map(CredentialLeaseDescriptor::epoch)
     }
 
     pub fn installed_lease_count(&self) -> usize {
-        self.leases
+        self.state
             .read()
             .unwrap_or_else(|error| error.into_inner())
+            .leases
             .len()
     }
 }
@@ -162,6 +196,24 @@ impl ConnectorStorageResolver for QueryContextCredentialSlot {
         request: &StorageAccessRequest,
     ) -> Result<ResolvedVendedS3Access, ConnectorError> {
         Self::resolve_vended_s3(self, request)
+    }
+}
+
+#[derive(Debug)]
+struct ClosedCredentialSlot;
+impl fmt::Display for ClosedCredentialSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("credential announcements cannot be installed after context closure")
+    }
+}
+impl std::error::Error for ClosedCredentialSlot {}
+impl novarocks_execution_contract::failure::FailureProjection for ClosedCredentialSlot {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::DomainAfterSeal.reason(),
+        )
     }
 }
 
@@ -194,7 +246,8 @@ fn vended_storage_access_denied() -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use super::QueryContextCredentialSlot;
     use novarocks_spi::connector::{
@@ -252,6 +305,109 @@ mod tests {
 
     fn request(location: &str) -> StorageAccessRequest {
         StorageAccessRequest::try_new(owner(), location).expect("legal storage request")
+    }
+
+    fn assert_closed(rejection: crate::HostRejection) {
+        use novarocks_execution_contract::{
+            failure::{FailureClass, FailureProjection},
+            task_execution::status::TaskFailureCategory,
+        };
+        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+        assert_eq!(rejection.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            rejection.failure_fact().reason(),
+            crate::failure_reason::WorkerFailureReason::DomainAfterSeal.reason()
+        );
+        assert!(!rejection.is_closed_queue());
+    }
+
+    #[test]
+    fn close_withdraws_every_announcement_and_refuses_future_rotations_for_this_instance() {
+        let slot = QueryContextCredentialSlot::new();
+        slot.install(&[
+            lease(1, 1, &["s3://bucket/a"]),
+            lease(2, 1, &["s3://bucket/b"]),
+        ])
+        .unwrap();
+        slot.close();
+        slot.close();
+        assert_eq!(slot.installed_lease_count(), 0);
+        assert_eq!(slot.installed_epoch(lease_id(1)), None);
+        assert_eq!(slot.installed_epoch(lease_id(2)), None);
+        assert!(slot.resolve_vended_s3(&request("s3://bucket/a/x")).is_err());
+        assert!(slot.resolve_vended_s3(&request("s3://bucket/b/x")).is_err());
+        assert_closed(
+            slot.install(&[lease(1, 2, &["s3://bucket/a"])])
+                .expect_err("closed slot refuses a valid later rotation"),
+        );
+        assert_closed(slot.install(&[]).expect_err("empty install cannot reopen"));
+
+        let other = QueryContextCredentialSlot::new();
+        other.install(&[lease(1, 1, &["s3://bucket/a"])]).unwrap();
+        assert!(other.resolve_vended_s3(&request("s3://bucket/a/x")).is_ok());
+    }
+
+    #[test]
+    fn clear_allows_replacement_while_open_and_does_not_reopen_after_close() {
+        let slot = QueryContextCredentialSlot::new();
+        slot.install(&[lease(1, 1, &["s3://bucket/a"])]).unwrap();
+        slot.clear();
+        slot.clear();
+        assert_eq!(slot.installed_lease_count(), 0);
+        assert!(slot.resolve_vended_s3(&request("s3://bucket/a/x")).is_err());
+        slot.install(&[lease(2, 2, &["s3://bucket/b"])]).unwrap();
+        assert_eq!(slot.installed_epoch(lease_id(2)), Some(2));
+        assert!(slot.resolve_vended_s3(&request("s3://bucket/b/x")).is_ok());
+        slot.close();
+        slot.clear();
+        assert_closed(
+            slot.install(&[lease(3, 3, &["s3://bucket/c"])])
+                .expect_err("clear must preserve permanent closure"),
+        );
+        assert_eq!(slot.installed_lease_count(), 0);
+        assert!(slot.resolve_vended_s3(&request("s3://bucket/c/x")).is_err());
+    }
+
+    #[test]
+    fn a_real_install_close_race_always_ends_closed_without_an_announcement() {
+        for _ in 0..16 {
+            let slot = Arc::new(QueryContextCredentialSlot::new());
+            slot.install(&[lease(1, 1, &["s3://bucket/a"])]).unwrap();
+            let start = Arc::new(Barrier::new(3));
+            let installer = {
+                let slot = slot.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    let rotation = [lease(2, 2, &["s3://bucket/b"])];
+                    start.wait();
+                    slot.install(&rotation)
+                })
+            };
+            let closer = {
+                let slot = slot.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    slot.close();
+                })
+            };
+            start.wait();
+            let installed = installer.join().unwrap();
+            closer.join().unwrap();
+            // Either installation committed first, or closure refused it.
+            // Both actual threads have returned before checking the final state.
+            if let Err(rejection) = installed {
+                assert_closed(rejection);
+            }
+            assert_eq!(slot.installed_lease_count(), 0);
+            assert_eq!(slot.installed_epoch(lease_id(2)), None);
+            assert!(slot.resolve_vended_s3(&request("s3://bucket/a/x")).is_err());
+            assert!(slot.resolve_vended_s3(&request("s3://bucket/b/x")).is_err());
+            assert_closed(
+                slot.install(&[lease(3, 3, &["s3://bucket/c"])])
+                    .expect_err("a joined close is a permanent install barrier"),
+            );
+        }
     }
 
     #[test]

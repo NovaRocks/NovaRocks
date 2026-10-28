@@ -19,6 +19,7 @@
 
 use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use std::alloc::Layout;
+use std::mem::ManuallyDrop;
 #[cfg(test)]
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -29,9 +30,9 @@ use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::chunk::{RootArrayStorageLimits, borrowed_root_chunk_storage};
 use novarocks_execution::runtime::fragment::io::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, ResultAbort, ResultWriteAdmission,
-    ResultWriteCredit, RootInputAdmission, RootInputAuthority, RootInputPermit,
-    RootInputReservationAdmission, RootProducerState, RootResultSession, RootResultWriteSpec,
-    RootWorkExitProgress,
+    ResultWriteCredit, RootFailureObservation, RootInputAdmission, RootInputAuthority,
+    RootInputPermit, RootInputReservationAdmission, RootProducerState, RootResultSession,
+    RootResultWriteSpec, RootWorkExitProgress,
 };
 use novarocks_execution::runtime::observable::{Observable, ObserverSubscription};
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
@@ -48,9 +49,10 @@ use novarocks_worker::root_result_channel::{
 };
 
 use crate::root_producer_pool::{
-    RootCleanupPlan, RootCleanupProgress, RootExitRole, RootProducerExitObservation,
-    RootProducerExitStatus, RootProducerJob, RootProducerRegistration, RootProducerReserveFailure,
-    RootProducerTurn, RootProducerWake, root_exit_metadata_bytes, weak_core_backing_bytes,
+    RootCleanupPlan, RootCleanupPredecessors, RootCleanupProgress, RootExitRole,
+    RootProducerExitObservation, RootProducerExitStatus, RootProducerJob, RootProducerRegistration,
+    RootProducerReserveFailure, RootProducerTurn, RootProducerWake, root_exit_metadata_bytes,
+    weak_core_backing_bytes,
 };
 pub use crate::root_producer_pool::{RootProducerLimits, RootProducerPool};
 
@@ -370,6 +372,123 @@ impl InputExitAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureSourcePhase {
+    Pending,
+    Started,
+    Transferred,
+    Disposed,
+    Unresolved,
+}
+/// One first-wins record. Neutral metadata survives the original source's
+/// transfer; taking that source never turns a failure into normal completion.
+struct RootFailureRecord {
+    observation: Option<RootFailureObservation>,
+    live_source: Option<ManuallyDrop<ExecutionFailure>>,
+    phase: FailureSourcePhase,
+}
+impl RootFailureRecord {
+    fn new(source: ExecutionFailure) -> Self {
+        Self {
+            observation: None,
+            live_source: Some(ManuallyDrop::new(source)),
+            phase: FailureSourcePhase::Pending,
+        }
+    }
+    fn begin_action(&mut self) -> Result<Option<ManuallyDrop<ExecutionFailure>>, ()> {
+        match self.phase {
+            FailureSourcePhase::Transferred | FailureSourcePhase::Disposed => Ok(None),
+            FailureSourcePhase::Started | FailureSourcePhase::Unresolved => Err(()),
+            FailureSourcePhase::Pending => {
+                let Some(source) = self.live_source.take() else {
+                    self.phase = FailureSourcePhase::Unresolved;
+                    return Err(());
+                };
+                self.phase = FailureSourcePhase::Started;
+                Ok(Some(source))
+            }
+        }
+    }
+    fn finish_action(&mut self, phase: FailureSourcePhase) {
+        assert_eq!(
+            self.phase,
+            FailureSourcePhase::Started,
+            "one original source action"
+        );
+        assert!(
+            self.live_source.is_none(),
+            "source responsibility has moved"
+        );
+        self.phase = phase;
+    }
+    fn restore_unresolved(&mut self, source: Option<ManuallyDrop<ExecutionFailure>>) {
+        // Only Started holds this source slot; other state writers cannot
+        // replace the first record or install a second source during its call.
+        if let Some(source) = source {
+            self.live_source = Some(source);
+        }
+        self.phase = FailureSourcePhase::Unresolved;
+    }
+    fn producer_state(&self) -> RootProducerState {
+        self.observation
+            .as_ref()
+            .map_or(RootProducerState::AwaitTerminalControl, |observation| {
+                RootProducerState::Failed(observation.clone())
+            })
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureRecordKind {
+    Primary,
+    Cleanup,
+}
+/// The original synchronous producer owns this action. Unwind restores an
+/// untransferred opaque to its same fixed record and leaves unknown custody;
+/// it never implicitly destroys the source under a metadata lock.
+struct FailureSourceAction<'a> {
+    owner: &'a RootSessionState,
+    kind: FailureRecordKind,
+    source: Option<ManuallyDrop<ExecutionFailure>>,
+    completed: bool,
+}
+impl FailureSourceAction<'_> {
+    fn source(&self) -> &ExecutionFailure {
+        self.source.as_deref().expect("original source action")
+    }
+    fn take_source(&mut self) -> ExecutionFailure {
+        ManuallyDrop::into_inner(self.source.take().expect("one source transfer"))
+    }
+    fn publish_observation(&self, observation: RootFailureObservation) {
+        let mut state = self.owner.state.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .failure_record_mut(self.kind)
+            .expect("original source record");
+        record.observation = Some(observation);
+    }
+    fn finish(mut self, phase: FailureSourcePhase) {
+        let mut state = self.owner.state.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .failure_record_mut(self.kind)
+            .expect("original source record")
+            .finish_action(phase);
+        self.completed = true;
+    }
+}
+impl Drop for FailureSourceAction<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut state = self.owner.state.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .failure_record_mut(self.kind)
+            .expect("original source record");
+        // A consumed source may already belong to the Task owner; this empty
+        // field does not convert its unknown handoff into positive exit.
+        record.restore_unresolved(self.source.take());
+    }
+}
+
 struct ProducerState {
     input: Option<Input>,
     /// Reuse a proof only for the same immutable typed input owner. The cursor
@@ -390,17 +509,23 @@ struct ProducerState {
     /// cancel (for example a pool shutdown racing the job's removal) cannot
     /// turn a completed producer into a failed one.
     completed: bool,
-    /// This actor lifetime has completed its admitted cleanup job, including
-    /// a cold cancellation with no input/producer guard. It never reopens.
-    job_exit_complete: bool,
+    /// The original pool has entered cleanup, including cold cancellation.
+    /// This seals further work; it is not an actual exit receipt.
+    cleanup_started: bool,
     // Rollback is not a runtime result terminal. Observation follows actual exit.
     abort_is_rollback: bool,
     terminal_observed: bool,
-    failed: Option<ExecutionFailure>,
-    cleanup_failure: Option<ExecutionFailure>,
+    failed: Option<RootFailureRecord>,
+    cleanup_failure: Option<RootFailureRecord>,
     producer: Option<RootProducerExit>,
 }
 impl ProducerState {
+    fn failure_record_mut(&mut self, kind: FailureRecordKind) -> Option<&mut RootFailureRecord> {
+        match kind {
+            FailureRecordKind::Primary => self.failed.as_mut(),
+            FailureRecordKind::Cleanup => self.cleanup_failure.as_mut(),
+        }
+    }
     fn take_terminal_observation(&mut self) -> Option<&'static str> {
         if self.terminal_observed {
             return None;
@@ -430,13 +555,7 @@ impl WakeBridge {
     }
 }
 
-#[derive(Clone)]
-enum RootFailureReporter {
-    Task(Arc<novarocks_execution::runtime::task_control::TaskExecutionControl>),
-    // Pure encoding retains its original result in ProducerState. It owns no
-    // Task, no Task conclusion, and no extra local failure-control allocation.
-    LocalEncoding,
-}
+type RootFailureReporter = Arc<novarocks_execution::runtime::task_control::TaskExecutionControl>;
 
 /// Driver calls transfer one original input. Rendering runs only on the shared
 /// fixed CPU pool; neither a full queue nor a pending ACK occupies that pool.
@@ -474,8 +593,24 @@ struct NativeRootWork {
 
 // Four distinct input phases allow independent data holders to exit even if
 // another destructor unwinds. The original protection grants depend on both.
-const ROOT_CLEANUP_PHASES: &[u16] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+const ROOT_CLEANUP_PHASES: &[u16] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 9, 10, 11, 12, 13];
 const ROOT_CLEANUP: RootCleanupPlan = RootCleanupPlan::new(ROOT_CLEANUP_PHASES);
+
+/// Empty payload fields are not exit receipts: their destructors may have
+/// unwound after taking ownership. The pool owns the actual completed prefix.
+pub(crate) fn encoder_cleanup_ready(
+    predecessors: RootCleanupPredecessors,
+    input_present: bool,
+    builder_present: bool,
+) -> bool {
+    predecessors.all_exited() && !input_present && !builder_present
+}
+
+/// A completed CPU turn is a scheduling fact. Only the channel's published
+/// End supplies the positive result fact, independently of retained sources.
+pub(crate) fn turn_has_published_end(turn: RootProducerTurn, end_sequence: Option<u64>) -> bool {
+    turn == RootProducerTurn::Complete && end_sequence.is_some()
+}
 
 struct NativeRootPreparationChild {
     authority: RootInputAuthority,
@@ -527,37 +662,14 @@ impl NativeRootResultSession {
                 novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
             ));
         }
-        Self::open_in_scope(
-            channel,
-            pool,
-            RootFailureReporter::Task(control),
-            Some(preparation_child),
-        )
+        Self::open_in_scope(channel, pool, control, preparation_child)
     }
 
-    /// Pure codec execution has no Task lifecycle. Callers explicitly choose
-    /// this domain; an absent Task capability never selects it implicitly.
-    pub fn try_open_for_local_encoding(
-        channel: Arc<RootResultChannel>,
-        pool: &Arc<RootProducerPool>,
-    ) -> Result<Arc<Self>, FragmentIoError> {
-        Self::open(channel, pool, RootFailureReporter::LocalEncoding)
-    }
-
-    fn open(
-        channel: Arc<RootResultChannel>,
-        pool: &Arc<RootProducerPool>,
-        failure_reporter: RootFailureReporter,
-    ) -> Result<Arc<Self>, FragmentIoError> {
-        Self::open_in_scope(channel, pool, failure_reporter, None)
-    }
     fn open_in_scope(
         channel: Arc<RootResultChannel>,
         pool: &Arc<RootProducerPool>,
         failure_reporter: RootFailureReporter,
-        preparation: Option<
-            &Arc<crate::backend_task_execution::prepared_owner::NativePreparationChild>,
-        >,
+        preparation: &Arc<crate::backend_task_execution::prepared_owner::NativePreparationChild>,
     ) -> Result<Arc<Self>, FragmentIoError> {
         let contract = &channel.spec().contract;
         // Every closed internal domain has its producer codec; only a scalar
@@ -597,7 +709,10 @@ impl NativeRootResultSession {
             + arc::<Arc<dyn Fn() + Send + Sync>>()
             + 2 * std::mem::size_of::<std::sync::Weak<Arc<dyn Fn() + Send + Sync>>>()
             + arc::<RootMetadataReservation>()
-            + weak_core_backing_bytes();
+            + weak_core_backing_bytes()
+            // Two persistent summaries plus one serial freeze action's
+            // bounded rendering/normalization temporaries, never a source.
+            + 4 * novarocks_execution_contract::status::SAFE_DETAIL_MAX_BYTES;
         #[cfg(target_vendor = "apple")]
         let metadata_bytes = metadata_bytes + 3 * Layout::new::<(isize, [u8; 56])>().size();
         let metadata = channel
@@ -614,7 +729,7 @@ impl NativeRootResultSession {
             pool.execution_health(),
             Arc::clone(&metadata) as Arc<dyn std::any::Any + Send + Sync>,
         )?;
-        if let Some(preparation) = preparation {
+        {
             let mut child: Option<Arc<dyn novarocks_worker::TaskPreparationChild>> =
                 Some(Arc::new(NativeRootPreparationChild {
                     authority: authority.clone(),
@@ -645,7 +760,7 @@ impl NativeRootResultSession {
                 scalar_rows: 0,
                 sealed: false,
                 completed: false,
-                job_exit_complete: false,
+                cleanup_started: false,
                 abort_is_rollback: false,
                 terminal_observed: false,
                 failed: None,
@@ -722,12 +837,8 @@ impl NativeRootResultSession {
         self.shared.state()
     }
     #[cfg(test)]
-    fn fail(
-        &self,
-        state: &mut ProducerState,
-        cause: impl Into<ExecutionFailure>,
-    ) -> RootProducerTurn {
-        self.shared.fail(state, cause)
+    fn fail(&self, cause: ExecutionFailure) {
+        self.shared.capture_failure(cause);
     }
 }
 impl RootSessionState {
@@ -750,13 +861,17 @@ impl RootSessionState {
                 let mut state = poisoned.into_inner();
                 state.completed |= self.channel.snapshot().end_sequence.is_some();
                 if state.completed {
-                    state
-                        .cleanup_failure
-                        .get_or_insert_with(|| RootSessionFailure::StatePoisoned.into());
+                    if state.cleanup_failure.is_none() {
+                        state.cleanup_failure = Some(RootFailureRecord::new(
+                            RootSessionFailure::StatePoisoned.into(),
+                        ));
+                    }
                 } else {
-                    state
-                        .failed
-                        .get_or_insert_with(|| RootSessionFailure::StatePoisoned.into());
+                    if state.failed.is_none() {
+                        state.failed = Some(RootFailureRecord::new(
+                            RootSessionFailure::StatePoisoned.into(),
+                        ));
+                    }
                 }
                 state.sealed = true;
                 // The following real pool turn still destroys input/cursor and
@@ -771,24 +886,80 @@ impl RootSessionState {
         self.wake.wake().map_err(io_error)
     }
     fn start(&self, state: &mut ProducerState) -> Result<(), FragmentIoError> {
-        if state.producer.is_none() && !state.job_exit_complete {
+        if state.producer.is_none() && !state.cleanup_started {
             state.producer = Some(self.channel.start_producer().map_err(io_error)?);
         }
         Ok(())
     }
-    fn fail(
-        &self,
-        state: &mut ProducerState,
-        cause: impl Into<ExecutionFailure>,
-    ) -> RootProducerTurn {
-        state.failed.get_or_insert_with(|| cause.into());
-        state.sealed = true;
-        RootProducerTurn::Complete
+    /// A real producer return supplies the original source outside its state
+    /// lock. A later contender is disposed on that original supervised stack.
+    fn capture_failure(&self, cause: ExecutionFailure) {
+        let mut cause = Some(cause);
+        {
+            let mut state = self.state();
+            state.completed |= self.channel.snapshot().end_sequence.is_some();
+            let record = if state.completed {
+                // A published normal End cannot be replaced by a later fault.
+                &mut state.cleanup_failure
+            } else {
+                &mut state.failed
+            };
+            if record.is_none() {
+                *record = Some(RootFailureRecord::new(cause.take().unwrap()));
+            }
+            state.sealed = true;
+        }
+        drop(cause);
+    }
+    fn retire_failure_source(&self, kind: FailureRecordKind) -> RootCleanupProgress {
+        let (source, rollback) = {
+            let mut state = self.state();
+            let rollback = state.abort_is_rollback;
+            let Some(record) = state.failure_record_mut(kind) else {
+                return RootCleanupProgress::Exited;
+            };
+            let source = match record.begin_action() {
+                Ok(Some(source)) => source,
+                Ok(None) => return RootCleanupProgress::Exited,
+                Err(()) => return RootCleanupProgress::Unresolved,
+            };
+            (source, rollback)
+        };
+        let mut action = FailureSourceAction {
+            owner: self,
+            kind,
+            source: Some(source),
+            completed: false,
+        };
+        // Projection, Task handoff and opaque destruction are all outside
+        // both producer/reporter locks. This owner supplies the only live E.
+        let observation = RootFailureObservation::from_failure(action.source());
+        action.publish_observation(observation);
+        if kind == FailureRecordKind::Primary && !rollback {
+            let reporter = self
+                .failure_reporter
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            let Some(reporter) = reporter else {
+                return RootCleanupProgress::Unresolved;
+            };
+            reporter.report_failure(action.take_source());
+            drop(reporter);
+            action.finish(FailureSourcePhase::Transferred);
+        } else {
+            drop(action.take_source());
+            action.finish(FailureSourcePhase::Disposed);
+        }
+        RootCleanupProgress::Exited
     }
 
-    fn advance(&self, state: &mut ProducerState) -> RootProducerTurn {
-        if state.failed.is_some() || self.channel.is_closed() {
-            return self.fail(state, RootSessionFailure::ObservedStop);
+    fn advance(&self, state: &mut ProducerState) -> ExecutionResult<RootProducerTurn> {
+        if state.failed.is_some() {
+            return Ok(RootProducerTurn::Complete);
+        }
+        if self.channel.is_closed() {
+            return Err(RootSessionFailure::ObservedStop.into());
         }
         if let Some(input) = state.input.as_mut() {
             if self.spec().contract.kind() == RootOutputKind::CountOnly {
@@ -796,24 +967,23 @@ impl RootSessionState {
                 let rows = match u64::try_from(requested) {
                     Ok(rows) => rows,
                     Err(source) => {
-                        return self.fail(
-                            state,
-                            RootSessionFailure::RowCountWidth { requested, source },
+                        return Err(
+                            (RootSessionFailure::RowCountWidth { requested, source }).into()
                         );
                     }
                 };
                 if let Err(cause) = self.channel.note_rows(rows) {
-                    return self.fail(state, cause.into_execution());
+                    return Err(cause.into_execution());
                 }
                 state.input.as_mut().unwrap().retiring = true;
-                return RootProducerTurn::Yielded;
+                return Ok(RootProducerTurn::Yielded);
             }
             if input.encoder.is_none() {
                 let capacity = NativeResultSupportGeometry::V1.root_scratch_capacity_bytes as usize;
                 let credit = match self.channel.try_reserve(capacity) {
                     Ok(ResultWriteAdmission::Granted(credit)) => credit,
-                    Ok(ResultWriteAdmission::Blocked) => return RootProducerTurn::Blocked,
-                    Err(cause) => return self.fail(state, cause.into_execution()),
+                    Ok(ResultWriteAdmission::Blocked) => return Ok(RootProducerTurn::Blocked),
+                    Err(cause) => return Err(cause.into_execution()),
                 };
                 input.scratch = Some(std::mem::ManuallyDrop::new(credit));
                 // This clone only allocates the finite columns Vec. Original
@@ -834,10 +1004,10 @@ impl RootSessionState {
                 input.execution = InputExecution::Idle;
                 let encoder = match construction {
                     Ok(encoder) => encoder,
-                    Err(message) => return self.fail(state, message),
+                    Err(message) => return Err(message),
                 };
                 input.encoder = Some(std::mem::ManuallyDrop::new(encoder));
-                return RootProducerTurn::Yielded;
+                return Ok(RootProducerTurn::Yielded);
             }
             if state.builder.is_none() {
                 match self.channel.try_segment() {
@@ -845,8 +1015,8 @@ impl RootSessionState {
                         state.builder = Some(builder);
                         state.used = 0;
                     }
-                    Ok(None) => return RootProducerTurn::Blocked,
-                    Err(cause) => return self.fail(state, cause.into_execution()),
+                    Ok(None) => return Ok(RootProducerTurn::Blocked),
+                    Err(cause) => return Err(cause.into_execution()),
                 }
             }
             input.execution = InputExecution::Rendering;
@@ -858,23 +1028,23 @@ impl RootSessionState {
             input.execution = InputExecution::Idle;
             let turn = match rendering {
                 Ok(turn) => turn,
-                Err(message) => return self.fail(state, message),
+                Err(message) => return Err(message),
             };
             state.used += turn.emitted_bytes;
             if let Err(cause) = self.channel.note_rows(turn.completed_rows) {
-                return self.fail(state, cause.into_execution());
+                return Err(cause.into_execution());
             }
             let input_complete = turn.status == RenderTurnStatus::InputComplete;
             if self.scalar() {
                 // The whole record fits one segment and stays unpublished:
                 // only the sealed normal End publishes it (or NoRows).
                 if turn.status == RenderTurnStatus::NeedsOutput {
-                    return self.fail(state, RootSessionFailure::ScalarSegment);
+                    return Err(RootSessionFailure::ScalarSegment.into());
                 }
                 if input_complete {
                     state.input.as_mut().unwrap().retiring = true;
                 }
-                return RootProducerTurn::Yielded;
+                return Ok(RootProducerTurn::Yielded);
             }
             if input_complete {
                 let encoder = input.encoder.as_ref().unwrap();
@@ -891,10 +1061,10 @@ impl RootSessionState {
             }
             let finishing = input_complete && state.sealed;
             if finishing && let Err(message) = self.sealed_domain_complete(state) {
-                return self.fail(state, message);
+                return Err(message);
             }
             if finishing && let Err(cause) = self.channel.request_finish() {
-                return self.fail(state, cause.into_execution());
+                return Err(cause.into_execution());
             }
             let flush = input_complete
                 || turn.completed_rows != 0
@@ -906,36 +1076,36 @@ impl RootSessionState {
                 if bytes == 0 {
                     drop(builder);
                 } else if let Err(cause) = self.channel.publish_segment(builder, bytes, finishing) {
-                    return self.fail(state, cause.into_execution());
+                    return Err(cause.into_execution());
                 }
                 if finishing {
                     if bytes == 0
                         && let Err(cause) = self.channel.publish_end()
                     {
-                        return self.fail(state, cause.into_execution());
+                        return Err(cause.into_execution());
                     }
-                    return RootProducerTurn::Complete;
+                    return Ok(RootProducerTurn::Complete);
                 }
             }
-            return RootProducerTurn::Yielded;
+            return Ok(RootProducerTurn::Yielded);
         }
         if state.sealed {
             if self.scalar() {
                 return self.finish_scalar(state);
             }
             if let Err(message) = self.sealed_domain_complete(state) {
-                return self.fail(state, message);
+                return Err(message);
             }
             if let Err(cause) = self
                 .channel
                 .request_finish()
                 .and_then(|_| self.channel.publish_end())
             {
-                return self.fail(state, cause.into_execution());
+                return Err(cause.into_execution());
             }
-            return RootProducerTurn::Complete;
+            return Ok(RootProducerTurn::Complete);
         }
-        RootProducerTurn::Idle
+        Ok(RootProducerTurn::Idle)
     }
     /// One cursor for one original input, chosen by the frozen root purpose.
     /// Every cursor's storage is prepaid by `capacity` before it is created.
@@ -1083,7 +1253,7 @@ impl RootSessionState {
     /// Normal sealed End of a ScalarValueV1 root: exactly one record, the
     /// accepted value or the unique NoRows, published together with End.
     /// Failure and cancellation never reach here, so they publish neither.
-    fn finish_scalar(&self, state: &mut ProducerState) -> RootProducerTurn {
+    fn finish_scalar(&self, state: &mut ProducerState) -> ExecutionResult<RootProducerTurn> {
         let FrozenRootOutput::ScalarValue(schema) = self.spec().contract.output() else {
             unreachable!("scalar finish is reached only for a scalar root");
         };
@@ -1093,13 +1263,13 @@ impl RootSessionState {
                     state.builder = Some(builder);
                     state.used = 0;
                 }
-                Ok(None) => return RootProducerTurn::Blocked,
-                Err(cause) => return self.fail(state, cause.into_execution()),
+                Ok(None) => return Ok(RootProducerTurn::Blocked),
+                Err(cause) => return Err(cause.into_execution()),
             }
         }
         if state.scalar_rows == 0 {
             if state.used != 0 {
-                return self.fail(state, RootSessionFailure::ScalarBytesWithoutRow);
+                return Err(RootSessionFailure::ScalarBytesWithoutRow.into());
             }
             let output = state.builder.as_mut().unwrap().output_at(0);
             let written =
@@ -1109,21 +1279,21 @@ impl RootSessionState {
                 });
             match written {
                 Ok((true, bytes)) => state.used = bytes,
-                Ok((false, _)) => return self.fail(state, RootSessionFailure::NoRowsIncomplete),
-                Err(cause) => return self.fail(state, ExecutionFailure::from_domain(cause)),
+                Ok((false, _)) => return Err(RootSessionFailure::NoRowsIncomplete.into()),
+                Err(cause) => return Err(ExecutionFailure::from_domain(cause)),
             }
         } else if state.used == 0 {
-            return self.fail(state, RootSessionFailure::ScalarRowWithoutRecord);
+            return Err(RootSessionFailure::ScalarRowWithoutRecord.into());
         }
         if let Err(cause) = self.channel.request_finish() {
-            return self.fail(state, cause.into_execution());
+            return Err(cause.into_execution());
         }
         let builder = state.builder.take().unwrap();
         let bytes = std::mem::take(&mut state.used);
         if let Err(cause) = self.channel.publish_segment(builder, bytes, true) {
-            return self.fail(state, cause.into_execution());
+            return Err(cause.into_execution());
         }
-        RootProducerTurn::Complete
+        Ok(RootProducerTurn::Complete)
     }
 }
 impl RootResultSession for NativeRootResultSession {
@@ -1136,10 +1306,10 @@ impl RootResultSession for NativeRootResultSession {
     fn try_acquire_input(&self) -> Result<RootInputAdmission, FragmentIoError> {
         {
             let state = self.shared.state();
-            if let Some(cause) = &state.failed {
-                return Err(io_error(cause.clone()));
+            if state.failed.is_some() {
+                return Err(io_error(RootSessionFailure::ProducerClosed));
             }
-            if self.shared.channel.is_closed() || state.sealed || state.job_exit_complete {
+            if self.shared.channel.is_closed() || state.sealed || state.cleanup_started {
                 return Err(io_error(RootSessionFailure::InputClosed));
             }
         }
@@ -1231,8 +1401,8 @@ impl RootResultSession for NativeRootResultSession {
     }
     fn finish_input(&self) -> Result<(), FragmentIoError> {
         let mut state = self.shared.state();
-        if let Some(cause) = &state.failed {
-            return Err(io_error(cause.clone()));
+        if state.failed.is_some() {
+            return Err(io_error(RootSessionFailure::ProducerClosed));
         }
         if self.shared.channel.is_closed() {
             return Err(io_error(RootSessionFailure::ProducerClosed));
@@ -1258,13 +1428,11 @@ impl RootResultSession for NativeRootResultSession {
         if state.completed {
             return self.shared.channel.producer_state();
         }
-        if let Some(cause) = &state.failed {
-            return RootProducerState::Failed(cause.clone());
+        if let Some(failure) = &state.failed {
+            return failure.producer_state();
         }
         if self.shared.channel.is_closed() {
-            return RootProducerState::Failed(
-                novarocks_worker::root_result_channel::RootChannelError::Closed.into_execution(),
-            );
+            return RootProducerState::AwaitTerminalControl;
         }
         let published = self.shared.channel.producer_state();
         if state.sealed && published == RootProducerState::Accepting {
@@ -1310,29 +1478,27 @@ impl RootProducerJob for NativeRootWork {
             );
             return RootProducerTurn::Complete;
         }
-        let turn = self.shared.advance(&mut state);
-        let failure = (turn == RootProducerTurn::Complete)
-            .then(|| state.failed.clone())
-            .flatten();
-        let rollback = state.abort_is_rollback;
-        if turn == RootProducerTurn::Complete && failure.is_none() {
-            state.completed = true;
-        }
-        drop(state);
-        if let Some(failure) = failure {
-            // A Task observer may synchronously call abort/producer_state.
-            // Never publish while holding the producer or reporter mutex.
-            if !rollback {
-                let reporter = self
-                    .shared
-                    .failure_reporter
-                    .lock()
-                    .expect("root failure reporter lock")
-                    .clone();
-                if let Some(RootFailureReporter::Task(reporter)) = reporter {
-                    reporter.report_failure(failure);
-                }
+        let turn = match self.shared.advance(&mut state) {
+            Ok(turn) => turn,
+            Err(source) => {
+                // advance never changes failed and returns Complete without
+                // constructing a source when that record already exists. This
+                // pure move reserves the first record before abort can enter;
+                // no projection, callback or opaque destructor runs here.
+                state.failed = Some(RootFailureRecord::new(source));
+                state.sealed = true;
+                RootProducerTurn::Complete
             }
+        };
+        state.completed |=
+            turn_has_published_end(turn, self.shared.channel.snapshot().end_sequence);
+        drop(state);
+        if self
+            .shared
+            .retire_failure_source(FailureRecordKind::Primary)
+            == RootCleanupProgress::Unresolved
+        {
+            return RootProducerTurn::Complete;
         }
         if self.shared.retire_completed_input() == RootCleanupProgress::Unresolved {
             // No new Task cause or normal End: the exact owner is unresolved.
@@ -1344,17 +1510,21 @@ impl RootProducerJob for NativeRootWork {
         self.shared
             .request_abort(ResultAbort::Cancelled(String::new()));
     }
-    fn cleanup_step(&self, phase: u16) -> RootCleanupProgress {
-        self.shared.cleanup_step(phase)
+    fn cleanup_step(
+        &self,
+        phase: u16,
+        predecessors: RootCleanupPredecessors,
+    ) -> RootCleanupProgress {
+        self.shared.cleanup_step(phase, predecessors)
     }
 }
 
 impl RootSessionState {
     fn input_refusal(&self, state: &ProducerState) -> Option<ExecutionFailure> {
-        if let Some(cause) = &state.failed {
-            return Some(cause.clone());
+        if state.failed.is_some() {
+            return Some(RootSessionFailure::ProducerClosed.into());
         }
-        if state.sealed || state.job_exit_complete || self.channel.is_closed() {
+        if state.sealed || state.cleanup_started || self.channel.is_closed() {
             return Some(RootSessionFailure::InputClosed.into());
         }
         state
@@ -1365,7 +1535,7 @@ impl RootSessionState {
     fn request_abort(&self, reason: ResultAbort) {
         let mut state = self.state();
         state.completed |= self.channel.snapshot().end_sequence.is_some();
-        if state.completed || state.job_exit_complete {
+        if state.completed || state.cleanup_started {
             return;
         }
         if state.failed.is_none() {
@@ -1374,9 +1544,11 @@ impl RootSessionState {
                 ResultAbort::PrepareRollback | ResultAbort::NeverStarted
             );
         }
-        state
-            .failed
-            .get_or_insert_with(|| RootSessionFailure::ObservedStop.into());
+        if state.failed.is_none() {
+            state.failed = Some(RootFailureRecord::new(
+                RootSessionFailure::ObservedStop.into(),
+            ));
+        }
         state.sealed = true;
     }
     fn exit_input_phase(&self, phase: InputExitPhase) -> RootCleanupProgress {
@@ -1449,12 +1621,16 @@ impl RootSessionState {
         }
         progress
     }
-    fn cleanup_step(&self, phase: u16) -> RootCleanupProgress {
+    fn cleanup_step(
+        &self,
+        phase: u16,
+        predecessors: RootCleanupPredecessors,
+    ) -> RootCleanupProgress {
         match phase {
             0 => {
                 {
                     let mut state = self.state();
-                    state.job_exit_complete = true;
+                    state.cleanup_started = true;
                     state.sealed = true;
                     state.completed |= self.channel.snapshot().end_sequence.is_some();
                 }
@@ -1483,14 +1659,33 @@ impl RootSessionState {
                 // pool already owns the failed phase and its original work.
                 let producer = {
                     let mut state = self.state();
-                    if state.input.is_some() || state.builder.is_some() {
+                    if !encoder_cleanup_ready(
+                        predecessors,
+                        state.input.is_some(),
+                        state.builder.is_some(),
+                    ) {
                         return RootCleanupProgress::Unresolved;
                     }
                     state.producer.take()
                 };
-                if let Some(producer) = producer {
-                    producer.finish_encoder();
+                if let Some(producer) = producer
+                    && let Some(source) = producer.finish_encoder()
+                {
+                    self.capture_failure(source);
+                    return self.retire_failure_source(FailureRecordKind::Primary);
                 }
+            }
+            14 | 15 => {
+                // These fixed source actions cannot use field emptiness or a
+                // logical terminal as the missing data/capture exit proof.
+                if !predecessors.all_exited() {
+                    return RootCleanupProgress::Unresolved;
+                }
+                return self.retire_failure_source(if phase == 14 {
+                    FailureRecordKind::Primary
+                } else {
+                    FailureRecordKind::Cleanup
+                });
             }
             9 => {
                 let owner = self.failure_reporter.lock().unwrap().take();
@@ -1615,7 +1810,11 @@ mod terminal_observation_tests {
         fn cancel(&self) {
             self.release();
         }
-        fn cleanup_step(&self, _phase: u16) -> RootCleanupProgress {
+        fn cleanup_step(
+            &self,
+            _phase: u16,
+            _predecessors: RootCleanupPredecessors,
+        ) -> RootCleanupProgress {
             RootCleanupProgress::Exited
         }
     }
@@ -3406,5 +3605,150 @@ mod terminal_observation_tests {
         );
         assert!(fixture.session.try_acquire_input().is_err());
         assert!(!fixture.session.channel().physical_idle());
+    }
+}
+
+#[cfg(test)]
+mod failure_record_tests {
+    use super::*;
+    use novarocks_execution_contract::{SourceRetentionCapability, failure::FailureProjection};
+
+    #[derive(Debug)]
+    struct SourceExit {
+        exits: Arc<AtomicUsize>,
+        unwound: Arc<AtomicBool>,
+    }
+    impl SourceRetentionCapability for SourceExit {}
+    impl Drop for SourceExit {
+        fn drop(&mut self) {
+            self.unwound
+                .store(std::thread::panicking(), Ordering::Release);
+            self.exits.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fn source() -> (ExecutionFailure, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let source: ExecutionFailure = novarocks_functions::KernelFailure::DeadlineExceeded.into();
+        let exits = Arc::new(AtomicUsize::new(0));
+        let unwound = Arc::new(AtomicBool::new(false));
+        source.retain_source_lifetime(Box::new(SourceExit {
+            exits: exits.clone(),
+            unwound: unwound.clone(),
+        }));
+        (source, exits, unwound)
+    }
+
+    #[test]
+    fn neutral_record_retains_the_first_fact_without_retaining_the_source_graph() {
+        let (source, exits, _) = source();
+        let original = source.clone();
+        let fact = source.failure_fact();
+        let mut record = RootFailureRecord::new(source);
+        assert_eq!(
+            record.producer_state(),
+            RootProducerState::AwaitTerminalControl
+        );
+        let source = ManuallyDrop::into_inner(record.begin_action().unwrap().unwrap());
+        assert!(std::ptr::eq(source.cause(), original.cause()));
+        record.observation = Some(RootFailureObservation::from_failure(&source));
+        record.finish_action(FailureSourcePhase::Transferred);
+        assert!(record.begin_action().unwrap().is_none());
+        let retained = record.producer_state();
+        assert!(
+            matches!(&retained, RootProducerState::Failed(observation) if observation.fact() == fact)
+        );
+        drop(source);
+        assert_eq!(
+            exits.load(Ordering::Acquire),
+            0,
+            "an actual caller still owns E"
+        );
+        drop(original);
+        assert_eq!(exits.load(Ordering::Acquire), 1);
+        assert_eq!(record.producer_state(), retained);
+        assert_eq!(record.phase, FailureSourcePhase::Transferred);
+    }
+
+    #[test]
+    fn a_started_source_cannot_be_inferred_exited_from_its_empty_field() {
+        let (source, exits, _) = source();
+        let mut record = RootFailureRecord::new(source);
+        let source = record.begin_action().unwrap().unwrap();
+        assert!(record.live_source.is_none());
+        assert!(record.begin_action().is_err());
+        record.restore_unresolved(Some(source));
+        assert_eq!(record.phase, FailureSourcePhase::Unresolved);
+        assert!(record.live_source.is_some());
+        assert!(record.begin_action().is_err());
+        assert_eq!(exits.load(Ordering::Acquire), 0);
+        // Test teardown destroys the actual retained object, without changing
+        // or discharging the unknown record's independent state.
+        drop(ManuallyDrop::into_inner(record.live_source.take().unwrap()));
+        assert_eq!(exits.load(Ordering::Acquire), 1);
+        assert_eq!(record.phase, FailureSourcePhase::Unresolved);
+    }
+
+    #[test]
+    fn a_source_consumed_during_unwind_does_not_become_a_successful_handoff() {
+        let (source, exits, unwound) = source();
+        let mut record = RootFailureRecord::new(source);
+        let source = record.begin_action().unwrap().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _original = ManuallyDrop::into_inner(source);
+            panic!("the actual source-consuming call did not return");
+        }));
+        assert!(result.is_err());
+        record.restore_unresolved(None);
+        assert!(record.live_source.is_none());
+        assert_eq!(exits.load(Ordering::Acquire), 1);
+        assert!(unwound.load(Ordering::Acquire));
+        assert_eq!(record.phase, FailureSourcePhase::Unresolved);
+        assert!(record.begin_action().is_err());
+        assert_eq!(
+            record.producer_state(),
+            RootProducerState::AwaitTerminalControl
+        );
+    }
+
+    struct ReentrantSourceExit {
+        target: Arc<std::sync::OnceLock<std::sync::Weak<Mutex<RootFailureRecord>>>>,
+        observed: Arc<AtomicBool>,
+    }
+    impl std::fmt::Debug for ReentrantSourceExit {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ReentrantSourceExit")
+        }
+    }
+    impl SourceRetentionCapability for ReentrantSourceExit {}
+    impl Drop for ReentrantSourceExit {
+        fn drop(&mut self) {
+            let record = self.target.get().unwrap().upgrade().unwrap();
+            let available = record.try_lock().is_ok();
+            self.observed.store(available, Ordering::Release);
+        }
+    }
+    #[test]
+    fn source_extraction_leaves_the_original_lock_free_for_its_real_destructor() {
+        let source: ExecutionFailure = novarocks_functions::KernelFailure::ResourceExhausted.into();
+        let target = Arc::new(std::sync::OnceLock::new());
+        let observed = Arc::new(AtomicBool::new(false));
+        source.retain_source_lifetime(Box::new(ReentrantSourceExit {
+            target: target.clone(),
+            observed: observed.clone(),
+        }));
+        let record = Arc::new(Mutex::new(RootFailureRecord::new(source)));
+        assert!(target.set(Arc::downgrade(&record)).is_ok());
+        let source = record.lock().unwrap().begin_action().unwrap().unwrap();
+        let observation = RootFailureObservation::from_failure(&source);
+        record.lock().unwrap().observation = Some(observation);
+        drop(ManuallyDrop::into_inner(source));
+        assert!(observed.load(Ordering::Acquire));
+        record
+            .lock()
+            .unwrap()
+            .finish_action(FailureSourcePhase::Disposed);
+        assert!(matches!(
+            record.lock().unwrap().producer_state(),
+            RootProducerState::Failed(_)
+        ));
     }
 }

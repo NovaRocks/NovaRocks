@@ -28,7 +28,7 @@ use novarocks_control_runtime_core::{
     identity::{ActionId, Generation, ScopeId, Tick, WorkId},
     mailbox::InputEnvelope,
 };
-use novarocks_execution_contract::{TaskIdentity, TaskOperationId};
+use novarocks_execution_contract::{QueryContextState, TaskIdentity, TaskOperationId};
 use novarocks_worker_protocol::{
     context::{ContextCore, ContextEffect, ContextInput, RequestSettlement},
     creation::RequestContext,
@@ -72,6 +72,7 @@ pub(crate) enum WorkerAction {
         admitted: Option<novarocks_control_runtime_core::identity::ReservationId>,
     },
     Reply(RequestSettlement),
+    ControlReply(novarocks_worker_protocol::control::ControlRequestSettlement),
     OwnerFailed {
         scope: ScopeId,
         generation: Generation,
@@ -150,6 +151,17 @@ impl Actor for ContextActor {
             None => self.core.handle(now, command, &mut admission),
         }
         .expect("context protocol input preserves its frozen invariants");
+        if matches!(
+            self.core.state(),
+            QueryContextState::Aborting
+                | QueryContextState::Releasing
+                | QueryContextState::TerminalRetained
+        ) {
+            // Commit the start fence with this same pure decision, before a
+            // host consumes any stop/release effect. Already started work and
+            // conclusion-before-stop publication keep their separate duties.
+            step.stop_producing();
+        }
         assert!(
             step.charge(result.records_visited),
             "bounded context traversal"
@@ -193,6 +205,8 @@ impl Actor for ContextActor {
                 ContextEffect::PublishTask { task, .. }
                 | ContextEffect::PublishMetrics { task, .. }
                 | ContextEffect::PublishTaskConvergence { task, .. }
+                | ContextEffect::SummaryConsumed { task, .. }
+                | ContextEffect::RetireTask { task, .. }
                 | ContextEffect::PublishConclusion { task, .. } => {
                     if let Some(previous) = publications.get(task) {
                         dependencies.push(*previous);
@@ -214,7 +228,6 @@ impl Actor for ContextActor {
                 }
                 ContextEffect::DisposeSource { .. }
                 | ContextEffect::CancelLoader { .. }
-                | ContextEffect::RetireTask { .. }
                 | ContextEffect::ReleaseHost { .. }
                 | ContextEffect::SealRoot { .. } => EffectKind::Cleanup,
                 // These are neutral control/publication handoffs. Their actual
@@ -227,6 +240,8 @@ impl Actor for ContextActor {
                 ContextEffect::PublishTask { task, .. }
                 | ContextEffect::PublishMetrics { task, .. }
                 | ContextEffect::PublishTaskConvergence { task, .. }
+                | ContextEffect::SummaryConsumed { task, .. }
+                | ContextEffect::RetireTask { task, .. }
                 | ContextEffect::PublishConclusion { task, .. } => {
                     publications.insert(*task, id);
                 }
@@ -308,7 +323,7 @@ impl Actor for ContextActor {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 mod control;
 mod worker;

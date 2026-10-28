@@ -18,13 +18,37 @@
 //! Worker binding of the common control runtime and the pure protocol.
 
 pub(crate) mod actors;
+pub(crate) mod admitted_role;
+pub(crate) mod context_executors;
+pub(crate) mod context_host;
+pub(crate) mod context_host_jobs;
+pub(crate) mod context_io;
+pub(crate) mod context_lifecycle;
+pub(crate) mod context_ready;
+pub(crate) mod control_internal;
+pub(crate) mod control_request;
+pub(crate) mod control_ticket;
+pub(crate) mod establish_ingress;
+pub(crate) mod establish_route;
+pub(crate) mod process_control;
+pub(crate) mod service;
 
 pub(crate) mod effect_dispatch;
+pub(crate) mod host_executor;
+pub(crate) mod open_summary;
 
 pub(crate) mod preparation;
+pub(crate) mod preparation_refusal;
 
 pub(crate) mod task;
+pub(crate) mod task_publication;
 
 pub(crate) mod causal;
+pub(crate) mod completion_action;
 pub(crate) mod failure;
+pub(crate) mod lifecycle_read;
 pub(crate) mod loading;
+pub(crate) mod loading_events;
+pub(crate) mod loading_host_job;
+pub(crate) mod source_custody;
+pub(crate) mod source_positions;

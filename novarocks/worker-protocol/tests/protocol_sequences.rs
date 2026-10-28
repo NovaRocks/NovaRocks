@@ -35,12 +35,14 @@ use novarocks_worker_protocol::{
         AdmissionCore, AdmissionTicketConfig, AdmissionTicketObservation, AdmissionTicketRedemption,
     },
     context::{
-        ContextConfig, ContextCore, ContextEffect, ContextInput, PhysicalFact, RequestResult,
+        ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
+        ContextEstablishmentDecision, ContextInput, ContextMaterialized, ContextStep, PhysicalFact,
+        RequestResult,
     },
     creation::{
         AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestContext,
     },
-    lease::{InstalledLease, LeaseBounds, MonotonicInstant},
+    lease::{LeaseBounds, MonotonicInstant},
     observation::{
         CoveredObservationFact, CoveredObservationFrame, CoveredSubscriptionError,
         ObservationSource, SubscriptionId,
@@ -77,9 +79,34 @@ fn task(n: u32) -> TaskIdentity {
     )
 }
 fn core(max_tasks: usize, max_preparing: usize) -> ContextCore {
+    core_with_initial_lease(max_tasks, max_preparing, at(0))
+}
+fn core_with_initial_lease(
+    max_tasks: usize,
+    max_preparing: usize,
+    elected_at: MonotonicInstant,
+) -> ContextCore {
+    core_with_establishment(
+        ContextEstablishment {
+            operation: operation(2),
+            ticket: AdmissionTicketId::try_from_bytes([4; 16]).unwrap(),
+            payload: PayloadId(1),
+            semantics: semantics(),
+            elected_at,
+        },
+        max_tasks,
+        max_preparing,
+    )
+}
+fn core_with_establishment(
+    establishment: ContextEstablishment,
+    max_tasks: usize,
+    max_preparing: usize,
+) -> ContextCore {
     ContextCore::new(
         context(),
         Generation::new(1).unwrap(),
+        establishment,
         ContextConfig {
             max_tasks,
             max_creation_waiters: 8,
@@ -90,12 +117,6 @@ fn core(max_tasks: usize, max_preparing: usize) -> ContextCore {
             lease_bounds: LeaseBounds::DEFAULT,
             metric_publish_interval: Duration::from_millis(100),
         },
-        at(0),
-        InstalledLease::install_initial(
-            LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
-            LeaseBounds::DEFAULT,
-            at(0),
-        ),
     )
     .unwrap()
 }
@@ -129,7 +150,16 @@ fn cost() -> CreationCost {
     }
 }
 fn activate(core: &mut ContextCore, port: &mut Port) {
-    core.handle(at(0), ContextInput::Established, port).unwrap();
+    core.handle(
+        at(0),
+        ContextInput::MaterializationFinished {
+            result: Ok(ContextMaterialized {
+                initial_credential_resource: 101,
+            }),
+        },
+        port,
+    )
+    .unwrap();
 }
 fn create(core: &mut ContextCore, port: &mut Port, n: u8) {
     core.handle(
@@ -1352,12 +1382,17 @@ fn final_info_freezes_the_real_status_writer_and_operator_facts() {
     assert!(!core.task(task(1)).unwrap().actual_stopped);
 }
 fn control() -> novarocks_worker_protocol::control::ControlCore {
+    control_with_pending_limit(16)
+}
+fn control_with_pending_limit(
+    max_pending_requests: usize,
+) -> novarocks_worker_protocol::control::ControlCore {
     use novarocks_worker_protocol::control::{ControlConfig, ControlCore};
     ControlCore::new(
         ControlConfig {
             max_contexts: 8,
             max_waiters: 8,
-            max_pending_requests: 16,
+            max_pending_requests,
             step_budget: ControlCore::MAX_STEP_WORK,
             retained_contexts: 8,
             gone_fences: 8,
@@ -1377,6 +1412,7 @@ fn semantics() -> novarocks_worker_protocol::control::EstablishSemanticFacts {
         query_options: ContentFingerprint::from_bytes([3; 16]),
         credential_lease: CredentialLeaseId::new(1),
         credential_epoch: CredentialEpoch::new(1).unwrap(),
+        initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
     }
 }
 fn grant(
@@ -1397,6 +1433,1253 @@ fn grant(
         .unwrap();
     ticket
 }
+
+fn another_control_context() -> QueryContextRef {
+    QueryContextRef::new(
+        QueryExecutionId::new(QueryId::new(7301, 7302), AttemptId::new(1).unwrap()).unwrap(),
+        context().frontend_process_id(),
+        context().backend_process_id(),
+    )
+}
+fn active_establish_input(
+    ticket: AdmissionTicketId,
+    payload: u64,
+) -> novarocks_worker_protocol::control::ControlInput {
+    novarocks_worker_protocol::control::ControlInput::Establish {
+        request: operation(2),
+        context: context(),
+        ticket,
+        payload: PayloadId(payload),
+        semantics: semantics(),
+        generation: Generation::new(1).unwrap(),
+    }
+}
+
+fn routed_establish_request(
+    step: &novarocks_worker_protocol::control::ControlStep,
+) -> (
+    QueryContextRef,
+    novarocks_worker_protocol::context::EstablishReplayRequest,
+) {
+    let routes: Vec<_> = step
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            novarocks_worker_protocol::control::ControlEffect::RouteEstablish {
+                context,
+                request,
+            } => Some((*context, *request)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        routes.len(),
+        1,
+        "one actual neutral route for this original R"
+    );
+    assert!(step.charged_work() <= novarocks_worker_protocol::control::ControlCore::MAX_STEP_WORK);
+    assert!(step.requests.is_empty());
+    routes[0]
+}
+fn finish_routed_establish(
+    control: &mut novarocks_worker_protocol::control::ControlCore,
+    port: &mut Port,
+    route: &novarocks_worker_protocol::control::ControlStep,
+    now: u64,
+    decided_at: u64,
+    result: Result<OperationOutcome, novarocks_worker_protocol::context::DomainRefusal>,
+) -> novarocks_worker_protocol::control::ControlStep {
+    let (context, request) = routed_establish_request(route);
+    let step = control
+        .handle(
+            at(now),
+            novarocks_worker_protocol::control::ControlInput::RoutedEstablishFinished {
+                context,
+                request: request.request,
+                result,
+                decided_at: at(decided_at),
+            },
+            port,
+        )
+        .unwrap();
+    assert!(step.charged_work() <= control.max_step_work());
+    step
+}
+
+struct ActiveControlFixture {
+    control: novarocks_worker_protocol::control::ControlCore,
+    port: Port,
+    ticket: AdmissionTicketId,
+}
+impl ActiveControlFixture {
+    fn new(max_pending_requests: usize, deadline: u64) -> Self {
+        let mut control = control_with_pending_limit(max_pending_requests);
+        let mut port = Port::default();
+        let ticket = grant(&mut control, &mut port);
+        let first = control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(1).unwrap(),
+                    operation: operation(2),
+                    deadline: at(deadline),
+                },
+                active_establish_input(ticket, 1),
+                &mut port,
+            )
+            .unwrap();
+        assert!(first.charged_work() <= control.max_step_work());
+        assert!(first.requests.is_empty());
+        assert_eq!(port.calls.len(), 2);
+        Self {
+            control,
+            port,
+            ticket,
+        }
+    }
+    fn request(
+        &mut self,
+        token: u64,
+        deadline: u64,
+        input: novarocks_worker_protocol::control::ControlInput,
+    ) -> novarocks_worker_protocol::control::ControlStep {
+        let step = self
+            .control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(token).unwrap(),
+                    operation: operation(2),
+                    deadline: at(deadline),
+                },
+                input,
+                &mut self.port,
+            )
+            .unwrap();
+        assert!(step.charged_work() <= self.control.max_step_work());
+        step
+    }
+    fn reject(
+        &mut self,
+        token: u64,
+        deadline: u64,
+        input: novarocks_worker_protocol::control::ControlInput,
+        outcome: OperationOutcome,
+    ) {
+        let calls = self.port.calls.len();
+        let refused = self.request(token, deadline, input);
+        assert!(
+            refused.effects.is_empty(),
+            "a conflict cannot act on the original operation"
+        );
+        assert_eq!(refused.requests.len(), 1);
+        assert_eq!(
+            refused.requests[0].request.token,
+            InputId::new(token).unwrap()
+        );
+        assert_eq!(refused.requests[0].result, RequestResult::Outcome(outcome));
+        assert_eq!(self.port.calls.len(), calls);
+    }
+    fn materialized(&mut self) -> novarocks_worker_protocol::control::ControlStep {
+        let step = self
+            .control
+            .handle(
+                at(0),
+                novarocks_worker_protocol::control::ControlInput::EstablishmentDecided {
+                    context: context(),
+                    decision: active_establishment_decision(),
+                },
+                &mut self.port,
+            )
+            .unwrap();
+        assert!(step.charged_work() <= self.control.max_step_work());
+        step
+    }
+    fn flush(&mut self) -> novarocks_worker_protocol::control::ControlStep {
+        let step = self
+            .control
+            .handle(
+                at(0),
+                novarocks_worker_protocol::control::ControlInput::ContinueRequestReplies {
+                    operation: operation(2),
+                },
+                &mut self.port,
+            )
+            .unwrap();
+        assert!(step.charged_work() <= self.control.max_step_work());
+        step
+    }
+    fn finish_original(&mut self) {
+        let completed = self.materialized();
+        assert_eq!(completed.requests.len(), 1);
+        assert_eq!(
+            completed.requests[0].request.token,
+            InputId::new(1).unwrap()
+        );
+        assert_eq!(
+            completed.requests[0].result,
+            RequestResult::Outcome(OperationOutcome::Accepted)
+        );
+        assert!(self.flush().requests.is_empty());
+        assert_eq!(self.port.calls.len(), 2);
+    }
+}
+
+#[test]
+fn root_routes_existing_establish_fields_without_interpreting_entity_equality() {
+    use novarocks_worker_protocol::control::ControlInput;
+    for changed in 0..8 {
+        let mut f = ActiveControlFixture::new(16, 100);
+        let mut candidate = active_establish_input(f.ticket, 2);
+        let ControlInput::Establish {
+            ticket, semantics, ..
+        } = &mut candidate
+        else {
+            unreachable!()
+        };
+        match changed {
+            0 => *ticket = AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+            1 => {
+                semantics.catalog =
+                    novarocks_execution_contract::ContentFingerprint::from_bytes([9; 16])
+            }
+            2 => {
+                semantics.shared_filter =
+                    novarocks_execution_contract::ContentFingerprint::from_bytes([9; 16])
+            }
+            3 => {
+                semantics.query_options =
+                    novarocks_execution_contract::ContentFingerprint::from_bytes([9; 16])
+            }
+            4 => {
+                semantics.credential_lease = novarocks_execution_contract::CredentialLeaseId::new(2)
+            }
+            5 => {
+                semantics.credential_epoch =
+                    novarocks_execution_contract::CredentialEpoch::new(2).unwrap()
+            }
+            6 => {
+                semantics.initial_lease_valid_for =
+                    LeaseValidFor::new(Duration::from_secs(29)).unwrap()
+            }
+            7 => {}
+            _ => unreachable!(),
+        }
+        let ControlInput::Establish {
+            ticket: expected_ticket,
+            semantics: expected_semantics,
+            ..
+        } = &candidate
+        else {
+            unreachable!()
+        };
+        let expected_ticket = *expected_ticket;
+        let expected_semantics = *expected_semantics;
+        let routed = f.request(2, 100, candidate);
+        let (target, actual) = routed_establish_request(&routed);
+        assert_eq!(actual.ticket, expected_ticket);
+        assert_eq!(actual.semantics, expected_semantics);
+        assert_eq!(target, context());
+        assert_eq!(actual.payload, PayloadId(2));
+        let completed = finish_routed_establish(
+            &mut f.control,
+            &mut f.port,
+            &routed,
+            0,
+            0,
+            Ok(if changed == 7 {
+                OperationOutcome::Idempotent
+            } else {
+                OperationOutcome::ContextConflict
+            }),
+        );
+        assert_eq!(
+            completed.requests[0].request.token,
+            InputId::new(2).unwrap()
+        );
+        assert_eq!(
+            completed.requests[0].result,
+            RequestResult::Outcome(if changed == 7 {
+                OperationOutcome::Idempotent
+            } else {
+                OperationOutcome::ContextConflict
+            })
+        );
+        f.finish_original();
+    }
+}
+
+#[test]
+fn an_absent_other_context_cannot_reuse_a_live_creation_operation() {
+    use novarocks_worker_protocol::control::ControlInput;
+    let mut f = ActiveControlFixture::new(8, 100);
+    let mut candidate = active_establish_input(f.ticket, 2);
+    let ControlInput::Establish {
+        context: target, ..
+    } = &mut candidate
+    else {
+        unreachable!()
+    };
+    *target = another_control_context();
+    f.reject(2, 100, candidate, OperationOutcome::ContextConflict);
+    assert_eq!(
+        f.control.route(another_control_context()),
+        QueryContextState::Absent
+    );
+    f.finish_original();
+}
+
+#[test]
+fn active_establish_cannot_be_joined_by_an_acquire_of_the_same_operation() {
+    use novarocks_worker_protocol::control::ControlInput;
+    let mut f = ActiveControlFixture::new(16, 100);
+    let request = AcquireQueryContextAdmissionTicket::new(
+        operation(2),
+        another_control_context(),
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        f.control.admission().capability(),
+    );
+    f.reject(
+        2,
+        100,
+        ControlInput::Acquire {
+            request,
+            ticket: AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+        },
+        OperationOutcome::DomainConflict,
+    );
+    f.finish_original();
+}
+
+#[test]
+fn same_operation_routed_requests_have_independent_results_and_settle_once() {
+    let mut f = ActiveControlFixture::new(16, 100);
+    let second = f.request(2, 80, active_establish_input(f.ticket, 20));
+    let third = f.request(3, 90, active_establish_input(f.ticket, 30));
+    assert_eq!(routed_establish_request(&second).1.payload, PayloadId(20));
+    assert_eq!(routed_establish_request(&third).1.payload, PayloadId(30));
+    let first = f.materialized();
+    assert_eq!(first.requests.len(), 1);
+    assert_eq!(first.requests[0].request.token, InputId::new(1).unwrap());
+    assert_eq!(
+        first.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    for (route, token, outcome) in [
+        (third, 3, OperationOutcome::ContextConflict),
+        (second, 2, OperationOutcome::Idempotent),
+    ] {
+        let completed =
+            finish_routed_establish(&mut f.control, &mut f.port, &route, 0, 0, Ok(outcome));
+        assert_eq!(completed.requests.len(), 1);
+        assert_eq!(
+            completed.requests[0].request.token,
+            InputId::new(token).unwrap()
+        );
+        assert_eq!(
+            completed.requests[0].result,
+            RequestResult::Outcome(outcome)
+        );
+        assert!(
+            finish_routed_establish(&mut f.control, &mut f.port, &route, 0, 0, Ok(outcome))
+                .requests
+                .is_empty()
+        );
+    }
+    assert!(f.flush().requests.is_empty());
+    assert_eq!(f.port.calls.len(), 2);
+}
+
+#[test]
+fn a_different_operation_routes_its_own_payload_instead_of_joining_the_directory_body() {
+    use novarocks_worker_protocol::control::ControlInput;
+    let mut f = ActiveControlFixture::new(16, 100);
+    let mut candidate = active_establish_input(f.ticket, 30);
+    let ControlInput::Establish { request, .. } = &mut candidate else {
+        unreachable!()
+    };
+    *request = operation(3);
+    let routed = f
+        .control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(2).unwrap(),
+                operation: operation(3),
+                deadline: at(100),
+            },
+            candidate,
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(routed_establish_request(&routed).1.payload, PayloadId(30));
+    let completed = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &routed,
+        0,
+        0,
+        Ok(OperationOutcome::ContextConflict),
+    );
+    assert_eq!(completed.requests[0].request.operation, operation(3));
+    assert_eq!(
+        completed.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::ContextConflict)
+    );
+    f.finish_original();
+}
+
+#[test]
+fn an_expired_existing_request_neither_routes_nor_replays_another_requests_body() {
+    let mut f = ActiveControlFixture::new(16, 100);
+    let timed_out = f.request(2, 0, active_establish_input(f.ticket, 2));
+    assert_eq!(timed_out.requests.len(), 1);
+    assert_eq!(
+        timed_out.requests[0].request.token,
+        InputId::new(2).unwrap()
+    );
+    assert_eq!(
+        timed_out.requests[0].result,
+        RequestResult::TimeoutWhileAccepted
+    );
+    assert!(timed_out.effects.is_empty());
+    f.finish_original();
+}
+
+#[test]
+fn a_routed_conflict_does_not_take_or_replace_the_original_creation_success() {
+    let mut f = ActiveControlFixture::new(16, 100);
+    let route = f.request(2, 100, active_establish_input(f.ticket, 2));
+    let first = f.materialized();
+    assert_eq!(first.requests.len(), 1);
+    assert_eq!(first.requests[0].request.token, InputId::new(1).unwrap());
+    assert_eq!(
+        first.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    let conflict = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        0,
+        0,
+        Ok(OperationOutcome::ContextConflict),
+    );
+    assert_eq!(conflict.requests.len(), 1);
+    assert_eq!(conflict.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(
+        conflict.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::ContextConflict)
+    );
+    assert!(f.flush().requests.is_empty());
+    assert_eq!(
+        first.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+}
+
+#[test]
+fn existing_routes_share_the_original_pending_request_bound() {
+    let mut f = ActiveControlFixture::new(1, 100);
+    f.reject(
+        2,
+        100,
+        active_establish_input(f.ticket, 2),
+        OperationOutcome::ResourceExhausted,
+    );
+    f.finish_original();
+    let route = f.request(3, 100, active_establish_input(f.ticket, 3));
+    assert_eq!(
+        routed_establish_request(&route).1.request.token,
+        InputId::new(3).unwrap()
+    );
+    f.reject(
+        4,
+        100,
+        active_establish_input(f.ticket, 4),
+        OperationOutcome::ResourceExhausted,
+    );
+    let completed = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        0,
+        0,
+        Ok(OperationOutcome::Idempotent),
+    );
+    assert_eq!(
+        completed.requests[0].request.token,
+        InputId::new(3).unwrap()
+    );
+    let next = f.request(5, 100, active_establish_input(f.ticket, 5));
+    assert_eq!(
+        routed_establish_request(&next).1.request.token,
+        InputId::new(5).unwrap()
+    );
+    assert_eq!(f.port.calls.len(), 2);
+}
+
+#[test]
+fn active_control_shape_dies_with_the_last_waiter_without_revoking_materialization() {
+    use novarocks_worker_protocol::control::ControlInput;
+    let mut f = ActiveControlFixture::new(1, 1);
+    let expired = f
+        .control
+        .handle(at(1), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert_eq!(expired.requests.len(), 1);
+    assert_eq!(
+        expired.requests[0].result,
+        RequestResult::TimeoutWhileAccepted
+    );
+    assert_eq!(f.control.route(context()), QueryContextState::Establishing);
+    let request = AcquireQueryContextAdmissionTicket::new(
+        operation(2),
+        another_control_context(),
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        f.control.admission().capability(),
+    );
+    let acquired = f
+        .control
+        .handle_request(
+            at(1),
+            RequestContext {
+                token: InputId::new(2).unwrap(),
+                operation: operation(2),
+                deadline: at(100),
+            },
+            ControlInput::Acquire {
+                request,
+                ticket: AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(acquired.requests.len(), 1);
+    assert_eq!(
+        acquired.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    assert_eq!(
+        f.port.calls.len(),
+        3,
+        "no stale active shape is a permanent decision latch"
+    );
+    let completed = f
+        .control
+        .handle(
+            at(1),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision: active_establishment_decision(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert!(
+        completed.requests.is_empty(),
+        "the expired original waiter stays retired"
+    );
+}
+
+#[test]
+fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinates() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut control = control();
+    let mut port = Port::default();
+    let original = AcquireQueryContextAdmissionTicket::new(
+        operation(1),
+        context(),
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        control.admission().capability(),
+    );
+    let mut receipt = None;
+    for (token, new_ticket, deadline) in [(1, 4, 100), (2, 9, 80)] {
+        let capability = control.admission().capability();
+        if token == 2 {
+            assert_ne!(capability, original.admission_epoch_capability());
+        }
+        let request = AcquireQueryContextAdmissionTicket::new(
+            operation(1),
+            context(),
+            original.valid_for(),
+            original.native_compatibility_id(),
+            capability,
+        );
+        let step = control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(token).unwrap(),
+                    operation: operation(1),
+                    deadline: at(deadline),
+                },
+                ControlInput::Acquire {
+                    request,
+                    ticket: AdmissionTicketId::try_from_bytes([new_ticket; 16]).unwrap(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(step.charged_work() <= control.max_step_work());
+        let actual = step
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                ControlEffect::AdmissionReply {
+                    result: Ok(actual), ..
+                } => Some(*actual),
+                _ => None,
+            })
+            .unwrap();
+        if let Some(original_receipt) = receipt {
+            assert_eq!(actual, original_receipt);
+        }
+        receipt = Some(actual);
+        assert_eq!(step.requests.len(), 1);
+        assert_eq!(step.requests[0].request.token, InputId::new(token).unwrap());
+    }
+    for changed in 0..3 {
+        let request = AcquireQueryContextAdmissionTicket::new(
+            operation(1),
+            if changed == 0 {
+                another_control_context()
+            } else {
+                context()
+            },
+            LeaseValidFor::new(Duration::from_secs(if changed == 1 { 4 } else { 5 })).unwrap(),
+            NativeCompatibilityId::new([if changed == 2 { 9 } else { 3 }; 32]),
+            control.admission().capability(),
+        );
+        let step = control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(3 + changed).unwrap(),
+                    operation: operation(1),
+                    deadline: at(100),
+                },
+                ControlInput::Acquire {
+                    request,
+                    ticket: AdmissionTicketId::try_from_bytes([10; 16]).unwrap(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(
+            step.requests[0].result,
+            RequestResult::Outcome(OperationOutcome::DomainConflict)
+        );
+    }
+    assert_eq!(port.calls.len(), 1);
+}
+
+#[test]
+fn a_new_establish_with_an_unknown_ticket_keeps_the_original_gone_verdict() {
+    use novarocks_worker_protocol::control::ControlInput;
+    let mut control = control();
+    let mut port = Port::default();
+    let step = control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(1).unwrap(),
+                operation: operation(2),
+                deadline: at(100),
+            },
+            active_establish_input(AdmissionTicketId::try_from_bytes([9; 16]).unwrap(), 1),
+            &mut port,
+        )
+        .unwrap();
+    assert!(step.charged_work() <= control.max_step_work());
+    assert_eq!(step.requests.len(), 1);
+    assert_eq!(
+        step.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Gone)
+    );
+    assert!(!step.effects.iter().any(|effect| matches!(
+        effect,
+        novarocks_worker_protocol::control::ControlEffect::Materialize { .. }
+    )));
+    assert_eq!(control.route(context()), QueryContextState::Absent);
+    assert!(port.calls.is_empty());
+    let no_waiter = control
+        .handle(
+            at(0),
+            ControlInput::ContinueRequestReplies {
+                operation: operation(2),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(no_waiter.requests.is_empty());
+}
+
+fn establishment_decision(step: &ContextStep) -> (Generation, ContextEstablishmentDecision) {
+    assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+    let decisions: Vec<_> = step
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            ContextEffect::EstablishmentDecided {
+                context: identity,
+                close_epoch,
+                decision,
+            } => {
+                assert_eq!(*identity, context());
+                Some((*close_epoch, decision.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(decisions.len(), 1, "one decision for the actual input");
+    decisions[0].clone()
+}
+
+fn active_establishment_decision() -> ContextEstablishmentDecision {
+    ContextEstablishmentDecision {
+        state: QueryContextState::Active,
+        outcome: Ok(OperationOutcome::Accepted),
+    }
+}
+fn closed_establishment_decision(
+    state: QueryContextState,
+    outcome: OperationOutcome,
+) -> ContextEstablishmentDecision {
+    ContextEstablishmentDecision {
+        state,
+        outcome: Ok(outcome),
+    }
+}
+
+#[test]
+fn materialize_preserves_the_complete_original_establishment_for_the_context_core() {
+    use novarocks_execution_contract::{ContentFingerprint, CredentialEpoch, CredentialLeaseId};
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut control = control();
+    let mut port = Port::default();
+    let ticket = selector_grant(&mut control, &mut port, context(), 71, 5);
+    let original = ContextEstablishment {
+        operation: operation(72),
+        ticket,
+        payload: PayloadId(901),
+        semantics: novarocks_worker_protocol::control::EstablishSemanticFacts {
+            catalog: ContentFingerprint::from_bytes([41; 16]),
+            shared_filter: ContentFingerprint::from_bytes([42; 16]),
+            query_options: ContentFingerprint::from_bytes([43; 16]),
+            credential_lease: CredentialLeaseId::new(44),
+            credential_epoch: CredentialEpoch::new(45).unwrap(),
+            initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(20)).unwrap(),
+        },
+        elected_at: at(2),
+    };
+    let elected = control
+        .handle(
+            at(2),
+            ControlInput::Establish {
+                request: original.operation,
+                context: context(),
+                ticket: original.ticket,
+                payload: original.payload,
+                semantics: original.semantics,
+                generation: Generation::new(1).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(elected.charged_work() <= control.max_step_work());
+    let materializations: Vec<_> = elected
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            ControlEffect::Materialize {
+                context,
+                establishment,
+                generation,
+                ..
+            } => Some((*context, *establishment, *generation)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        materializations,
+        vec![(context(), original, Generation::new(1).unwrap())]
+    );
+    let (identity, establishment, generation) = materializations[0];
+    let mut context_core = core_with_establishment(establishment, 1, 1);
+    assert_eq!(context_core.identity(), identity);
+    assert_eq!(context_core.generation(), generation);
+    assert_eq!(context_core.establishment(), original);
+    assert_eq!(context_core.next_deadline(), Some(at(22)));
+    assert_eq!(
+        context_core
+            .handle(at(1), ContextInput::Tick, &mut port)
+            .unwrap_err(),
+        novarocks_worker_protocol::context::CoreError::TimeRegressed
+    );
+    let finished = context_core
+        .handle(
+            at(4),
+            ContextInput::MaterializationFinished {
+                result: Ok(ContextMaterialized {
+                    initial_credential_resource: 101,
+                }),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(finished.charged_work() <= context_core.max_step_work());
+    assert_eq!(context_core.state(), QueryContextState::Active);
+    assert_eq!(context_core.establishment(), original);
+}
+
+#[test]
+fn matching_context_and_generation_do_not_replace_the_original_establish_header() {
+    use novarocks_execution_contract::{ContentFingerprint, CredentialEpoch, CredentialLeaseId};
+    let original = ContextEstablishment {
+        operation: operation(2),
+        ticket: AdmissionTicketId::try_from_bytes([4; 16]).unwrap(),
+        payload: PayloadId(1),
+        semantics: semantics(),
+        elected_at: at(0),
+    };
+    let original_core = core_with_establishment(original, 1, 1);
+    // Each original header field remains independently meaningful, even when
+    // the routing identity and protocol generation happen to be identical.
+    for changed in 0..10 {
+        let mut candidate = original;
+        match changed {
+            0 => candidate.operation = operation(3),
+            1 => candidate.ticket = AdmissionTicketId::try_from_bytes([5; 16]).unwrap(),
+            2 => candidate.payload = PayloadId(2),
+            3 => candidate.semantics.catalog = ContentFingerprint::from_bytes([9; 16]),
+            4 => candidate.semantics.shared_filter = ContentFingerprint::from_bytes([9; 16]),
+            5 => candidate.semantics.query_options = ContentFingerprint::from_bytes([9; 16]),
+            6 => candidate.semantics.credential_lease = CredentialLeaseId::new(2),
+            7 => candidate.semantics.credential_epoch = CredentialEpoch::new(2).unwrap(),
+            8 => {
+                candidate.semantics.initial_lease_valid_for =
+                    LeaseValidFor::new(Duration::from_secs(31)).unwrap();
+            }
+            9 => candidate.elected_at = at(1),
+            _ => unreachable!(),
+        }
+        assert_ne!(candidate, original);
+        let candidate_core = core_with_establishment(candidate, 1, 1);
+        assert_eq!(candidate_core.identity(), original_core.identity());
+        assert_eq!(candidate_core.generation(), original_core.generation());
+        assert_eq!(candidate_core.establishment(), candidate);
+        assert_ne!(
+            candidate_core.establishment(),
+            original_core.establishment()
+        );
+        assert_eq!(original_core.establishment(), original);
+    }
+}
+
+#[test]
+fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut control = control();
+    let mut port = Port::default();
+    let ticket = grant(&mut control, &mut port);
+    let elected = control
+        .handle(
+            at(2),
+            ControlInput::Establish {
+                request: operation(2),
+                context: context(),
+                ticket,
+                payload: PayloadId(1),
+                semantics: semantics(),
+                generation: Generation::new(1).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(elected.charged_work() <= control.max_step_work());
+    let establishment = elected
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ControlEffect::Materialize { establishment, .. } => Some(*establishment),
+            _ => None,
+        })
+        .expect("the actual elected Materialize effect");
+    assert_eq!(establishment.elected_at, at(2));
+    // The first observed driver input can be delayed; construction has no
+    // independent clock or lease argument that could move the origin.
+    let mut context_core = core_with_establishment(establishment, 1, 1);
+    let delayed = context_core
+        .handle(at(19), ContextInput::Tick, &mut port)
+        .unwrap();
+    assert!(delayed.charged_work() <= context_core.max_step_work());
+    assert_eq!(context_core.next_deadline(), Some(at(32)));
+    let established = context_core
+        .handle(
+            at(31),
+            ContextInput::MaterializationFinished {
+                result: Ok(ContextMaterialized {
+                    initial_credential_resource: 101,
+                }),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(
+        establishment_decision(&established),
+        (Generation::new(1).unwrap(), active_establishment_decision())
+    );
+    assert_eq!(context_core.next_deadline(), Some(at(32)));
+    let duplicate = context_core
+        .handle(
+            at(31),
+            ContextInput::MaterializationFinished {
+                result: Ok(ContextMaterialized {
+                    initial_credential_resource: 101,
+                }),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(
+        establishment_decision(&duplicate),
+        establishment_decision(&established)
+    );
+    assert_eq!(context_core.next_deadline(), Some(at(32)));
+    let expired = context_core
+        .handle(
+            at(32),
+            ContextInput::MaterializationFinished {
+                result: Ok(ContextMaterialized {
+                    initial_credential_resource: 101,
+                }),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(
+        establishment_decision(&expired),
+        (
+            Generation::new(2).unwrap(),
+            closed_establishment_decision(
+                QueryContextState::Aborting,
+                OperationOutcome::LeaseExpired
+            )
+        )
+    );
+    assert_eq!(context_core.state(), QueryContextState::Aborting);
+    assert!(
+        expired
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ContextEffect::CloseExternalAdmission { .. }))
+    );
+    assert!(!expired.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::EstablishmentDecided {
+            decision: ContextEstablishmentDecision {
+                state: QueryContextState::Active,
+                ..
+            },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_late_first_establishment_reports_expiry_and_cannot_reopen_on_repetition() {
+    let mut context_core = core_with_initial_lease(1, 1, at(2));
+    let mut port = Port::default();
+    for now in [at(32), at(33)] {
+        let closed = context_core
+            .handle(
+                now,
+                ContextInput::MaterializationFinished {
+                    result: Ok(ContextMaterialized {
+                        initial_credential_resource: 101,
+                    }),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(
+            establishment_decision(&closed),
+            (
+                Generation::new(2).unwrap(),
+                closed_establishment_decision(
+                    QueryContextState::Aborting,
+                    OperationOutcome::LeaseExpired
+                )
+            )
+        );
+        assert_eq!(context_core.state(), QueryContextState::Aborting);
+    }
+    assert!(port.calls.is_empty());
+}
+
+#[test]
+fn an_abort_before_establishment_keeps_its_original_closed_outcome() {
+    let mut context_core = core(1, 1);
+    let mut port = Port::default();
+    let aborted = context_core
+        .handle(
+            at(1),
+            ContextInput::Abort {
+                request: operation(2),
+                cause: AbortCause::QueryFailed,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(aborted.charged_work() <= ContextCore::MAX_STEP_WORK);
+    for now in [at(1), at(31)] {
+        let closed = context_core
+            .handle(
+                now,
+                ContextInput::MaterializationFinished {
+                    result: Ok(ContextMaterialized {
+                        initial_credential_resource: 101,
+                    }),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(
+            establishment_decision(&closed),
+            (
+                Generation::new(2).unwrap(),
+                closed_establishment_decision(
+                    QueryContextState::Aborting,
+                    OperationOutcome::ContextTerminalReceipt
+                )
+            )
+        );
+        assert_eq!(context_core.state(), QueryContextState::Aborting);
+    }
+}
+
+#[test]
+fn quiesce_during_materialization_fences_late_establishment_without_inventing_host_exit() {
+    let mut context_core = core(1, 1);
+    let mut port = Port::default();
+    let quiesce = context_core
+        .handle(
+            at(1),
+            ContextInput::Quiesce {
+                request: operation(2),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(quiesce.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert_eq!(context_core.state(), QueryContextState::Quiescing);
+    assert!(
+        quiesce
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ContextEffect::CloseExternalAdmission { .. }))
+    );
+    assert!(
+        quiesce
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ContextEffect::ContinueQuiesce))
+    );
+    assert!(!quiesce.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::Reply { .. }
+            | ContextEffect::QuiesceReply { .. }
+            | ContextEffect::ReleaseHost { .. }
+    )));
+    let waiting = context_core
+        .handle(
+            at(1),
+            ContextInput::Quiesce {
+                request: operation(3),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(waiting.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(waiting.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::WaitQuiesce { request } if *request == operation(3)
+    )));
+    for now in [at(1), at(2)] {
+        let late = context_core
+            .handle(
+                now,
+                ContextInput::MaterializationFinished {
+                    result: Ok(ContextMaterialized {
+                        initial_credential_resource: 101,
+                    }),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(
+            establishment_decision(&late),
+            (
+                Generation::new(1).unwrap(),
+                closed_establishment_decision(
+                    QueryContextState::Quiescing,
+                    OperationOutcome::ContextTerminalReceipt
+                )
+            )
+        );
+        assert_eq!(context_core.state(), QueryContextState::Quiescing);
+        assert!(
+            !late
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
+        );
+    }
+    // Only the existing bounded quiesce continuation may publish its fence
+    // receipt. It is not a materialization rollback or physical host release.
+    let completed = context_core
+        .handle(at(2), ContextInput::ContinueQuiesce, &mut port)
+        .unwrap();
+    assert!(completed.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(completed.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::QuiesceReply { request, outcome: OperationOutcome::Accepted, receipt }
+            if *request == operation(2) && receipt.state() == QueryContextState::Quiescing
+    )));
+    let repeated = context_core
+        .handle(
+            at(2),
+            ContextInput::Quiesce {
+                request: operation(3),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(repeated.charged_work() <= ContextCore::MAX_STEP_WORK);
+    let idempotent = context_core
+        .handle(at(2), ContextInput::ContinueQuiesce, &mut port)
+        .unwrap();
+    assert!(idempotent.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(idempotent.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::QuiesceReply { request, outcome: OperationOutcome::Idempotent, receipt }
+            if *request == operation(3) && receipt.state() == QueryContextState::Quiescing
+    )));
+    for step in [&completed, &repeated, &idempotent] {
+        assert!(
+            !step
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
+        );
+    }
+    assert_eq!(context_core.state(), QueryContextState::Quiescing);
+    assert!(port.calls.is_empty());
+}
+
+#[test]
+fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_order() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    for close_first in [false, true] {
+        let mut control = control();
+        let mut context_core = core(1, 1);
+        let mut port = Port::default();
+        let ticket = grant(&mut control, &mut port);
+        control
+            .handle(
+                at(0),
+                ControlInput::Establish {
+                    request: operation(2),
+                    context: context(),
+                    ticket,
+                    payload: PayloadId(1),
+                    semantics: semantics(),
+                    generation: Generation::new(1).unwrap(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        control
+            .handle(
+                at(1),
+                ControlInput::FenceFrontend {
+                    frontend: context().frontend_process_id(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        let fence = control
+            .handle(at(1), ControlInput::ContinueFence, &mut port)
+            .unwrap();
+        assert!(fence.charged_work() <= control.max_step_work());
+        let close = || ContextInput::Abort {
+            request: operation(3),
+            cause: AbortCause::QueryFailed,
+        };
+        if close_first {
+            context_core.handle(at(1), close(), &mut port).unwrap();
+        }
+        let decided = context_core
+            .handle(
+                at(1),
+                ContextInput::MaterializationFinished {
+                    result: Ok(ContextMaterialized {
+                        initial_credential_resource: 101,
+                    }),
+                },
+                &mut port,
+            )
+            .unwrap();
+        let (_, verdict) = establishment_decision(&decided);
+        assert_eq!(
+            verdict,
+            if close_first {
+                closed_establishment_decision(
+                    QueryContextState::Aborting,
+                    OperationOutcome::ContextTerminalReceipt,
+                )
+            } else {
+                active_establishment_decision()
+            }
+        );
+        if !close_first {
+            context_core.handle(at(1), close(), &mut port).unwrap();
+        }
+
+        let returned = control
+            .handle(
+                at(1),
+                ControlInput::EstablishmentDecided {
+                    context: context(),
+                    decision: verdict,
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(returned.charged_work() <= control.max_step_work());
+        assert_eq!(context_core.state(), QueryContextState::Aborting);
+        assert_eq!(control.route(context()), QueryContextState::Aborting);
+        assert!(!returned.effects.iter().any(|effect| matches!(
+            effect,
+            ControlEffect::Route {
+                state: QueryContextState::Active,
+                ..
+            }
+        )));
+        assert!(returned.effects.iter().any(|effect| matches!(
+            effect,
+            ControlEffect::Reply {
+                outcome: OperationOutcome::ContextTerminalReceipt,
+                ..
+            }
+        )));
+    }
+}
+
 #[test]
 fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materialization() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
@@ -1417,8 +2700,6 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
                 ticket,
                 payload: PayloadId(1),
                 semantics: semantics(),
-                compared_payload: None,
-                same_credential: false,
                 generation: Generation::new(1).unwrap(),
             },
             &mut port,
@@ -1441,9 +2722,9 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
     let materialized = control
         .handle(
             at(2),
-            ControlInput::Materialized {
+            ControlInput::EstablishmentDecided {
                 context: context(),
-                result: Ok(()),
+                decision: active_establishment_decision(),
             },
             &mut port,
         )
@@ -1453,78 +2734,56 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
     assert_eq!(port.calls.len(), 2);
 }
 #[test]
-fn frontend_fence_cannot_be_undone_by_late_materialization_and_replay_compares_exact_establish_facts()
- {
+fn frontend_fence_blocks_late_materialization_and_new_entity_routing() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
-    let mut control = control();
-    let mut port = Port::default();
-    let ticket = grant(&mut control, &mut port);
-    control
-        .handle(
-            at(0),
-            ControlInput::Establish {
-                request: operation(2),
-                context: context(),
-                ticket,
-                payload: PayloadId(1),
-                semantics: semantics(),
-                compared_payload: None,
-                same_credential: false,
-                generation: Generation::new(1).unwrap(),
-            },
-            &mut port,
-        )
-        .unwrap();
-    // A semantic replay mismatch is fatal even if the first request is still materializing.
-    let mut conflict = semantics();
-    conflict.query_options = novarocks_execution_contract::ContentFingerprint::from_bytes([9; 16]);
-    let refused = control
-        .handle(
-            at(0),
-            ControlInput::Establish {
-                request: operation(3),
-                context: context(),
-                ticket,
-                payload: PayloadId(2),
-                semantics: conflict,
-                compared_payload: Some(PayloadId(1)),
-                same_credential: true,
-                generation: Generation::new(1).unwrap(),
-            },
-            &mut port,
-        )
-        .unwrap();
-    assert!(refused.effects.iter().any(|effect| matches!(
-        effect,
-        ControlEffect::Reply {
-            outcome: OperationOutcome::ContextConflict,
-            ..
-        }
-    )));
-    control
+    let mut f = ActiveControlFixture::new(8, 100);
+    let route = f.request(2, 100, active_establish_input(f.ticket, 2));
+    routed_establish_request(&route);
+    f.control
         .handle(
             at(0),
             ControlInput::FenceFrontend {
                 frontend: context().frontend_process_id(),
             },
-            &mut port,
+            &mut f.port,
         )
         .unwrap();
-    control
-        .handle(at(0), ControlInput::ContinueFence, &mut port)
+    f.control
+        .handle(at(0), ControlInput::ContinueFence, &mut f.port)
         .unwrap();
-    assert_eq!(control.route(context()), QueryContextState::Aborting);
-    control
-        .handle(
-            at(0),
-            ControlInput::Materialized {
-                context: context(),
-                result: Ok(()),
-            },
-            &mut port,
-        )
-        .unwrap();
-    assert_eq!(control.route(context()), QueryContextState::Aborting);
+    assert_eq!(f.control.route(context()), QueryContextState::Aborting);
+    let late = f.materialized();
+    assert_eq!(f.control.route(context()), QueryContextState::Aborting);
+    assert!(late.effects.iter().all(|effect| !matches!(
+        effect,
+        ControlEffect::Route {
+            state: QueryContextState::Active,
+            ..
+        }
+    )));
+    f.reject(
+        3,
+        100,
+        active_establish_input(f.ticket, 3),
+        OperationOutcome::Gone,
+    );
+    let completed = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        0,
+        0,
+        Ok(OperationOutcome::InvalidStateOrRequest),
+    );
+    assert_eq!(
+        completed.requests[0].request.token,
+        InputId::new(2).unwrap()
+    );
+    assert_eq!(
+        completed.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::InvalidStateOrRequest)
+    );
+    assert_eq!(f.port.calls.len(), 2);
 }
 #[test]
 fn covered_reconnect_positions_validate_convergence_and_skip_known_context_receipt() {
@@ -2172,95 +3431,85 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
     );
 }
 #[test]
-fn expired_establish_reply_positions_do_not_fill_the_waiter_bound_or_revoke_materialization() {
-    use novarocks_worker_protocol::control::ControlInput;
-    let mut control = control();
-    let mut port = Port::default();
-    let ticket = grant(&mut control, &mut port);
-    let establish = |op: TaskOperationId, replay: bool| ControlInput::Establish {
-        request: op,
-        context: context(),
-        ticket,
-        payload: PayloadId(if replay { 99 } else { 1 }),
-        semantics: semantics(),
-        compared_payload: replay.then_some(PayloadId(1)),
-        same_credential: replay,
-        generation: Generation::new(1).unwrap(),
-    };
-    control
-        .handle_request(
-            at(0),
-            RequestContext {
-                token: InputId::new(1).unwrap(),
-                operation: operation(2),
-                deadline: at(1),
-            },
-            establish(operation(2), false),
-            &mut port,
-        )
+fn expired_establish_routes_do_not_fill_the_request_bound_or_revoke_materialization() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut f = ActiveControlFixture::new(2, 1);
+    let first = f
+        .control
+        .handle(at(1), ControlInput::Tick, &mut f.port)
         .unwrap();
-    control
-        .handle(at(1), ControlInput::Tick, &mut port)
-        .unwrap();
-    for n in 0..13u8 {
-        let now = u64::from(n) + 1;
-        let op = operation(n + 10);
-        let admitted = control
+    assert_eq!(first.requests[0].request.token, InputId::new(1).unwrap());
+    for n in 0..13u64 {
+        let now = n + 1;
+        let routed = f
+            .control
             .handle_request(
                 at(now),
                 RequestContext {
-                    token: InputId::new(u64::from(n) + 2).unwrap(),
-                    operation: op,
+                    token: InputId::new(n + 2).unwrap(),
+                    operation: operation(2),
                     deadline: at(now + 1),
                 },
-                establish(op, true),
-                &mut port,
+                active_establish_input(f.ticket, n + 99),
+                &mut f.port,
             )
             .unwrap();
-        assert!(admitted.requests.is_empty());
-        let timeout = control
-            .handle(at(now + 1), ControlInput::Tick, &mut port)
+        let original = routed_establish_request(&routed).1.request;
+        let timed = f
+            .control
+            .handle(at(now + 1), ControlInput::Tick, &mut f.port)
             .unwrap();
+        assert_eq!(timed.requests[0].request, original);
         assert_eq!(
-            timeout.requests[0].result,
+            timed.requests[0].result,
             RequestResult::TimeoutWhileAccepted
         );
-        assert_eq!(control.route(context()), QueryContextState::Establishing);
+        assert!(timed.effects.iter().any(|effect|matches!(effect,ControlEffect::CancelEstablishRoute{request,..} if *request==original)));
+        assert_eq!(f.control.route(context()), QueryContextState::Establishing);
     }
-    control
+    let route = f
+        .control
         .handle_request(
             at(20),
             RequestContext {
                 token: InputId::new(100).unwrap(),
-                operation: operation(50),
+                operation: operation(2),
                 deadline: at(100),
             },
-            establish(operation(50), true),
-            &mut port,
+            active_establish_input(f.ticket, 100),
+            &mut f.port,
         )
         .unwrap();
-    let materialized = control
+    let materialized = f
+        .control
         .handle(
             at(20),
-            ControlInput::Materialized {
+            ControlInput::EstablishmentDecided {
                 context: context(),
-                result: Ok(()),
+                decision: active_establishment_decision(),
             },
-            &mut port,
+            &mut f.port,
         )
         .unwrap();
-    assert_eq!(materialized.requests.len(), 1);
-    assert_eq!(materialized.requests[0].request.operation, operation(50));
-    assert_eq!(
-        materialized.requests[0].result,
-        RequestResult::Outcome(OperationOutcome::Accepted)
+    assert!(
+        materialized.requests.is_empty(),
+        "the expired creator is not a live routed request"
     );
-    assert_eq!(control.route(context()), QueryContextState::Active);
-    assert_eq!(
-        port.calls.len(),
-        2,
-        "the redeemed ticket and its one context materialization stay owned"
+    let reply = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        20,
+        20,
+        Ok(OperationOutcome::Idempotent),
     );
+    assert_eq!(reply.requests[0].request.token, InputId::new(100).unwrap());
+    assert_eq!(
+        reply.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Idempotent)
+    );
+    assert_eq!(f.control.route(context()), QueryContextState::Active);
+    assert_eq!(f.port.calls.len(), 2);
 }
 #[test]
 fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
@@ -2511,7 +3760,7 @@ fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_b
 }
 #[test]
 fn typed_ticket_capacity_refusal_is_replayed_without_losing_its_failure_facts() {
-    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
     let refusal = inbound_refusal();
     let mut control = control();
     let mut port = Port {
@@ -2546,8 +3795,93 @@ fn typed_ticket_capacity_refusal_is_replayed_without_losing_its_failure_facts() 
             step.requests[0].result,
             RequestResult::Outcome(refusal.outcome())
         );
+        let AdmissionRefusal::Domain(outcome, failure) = &refusal else {
+            unreachable!()
+        };
+        assert_eq!(
+            step.requests[0].body,
+            ControlReplyBody::Domain(novarocks_worker_protocol::context::DomainRefusal {
+                outcome: *outcome,
+                failure: failure.clone()
+            })
+        );
+        assert_eq!(step.requests[0].request.token, InputId::new(token).unwrap());
         port.typed_reject = None;
     }
+    assert_eq!(port.calls.len(), 1);
+}
+#[test]
+fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_the_operation() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
+    let mut control = control();
+    let mut port = Port::default();
+    let request = AcquireQueryContextAdmissionTicket::new(
+        operation(1),
+        context(),
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        control.admission().capability(),
+    );
+    let first = control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(1).unwrap(),
+                operation: operation(1),
+                deadline: at(100),
+            },
+            ControlInput::Acquire {
+                request,
+                ticket: AdmissionTicketId::try_from_bytes([4; 16]).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    let receipt = first
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ControlEffect::AdmissionReply {
+                result: Ok(receipt),
+                ..
+            } => Some(*receipt),
+            _ => None,
+        })
+        .unwrap();
+    // Keep the earlier output unconsumed while the Core decides a conflicting
+    // later input. Neither host order nor a new operation cache is an oracle.
+    let conflicting = AcquireQueryContextAdmissionTicket::new(
+        operation(1),
+        context(),
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([9; 32]),
+        request.admission_epoch_capability(),
+    );
+    let next = control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(2).unwrap(),
+                operation: operation(1),
+                deadline: at(100),
+            },
+            ControlInput::Acquire {
+                request: conflicting,
+                ticket: AdmissionTicketId::try_from_bytes([5; 16]).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(
+        first.requests[0].body,
+        ControlReplyBody::Admission(Ok(receipt))
+    );
+    assert_eq!(
+        next.requests[0].body,
+        ControlReplyBody::Admission(Err(OperationOutcome::DomainConflict))
+    );
+    assert!(first.requests[0].body.matches(first.requests[0].result));
+    assert!(next.requests[0].body.matches(next.requests[0].result));
     assert_eq!(port.calls.len(), 1);
 }
 #[test]
@@ -2603,8 +3937,6 @@ fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection()
                 ticket,
                 payload: PayloadId(1),
                 semantics: semantics(),
-                compared_payload: None,
-                same_credential: false,
                 generation: Generation::new(1).unwrap(),
             },
             &mut port,
@@ -2787,8 +4119,6 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
         ticket,
         payload: PayloadId(payload),
         semantics: semantics(),
-        compared_payload: None,
-        same_credential: false,
         generation: Generation::new(1).unwrap(),
     };
     for (token, op, identity, ticket, payload) in [
@@ -2846,9 +4176,9 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
             control
                 .handle(
                     at(0),
-                    ControlInput::Materialized {
+                    ControlInput::EstablishmentDecided {
                         context: identity,
-                        result: Ok(()),
+                        decision: active_establishment_decision(),
                     },
                     &mut port,
                 )
@@ -2905,8 +4235,6 @@ fn physically_retained_context_returns_the_active_ticket_before_metadata_evictio
                 ticket,
                 payload: PayloadId(1),
                 semantics: semantics(),
-                compared_payload: None,
-                same_credential: false,
                 generation: Generation::new(1).unwrap(),
             },
             &mut port,
@@ -2915,9 +4243,9 @@ fn physically_retained_context_returns_the_active_ticket_before_metadata_evictio
     control
         .handle(
             at(1),
-            ControlInput::Materialized {
+            ControlInput::EstablishmentDecided {
                 context: context(),
-                result: Ok(()),
+                decision: active_establishment_decision(),
             },
             &mut port,
         )
@@ -3016,5 +4344,3055 @@ fn physically_retained_context_returns_the_active_ticket_before_metadata_evictio
         vec![ControlEffect::RetireReservation(
             ReservationId::new(2).unwrap()
         )]
+    );
+}
+
+#[test]
+fn succeeded_proposal_requires_actual_stop_and_complete_output_before_handoff() {
+    use novarocks_worker_protocol::context::CoreError;
+    let mut core = core(4, 1);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    create(&mut core, &mut port, 1);
+    loaded(&mut core, &mut port, 1);
+    for complete_output in [false, true] {
+        core.handle(
+            at(0),
+            ContextInput::OutputFacts {
+                task: task(1),
+                facts: TaskOutputFacts::new(complete_output),
+            },
+            &mut port,
+        )
+        .unwrap();
+        assert_eq!(
+            core.handle(
+                at(0),
+                ContextInput::Proposal {
+                    task: task(1),
+                    proposal: proposal(TaskConclusion::Succeeded),
+                },
+                &mut port
+            )
+            .unwrap_err(),
+            CoreError::IllegalFact
+        );
+        assert!(core.task(task(1)).unwrap().conclusion.accepted.is_none());
+        assert!(!core.task(task(1)).unwrap().actual_stopped);
+    }
+    let stopped = core
+        .handle(
+            at(0),
+            ContextInput::Physical {
+                task: task(1),
+                fact: PhysicalFact::ActualStopped,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(stopped.charged_work() <= ContextCore::MAX_STEP_WORK);
+    let accepted = core
+        .handle(
+            at(0),
+            ContextInput::Proposal {
+                task: task(1),
+                proposal: proposal(TaskConclusion::Succeeded),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(accepted.charged_work() <= ContextCore::MAX_STEP_WORK);
+    core.handle(at(0), ContextInput::Adjudicate { task: task(1) }, &mut port)
+        .unwrap();
+    assert_eq!(
+        core.task(task(1)).unwrap().conclusion.accepted,
+        Some(TaskConclusion::Succeeded)
+    );
+}
+
+fn completion_fixture() -> (ContextCore, Port) {
+    let mut core = core(4, 1);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    create(&mut core, &mut port, 1);
+    loaded(&mut core, &mut port, 1);
+    for input in [
+        ContextInput::Installed { task: task(1) },
+        ContextInput::Running { task: task(1) },
+    ] {
+        completion_step(&mut core, &mut port, input);
+    }
+    (core, port)
+}
+fn completion_step(
+    core: &mut ContextCore,
+    port: &mut Port,
+    input: ContextInput,
+) -> novarocks_worker_protocol::context::ContextStep {
+    let label = format!("{input:?}");
+    let step = core.handle(at(0), input, port).unwrap();
+    assert!(
+        step.charged_work() <= ContextCore::MAX_STEP_WORK,
+        "{label}: actual charged work {} exceeds {}: {:?}",
+        step.charged_work(),
+        ContextCore::MAX_STEP_WORK,
+        step.effects
+    );
+    step
+}
+fn completion_failure(source: u64) -> Proposal {
+    use novarocks_execution_contract::{
+        SafeDetail, TaskFailure,
+        failure::{FailureClass, FailureEvidence, FailureFact, FailureReason, domain},
+    };
+    use novarocks_worker_protocol::proposal_summary::SourceId;
+    Proposal {
+        conclusion: TaskConclusion::Terminated(TerminationDetail::Failed(TaskFailure::new(
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::EXECUTION, std::num::NonZeroU16::new(51).unwrap()),
+            ),
+            SafeDetail::truncating("original completion failure"),
+        ))),
+        evidence: Some(FailureEvidence::Originating),
+        source: Some(SourceId(source)),
+        diagnostic: None,
+    }
+}
+
+#[test]
+fn completion_intent_waits_for_the_original_action_and_fact_exit_without_waiting_for_preparation() {
+    let (mut core, mut port) = completion_fixture();
+    let admitted = port.calls.len();
+    let intent = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: Some(TaskOutputFacts::new(true)),
+        },
+    );
+    assert!(intent.effects.is_empty());
+    let record = core.task(task(1)).unwrap();
+    assert!(record.completion_success_pending);
+    assert!(record.conclusion.accepted.is_none());
+    assert!(!record.actual_stopped);
+    assert!(!record.resources_converged);
+    assert!(!record.preparation_body_exited);
+    assert!(!record.preparation_exited);
+    let exited = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Finished);
+    assert_eq!(record.conclusion.accepted, Some(TaskConclusion::Succeeded));
+    assert!(record.actual_stopped && record.resources_converged);
+    assert!(!record.completion_success_pending);
+    assert!(!record.preparation_exited);
+    assert!(!record.output_released && !record.root_idle);
+    assert!(
+        !exited
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ContextEffect::RetireTask { .. }))
+    );
+    let published = record.published.clone();
+    assert!(
+        completion_step(
+            &mut core,
+            &mut port,
+            ContextInput::CompletionExited { task: task(1) }
+        )
+        .effects
+        .is_empty()
+    );
+    assert_eq!(core.task(task(1)).unwrap().published, published);
+    assert_eq!(
+        port.calls.len(),
+        admitted,
+        "completion uses originally admitted responsibility"
+    );
+}
+
+#[test]
+fn completion_exit_can_precede_success_intent_and_later_output_facts_close_it() {
+    use novarocks_worker_protocol::context::CoreError;
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    assert!(core.task(task(1)).unwrap().conclusion.accepted.is_none());
+    assert_eq!(
+        core.handle(
+            at(0),
+            ContextInput::Proposal {
+                task: task(1),
+                proposal: proposal(TaskConclusion::Succeeded),
+            },
+            &mut port
+        )
+        .unwrap_err(),
+        CoreError::IllegalFact,
+        "actual stop still does not grant missing output responsibility",
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    assert!(core.task(task(1)).unwrap().completion_success_pending);
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Running);
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::OutputFacts {
+            task: task(1),
+            facts: TaskOutputFacts::new(true),
+        },
+    );
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Finished);
+    assert!(!core.task(task(1)).unwrap().preparation_exited);
+}
+
+#[test]
+fn a_true_actual_stop_fact_closes_the_intent_without_inventing_resource_convergence() {
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: Some(TaskOutputFacts::new(true)),
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Physical {
+            task: task(1),
+            fact: PhysicalFact::ActualStopped,
+        },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Finished);
+    assert!(record.actual_stopped);
+    assert!(!record.resources_converged);
+}
+
+#[test]
+fn the_last_original_publication_hold_retries_success_without_waiting_for_whole_preparation() {
+    use novarocks_worker_protocol::context::PreparationExitRole;
+    let (mut core, mut port) = completion_fixture();
+    for role in [
+        PreparationExitRole::Admission,
+        PreparationExitRole::Preparation,
+    ] {
+        completion_step(
+            &mut core,
+            &mut port,
+            ContextInput::PreparationExitHold {
+                task: task(1),
+                role,
+                held: true,
+            },
+        );
+    }
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: Some(TaskOutputFacts::new(true)),
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Physical {
+            task: task(1),
+            fact: PhysicalFact::PreparationBodyExited,
+        },
+    );
+    assert!(core.task(task(1)).unwrap().runtime_actual_stopped_received);
+    assert!(!core.task(task(1)).unwrap().actual_stopped);
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::PreparationExitHold {
+            task: task(1),
+            role: PreparationExitRole::Admission,
+            held: false,
+        },
+    );
+    assert!(core.task(task(1)).unwrap().conclusion.accepted.is_none());
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::PreparationExitHold {
+            task: task(1),
+            role: PreparationExitRole::Preparation,
+            held: false,
+        },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Finished);
+    assert!(record.actual_stopped && record.resources_converged);
+    assert!(!record.preparation_exited);
+}
+
+#[test]
+fn successful_root_production_waits_for_output_and_drain_reply_follows_the_terminal_publication() {
+    use novarocks_worker_protocol::context::RootDrainVerdict;
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Flushing { task: task(1) },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Flushing);
+    assert!(core.task(task(1)).unwrap().completion_success_pending);
+    let drained = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::RootDrained {
+            request: operation(10),
+            task: task(1),
+        },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Finished);
+    let terminal = drained.effects.iter().position(|effect| matches!(effect,
+        ContextEffect::PublishTask { state: TaskState::Finished, snapshot, .. } if snapshot.output().responsibility_complete())).unwrap();
+    let reply = drained.effects.iter().position(|effect| matches!(effect,
+        ContextEffect::RootDrainReply { result: RootDrainVerdict::Published(version), .. } if *version == record.version)).unwrap();
+    assert!(terminal < reply);
+    assert!(record.output.responsibility_complete());
+    assert!(
+        !record.output_released,
+        "consumer ACK is separate from output ownership release"
+    );
+}
+
+#[test]
+fn a_cancellation_between_success_intent_and_exit_keeps_its_conclusion_and_independent_output() {
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: Some(TaskOutputFacts::new(true)),
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Cancel {
+            request: operation(10),
+            task: task(1),
+            reason: CancelReason::UpstreamNoLongerNeeded,
+        },
+    );
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Canceling);
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Canceled);
+    assert!(record.output.responsibility_complete());
+    assert!(!record.completion_success_pending);
+}
+
+#[test]
+fn a_stopped_root_success_intent_is_completed_as_the_later_cancellation_without_drain() {
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Running);
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Cancel {
+            request: operation(10),
+            task: task(1),
+            reason: CancelReason::UpstreamNoLongerNeeded,
+        },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Canceled);
+    assert!(!record.output.responsibility_complete());
+    assert!(!record.completion_success_pending);
+}
+
+#[test]
+fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and_cannot_refine_after_sealing()
+ {
+    use novarocks_worker_protocol::proposal_summary::{ProposalSummary, SourceId};
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Proposal {
+            task: task(1),
+            proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Aborted(
+                AbortCause::PeerTaskFailed,
+            ))),
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Adjudicate { task: task(1) },
+    );
+    let first = completion_failure(17);
+    let expected = first.conclusion.clone();
+    let mut summary = ProposalSummary::default();
+    summary.push(first);
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Summary {
+            task: task(1),
+            generation: Generation::new(1).unwrap(),
+            cut: None,
+            summary,
+        },
+    );
+    assert_eq!(
+        core.task(task(1)).unwrap().conclusion.source,
+        Some(SourceId(17))
+    );
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Failing);
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Failed);
+    assert_eq!(
+        core.task(task(1)).unwrap().conclusion.accepted,
+        Some(expected.clone())
+    );
+    let mut late = ProposalSummary::default();
+    late.push(completion_failure(18));
+    let discarded = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Summary {
+            task: task(1),
+            generation: Generation::new(1).unwrap(),
+            cut: None,
+            summary: late,
+        },
+    );
+    assert!(discarded.effects.contains(&ContextEffect::DisposeSource {
+        task: task(1),
+        source: SourceId(18)
+    }));
+    assert_eq!(
+        core.task(task(1)).unwrap().conclusion.source,
+        Some(SourceId(17))
+    );
+    assert_eq!(
+        core.task(task(1)).unwrap().conclusion.accepted,
+        Some(expected)
+    );
+}
+
+#[test]
+fn both_predecessor_summaries_are_adjudicated_before_a_pending_completion_can_seal_the_result() {
+    use novarocks_worker_protocol::proposal_summary::{ProposalSummary, SourceId};
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Proposal {
+            task: task(1),
+            proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Aborted(
+                AbortCause::PeerTaskFailed,
+            ))),
+        },
+    );
+    let mut summary = ProposalSummary::default();
+    summary.push(completion_failure(19));
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Summary {
+            task: task(1),
+            generation: Generation::new(1).unwrap(),
+            cut: None,
+            summary,
+        },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Failed);
+    assert_eq!(record.conclusion.source, Some(SourceId(19)));
+    assert_eq!(record.conclusion.generation, 2);
+}
+
+#[test]
+fn finishing_a_prior_termination_clears_the_waiting_intent_and_late_success_never_reopens_it() {
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Cancel {
+            request: operation(10),
+            task: task(1),
+            reason: CancelReason::UpstreamNoLongerNeeded,
+        },
+    );
+    completion_step(&mut core, &mut port, ContextInput::Finish { task: task(1) });
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Canceled);
+    assert!(!core.task(task(1)).unwrap().actual_stopped);
+    assert!(!core.task(task(1)).unwrap().completion_success_pending);
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    assert_eq!(core.task(task(1)).unwrap().state, TaskState::Canceled);
+}
+
+#[test]
+fn completion_intent_rejects_unowned_uninstalled_or_incomplete_positive_output_facts() {
+    use novarocks_worker_protocol::context::CoreError;
+    let mut core = core(4, 1);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    create(&mut core, &mut port, 1);
+    for input in [
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+        ContextInput::CompletionExited { task: task(1) },
+    ] {
+        assert_eq!(
+            core.handle(at(0), input, &mut port).unwrap_err(),
+            CoreError::IllegalFact
+        );
+    }
+    loaded(&mut core, &mut port, 1);
+    assert_eq!(
+        core.handle(
+            at(0),
+            ContextInput::CompletionIntent {
+                task: task(1),
+                completed_output: None
+            },
+            &mut port
+        )
+        .unwrap_err(),
+        CoreError::IllegalFact
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Installed { task: task(1) },
+    );
+    assert_eq!(
+        core.handle(
+            at(0),
+            ContextInput::CompletionIntent {
+                task: task(1),
+                completed_output: Some(TaskOutputFacts::new(false))
+            },
+            &mut port
+        )
+        .unwrap_err(),
+        CoreError::IllegalFact
+    );
+    assert!(!core.task(task(1)).unwrap().completion_success_pending);
+    assert!(core.task(task(1)).unwrap().conclusion.accepted.is_none());
+}
+
+#[test]
+fn completion_summary_with_lease_expiry_source_release_and_task_retirement_stays_in_the_fifteen_unit_budget()
+ {
+    use novarocks_execution_contract::failure::FailureEvidence;
+    use novarocks_worker_protocol::proposal_summary::ProposalSummary;
+    let candidate = |kind, source| match kind {
+        0 => None,
+        1 => Some(proposal(TaskConclusion::Terminated(
+            TerminationDetail::Aborted(AbortCause::PeerTaskFailed),
+        ))),
+        2 => Some(proposal(TaskConclusion::Terminated(
+            TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+        ))),
+        3 => Some(completion_failure(source)),
+        4 => {
+            let mut failure = completion_failure(source);
+            failure.evidence = Some(FailureEvidence::StopObservation);
+            Some(failure)
+        }
+        _ => unreachable!(),
+    };
+    let mut maximum = 0;
+    for a in 0..5 {
+        for b in 0..5 {
+            for c in 0..5 {
+                for d in 0..5 {
+                    let (mut core, mut port) = completion_fixture();
+                    completion_step(
+                        &mut core,
+                        &mut port,
+                        ContextInput::CompletionIntent {
+                            task: task(1),
+                            completed_output: None,
+                        },
+                    );
+                    completion_step(
+                        &mut core,
+                        &mut port,
+                        ContextInput::CompletionExited { task: task(1) },
+                    );
+                    for fact in [
+                        PhysicalFact::LoaderExited,
+                        PhysicalFact::PreparationBodyExited,
+                        PhysicalFact::PreparationExited,
+                        PhysicalFact::OutputReleased,
+                        PhysicalFact::RootIdle,
+                    ] {
+                        completion_step(
+                            &mut core,
+                            &mut port,
+                            ContextInput::Physical {
+                                task: task(1),
+                                fact,
+                            },
+                        );
+                    }
+                    for (kind, source) in [(a, 1), (b, 2)] {
+                        if let Some(proposal) = candidate(kind, source) {
+                            completion_step(
+                                &mut core,
+                                &mut port,
+                                ContextInput::Proposal {
+                                    task: task(1),
+                                    proposal,
+                                },
+                            );
+                        }
+                    }
+                    let mut summary = ProposalSummary::default();
+                    for (kind, source) in [(c, 3), (d, 4)] {
+                        if let Some(proposal) = candidate(kind, source) {
+                            summary.push(proposal);
+                        }
+                    }
+                    let step = core
+                        .handle(
+                            at(31),
+                            ContextInput::Summary {
+                                task: task(1),
+                                generation: Generation::new(1).unwrap(),
+                                cut: None,
+                                summary,
+                            },
+                            &mut port,
+                        )
+                        .unwrap();
+                    maximum = maximum.max(step.charged_work());
+                    assert!(
+                        step.charged_work() <= ContextCore::MAX_STEP_WORK,
+                        "candidate sequence {a},{b},{c},{d} charges {}: {:?}",
+                        step.charged_work(),
+                        step.effects
+                    );
+                    let record = core.task(task(1)).unwrap();
+                    if a + b + c + d != 0 {
+                        assert!(record.state.is_terminal());
+                        assert_eq!(
+                            record.phase,
+                            novarocks_worker_protocol::task::CreationPhase::Retained
+                        );
+                        assert!(!record.completion_success_pending);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        maximum >= 10,
+        "the matrix reaches combined publication and source-release work"
+    );
+}
+
+#[test]
+fn task_close_retries_a_stopped_pending_success_as_the_existing_abort() {
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Abort {
+            request: operation(10),
+            cause: AbortCause::PeerTaskFailed,
+        },
+    );
+    completion_step(&mut core, &mut port, ContextInput::ContinueClose);
+    let closed = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::ApplyTaskClose {
+            task: task(1),
+            generation: Generation::new(2).unwrap(),
+        },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Aborted);
+    assert!(!record.completion_success_pending);
+    assert!(!record.output.responsibility_complete());
+    assert!(closed.effects.iter().any(|effect| matches!(
+        effect,
+        ContextEffect::PublishTask {
+            state: TaskState::Aborted,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abort() {
+    use novarocks_worker_protocol::context::RootDrainVerdict;
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: None,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Proposal {
+            task: task(1),
+            proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Aborted(
+                AbortCause::PeerTaskFailed,
+            ))),
+        },
+    );
+    let drained = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::RootDrained {
+            task: task(1),
+            request: operation(10),
+        },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Aborted);
+    assert!(
+        record.published.output().responsibility_complete(),
+        "the same operation's positive output must be in its terminal publication"
+    );
+    assert!(
+        matches!(drained.effects.last(), Some(ContextEffect::RootDrainReply {
+        result: RootDrainVerdict::Published(version), ..
+    }) if *version == record.version)
+    );
+}
+
+#[test]
+fn one_finish_with_output_event_preserves_its_causal_failure_source_and_positive_output_without_claiming_exit()
+ {
+    use novarocks_worker_protocol::proposal_summary::SourceId;
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Proposal {
+            task: task(1),
+            proposal: completion_failure(77),
+        },
+    );
+    let finish = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::FinishWithOutput {
+            task: task(1),
+            output: Some(TaskOutputFacts::new(true)),
+        },
+    );
+    let record = core.task(task(1)).unwrap();
+    assert_eq!(record.state, TaskState::Failed);
+    assert_eq!(record.conclusion.source, Some(SourceId(77)));
+    assert!(record.published.output().responsibility_complete());
+    assert!(!record.actual_stopped && !record.resources_converged && !record.output_released);
+    assert!(matches!(
+        finish.effects.last(),
+        Some(ContextEffect::PublishTask {
+            state: TaskState::Failed,
+            ..
+        })
+    ));
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::FinishWithOutput {
+            task: task(1),
+            output: None,
+        },
+    );
+    assert!(
+        core.task(task(1)).unwrap().output.responsibility_complete(),
+        "absence of new output evidence cannot revoke a completed handoff"
+    );
+}
+
+#[test]
+fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
+    use novarocks_worker_protocol::context::PreparationExitRole;
+    let (mut core, mut port) = completion_fixture();
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::PreparationExitHold {
+            task: task(1),
+            role: PreparationExitRole::Preparation,
+            held: true,
+        },
+    );
+    let released = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Physical {
+            task: task(1),
+            fact: PhysicalFact::OutputReleased,
+        },
+    );
+    let released_snapshot = released
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::PublishTaskConvergence {
+                version, snapshot, ..
+            } => {
+                assert_eq!(*version, snapshot.version());
+                Some(*snapshot)
+            }
+            _ => None,
+        })
+        .expect("an independent output release publishes even under a preparation hold");
+    assert!(released_snapshot.output_released());
+    assert!(!released_snapshot.actual_stopped());
+    assert_eq!(
+        released
+            .effects
+            .iter()
+            .filter(|e| matches!(e, ContextEffect::PublishTaskConvergence { .. }))
+            .count(),
+        1
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: Some(TaskOutputFacts::new(true)),
+        },
+    );
+    let deferred_exit = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    assert!(
+        !deferred_exit
+            .effects
+            .iter()
+            .any(|e| matches!(e, ContextEffect::PublishTaskConvergence { .. }))
+    );
+    let terminal = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::PreparationExitHold {
+            task: task(1),
+            role: PreparationExitRole::Preparation,
+            held: false,
+        },
+    );
+    let actual_exit = terminal
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::PublishTaskConvergence {
+                version, snapshot, ..
+            } => {
+                assert_eq!(*version, snapshot.version());
+                Some(*snapshot)
+            }
+            _ => None,
+        })
+        .expect("the real exit publishes the applied receipts");
+    assert!(
+        actual_exit.actual_stopped()
+            && actual_exit.resources_converged()
+            && actual_exit.output_released()
+    );
+    assert!(!actual_exit.conclusion_stable());
+    assert!(actual_exit.version() > released_snapshot.version());
+    let stable = terminal
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::PublishTask {
+                state: TaskState::Finished,
+                convergence,
+                ..
+            } => Some(*convergence),
+            _ => None,
+        })
+        .expect("the actual terminal publication carries its final neutral convergence");
+    assert!(stable.conclusion_stable() && stable.retirement_ready());
+    assert!(stable.version() > actual_exit.version());
+    for fact in [
+        PhysicalFact::LoaderExited,
+        PhysicalFact::PreparationBodyExited,
+        PhysicalFact::PreparationExited,
+    ] {
+        completion_step(
+            &mut core,
+            &mut port,
+            ContextInput::Physical {
+                task: task(1),
+                fact,
+            },
+        );
+    }
+    let retired = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Physical {
+            task: task(1),
+            fact: PhysicalFact::RootIdle,
+        },
+    );
+    let final_snapshot = retired
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::RetireTask { convergence, .. } => Some(*convergence),
+            _ => None,
+        })
+        .expect("actual retirement publishes the final monotonic view");
+    assert!(final_snapshot.retired());
+    assert!(!final_snapshot.retirement_ready());
+    assert!(final_snapshot.version() > stable.version());
+    assert_eq!(
+        final_snapshot,
+        core.task(task(1)).unwrap().convergence.snapshot()
+    );
+}
+
+#[test]
+fn summary_consumed_contains_the_actual_bounded_diagnostics_author_view() {
+    use novarocks_execution_contract::{
+        SafeDetail, TaskFailurePhase,
+        failure::{FailureClass, FailureFact, FailureReason, domain},
+    };
+    use novarocks_worker_protocol::proposal_summary::{Diagnostic, ProposalSummary};
+    let (mut core, mut port) = completion_fixture();
+    let mut summary = ProposalSummary::default();
+    for i in 0..7 {
+        summary.cleanup(Diagnostic {
+            phase: TaskFailurePhase::Execution,
+            fact: FailureFact::new(
+                FailureClass::Unexpected,
+                FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(60001).unwrap()),
+            ),
+            detail: SafeDetail::truncating(&format!("cleanup {i}")),
+            cleanup: true,
+        });
+    }
+    let consumed = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::Summary {
+            task: task(1),
+            generation: Generation::new(1).unwrap(),
+            cut: None,
+            summary,
+        },
+    );
+    let actual = consumed
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::SummaryConsumed { diagnostics, .. } => Some(diagnostics),
+            _ => None,
+        })
+        .expect("the existing summary receipt carries the author's bounded view");
+    assert_eq!(actual, &core.task(task(1)).unwrap().diagnostics);
+    assert_eq!(actual.entries.len(), 4);
+    assert_eq!(actual.dropped, 3);
+}
+
+#[test]
+fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in_frozen_final_info()
+{
+    use novarocks_execution_contract::{OperatorStatistics, SafeDetail};
+    let (mut core, mut port) = completion_fixture();
+    let statistics = |rows| {
+        vec![OperatorStatistics::new(1, SafeDetail::truncating("scan")).with_output_rows(rows)]
+    };
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::OperatorStatistics {
+            task: task(1),
+            statistics: statistics(10),
+            truncated: true,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::OperatorStatistics {
+            task: task(1),
+            statistics: statistics(2),
+            truncated: false,
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionIntent {
+            task: task(1),
+            completed_output: Some(TaskOutputFacts::new(true)),
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::CompletionExited { task: task(1) },
+    );
+    let read = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::GetFinalInfo {
+            request: operation(11),
+            task: task(1),
+        },
+    );
+    let info = read
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::FinalInfoReply { info, .. } => Some(info),
+            _ => None,
+        })
+        .expect("real final information is frozen at the terminal publication");
+    assert_eq!(
+        info.operator_statistics(),
+        statistics(2),
+        "complete operator snapshots replace previous counters; they are not deltas"
+    );
+    assert!(
+        info.operator_statistics_truncated(),
+        "a later short snapshot cannot erase already observed truncation"
+    );
+    // Late producer observations cannot rewrite the immutable final export.
+    completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::OperatorStatistics {
+            task: task(1),
+            statistics: statistics(99),
+            truncated: false,
+        },
+    );
+    let reread = completion_step(
+        &mut core,
+        &mut port,
+        ContextInput::GetFinalInfo {
+            request: operation(12),
+            task: task(1),
+        },
+    );
+    let later = reread
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::FinalInfoReply { info, .. } => Some(info),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(later, info);
+}
+
+fn selector_context(query: u64, frontend: u8) -> QueryContextRef {
+    QueryContextRef::new(
+        QueryExecutionId::new(
+            QueryId::new(
+                i64::try_from(query).unwrap(),
+                i64::try_from(query + 1).unwrap(),
+            ),
+            AttemptId::new(1).unwrap(),
+        )
+        .unwrap(),
+        FrontendProcessId::try_from_bytes(bytes(frontend)).unwrap(),
+        context().backend_process_id(),
+    )
+}
+
+fn selector_grant(
+    control: &mut novarocks_worker_protocol::control::ControlCore,
+    port: &mut Port,
+    context: QueryContextRef,
+    base: u8,
+    valid_for: u64,
+) -> AdmissionTicketId {
+    use novarocks_worker_protocol::control::ControlInput;
+    let ticket = AdmissionTicketId::try_from_bytes([base; 16]).unwrap();
+    let request = AcquireQueryContextAdmissionTicket::new(
+        operation(base),
+        context,
+        LeaseValidFor::new(Duration::from_secs(valid_for)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        control.admission().capability(),
+    );
+    let granted = control
+        .handle(at(0), ControlInput::Acquire { request, ticket }, port)
+        .unwrap();
+    assert!(granted.charged_work() <= control.max_step_work());
+    ticket
+}
+
+fn selector_establish(
+    control: &mut novarocks_worker_protocol::control::ControlCore,
+    port: &mut Port,
+    context: QueryContextRef,
+    base: u8,
+) -> novarocks_worker_protocol::control::ControlStep {
+    use novarocks_worker_protocol::control::ControlInput;
+    let ticket = selector_grant(control, port, context, base, 5);
+    let step = control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(u64::from(base) * 10 + 1).unwrap(),
+                operation: operation(base + 1),
+                deadline: at(100),
+            },
+            ControlInput::Establish {
+                request: operation(base + 1),
+                context,
+                ticket,
+                payload: PayloadId(u64::from(base)),
+                semantics: semantics(),
+                generation: Generation::new(1).unwrap(),
+            },
+            port,
+        )
+        .unwrap();
+    assert!(step.requests.is_empty());
+    assert!(step.charged_work() <= control.max_step_work());
+    step
+}
+
+#[test]
+fn next_internal_fairly_services_fences_and_due_maintenance_without_taking_routed_replies() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut control = control();
+    let mut port = Port::default();
+    let contexts = [selector_context(8101, 1), selector_context(8201, 1)];
+    let mut routes = Vec::new();
+    for (index, identity) in contexts.into_iter().enumerate() {
+        let base = 10 + index as u8 * 10;
+        selector_establish(&mut control, &mut port, identity, base);
+        let replay = control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(u64::from(base) * 10 + 2).unwrap(),
+                    operation: operation(base + 1),
+                    deadline: at(100),
+                },
+                ControlInput::Establish {
+                    request: operation(base + 1),
+                    context: identity,
+                    ticket: AdmissionTicketId::try_from_bytes([base; 16]).unwrap(),
+                    payload: PayloadId(999),
+                    semantics: semantics(),
+                    generation: Generation::new(1).unwrap(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        routed_establish_request(&replay);
+        routes.push(replay);
+    }
+    control
+        .handle(
+            at(0),
+            ControlInput::FenceFrontend {
+                frontend: contexts[0].frontend_process_id(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    selector_grant(&mut control, &mut port, selector_context(8301, 2), 30, 1);
+    let due_reservation = ReservationId::new(port.next).unwrap();
+    let calls = port.calls.len();
+    let mut steps = Vec::new();
+    for _ in 0..16 {
+        let next = control
+            .handle(at(1), ControlInput::NextInternal, &mut port)
+            .unwrap();
+        assert!(
+            next.charged_work() + usize::from(control.has_internal_work())
+                <= control.max_step_work()
+        );
+        assert!(
+            next.requests.is_empty(),
+            "the selector cannot decide a pending routed R"
+        );
+        steps.push(next);
+        if !control.has_internal_work() {
+            break;
+        }
+    }
+    assert!(!control.has_internal_work());
+    let retire_position=steps.iter().position(|step|step.effects.iter().any(|effect|matches!(effect,ControlEffect::RetireReservation(id) if *id==due_reservation))).unwrap();
+    assert!(
+        retire_position < 4,
+        "due maintenance gets a turn while the fence still has members"
+    );
+    for identity in contexts {
+        assert_eq!(steps.iter().flat_map(|step|&step.effects).filter(|effect|matches!(effect,ControlEffect::AbortContext {context,..} if *context==identity)).count(),1);
+    }
+    for route in &routes {
+        let reply = finish_routed_establish(
+            &mut control,
+            &mut port,
+            route,
+            1,
+            1,
+            Ok(OperationOutcome::InvalidStateOrRequest),
+        );
+        assert_eq!(reply.requests.len(), 1);
+        assert_eq!(
+            reply.requests[0].request,
+            routed_establish_request(route).1.request
+        );
+    }
+    assert_eq!(port.calls.len(), calls);
+    for _ in 0..3 {
+        let idle = control
+            .handle(at(1), ControlInput::NextInternal, &mut port)
+            .unwrap();
+        assert!(idle.effects.is_empty());
+        assert!(idle.requests.is_empty());
+        assert!(!control.has_internal_work());
+    }
+}
+
+#[test]
+fn a_routed_deadline_cancels_only_that_route_without_a_reply_selector_loop() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut f = ActiveControlFixture::new(4, 100);
+    let route = f.request(2, 1, active_establish_input(f.ticket, 2));
+    let original = routed_establish_request(&route).1.request;
+    let timed = f
+        .control
+        .handle(at(1), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert_eq!(timed.requests.len(), 1);
+    assert_eq!(timed.requests[0].request, original);
+    assert_eq!(
+        timed.requests[0].result,
+        RequestResult::TimeoutWhileAccepted
+    );
+    assert_eq!(timed.effects.iter().filter(|effect|matches!(effect,ControlEffect::CancelEstablishRoute{context:target,request} if *target==context() && *request==original)).count(),1);
+    assert!(!f.control.has_internal_work());
+    let idle = f
+        .control
+        .handle(at(1), ControlInput::NextInternal, &mut f.port)
+        .unwrap();
+    assert!(idle.effects.is_empty());
+    assert!(idle.requests.is_empty());
+    let late = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        1,
+        0,
+        Ok(OperationOutcome::Idempotent),
+    );
+    assert!(late.requests.is_empty());
+    assert_eq!(f.control.route(context()), QueryContextState::Establishing);
+}
+
+#[test]
+fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut control = control();
+    let mut port = Port::default();
+    let contexts = [
+        selector_context(9101, 3),
+        selector_context(9201, 3),
+        selector_context(9301, 4),
+    ];
+    for (i, context) in contexts.into_iter().enumerate() {
+        let base = 40 + i as u8 * 3;
+        let ticket = selector_grant(&mut control, &mut port, context, base, 5);
+        control
+            .handle(
+                at(0),
+                ControlInput::Establish {
+                    request: operation(base + 1),
+                    context,
+                    ticket,
+                    payload: PayloadId(u64::from(base)),
+                    semantics: semantics(),
+                    generation: Generation::new(1).unwrap(),
+                },
+                &mut port,
+            )
+            .unwrap();
+    }
+    // Both ordinary FE loss facts can arrive before the first scan starts.
+    for frontend in [
+        contexts[0].frontend_process_id(),
+        contexts[2].frontend_process_id(),
+    ] {
+        let queued = control
+            .handle(at(0), ControlInput::FenceFrontend { frontend }, &mut port)
+            .unwrap();
+        assert_eq!(queued.effects, vec![ControlEffect::ContinueFence]);
+        assert!(queued.charged_work() <= control.max_step_work());
+    }
+    let mut effects = Vec::new();
+    for _ in 0..8 {
+        let duplicate = control
+            .handle(
+                at(0),
+                ControlInput::FenceFrontend {
+                    frontend: contexts[0].frontend_process_id(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(duplicate.effects.is_empty());
+        if !control.has_internal_work() {
+            break;
+        }
+        let step = control
+            .handle(at(0), ControlInput::NextInternal, &mut port)
+            .unwrap();
+        assert!(
+            step.charged_work() + usize::from(control.has_internal_work())
+                <= control.max_step_work()
+        );
+        effects.extend(step.effects);
+    }
+    assert!(!control.has_internal_work());
+    for (i, context) in contexts.into_iter().enumerate() {
+        assert_eq!(control.route(context), QueryContextState::Aborting);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect,
+                    ControlEffect::AbortContext { context: original, generation }
+                        if *original == context && *generation == Generation::new(2).unwrap()
+                ))
+                .count(),
+            1
+        );
+        let materialized = control
+            .handle(
+                at(0),
+                ControlInput::EstablishmentDecided {
+                    context,
+                    decision: active_establishment_decision(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(materialized.effects.iter().any(|effect| matches!(effect,
+            ControlEffect::Reply { request, outcome: OperationOutcome::ContextTerminalReceipt }
+                if *request == operation(41 + i as u8 * 3)
+        )));
+        assert_eq!(control.route(context), QueryContextState::Aborting);
+        assert!(materialized.charged_work() <= control.max_step_work());
+    }
+    let calls = port.calls.len();
+    let refused_context = selector_context(9401, 4);
+    let request = AcquireQueryContextAdmissionTicket::new(
+        operation(60),
+        refused_context,
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        control.admission().capability(),
+    );
+    let refused = control
+        .handle(
+            at(0),
+            ControlInput::Acquire {
+                request,
+                ticket: AdmissionTicketId::try_from_bytes([60; 16]).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(refused.effects.iter().any(|effect| matches!(
+        effect,
+        ControlEffect::AdmissionReply {
+            result: Err(OperationOutcome::Gone),
+            ..
+        }
+    )));
+    assert_eq!(port.calls.len(), calls);
+}
+
+#[test]
+fn next_internal_empty_frontend_fences_each_take_one_step_and_preserve_the_fence_bound() {
+    use novarocks_worker_protocol::control::{
+        ControlConfig, ControlCore, ControlEffect, ControlInput,
+    };
+    let mut control = ControlCore::new(
+        ControlConfig {
+            max_contexts: 2,
+            max_waiters: 2,
+            max_pending_requests: 2,
+            step_budget: ControlCore::MAX_STEP_WORK,
+            retained_contexts: 2,
+            gone_fences: 2,
+            retention: Duration::from_secs(10),
+        },
+        AdmissionTicketConfig::DEFAULT,
+        [1; 8],
+        at(0),
+    )
+    .unwrap();
+    let mut port = Port::default();
+    let frontends = [3, 4, 5].map(|id| FrontendProcessId::try_from_bytes(bytes(id)).unwrap());
+    for frontend in &frontends[..2] {
+        control
+            .handle(
+                at(0),
+                ControlInput::FenceFrontend {
+                    frontend: *frontend,
+                },
+                &mut port,
+            )
+            .unwrap();
+    }
+    let first = control
+        .handle(at(0), ControlInput::NextInternal, &mut port)
+        .unwrap();
+    assert_eq!(first.effects, vec![ControlEffect::ContinueFence]);
+    assert!(control.has_internal_work());
+    let second = control
+        .handle(at(0), ControlInput::NextInternal, &mut port)
+        .unwrap();
+    assert!(second.effects.is_empty());
+    assert!(!control.has_internal_work());
+    let duplicate = control
+        .handle(
+            at(0),
+            ControlInput::FenceFrontend {
+                frontend: frontends[0],
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(duplicate.effects.is_empty());
+    assert!(!control.has_internal_work());
+    assert_eq!(
+        control
+            .handle(
+                at(0),
+                ControlInput::FenceFrontend {
+                    frontend: frontends[2]
+                },
+                &mut port
+            )
+            .unwrap_err(),
+        novarocks_worker_protocol::context::CoreError::InvalidConfiguration
+    );
+    assert!(port.calls.is_empty());
+    for step in [first, second, duplicate] {
+        assert!(step.charged_work() <= control.max_step_work());
+    }
+}
+
+#[test]
+fn a_routed_decision_uses_its_context_time_instead_of_root_delivery_time() {
+    let mut f = ActiveControlFixture::new(4, 1);
+    let route = f.request(2, 1, active_establish_input(f.ticket, 2));
+    let first = f.materialized();
+    assert_eq!(first.requests[0].request.token, InputId::new(1).unwrap());
+    let late = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        2,
+        0,
+        Ok(OperationOutcome::Idempotent),
+    );
+    assert_eq!(late.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(
+        late.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Idempotent)
+    );
+    assert!(!f.control.has_internal_work());
+}
+
+fn materialization_refusal() -> AdmissionRefusal {
+    use novarocks_execution_contract::{
+        OperationDomainFailure, SafeDetail,
+        failure::{FailureClass, FailureFact, FailureReason, domain},
+        operation::DomainFailureOutcome,
+    };
+    AdmissionRefusal::Domain(
+        DomainFailureOutcome::InvalidStateOrRequest,
+        OperationDomainFailure::new(
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::EXECUTION, std::num::NonZeroU16::new(91).unwrap()),
+            ),
+            SafeDetail::truncating("context shared facts materialization rejected"),
+        ),
+    )
+}
+
+#[test]
+fn typed_materialization_failure_is_original_and_does_not_decide_a_routed_request() {
+    use novarocks_worker_protocol::{
+        context::DomainRefusal,
+        control::{ControlInput, ControlReplyBody},
+    };
+    let refusal = materialization_refusal();
+    let AdmissionRefusal::Domain(outcome, failure) = refusal.clone() else {
+        unreachable!()
+    };
+    let expected = DomainRefusal { outcome, failure };
+    let mut f = ActiveControlFixture::new(4, 1);
+    let route = f.request(2, 1, active_establish_input(f.ticket, 2));
+    let mut context_core = core(1, 1);
+    let finished = context_core
+        .handle(
+            at(0),
+            ContextInput::MaterializationFinished {
+                result: Err(refusal),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    let (close_epoch, decision) = establishment_decision(&finished);
+    assert_eq!(close_epoch, Generation::new(2).unwrap());
+    assert_eq!(decision.outcome, Err(expected.clone()));
+    let first = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision,
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(first.requests.len(), 1);
+    assert_eq!(first.requests[0].request.token, InputId::new(1).unwrap());
+    assert_eq!(first.requests[0].body, ControlReplyBody::Domain(expected));
+    let duplicate = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision: active_establishment_decision(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert!(duplicate.effects.is_empty());
+    assert!(duplicate.requests.is_empty());
+    let second = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        2,
+        0,
+        Ok(OperationOutcome::InvalidStateOrRequest),
+    );
+    assert_eq!(second.requests.len(), 1);
+    assert_eq!(second.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(
+        second.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::InvalidStateOrRequest)
+    );
+    assert_eq!(f.control.route(context()), QueryContextState::Aborting);
+}
+
+#[test]
+fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_it() {
+    for failed in [false, true] {
+        for now in [2, 30] {
+            for tick_first in [false, true] {
+                let mut context_core = core(1, 1);
+                let mut port = Port::default();
+                context_core
+                    .handle(
+                        at(1),
+                        ContextInput::Quiesce {
+                            request: operation(2),
+                        },
+                        &mut port,
+                    )
+                    .unwrap();
+                if tick_first {
+                    context_core
+                        .handle(at(now), ContextInput::Tick, &mut port)
+                        .unwrap();
+                }
+                let finished = context_core
+                    .handle(
+                        at(now),
+                        ContextInput::MaterializationFinished {
+                            result: if failed {
+                                Err(materialization_refusal())
+                            } else {
+                                Ok(ContextMaterialized {
+                                    initial_credential_resource: 101,
+                                })
+                            },
+                        },
+                        &mut port,
+                    )
+                    .unwrap();
+                let (_, decision) = establishment_decision(&finished);
+                let expired = tick_first && now == 30;
+                assert_eq!(
+                    decision.state,
+                    if expired {
+                        QueryContextState::Aborting
+                    } else {
+                        QueryContextState::Quiescing
+                    }
+                );
+                if expired && failed {
+                    let AdmissionRefusal::Domain(outcome, failure) = materialization_refusal()
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        decision.outcome,
+                        Err(novarocks_worker_protocol::context::DomainRefusal { outcome, failure })
+                    );
+                } else {
+                    assert_eq!(
+                        decision.outcome,
+                        Ok(if expired {
+                            OperationOutcome::LeaseExpired
+                        } else {
+                            OperationOutcome::ContextTerminalReceipt
+                        })
+                    );
+                }
+                assert!(!finished.effects.iter().any(|effect| matches!(
+                    effect,
+                    ContextEffect::EstablishmentDecided {
+                        decision: ContextEstablishmentDecision {
+                            state: QueryContextState::Active,
+                            ..
+                        },
+                        ..
+                    }
+                )));
+                if !expired {
+                    // Finishing does not renew the lease. A following actual
+                    // timer at its old deadline still upgrades the live fence.
+                    assert_eq!(context_core.next_deadline(), Some(at(30)));
+                    let tick = context_core
+                        .handle(at(30), ContextInput::Tick, &mut port)
+                        .unwrap();
+                    assert!(tick.charged_work() <= ContextCore::MAX_STEP_WORK);
+                    assert_eq!(context_core.state(), QueryContextState::Aborting);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn materialization_host_error_preserves_domain_facts_without_replacing_the_first_close_cause() {
+    for expired in [false, true] {
+        let mut context_core = core(1, 1);
+        let mut port = Port::default();
+        let now = if expired { 30 } else { 1 };
+        if !expired {
+            context_core
+                .handle(
+                    at(now),
+                    ContextInput::Abort {
+                        request: operation(2),
+                        cause: AbortCause::QueryFailed,
+                    },
+                    &mut port,
+                )
+                .unwrap();
+        }
+        let error = context_core
+            .handle(
+                at(now),
+                ContextInput::MaterializationFinished {
+                    result: Err(materialization_refusal()),
+                },
+                &mut port,
+            )
+            .unwrap();
+        let (_, decision) = establishment_decision(&error);
+        let AdmissionRefusal::Domain(outcome, failure) = materialization_refusal() else {
+            unreachable!()
+        };
+        assert_eq!(
+            decision.outcome,
+            Err(novarocks_worker_protocol::context::DomainRefusal { outcome, failure })
+        );
+        assert_eq!(decision.state, QueryContextState::Aborting);
+        let later = context_core
+            .handle(
+                at(31),
+                ContextInput::MaterializationFinished {
+                    result: Ok(ContextMaterialized {
+                        initial_credential_resource: 101,
+                    }),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(
+            establishment_decision(&later).1.outcome,
+            Ok(if expired {
+                OperationOutcome::LeaseExpired
+            } else {
+                OperationOutcome::ContextTerminalReceipt
+            })
+        );
+    }
+}
+
+#[test]
+fn root_fence_blocks_late_active_without_erasing_typed_failure_or_lease_expiry() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
+    for (branch, scanned) in
+        (0..3).flat_map(|branch| [false, true].map(|scanned| (branch, scanned)))
+    {
+        let mut f = ActiveControlFixture::new(4, 100);
+        f.control
+            .handle(
+                at(0),
+                ControlInput::FenceFrontend {
+                    frontend: context().frontend_process_id(),
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        if scanned {
+            f.control
+                .handle(at(0), ControlInput::ContinueFence, &mut f.port)
+                .unwrap();
+        }
+        let mut context_core = core(1, 1);
+        let now = if branch == 2 { 30 } else { 0 };
+        let finished = context_core
+            .handle(
+                at(now),
+                ContextInput::MaterializationFinished {
+                    result: if branch == 1 {
+                        Err(materialization_refusal())
+                    } else {
+                        Ok(ContextMaterialized {
+                            initial_credential_resource: 101,
+                        })
+                    },
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        let result = f
+            .control
+            .handle(
+                at(now),
+                ControlInput::EstablishmentDecided {
+                    context: context(),
+                    decision: establishment_decision(&finished).1,
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        assert_eq!(f.control.route(context()), QueryContextState::Aborting);
+        assert_eq!(result.requests.len(), 1);
+        assert_eq!(
+            result.requests[0].result,
+            RequestResult::Outcome(match branch {
+                0 => OperationOutcome::ContextTerminalReceipt,
+                1 => OperationOutcome::InvalidStateOrRequest,
+                _ => OperationOutcome::LeaseExpired,
+            })
+        );
+        assert_eq!(
+            matches!(result.requests[0].body, ControlReplyBody::Domain(_)),
+            branch == 1
+        );
+        assert!(!result.effects.iter().any(|effect| matches!(
+            effect,
+            ControlEffect::Route {
+                state: QueryContextState::Active,
+                ..
+            }
+        )));
+        assert!(result.charged_work() <= f.control.max_step_work());
+    }
+}
+
+fn release_while_materialization_is_outstanding(core: &mut ContextCore, port: &mut Port) {
+    core.handle(
+        at(0),
+        ContextInput::Quiesce {
+            request: operation(70),
+        },
+        port,
+    )
+    .unwrap();
+    core.handle(at(0), ContextInput::ContinueQuiesce, port)
+        .unwrap();
+    let releasing = core
+        .handle(
+            at(0),
+            ContextInput::Release {
+                request: operation(71),
+            },
+            port,
+        )
+        .unwrap();
+    assert_eq!(core.state(), QueryContextState::Releasing);
+    assert!(
+        releasing
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
+    );
+}
+
+#[test]
+fn late_materialization_error_reports_actual_releasing_or_terminal_state_without_rollback() {
+    use novarocks_worker_protocol::control::{ControlInput, ControlReplyBody};
+    for host_released in [false, true] {
+        let mut f = ActiveControlFixture::new(4, 100);
+        let mut context_core = core(1, 1);
+        release_while_materialization_is_outstanding(&mut context_core, &mut f.port);
+        if host_released {
+            // Logical host release is an environment fact. It does not assert
+            // that the separate materialization Work/report has retired.
+            context_core
+                .handle(at(0), ContextInput::HostReleased, &mut f.port)
+                .unwrap();
+            f.control
+                .handle(
+                    at(0),
+                    ControlInput::Retained { context: context() },
+                    &mut f.port,
+                )
+                .unwrap();
+        }
+        let error = context_core
+            .handle(
+                at(1),
+                ContextInput::MaterializationFinished {
+                    result: Err(materialization_refusal()),
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        let (_, decision) = establishment_decision(&error);
+        let state = if host_released {
+            QueryContextState::TerminalRetained
+        } else {
+            QueryContextState::Releasing
+        };
+        assert_eq!(decision.state, state);
+        assert_eq!(context_core.state(), state);
+        assert!(!error.effects.iter().any(|effect| matches!(
+            effect,
+            ContextEffect::CloseExternalAdmission { .. } | ContextEffect::ReleaseHost { .. }
+        )));
+        let result = f
+            .control
+            .handle(
+                at(1),
+                ControlInput::EstablishmentDecided {
+                    context: context(),
+                    decision,
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        assert_eq!(f.control.route(context()), state);
+        assert_eq!(result.requests.len(), 1);
+        assert!(matches!(
+            result.requests[0].body,
+            ControlReplyBody::Domain(_)
+        ));
+        assert!(result.charged_work() <= f.control.max_step_work());
+    }
+}
+
+#[test]
+fn context_bootstrap_failure_keeps_the_original_reply_and_a_pending_route_is_independent() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
+    let mut f = ActiveControlFixture::new(4, 100);
+    let route = f.request(2, 100, active_establish_input(f.ticket, 2));
+    let calls = f.port.calls.len();
+    let failure = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::ContextBootstrapFailed {
+                context: context(),
+                refusal: materialization_refusal(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(failure.requests.len(), 1);
+    let original = failure.requests[0].body.clone();
+    assert!(matches!(original, ControlReplyBody::Domain(_)));
+    let duplicate = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::ContextBootstrapFailed {
+                context: context(),
+                refusal: OperationOutcome::ResourceExhausted.into(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert!(duplicate.effects.is_empty());
+    assert!(duplicate.requests.is_empty());
+    assert!(f.flush().requests.is_empty());
+    let refused = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        0,
+        0,
+        Ok(OperationOutcome::OwnerFailed),
+    );
+    assert_eq!(refused.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(
+        refused.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::OwnerFailed)
+    );
+    assert_eq!(failure.requests[0].body, original);
+    assert_eq!(f.port.calls.len(), calls);
+    assert!(!failure.effects.iter().any(|effect| matches!(
+        effect,
+        ControlEffect::Route {
+            state: QueryContextState::Active,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_routed_typed_decision_keeps_its_own_time_without_reusing_the_creation_body() {
+    use novarocks_worker_protocol::{
+        context::DomainRefusal,
+        control::{ControlInput, ControlReplyBody},
+    };
+    let mut f = ActiveControlFixture::new(4, 1);
+    let route = f.request(2, 1, active_establish_input(f.ticket, 2));
+    let first = f.materialized();
+    let AdmissionRefusal::Domain(outcome, failure) = materialization_refusal() else {
+        unreachable!()
+    };
+    let expected = DomainRefusal { outcome, failure };
+    let second = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        2,
+        0,
+        Err(expected.clone()),
+    );
+    assert_eq!(second.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(second.requests[0].body, ControlReplyBody::Domain(expected));
+    assert_eq!(
+        first.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    assert!(
+        f.control
+            .handle(at(2), ControlInput::Tick, &mut f.port)
+            .unwrap()
+            .requests
+            .is_empty()
+    );
+}
+
+#[test]
+fn terminal_establishment_and_retained_use_one_original_retirement_and_one_ttl_in_either_order() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    for retained_first in [false, true] {
+        let mut f = ActiveControlFixture::new(4, 100);
+        let mut context_core = core(1, 1);
+        release_while_materialization_is_outstanding(&mut context_core, &mut f.port);
+        context_core
+            .handle(at(0), ContextInput::HostReleased, &mut f.port)
+            .unwrap();
+        let finished = context_core
+            .handle(
+                at(0),
+                ContextInput::MaterializationFinished {
+                    result: Err(materialization_refusal()),
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        let decision = establishment_decision(&finished).1;
+        assert_eq!(decision.state, QueryContextState::TerminalRetained);
+        let decided = ControlInput::EstablishmentDecided {
+            context: context(),
+            decision,
+        };
+        let retained = ControlInput::Retained { context: context() };
+        let (first, second) = if retained_first {
+            (retained, decided)
+        } else {
+            (decided, retained)
+        };
+        let first = f.control.handle(at(1), first, &mut f.port).unwrap();
+        assert_eq!(
+            f.control.route(context()),
+            QueryContextState::TerminalRetained
+        );
+        assert_eq!(f.control.next_deadline(), Some(at(11)));
+        let second = f.control.handle(at(2), second, &mut f.port).unwrap();
+        assert_eq!(
+            f.control.route(context()),
+            QueryContextState::TerminalRetained
+        );
+        assert_eq!(
+            f.control.next_deadline(),
+            Some(at(11)),
+            "the second fact cannot restart retention"
+        );
+        let effects: Vec<_> = first.effects.iter().chain(&second.effects).collect();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, ControlEffect::RetireReservation(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    ControlEffect::Route {
+                        state: QueryContextState::TerminalRetained,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(first.requests.len() + second.requests.len(), 1);
+        for step in [first, second] {
+            assert!(
+                step.charged_work() + usize::from(f.control.has_internal_work())
+                    <= f.control.max_step_work()
+            );
+        }
+        // The host has not supplied HostRemoved. No physical Work/report exit
+        // follows from either of these terminal protocol inputs.
+        let pending = f
+            .control
+            .handle(at(11), ControlInput::Tick, &mut f.port)
+            .unwrap();
+        assert!(pending.effects.iter().any(|effect| matches!(effect, ControlEffect::RemoveHost { context: original } if *original == context())));
+        assert_eq!(
+            f.control.route(context()),
+            QueryContextState::TerminalRetained
+        );
+    }
+}
+
+#[test]
+fn materialization_decisions_reject_impossible_shapes_and_unknown_contexts() {
+    use novarocks_worker_protocol::{context::CoreError, control::ControlInput};
+    let mut f = ActiveControlFixture::new(4, 100);
+    let unknown = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::EstablishmentDecided {
+                context: another_control_context(),
+                decision: active_establishment_decision(),
+            },
+            &mut f.port,
+        )
+        .unwrap_err();
+    assert_eq!(unknown, CoreError::WrongIdentity);
+    for (state, outcome) in [
+        (
+            QueryContextState::Establishing,
+            Ok(OperationOutcome::Accepted),
+        ),
+        (
+            QueryContextState::Active,
+            Ok(OperationOutcome::ContextTerminalReceipt),
+        ),
+        (QueryContextState::Aborting, Ok(OperationOutcome::Accepted)),
+    ] {
+        assert_eq!(
+            f.control
+                .handle(
+                    at(0),
+                    ControlInput::EstablishmentDecided {
+                        context: context(),
+                        decision: ContextEstablishmentDecision { state, outcome },
+                    },
+                    &mut f.port
+                )
+                .unwrap_err(),
+            CoreError::IllegalFact
+        );
+        assert_eq!(f.control.route(context()), QueryContextState::Establishing);
+    }
+    assert_eq!(
+        f.control
+            .handle(
+                at(0),
+                ControlInput::ContextBootstrapFailed {
+                    context: context(),
+                    refusal: OperationOutcome::Accepted.into(),
+                },
+                &mut f.port
+            )
+            .unwrap_err(),
+        CoreError::IllegalFact
+    );
+    f.finish_original();
+}
+
+#[test]
+fn a_quiesced_context_does_not_accept_a_success_disguised_as_host_refusal() {
+    use novarocks_worker_protocol::context::CoreError;
+    for outcome in [OperationOutcome::Accepted, OperationOutcome::Idempotent] {
+        let mut context_core = core(1, 1);
+        let mut port = Port::default();
+        context_core
+            .handle(
+                at(1),
+                ContextInput::Quiesce {
+                    request: operation(2),
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(
+            context_core
+                .handle(
+                    at(2),
+                    ContextInput::MaterializationFinished {
+                        result: Err(AdmissionRefusal::Verdict(outcome)),
+                    },
+                    &mut port
+                )
+                .unwrap_err(),
+            CoreError::IllegalFact
+        );
+        assert_eq!(context_core.state(), QueryContextState::Quiescing);
+        assert!(port.calls.is_empty());
+    }
+}
+
+#[test]
+fn retained_state_without_a_completion_does_not_backdate_the_typed_establishment_decision() {
+    use novarocks_worker_protocol::control::ControlInput;
+    let mut f = ActiveControlFixture::new(4, 1);
+    let retained = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::Retained { context: context() },
+            &mut f.port,
+        )
+        .unwrap();
+    assert!(retained.requests.is_empty());
+    let mut context_core = core(1, 1);
+    release_while_materialization_is_outstanding(&mut context_core, &mut f.port);
+    context_core
+        .handle(at(0), ContextInput::HostReleased, &mut f.port)
+        .unwrap();
+    let finished = context_core
+        .handle(
+            at(0),
+            ContextInput::MaterializationFinished {
+                result: Err(materialization_refusal()),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    let late = f
+        .control
+        .handle(
+            at(2),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision: establishment_decision(&finished).1,
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(late.requests.len(), 1);
+    assert_eq!(
+        late.requests[0].result,
+        RequestResult::TimeoutWhileAccepted,
+        "Root retained state at zero was not yet an operation decision"
+    );
+    assert_eq!(
+        f.control.route(context()),
+        QueryContextState::TerminalRetained
+    );
+    assert!(late.charged_work() <= f.control.max_step_work());
+}
+
+fn creation_and_routed_request_with_deadlines(first: u64, second: u64) -> ActiveControlFixture {
+    use novarocks_worker_protocol::control::ControlInput;
+    let mut f = ActiveControlFixture::new(8, first);
+    let mut input = active_establish_input(f.ticket, 2);
+    let ControlInput::Establish { request, .. } = &mut input else {
+        unreachable!()
+    };
+    *request = operation(3);
+    let route = f
+        .control
+        .handle_request(
+            at(0),
+            RequestContext {
+                token: InputId::new(2).unwrap(),
+                operation: operation(3),
+                deadline: at(second),
+            },
+            input,
+            &mut f.port,
+        )
+        .unwrap();
+    routed_establish_request(&route);
+    f
+}
+
+fn terminal_typed_establishment_decision() -> ContextEstablishmentDecision {
+    use novarocks_worker_protocol::context::DomainRefusal;
+    let AdmissionRefusal::Domain(outcome, failure) = materialization_refusal() else {
+        unreachable!()
+    };
+    ContextEstablishmentDecision {
+        state: QueryContextState::TerminalRetained,
+        outcome: Err(DomainRefusal { outcome, failure }),
+    }
+}
+
+#[test]
+fn retained_host_removal_preserves_an_independent_routed_reply_without_restarting_retention() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
+    let mut f = ActiveControlFixture::new(8, 100);
+    let route = f.request(2, 100, active_establish_input(f.ticket, 2));
+    let first = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision: terminal_typed_establishment_decision(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(first.requests.len(), 1);
+    assert!(matches!(
+        first.requests[0].body,
+        ControlReplyBody::Domain(_)
+    ));
+    let due = f
+        .control
+        .handle(at(10), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert_eq!(due.effects.iter().filter(|effect|matches!(effect,ControlEffect::RemoveHost{context:target} if *target==context())).count(),1);
+    // The model reports actual Context physical removal only after its own
+    // route leg exited; a Root backchannel may still be awaiting delivery.
+    let gone = f
+        .control
+        .handle(
+            at(10),
+            ControlInput::HostRemoved { context: context() },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(f.control.route(context()), QueryContextState::Gone);
+    let second = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        11,
+        1,
+        Ok(OperationOutcome::ContextTerminalReceipt),
+    );
+    assert_eq!(second.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(
+        second.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt)
+    );
+    assert!(matches!(
+        first.requests[0].body,
+        ControlReplyBody::Domain(_)
+    ));
+    for step in [first, due, gone, second] {
+        assert!(step.charged_work() <= f.control.max_step_work());
+    }
+}
+
+#[test]
+fn an_expired_new_r_cannot_copy_a_creation_domain_body_or_consume_another_route() {
+    use novarocks_worker_protocol::control::{ControlInput, ControlReplyBody};
+    let mut f = ActiveControlFixture::new(8, 100);
+    let route = f.request(2, 100, active_establish_input(f.ticket, 2));
+    let first = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision: terminal_typed_establishment_decision(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    let expired = f
+        .control
+        .handle_request(
+            at(2),
+            RequestContext {
+                token: InputId::new(3).unwrap(),
+                operation: operation(2),
+                deadline: at(1),
+            },
+            active_establish_input(f.ticket, 3),
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(expired.requests.len(), 1);
+    assert_eq!(expired.requests[0].request.token, InputId::new(3).unwrap());
+    assert_eq!(
+        expired.requests[0].result,
+        RequestResult::TimeoutWhileAccepted
+    );
+    assert!(expired.effects.is_empty());
+    let original = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        2,
+        0,
+        Ok(OperationOutcome::ContextTerminalReceipt),
+    );
+    assert_eq!(original.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(
+        original.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt)
+    );
+    assert!(matches!(
+        first.requests[0].body,
+        ControlReplyBody::Domain(_)
+    ));
+}
+
+#[test]
+fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut f = ActiveControlFixture::new(8, 100);
+    let route = f.request(2, 11, active_establish_input(f.ticket, 2));
+    let original = routed_establish_request(&route).1.request;
+    f.control
+        .handle(
+            at(0),
+            ControlInput::Retained { context: context() },
+            &mut f.port,
+        )
+        .unwrap();
+    let due = f
+        .control
+        .handle(at(10), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert!(
+        !due.effects
+            .iter()
+            .any(|effect| matches!(effect, ControlEffect::RemoveHost { .. }))
+    );
+    assert!(!f.control.has_internal_work());
+    let decided = f
+        .control
+        .handle(
+            at(11),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision: terminal_typed_establishment_decision(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(decided.requests[0].request.token, InputId::new(1).unwrap());
+    assert_eq!(decided.effects.iter().filter(|effect|matches!(effect,ControlEffect::RemoveHost{context:target} if *target==context())).count(),1);
+    let timed = f
+        .control
+        .handle(at(11), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert_eq!(timed.requests[0].request, original);
+    assert_eq!(
+        timed.requests[0].result,
+        RequestResult::TimeoutWhileAccepted
+    );
+    assert!(timed.effects.iter().any(|effect|matches!(effect,ControlEffect::CancelEstablishRoute{request,..} if *request==original)));
+    assert!(
+        !timed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ControlEffect::RemoveHost { .. }))
+    );
+    assert!(
+        f.control
+            .next_deadline()
+            .is_none_or(|deadline| deadline > at(21)),
+        "neither M nor routed timeout restarts TTL"
+    );
+    let idle = f
+        .control
+        .handle(at(11), ControlInput::NextInternal, &mut f.port)
+        .unwrap();
+    assert!(idle.effects.is_empty());
+    let late = finish_routed_establish(
+        &mut f.control,
+        &mut f.port,
+        &route,
+        11,
+        10,
+        Ok(OperationOutcome::ContextTerminalReceipt),
+    );
+    assert!(late.requests.is_empty());
+}
+
+#[test]
+fn retained_capacity_eviction_preserves_a_routed_result_and_the_new_context_ttl() {
+    use novarocks_worker_protocol::control::{
+        ControlConfig, ControlCore, ControlEffect, ControlInput, ControlReplyBody,
+    };
+    let mut control = ControlCore::new(
+        ControlConfig {
+            max_contexts: 2,
+            max_waiters: 8,
+            max_pending_requests: 8,
+            step_budget: ControlCore::MAX_STEP_WORK,
+            retained_contexts: 1,
+            gone_fences: 8,
+            retention: Duration::from_secs(10),
+        },
+        AdmissionTicketConfig::DEFAULT,
+        [1; 8],
+        at(0),
+    )
+    .unwrap();
+    let mut port = Port::default();
+    let old = context();
+    let new = another_control_context();
+    let mut routed = None;
+    for (identity, base, tokens) in [(old, 70, vec![(1, 71), (2, 72)]), (new, 80, vec![(3, 81)])] {
+        let ticket = selector_grant(&mut control, &mut port, identity, base, 5);
+        for (token, op) in tokens {
+            let accepted = control
+                .handle_request(
+                    at(0),
+                    RequestContext {
+                        token: InputId::new(token).unwrap(),
+                        operation: operation(op),
+                        deadline: at(100),
+                    },
+                    ControlInput::Establish {
+                        request: operation(op),
+                        context: identity,
+                        ticket,
+                        payload: PayloadId(u64::from(base)),
+                        semantics: semantics(),
+                        generation: Generation::new(1).unwrap(),
+                    },
+                    &mut port,
+                )
+                .unwrap();
+            assert!(accepted.requests.is_empty());
+            assert!(accepted.charged_work() <= control.max_step_work());
+            if token == 2 {
+                routed_establish_request(&accepted);
+                routed = Some(accepted);
+            }
+        }
+    }
+    let calls = port.calls.len();
+    let first = control
+        .handle(
+            at(0),
+            ControlInput::EstablishmentDecided {
+                context: old,
+                decision: terminal_typed_establishment_decision(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(first.requests[0].request.token, InputId::new(1).unwrap());
+    assert!(matches!(
+        first.requests[0].body,
+        ControlReplyBody::Domain(_)
+    ));
+    let evicted = control
+        .handle(
+            at(1),
+            ControlInput::EstablishmentDecided {
+                context: new,
+                decision: terminal_typed_establishment_decision(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(evicted.requests[0].request.token, InputId::new(3).unwrap());
+    assert_eq!(
+        evicted
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect,ControlEffect::RemoveHost{context} if *context==old))
+            .count(),
+        1
+    );
+    assert_eq!(control.next_deadline(), Some(at(11)));
+    control
+        .handle(at(1), ControlInput::HostRemoved { context: old }, &mut port)
+        .unwrap();
+    let tail = finish_routed_establish(
+        &mut control,
+        &mut port,
+        &routed.unwrap(),
+        2,
+        1,
+        Ok(OperationOutcome::ContextTerminalReceipt),
+    );
+    assert_eq!(tail.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(
+        tail.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt)
+    );
+    assert_eq!(control.route(old), QueryContextState::Gone);
+    assert_eq!(control.route(new), QueryContextState::TerminalRetained);
+    assert_eq!(control.next_deadline(), Some(at(11)));
+    let before = control
+        .handle(at(10), ControlInput::Tick, &mut port)
+        .unwrap();
+    assert!(
+        !before
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ControlEffect::RemoveHost { .. }))
+    );
+    let due = control
+        .handle(at(11), ControlInput::Tick, &mut port)
+        .unwrap();
+    assert_eq!(
+        due.effects
+            .iter()
+            .filter(|effect| matches!(effect,ControlEffect::RemoveHost{context} if *context==new))
+            .count(),
+        1
+    );
+    assert_eq!(port.calls.len(), calls);
+    for step in [first, evicted, tail, before, due] {
+        assert!(step.charged_work() <= control.max_step_work());
+    }
+}
+
+#[test]
+fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization_decision() {
+    use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
+    let mut f = creation_and_routed_request_with_deadlines(1, 1);
+    let retained = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::Retained { context: context() },
+            &mut f.port,
+        )
+        .unwrap();
+    let first_timeout = f
+        .control
+        .handle(at(1), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    let last_timeout = f
+        .control
+        .handle(at(1), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert_eq!(first_timeout.requests.len(), 1);
+    assert_eq!(last_timeout.requests.len(), 1);
+    assert_eq!(
+        first_timeout.requests[0].request.token,
+        InputId::new(1).unwrap()
+    );
+    assert_eq!(
+        last_timeout.requests[0].request.token,
+        InputId::new(2).unwrap()
+    );
+    for result in [&first_timeout.requests[0], &last_timeout.requests[0]] {
+        assert_eq!(result.result, RequestResult::TimeoutWhileAccepted);
+    }
+    let due = f
+        .control
+        .handle(at(10), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert!(
+        !due.effects
+            .iter()
+            .any(|effect| matches!(effect, ControlEffect::RemoveHost { .. })),
+        "timeout is not a Context materialization completion"
+    );
+    assert!(!f.control.has_internal_work());
+    for _ in 0..2 {
+        let idle = f
+            .control
+            .handle(at(10), ControlInput::NextInternal, &mut f.port)
+            .unwrap();
+        assert!(idle.effects.is_empty());
+        assert!(idle.requests.is_empty());
+        assert!(
+            !f.control.has_internal_work(),
+            "unknown completion must not self-spin"
+        );
+        assert!(idle.charged_work() <= f.control.max_step_work());
+    }
+    let decided = f
+        .control
+        .handle(
+            at(11),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision: terminal_typed_establishment_decision(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert!(
+        decided.requests.is_empty(),
+        "both original RPC roles already timed out"
+    );
+    assert_eq!(decided.effects.iter().filter(|effect| matches!(effect, ControlEffect::RemoveHost { context: original } if *original == context())).count(), 1);
+    assert!(!f.control.has_internal_work());
+    let idle = f
+        .control
+        .handle(at(11), ControlInput::NextInternal, &mut f.port)
+        .unwrap();
+    assert!(idle.effects.is_empty());
+    let gone = f
+        .control
+        .handle(
+            at(11),
+            ControlInput::HostRemoved { context: context() },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(f.control.route(context()), QueryContextState::Gone);
+    for step in [
+        retained,
+        first_timeout,
+        last_timeout,
+        due,
+        decided,
+        idle,
+        gone,
+    ] {
+        assert!(
+            step.charged_work() + usize::from(f.control.has_internal_work())
+                <= f.control.max_step_work()
+        );
+    }
+}
+
+#[test]
+fn an_ingress_owner_failure_settles_only_its_original_token_without_business_admission() {
+    use novarocks_worker_protocol::control::{ControlInput, ControlReplyBody};
+    let mut control = control();
+    let mut port = Port::default();
+    control
+        .handle(
+            at(0),
+            ControlInput::FenceFrontend {
+                frontend: context().frontend_process_id(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    control
+        .handle(at(0), ControlInput::NextInternal, &mut port)
+        .unwrap();
+    let request = RequestContext {
+        token: InputId::new(1).unwrap(),
+        operation: operation(90),
+        deadline: at(0),
+    };
+    port.reject = Some(OperationOutcome::ResourceExhausted);
+    let failed = control
+        .handle_request(
+            at(5),
+            request,
+            ControlInput::IngressOwnerFailed {
+                request: request.operation,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(failed.records_visited, 1);
+    assert!(failed.effects.is_empty());
+    assert_eq!(failed.requests.len(), 1);
+    assert_eq!(failed.requests[0].request, request);
+    assert_eq!(
+        failed.requests[0].body,
+        ControlReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::OwnerFailed))
+    );
+    assert!(port.calls.is_empty());
+    assert!(!control.has_internal_work());
+    assert_eq!(control.route(context()), QueryContextState::Absent);
+
+    // The failed ingress did not leave an operation shape or directory row.
+    // This other unfenced context can use the same operation for a genuine
+    // independently paid acquisition, rather than joining a phantom failure.
+    port.reject = None;
+    let other = selector_context(15001, 2);
+    let acquire = AcquireQueryContextAdmissionTicket::new(
+        request.operation,
+        other,
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        control.admission().capability(),
+    );
+    let accepted = control
+        .handle_request(
+            at(5),
+            RequestContext {
+                token: InputId::new(2).unwrap(),
+                operation: request.operation,
+                deadline: at(100),
+            },
+            ControlInput::Acquire {
+                request: acquire,
+                ticket: AdmissionTicketId::try_from_bytes([90; 16]).unwrap(),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(accepted.requests.len(), 1);
+    assert!(matches!(
+        accepted.requests[0].body,
+        ControlReplyBody::Admission(Ok(_))
+    ));
+    assert_eq!(port.calls.len(), 1);
+    assert!(failed.charged_work() <= control.max_step_work());
+    assert!(accepted.charged_work() <= control.max_step_work());
+}
+
+#[test]
+fn an_ingress_failure_cannot_consume_an_original_creation_or_independent_routed_result() {
+    use novarocks_worker_protocol::control::{ControlInput, ControlReplyBody};
+    for phase in 0..3 {
+        let mut f = ActiveControlFixture::new(8, 100);
+        let route = f.request(2, 1, active_establish_input(f.ticket, 2));
+        let mut first = if phase == 0 {
+            None
+        } else {
+            Some(
+                f.control
+                    .handle(
+                        at(0),
+                        ControlInput::EstablishmentDecided {
+                            context: context(),
+                            decision: terminal_typed_establishment_decision(),
+                        },
+                        &mut f.port,
+                    )
+                    .unwrap(),
+            )
+        };
+        let calls = f.port.calls.len();
+        let failed = f
+            .control
+            .handle_request(
+                at(2),
+                RequestContext {
+                    token: InputId::new(3).unwrap(),
+                    operation: operation(2),
+                    deadline: at(0),
+                },
+                ControlInput::IngressOwnerFailed {
+                    request: operation(2),
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        assert_eq!(failed.records_visited, 1);
+        assert!(failed.effects.is_empty());
+        assert_eq!(failed.requests.len(), 1);
+        assert_eq!(failed.requests[0].request.token, InputId::new(3).unwrap());
+        assert_eq!(
+            failed.requests[0].body,
+            ControlReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::OwnerFailed))
+        );
+        assert_eq!(f.port.calls.len(), calls);
+        if phase == 0 {
+            assert_eq!(f.control.route(context()), QueryContextState::Establishing);
+            first = Some(
+                f.control
+                    .handle(
+                        at(2),
+                        ControlInput::EstablishmentDecided {
+                            context: context(),
+                            decision: active_establishment_decision(),
+                        },
+                        &mut f.port,
+                    )
+                    .unwrap(),
+            );
+        }
+        let first = first.unwrap();
+        assert_eq!(first.requests.len(), 1);
+        assert_eq!(first.requests[0].request.token, InputId::new(1).unwrap());
+        let original_body = first.requests[0].body.clone();
+        let routed_result = if phase == 0 {
+            Ok(OperationOutcome::Idempotent)
+        } else if phase == 1 {
+            let AdmissionRefusal::Domain(outcome, failure) = materialization_refusal() else {
+                unreachable!()
+            };
+            Err(novarocks_worker_protocol::context::DomainRefusal { outcome, failure })
+        } else {
+            Ok(OperationOutcome::ContextTerminalReceipt)
+        };
+        let second = finish_routed_establish(
+            &mut f.control,
+            &mut f.port,
+            &route,
+            2,
+            0,
+            routed_result.clone(),
+        );
+        assert_eq!(second.requests.len(), 1);
+        assert_eq!(second.requests[0].request.token, InputId::new(2).unwrap());
+        let expected = match routed_result {
+            Ok(outcome) => ControlReplyBody::Verdict(RequestResult::Outcome(outcome)),
+            Err(refusal) => ControlReplyBody::Domain(refusal),
+        };
+        assert_eq!(second.requests[0].body, expected);
+        assert_eq!(first.requests[0].body, original_body);
+        assert!(
+            f.control
+                .handle(at(2), ControlInput::Tick, &mut f.port)
+                .unwrap()
+                .requests
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
+    use novarocks_worker_protocol::{context::CoreError, control::ControlInput};
+    let mut f = ActiveControlFixture::new(4, 100);
+    let calls = f.port.calls.len();
+    assert_eq!(
+        f.control
+            .handle(
+                at(0),
+                ControlInput::IngressOwnerFailed {
+                    request: operation(2),
+                },
+                &mut f.port
+            )
+            .unwrap_err(),
+        CoreError::WrongIdentity
+    );
+    for (token, candidate_operation) in [(1, operation(2)), (2, operation(3))] {
+        assert_eq!(
+            f.control
+                .handle_request(
+                    at(0),
+                    RequestContext {
+                        token: InputId::new(token).unwrap(),
+                        operation: candidate_operation,
+                        deadline: at(100),
+                    },
+                    ControlInput::IngressOwnerFailed {
+                        request: operation(2)
+                    },
+                    &mut f.port
+                )
+                .unwrap_err(),
+            CoreError::WrongIdentity
+        );
+    }
+    let failed = f
+        .control
+        .handle_request(
+            at(1),
+            RequestContext {
+                token: InputId::new(2).unwrap(),
+                operation: operation(2),
+                deadline: at(0),
+            },
+            ControlInput::IngressOwnerFailed {
+                request: operation(2),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(failed.requests[0].request.token, InputId::new(2).unwrap());
+    assert_eq!(
+        f.control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    token: InputId::new(3).unwrap(),
+                    operation: operation(2),
+                    deadline: at(100),
+                },
+                ControlInput::IngressOwnerFailed {
+                    request: operation(2)
+                },
+                &mut f.port
+            )
+            .unwrap_err(),
+        CoreError::TimeRegressed
+    );
+    assert_eq!(f.port.calls.len(), calls);
+    let original = f
+        .control
+        .handle(
+            at(1),
+            ControlInput::EstablishmentDecided {
+                context: context(),
+                decision: active_establishment_decision(),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert_eq!(original.requests.len(), 1);
+    assert_eq!(original.requests[0].request.token, InputId::new(1).unwrap());
+    assert_eq!(
+        original.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
     );
 }

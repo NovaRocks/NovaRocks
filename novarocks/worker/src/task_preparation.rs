@@ -385,6 +385,11 @@ impl TaskPreparationScope {
                 Phase::NotStarted => state.phases[step as usize] = Phase::Started,
             }
         }
+        self.run_claimed(step, reason, action)
+    }
+    /// The original phase was claimed in the same transaction as its mode
+    /// gate. Its callback and capture disposal are both inside this boundary.
+    fn run_claimed(&self, step: Step, reason: R, action: impl FnOnce()) -> bool {
         match catch_unwind(AssertUnwindSafe(action)) {
             Ok(()) => {
                 self.state
@@ -431,14 +436,52 @@ impl TaskPreparationScope {
             .expect("preparation child scope lock")
             .body_exited = true;
     }
+    /// Read only the original provider-child cleanup observations. Adoption
+    /// transfers runtime ownership elsewhere; this proves only that these
+    /// preparation callbacks/metadata captures have actually exited.
+    pub(crate) fn host_captures_exited(&self) -> bool {
+        let state = self.state.lock().expect("preparation child scope lock");
+        state.body_exited
+            && Self::body_obligations_exited(&state)
+            && Self::started_actions_exited(&state)
+            && state.phases[Step::ChildDrop as usize] == Phase::Exited
+            && match state.mode {
+                Mode::Adopted => state.phases[Step::Publication as usize] == Phase::Exited,
+                Mode::Rollback => {
+                    state.phases[Step::Poll as usize] == Phase::Exited
+                        && [Step::Cancel, Step::Inbound, Step::Receiver]
+                            .iter()
+                            .all(|step| state.phases[*step as usize] == Phase::Exited)
+                }
+                Mode::Preparing | Mode::Adopting => false,
+            }
+    }
+    /// Never-started optional cleanup roles impose no exit obligation. Once
+    /// a real call starts, however, adoption cannot hide its live captures or
+    /// unresolved exit by switching to another lifecycle branch.
+    fn started_actions_exited(state: &State) -> bool {
+        state
+            .phases
+            .iter()
+            .all(|phase| matches!(phase, Phase::NotStarted | Phase::Exited))
+    }
     fn clear_child(&self) -> bool {
         let child = {
             let mut state = self.state.lock().expect("preparation child scope lock");
             match state.phases[Step::ChildDrop as usize] {
                 Phase::Exited => return true,
                 Phase::Started | Phase::Unresolved => return false,
-                Phase::NotStarted => state.phases[Step::ChildDrop as usize] = Phase::Started,
+                Phase::NotStarted => {}
             }
+            if !Self::started_actions_exited(&state)
+                || (state.mode == Mode::Rollback
+                    && [Step::Cancel, Step::Inbound, Step::Receiver, Step::Poll]
+                        .iter()
+                        .any(|step| state.phases[*step as usize] != Phase::Exited))
+            {
+                return false;
+            }
+            state.phases[Step::ChildDrop as usize] = Phase::Started;
             state.child.take()
         };
         match catch_unwind(AssertUnwindSafe(|| drop(child))) {
@@ -460,6 +503,7 @@ impl TaskPreparationScope {
             let mut state = self.state.lock().expect("preparation child scope lock");
             if !state.body_exited
                 || state.mode != Mode::Rollback
+                || !Self::started_actions_exited(&state)
                 || [Step::Cancel, Step::Inbound, Step::Receiver]
                     .iter()
                     .any(|step| state.phases[*step as usize] != Phase::Exited)
@@ -520,17 +564,23 @@ impl TaskPreparationScope {
             match state.mode {
                 Mode::Rollback => return false,
                 Mode::Adopted => return true,
-                Mode::Preparing => state.mode = Mode::Adopting,
-                Mode::Adopting => {}
+                Mode::Preparing | Mode::Adopting => {}
             }
+            // Claim in this same mode transaction. An earlier rollback must
+            // not be followed by a newly started provider adoption callback.
+            if state.phases[Step::Adopt as usize] != Phase::NotStarted {
+                return false;
+            }
+            state.mode = Mode::Adopting;
+            state.phases[Step::Adopt as usize] = Phase::Started;
             state.child.clone()
         };
-        let adopted = self.once(Step::Adopt, R::PreparationChildAdopt, || {
+        let adopted = self.run_claimed(Step::Adopt, R::PreparationChildAdopt, move || {
             if let Some(child) = &child {
                 child.adopt_runtime();
             }
+            drop(child);
         });
-        drop(child);
         if !adopted {
             if self.is_unresolved(Step::Adopt) {
                 self.request_rollback();
@@ -540,10 +590,11 @@ impl TaskPreparationScope {
         // adopt_runtime clears the provider's Preparation observation role.
         // Retain only its metadata cancellation handle until commit returns,
         // so an unknown commit cannot suppress independent Root cancellation.
-        self.state
-            .lock()
-            .expect("preparation child scope lock")
-            .mode = Mode::Adopted;
+        let mut state = self.state.lock().expect("preparation child scope lock");
+        if state.mode != Mode::Adopting {
+            return false;
+        }
+        state.mode = Mode::Adopted;
         true
     }
     pub(crate) fn stand_down(&self, action: impl FnOnce()) -> bool {
@@ -556,16 +607,43 @@ impl TaskPreparationScope {
     /// Runtime activation is independent owned cleanup work. Unknown opaque
     /// body custody keeps the original P, but cannot strand installed operators
     /// after their original Task cause has already stood them down.
-    pub(crate) fn start_runtime(&self, action: impl FnOnce()) -> bool {
-        if !self.once(Step::Publication, R::PreparationExitPublication, action) {
+    pub(crate) fn start_runtime<F: FnOnce()>(&self, action: F) -> Result<bool, F> {
+        {
+            let mut state = self.state.lock().expect("preparation child scope lock");
+            if state.mode != Mode::Adopted
+                || state.phases[Step::Publication as usize] != Phase::NotStarted
+            {
+                // The original host still owns a rejected action, including
+                // its dormant runtime captures. Refusal never destroys it or
+                // treats an earlier call as execution of this new closure.
+                return Err(action);
+            }
+            state.phases[Step::Publication as usize] = Phase::Started;
+        }
+        if !self.run_claimed(Step::Publication, R::PreparationExitPublication, action) {
             if self.is_unresolved(Step::Publication) {
                 self.request_rollback();
             }
-            return false;
+            return Ok(false);
+        }
+        if self
+            .state
+            .lock()
+            .expect("preparation child scope lock")
+            .mode
+            != Mode::Adopted
+        {
+            // Rollback may have won after the call really started. Its own
+            // cleanup owner must observe the child and every started callback
+            // before retiring the original preparation holder.
+            return Ok(false);
         }
         let child_retired = self.clear_child();
         let state = self.state.lock().expect("preparation child scope lock");
-        child_retired && Self::body_obligations_exited(&state)
+        Ok(child_retired
+            && state.mode == Mode::Adopted
+            && Self::body_obligations_exited(&state)
+            && Self::started_actions_exited(&state))
     }
     pub(crate) fn finish(&self, action: impl FnOnce()) -> bool {
         if !Self::body_obligations_exited(&self.state.lock().expect("preparation child scope lock"))
@@ -602,5 +680,263 @@ impl TaskPreparationScope {
         }
         state.settled = true;
         true
+    }
+}
+
+#[cfg(test)]
+mod host_handoff_tests {
+    use super::*;
+    use std::sync::{
+        Condvar,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+    impl Gate {
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+        }
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+    struct Threads {
+        gates: Vec<Arc<Gate>>,
+        joins: Vec<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Threads {
+        fn drop(&mut self) {
+            for gate in &self.gates {
+                gate.release();
+            }
+            for join in self.joins.drain(..) {
+                let _ = join.join();
+            }
+        }
+    }
+    struct Child {
+        adoption: Option<(mpsc::Sender<()>, Arc<Gate>)>,
+    }
+    impl TaskPreparationChild for Child {
+        fn request_rollback(&self) {}
+        fn poll_exit(&self) -> TaskPreparationChildExit {
+            TaskPreparationChildExit::Exited
+        }
+        fn adopt_runtime(&self) {
+            if let Some((entered, gate)) = &self.adoption {
+                let _ = entered.send(());
+                gate.wait();
+            }
+        }
+    }
+    fn scope() -> Arc<TaskPreparationScope> {
+        use novarocks_types::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(9301, 9302), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        Arc::new(TaskPreparationScope::new(
+            identity,
+            Arc::new(ExecutionHealth::default()),
+        ))
+    }
+    fn entered(receiver: &mpsc::Receiver<()>) {
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("original callback reaches its controlled handoff");
+    }
+    #[test]
+    fn late_adoption_cannot_overwrite_rollback_or_retire_a_running_receiver_cleanup() {
+        let scope = scope();
+        let adopt_gate = Arc::new(Gate::default());
+        let receiver_gate = Arc::new(Gate::default());
+        let mut threads = Threads {
+            gates: vec![adopt_gate.clone(), receiver_gate.clone()],
+            joins: vec![],
+        };
+        let (adopt_entered, adopt_rx) = mpsc::channel();
+        scope
+            .register(Arc::new(Child {
+                adoption: Some((adopt_entered, adopt_gate.clone())),
+            }))
+            .unwrap();
+        scope.body_exited();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let (adopted, adopted_rx) = mpsc::channel();
+        let owner = scope.clone();
+        let committed = commits.clone();
+        threads.joins.push(std::thread::spawn(move || {
+            let accepted = owner.adopt_runtime();
+            if accepted {
+                let _ = owner.start_runtime(|| {
+                    committed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+            let _ = adopted.send(accepted);
+        }));
+        entered(&adopt_rx);
+        scope.request_rollback();
+        scope.cleanup(PreparationCleanup::Inbound, || {});
+        let (receiver_entered, receiver_rx) = mpsc::channel();
+        let owner = scope.clone();
+        let gate = receiver_gate.clone();
+        threads.joins.push(std::thread::spawn(move || {
+            owner.cleanup(PreparationCleanup::Receiver, || {
+                let _ = receiver_entered.send(());
+                gate.wait();
+            });
+        }));
+        entered(&receiver_rx);
+        adopt_gate.release();
+        let adopted = adopted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("original adoption returns");
+        assert!(
+            !scope.host_captures_exited(),
+            "running receiver cleanup keeps the original preparation captures live"
+        );
+        assert!(
+            !adopted,
+            "rollback is irreversible even if an earlier adoption callback succeeds later"
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert!(!scope.rollback_exited());
+        receiver_gate.release();
+        drop(threads);
+        assert!(scope.rollback_exited());
+        assert!(scope.host_captures_exited());
+    }
+    #[test]
+    fn rollback_waits_for_the_original_runtime_start_call_before_dropping_child_custody() {
+        let scope = scope();
+        scope.register(Arc::new(Child { adoption: None })).unwrap();
+        scope.body_exited();
+        assert!(scope.adopt_runtime());
+        let start_gate = Arc::new(Gate::default());
+        let mut threads = Threads {
+            gates: vec![start_gate.clone()],
+            joins: vec![],
+        };
+        let (started, started_rx) = mpsc::channel();
+        let owner = scope.clone();
+        let gate = start_gate.clone();
+        threads.joins.push(std::thread::spawn(move || {
+            let _ = owner.start_runtime(|| {
+                let _ = started.send(());
+                gate.wait();
+            });
+        }));
+        entered(&started_rx);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rejected = scope.start_runtime(captured(&drops));
+        assert!(
+            rejected.is_err(),
+            "the original runtime start is already in flight"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        scope.request_rollback();
+        scope.cleanup(PreparationCleanup::Inbound, || {});
+        scope.cleanup(PreparationCleanup::Receiver, || {});
+        assert!(
+            !scope.rollback_exited(),
+            "an in-flight original publication still owns its captures"
+        );
+        assert!(!scope.host_captures_exited());
+        start_gate.release();
+        drop(threads);
+        assert!(scope.rollback_exited());
+        assert!(scope.host_captures_exited());
+    }
+    struct Capture(Arc<AtomicUsize>);
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn captured(drops: &Arc<AtomicUsize>) -> impl FnOnce() + Send + 'static {
+        let original = Capture(drops.clone());
+        move || {
+            std::hint::black_box(&original);
+        }
+    }
+    #[test]
+    fn refused_runtime_start_returns_its_original_captures_without_running_or_dropping_them() {
+        let scope = scope();
+        scope.body_exited();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rejected = scope.start_runtime(captured(&drops));
+        assert!(rejected.is_err(), "preparation has not adopted its runtime");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(scope.adopt_runtime());
+        assert!(
+            scope
+                .start_runtime(|| {})
+                .unwrap_or_else(|_| panic!("one original admitted start"))
+        );
+        assert!(
+            scope.host_captures_exited(),
+            "never-started cleanup does not block normal exit"
+        );
+        let rejected = scope.start_runtime(captured(&drops));
+        assert!(
+            rejected.is_err(),
+            "a prior start cannot consume a second action"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        scope.request_rollback();
+        let rejected = scope.start_runtime(captured(&drops));
+        assert!(
+            rejected.is_err(),
+            "rollback cannot start a later runtime action"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        scope.cleanup(PreparationCleanup::Inbound, || {});
+        scope.cleanup(PreparationCleanup::Receiver, || {});
+        assert!(scope.rollback_exited());
+        assert!(scope.host_captures_exited());
+    }
+    #[test]
+    fn a_runtime_start_panic_keeps_its_original_phase_unresolved_through_rollback() {
+        let scope = scope();
+        scope.body_exited();
+        assert!(scope.adopt_runtime());
+        assert!(
+            !scope
+                .start_runtime(|| panic!("original runtime start failed"))
+                .unwrap_or_else(|_| panic!("the first action is admitted"))
+        );
+        assert!(scope.health.failure().is_some());
+        scope.cleanup(PreparationCleanup::Inbound, || {});
+        scope.cleanup(PreparationCleanup::Receiver, || {});
+        assert!(!scope.rollback_exited());
+        assert!(!scope.host_captures_exited());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rejected = scope.start_runtime(captured(&drops));
+        assert!(rejected.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

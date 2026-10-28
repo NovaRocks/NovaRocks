@@ -40,6 +40,16 @@ pub enum SlotState {
     Filled,
     RevokedUnused,
 }
+/// One payload in this original report position, independent of its consumers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReturnState {
+    Unclaimed,
+    Reserved,
+    Filled,
+    Taken,
+    RevokedUnused,
+    Unknown,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionError {
     TooManyConsumers,
@@ -49,6 +59,9 @@ pub enum CompletionError {
     NotFilled,
     AlreadyRetired,
     InvalidRevocation,
+    ReturnAlreadyClaimed,
+    InvalidReturnClaim,
+    InvalidReturnState(ReturnState),
 }
 #[derive(Debug)]
 pub struct CompletionSlot {
@@ -59,6 +72,7 @@ pub struct CompletionSlot {
     state: SlotState,
     body_exited: bool,
     captures_exited: bool,
+    returned: ReturnState,
     consumers: BTreeMap<ConsumerId, (ConsumerKind, Consumption)>,
 }
 impl CompletionSlot {
@@ -88,6 +102,7 @@ impl CompletionSlot {
             state: SlotState::Reserved,
             body_exited: false,
             captures_exited: false,
+            returned: ReturnState::Unclaimed,
             consumers: entries,
         })
     }
@@ -105,6 +120,51 @@ impl CompletionSlot {
     }
     pub const fn state(&self) -> SlotState {
         self.state
+    }
+    pub const fn return_state(&self) -> ReturnState {
+        self.returned
+    }
+    /// The wrapper also verifies the original producer is bound, not started.
+    pub fn claim_return(&mut self) -> Result<(), CompletionError> {
+        if self.returned != ReturnState::Unclaimed {
+            return Err(CompletionError::ReturnAlreadyClaimed);
+        }
+        if self.state != SlotState::Reserved || self.body_exited || self.captures_exited {
+            return Err(CompletionError::InvalidReturnClaim);
+        }
+        self.returned = ReturnState::Reserved;
+        Ok(())
+    }
+    pub fn fill_return(&mut self) -> Result<(), CompletionError> {
+        if self.returned != ReturnState::Reserved {
+            return Err(CompletionError::InvalidReturnState(self.returned));
+        }
+        self.returned = ReturnState::Filled;
+        Ok(())
+    }
+    pub fn take_return(&mut self) -> Result<(), CompletionError> {
+        if self.returned != ReturnState::Filled {
+            return Err(CompletionError::InvalidReturnState(self.returned));
+        }
+        self.returned = ReturnState::Taken;
+        Ok(())
+    }
+    /// This revokes only an unfilled payload, not the role or any consumer.
+    pub fn revoke_return_unused(&mut self) -> Result<(), CompletionError> {
+        if self.returned != ReturnState::Reserved {
+            return Err(CompletionError::InvalidReturnState(self.returned));
+        }
+        self.returned = ReturnState::RevokedUnused;
+        Ok(())
+    }
+    /// Lost custody is sticky. A later producer must return its own value.
+    pub fn lose_return(&mut self) -> bool {
+        if matches!(self.returned, ReturnState::Reserved | ReturnState::Filled) {
+            self.returned = ReturnState::Unknown;
+            true
+        } else {
+            false
+        }
     }
     pub fn fill(&mut self) -> Result<(), CompletionError> {
         if self.state != SlotState::Reserved {
@@ -167,6 +227,10 @@ impl CompletionSlot {
     pub fn retirable(&self) -> bool {
         self.body_exited
             && self.captures_exited
+            && matches!(
+                self.returned,
+                ReturnState::Unclaimed | ReturnState::Taken | ReturnState::RevokedUnused
+            )
             && match self.state {
                 SlotState::Reserved => false,
                 SlotState::RevokedUnused => true,

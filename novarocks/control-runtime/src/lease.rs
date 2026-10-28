@@ -131,6 +131,40 @@ pub struct WorkLease {
     body_exited: bool,
     captures_exited: bool,
 }
+/// Read-only identity of an actually bound Work. It observes the common
+/// reaper's removal of that exact header, independently of body exit, report
+/// retirement and capacity release. It admits no Work and acknowledges no leg.
+#[derive(Clone)]
+pub struct WorkRetirementObserver {
+    scope: ScopeHandle,
+    work: WorkId,
+}
+impl std::fmt::Debug for WorkRetirementObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkRetirementObserver")
+            .field("scope", &self.scope.id())
+            .field("work", &self.work)
+            .finish()
+    }
+}
+impl WorkRetirementObserver {
+    pub fn is_retired(&self) -> bool {
+        let state = self
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        // This identity can only come from a bound lease. Bound Work cannot
+        // roll back, IDs never repeat, and removing its scope requires every
+        // Work header to have retired. Absence therefore has exact provenance.
+        state
+            .scopes
+            .get(&self.scope.id())
+            .is_none_or(|scope| scope.work(self.work).is_none())
+    }
+}
 impl WorkLease {
     pub(crate) fn new(scope: ScopeHandle, id: WorkId) -> Self {
         Self {
@@ -145,6 +179,12 @@ impl WorkLease {
     }
     pub fn scope(&self) -> &ScopeHandle {
         &self.scope
+    }
+    pub fn retirement_observer(&self) -> WorkRetirementObserver {
+        WorkRetirementObserver {
+            scope: self.scope.clone(),
+            work: self.id,
+        }
     }
     /// Actual exit includes the complete admitted child tree. A retained
     /// lease may outlive its pure record: this non-forgeable handle is created
@@ -335,8 +375,76 @@ pub struct CapacityBundle {
     active: bool,
 }
 impl CapacityBundle {
+    /// Validate only original ownership, under one original ledger lock. No
+    /// lifecycle, generation, health or resource-release fact is inferred.
+    pub(crate) fn validate_reported_work_binding(
+        &self,
+        work: &WorkLease,
+        report: &crate::completion::ReportSlot,
+    ) -> Result<(), crate::reported_work::ReportedWorkBindingError> {
+        use crate::{reported_work::ReportedWorkBindingError, sync::Arc};
+        let state = work
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        if !Arc::ptr_eq(&work.scope.runtime.shared, &self.scope.runtime.shared)
+            || !Arc::ptr_eq(&work.scope.runtime.shared, &report.runtime.shared)
+        {
+            return Err(ReportedWorkBindingError::DifferentLedger);
+        }
+        if self.scope.id != work.scope.id {
+            return Err(ReportedWorkBindingError::WrongScope);
+        }
+        let owner = state
+            .scopes
+            .get(&work.scope.id)
+            .ok_or(ReportedWorkBindingError::UnknownScope)?;
+        let original_work = owner
+            .work(work.id)
+            .ok_or(ReportedWorkBindingError::UnknownWork)?;
+        if original_work.unbound_guard {
+            return Err(ReportedWorkBindingError::UnboundWork);
+        }
+        if !self.active {
+            return Err(ReportedWorkBindingError::InactiveCapacity);
+        }
+        let capacity = state
+            .ledger
+            .reservation(self.id)
+            .ok_or(ReportedWorkBindingError::UnknownCapacity)?;
+        if !capacity.bound {
+            return Err(ReportedWorkBindingError::UnboundCapacity);
+        }
+        if capacity.scope != work.scope.id {
+            return Err(ReportedWorkBindingError::WrongScope);
+        }
+        if capacity.work != work.id {
+            return Err(ReportedWorkBindingError::CapacityWorkMismatch);
+        }
+        let original_report = state
+            .slots
+            .get(&report.id)
+            .ok_or(ReportedWorkBindingError::UnknownReport)?;
+        if original_report.scope() != work.scope.id {
+            return Err(ReportedWorkBindingError::WrongScope);
+        }
+        if original_report.producer() != work.id {
+            return Err(ReportedWorkBindingError::ReportProducerMismatch);
+        }
+        Ok(())
+    }
     pub const fn id(&self) -> ReservationId {
         self.id
+    }
+    /// This owned bundle has returned its entire reservation. A preparation
+    /// remainder may be empty after releasing its last P/byte charges; it
+    /// still carries the transfer receipt, but must not release them twice.
+    /// This observes no body, capture, report or Work-header retirement.
+    pub const fn is_released(&self) -> bool {
+        !self.active
     }
     pub fn resources(&self) -> Result<ResourceVector, RuntimeError> {
         let state = self
@@ -406,6 +514,19 @@ impl CapacityBundle {
         new_id: ReservationId,
         resources: &ResourceVector,
     ) -> Result<Self, RuntimeError> {
+        self.split_inner(Some(new_id), resources)
+    }
+    /// Splits the original held units using an identity chosen in the same
+    /// ledger transaction. No Work or capacity is admitted; the returned
+    /// bundle retains this exact scope and bound owner until explicit transfer.
+    pub fn split_next(&mut self, resources: &ResourceVector) -> Result<Self, RuntimeError> {
+        self.split_inner(None, resources)
+    }
+    fn split_inner(
+        &mut self,
+        new_id: Option<ReservationId>,
+        resources: &ResourceVector,
+    ) -> Result<Self, RuntimeError> {
         let mut state = self
             .scope
             .runtime
@@ -413,6 +534,10 @@ impl CapacityBundle {
             .state
             .lock()
             .expect("runtime ledger lock");
+        let new_id = match new_id {
+            Some(id) => id,
+            None => state.ledger.next_reservation_id()?,
+        };
         state.ledger.split(self.id, new_id, resources)?;
         self.scope
             .runtime

@@ -116,6 +116,12 @@ pub struct ProposalSummary {
     other_diagnostics: Vec<(u64, Diagnostic)>,
     omitted_other_diagnostics: u64,
 }
+#[derive(Clone, Copy)]
+enum CandidateRetention {
+    First { originating: bool },
+    Originating,
+    Discard,
+}
 #[derive(Debug)]
 pub struct SummaryResult {
     pub state: ConclusionState,
@@ -138,28 +144,61 @@ impl ProposalSummary {
             self.omitted_other_diagnostics = self.omitted_other_diagnostics.saturating_add(1);
         }
     }
-    /// Returns only sources guaranteed to lose for every legal entry state.
-    pub fn push(&mut self, mut proposal: Proposal) -> Option<SourceId> {
-        let order = self.order();
+    fn candidate_retention(&self, proposal: &Proposal) -> CandidateRetention {
         let first_origin = proposal.originating()
             && self.originating.is_none()
             && !self.first.as_ref().is_some_and(|(_, p)| p.originating());
+        if self.first.is_none() {
+            CandidateRetention::First {
+                originating: first_origin,
+            }
+        } else if first_origin {
+            CandidateRetention::Originating
+        } else {
+            CandidateRetention::Discard
+        }
+    }
+    /// Predicts only this open summary's candidate retention. It grants no
+    /// source capacity or permission to consume a later summary state.
+    pub fn will_retain(&self, proposal: &Proposal) -> bool {
+        !matches!(
+            self.candidate_retention(proposal),
+            CandidateRetention::Discard
+        )
+    }
+    /// At most two original custody IDs, in proposal order, without allocating
+    /// or manufacturing an ID for a candidate which has no source.
+    pub fn candidate_sources(&self) -> impl Iterator<Item = SourceId> + '_ {
+        self.first
+            .iter()
+            .chain(self.originating.iter())
+            .filter_map(|(_, proposal)| proposal.source)
+    }
+    /// Returns only sources guaranteed to lose for every legal entry state.
+    pub fn push(&mut self, mut proposal: Proposal) -> Option<SourceId> {
+        let retention = self.candidate_retention(&proposal);
+        let order = self.order();
         let diagnostic = proposal.diagnostic.take();
-        if first_origin {
+        if matches!(
+            retention,
+            CandidateRetention::First { originating: true } | CandidateRetention::Originating
+        ) {
             if let Some(diagnostic) = diagnostic {
                 self.originating_diagnostic = Some((order, diagnostic));
             }
         } else if let Some(diagnostic) = diagnostic {
             self.record_other(order, diagnostic);
         }
-        if self.first.is_none() {
-            self.first = Some((order, proposal));
-            None
-        } else if first_origin {
-            self.originating = Some((order, proposal));
-            None
-        } else {
-            proposal.source
+        match retention {
+            CandidateRetention::First { .. } => {
+                self.first = Some((order, proposal));
+                None
+            }
+            CandidateRetention::Originating => {
+                self.originating = Some((order, proposal));
+                None
+            }
+            CandidateRetention::Discard => proposal.source,
         }
     }
     pub fn cleanup(&mut self, diagnostic: Diagnostic) {
@@ -269,6 +308,11 @@ impl CausalSegments {
             failed: false,
         }
     }
+    /// Predicts retention in the current open segment, including while an
+    /// earlier segment is consuming. This grants no paid source position.
+    pub fn will_retain(&self, proposal: &Proposal) -> bool {
+        !self.failed && self.open.will_retain(proposal)
+    }
     pub fn push(&mut self, proposal: Proposal) -> Option<SourceId> {
         if self.failed {
             return proposal.source;
@@ -280,7 +324,10 @@ impl CausalSegments {
             self.open.cleanup(diagnostic);
         }
     }
-    pub fn reserve_cut(&mut self, id: CutId, consumers: u64) -> Result<(), CutError> {
+    /// Check the current reservation without creating an unpublished cell.
+    /// The ingress repeats `reserve_cut` under the same exclusive handoff
+    /// fence after its original source positions have accepted ownership.
+    pub fn check_reserve_cut(&self, id: CutId) -> Result<(), CutError> {
         if self.failed {
             return Err(CutError::NotReady);
         }
@@ -290,6 +337,10 @@ impl CausalSegments {
         if self.cells.len() == self.limit {
             return Err(CutError::Full);
         }
+        Ok(())
+    }
+    pub fn reserve_cut(&mut self, id: CutId, consumers: u64) -> Result<(), CutError> {
+        self.check_reserve_cut(id)?;
         self.last_cut = id.0;
         self.cells.insert(
             id,
@@ -328,10 +379,7 @@ impl CausalSegments {
         self.cells.remove(&id);
         Ok(())
     }
-    /// An open segment can progress without a lifecycle role registering a
-    /// cut. Its sole custody slot remains occupied after core acknowledgement,
-    /// until the original publication/disposal captures really exit.
-    pub fn begin_open(&mut self) -> Result<ProposalSummary, CutError> {
+    fn validate_open(&self) -> Result<(), CutError> {
         if self.failed {
             return Err(CutError::NotReady);
         }
@@ -341,6 +389,24 @@ impl CausalSegments {
         if !self.filled.is_empty() || self.open.is_empty() {
             return Err(CutError::NotReady);
         }
+        Ok(())
+    }
+    /// Borrows the same open summary which a current `begin_open` could take.
+    /// The observation does not consume it or authorize a later handoff.
+    pub fn peek_open(&self) -> Result<&ProposalSummary, CutError> {
+        self.validate_open()?;
+        Ok(&self.open)
+    }
+    /// Observe only the original queued open content. Empty content grants
+    /// no consumption, source exit, role retirement or failed-owner drain.
+    pub fn open_is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+    /// An open segment can progress without a lifecycle role registering a
+    /// cut. Its sole custody slot remains occupied after core acknowledgement,
+    /// until the original publication/disposal captures really exit.
+    pub fn begin_open(&mut self) -> Result<ProposalSummary, CutError> {
+        self.validate_open()?;
         self.consuming_open =
             Some(novarocks_control_runtime_core::completion::Consumption::Pending);
         Ok(std::mem::take(&mut self.open))
@@ -434,7 +500,7 @@ impl CausalSegments {
     pub fn begin_consume(&mut self, id: CutId) -> Result<ProposalSummary, CutError> {
         self.take_cut(id, false)
     }
-    fn take_cut(&mut self, id: CutId, abandoning: bool) -> Result<ProposalSummary, CutError> {
+    fn validate_cut_take(&self, id: CutId, abandoning: bool) -> Result<(), CutError> {
         use novarocks_control_runtime_core::completion::Consumption;
         if self.consuming_cut.is_some() {
             return Err(CutError::Consuming);
@@ -450,8 +516,29 @@ impl CausalSegments {
         if self.next_cut() != Some(id) {
             return Err(CutError::NotReady);
         }
-        let cell = self.cells.get_mut(&id).ok_or(CutError::Unknown)?;
-        let segment = cell.segment.take().ok_or(CutError::NotReady)?;
+        let cell = self.cells.get(&id).ok_or(CutError::Unknown)?;
+        cell.segment.as_ref().ok_or(CutError::NotReady)?;
+        Ok(())
+    }
+    /// Borrows the exact FIFO prefix subject to the same normal-consumption
+    /// gates as `begin_consume`. No Core acknowledgement or source readiness
+    /// is inferred by this metadata observation.
+    pub fn peek_cut(&self, id: CutId) -> Result<&ProposalSummary, CutError> {
+        self.validate_cut_take(id, false)?;
+        Ok(self.cells[&id]
+            .segment
+            .as_ref()
+            .expect("validated original cut summary"))
+    }
+    fn take_cut(&mut self, id: CutId, abandoning: bool) -> Result<ProposalSummary, CutError> {
+        self.validate_cut_take(id, abandoning)?;
+        let segment = self
+            .cells
+            .get_mut(&id)
+            .expect("validated original cut cell")
+            .segment
+            .take()
+            .expect("validated original cut summary");
         self.filled.pop_front();
         self.consuming_cut = Some(ConsumingCut { id, abandoning });
         Ok(segment)
@@ -531,6 +618,34 @@ mod tests {
     use novarocks_execution_contract::failure::{FailureClass, FailureReason, domain};
     use novarocks_execution_contract::{AbortCause, CancelReason, TaskFailure};
     use std::num::NonZeroU16;
+
+    #[test]
+    fn reservation_precheck_does_not_publish_a_cell_or_advance_its_identity() {
+        let mut cuts = CausalSegments::new(1);
+        assert_eq!(
+            cuts.check_reserve_cut(CutId(0)),
+            Err(CutError::IdentityOrder)
+        );
+        cuts.check_reserve_cut(CutId(1)).unwrap();
+        assert_eq!(cuts.resident_cuts(), 0);
+        assert_eq!(cuts.next_cut(), None);
+        cuts.reserve_cut(CutId(1), 1).unwrap();
+        assert_eq!(cuts.check_reserve_cut(CutId(2)), Err(CutError::Full));
+        assert_eq!(cuts.resident_cuts(), 1);
+        cuts.seal_cut(CutId(1)).unwrap();
+        cuts.begin_consume(CutId(1)).unwrap();
+        cuts.finish_consume(CutId(1)).unwrap();
+        cuts.observe_captures_exit(CutId(1)).unwrap();
+        cuts.observe_effects_exit(CutId(1)).unwrap();
+        cuts.consume(CutId(1), 0).unwrap();
+        cuts.retire(CutId(1)).unwrap();
+        cuts.check_reserve_cut(CutId(2)).unwrap();
+        assert_eq!(cuts.resident_cuts(), 0);
+        cuts.reserve_cut(CutId(2), 0).unwrap();
+        cuts.seal_cut(CutId(2)).unwrap();
+        cuts.begin_abandon(CutId(2)).unwrap();
+        assert_eq!(cuts.check_reserve_cut(CutId(3)), Err(CutError::NotReady));
+    }
 
     fn diagnostic(n: u16, cleanup: bool) -> Diagnostic {
         Diagnostic {
@@ -982,5 +1097,168 @@ mod tests {
         assert!(matches!(cuts.begin_open(), Err(CutError::NotReady)));
         assert_eq!(cuts.push(proposal(3, 7)), Some(SourceId(7)));
         assert_segment_bound(&cuts);
+    }
+    #[test]
+    fn retention_prediction_matches_push_for_every_legal_proposal_prefix() {
+        for length in 0..=5_u32 {
+            for sequence in 0..5_u32.pow(length) {
+                let mut code = sequence;
+                let mut summary = ProposalSummary::default();
+                for ordinal in 0..length {
+                    summary.push(proposal((code % 5) as u8, (ordinal + 1) as u16));
+                    summary.cleanup(diagnostic(100 + ordinal as u16, true));
+                    code /= 5;
+                }
+                for kind in 0..5 {
+                    let next = proposal(kind, 900);
+                    let before = format!("{summary:?}");
+                    let retained = summary.will_retain(&next);
+                    assert_eq!(format!("{summary:?}"), before, "prediction is read-only");
+                    let mut pushed = summary.clone();
+                    let count = pushed.candidate_count();
+                    let discarded = pushed.push(next.clone());
+                    assert_eq!(pushed.candidate_count() == count + 1, retained);
+                    assert_eq!(discarded, if retained { None } else { next.source });
+                    let mut expected: Vec<_> = summary.candidate_sources().collect();
+                    if retained {
+                        expected.extend(next.source);
+                    }
+                    assert_eq!(pushed.candidate_sources().collect::<Vec<_>>(), expected);
+                    assert!(expected.len() <= 2);
+                }
+            }
+        }
+    }
+    #[test]
+    fn pending_source_readiness_checks_leave_the_original_summary_untouched() {
+        let mut cuts = CausalSegments::new(1);
+        cuts.push(proposal(4, 1));
+        cuts.push(proposal(3, 2));
+        let mut ready = std::collections::BTreeSet::from([SourceId(1)]);
+        let resident = cuts.resident_segments();
+        for _ in 0..3 {
+            let prefix = cuts.peek_open().unwrap();
+            assert!(!prefix.candidate_sources().all(|id| ready.contains(&id)));
+            assert_eq!(
+                prefix.candidate_sources().collect::<Vec<_>>(),
+                vec![SourceId(1), SourceId(2)]
+            );
+            assert_eq!(cuts.resident_segments(), resident);
+        }
+        ready.insert(SourceId(2));
+        assert!(
+            cuts.peek_open()
+                .unwrap()
+                .candidate_sources()
+                .all(|id| ready.contains(&id))
+        );
+        let prefix = cuts.begin_open().unwrap();
+        assert_eq!(
+            prefix.candidate_sources().collect::<Vec<_>>(),
+            vec![SourceId(1), SourceId(2)]
+        );
+        assert_eq!(cuts.peek_open().unwrap_err(), CutError::Consuming);
+        assert_eq!(cuts.begin_open().unwrap_err(), CutError::Consuming);
+        // The unconsumable open buffer still accepts an independent proposal;
+        // peek readiness and candidate retention are distinct observations.
+        let proposal = proposal(3, 3);
+        assert!(cuts.will_retain(&proposal));
+        assert_eq!(cuts.push(proposal), None);
+    }
+    #[test]
+    fn cut_peeks_match_fifo_and_both_consuming_gates_without_taking_a_prefix() {
+        let mut cuts = CausalSegments::new(2);
+        cuts.push(proposal(3, 1));
+        cuts.begin_open().unwrap();
+        cuts.reserve_cut(CutId(1), 1).unwrap();
+        cuts.reserve_cut(CutId(2), 1).unwrap();
+        cuts.push(proposal(3, 2));
+        cuts.seal_cut(CutId(2)).unwrap();
+        cuts.push(proposal(3, 3));
+        cuts.seal_cut(CutId(1)).unwrap();
+        assert_eq!(cuts.next_cut(), Some(CutId(2)));
+        assert_eq!(cuts.peek_cut(CutId(2)).unwrap_err(), CutError::Consuming);
+        assert_eq!(
+            cuts.begin_consume(CutId(2)).unwrap_err(),
+            CutError::Consuming
+        );
+        cuts.observe_open_consumed().unwrap();
+        assert_eq!(cuts.peek_cut(CutId(1)).unwrap_err(), CutError::NotReady);
+        assert_eq!(
+            cuts.begin_consume(CutId(1)).unwrap_err(),
+            CutError::NotReady
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                cuts.peek_cut(CutId(2))
+                    .unwrap()
+                    .candidate_sources()
+                    .collect::<Vec<_>>(),
+                vec![SourceId(2)]
+            );
+            assert_eq!(cuts.next_cut(), Some(CutId(2)));
+        }
+        let taken = cuts.begin_consume(CutId(2)).unwrap();
+        assert_eq!(
+            taken.candidate_sources().collect::<Vec<_>>(),
+            vec![SourceId(2)]
+        );
+        assert_eq!(cuts.peek_cut(CutId(1)).unwrap_err(), CutError::Consuming);
+        assert_eq!(
+            cuts.begin_consume(CutId(1)).unwrap_err(),
+            CutError::Consuming
+        );
+        cuts.finish_consume(CutId(2)).unwrap();
+        assert_eq!(
+            cuts.peek_cut(CutId(1))
+                .unwrap()
+                .candidate_sources()
+                .collect::<Vec<_>>(),
+            vec![SourceId(3)]
+        );
+        cuts.begin_consume(CutId(1)).unwrap();
+        cuts.finish_consume(CutId(1)).unwrap();
+        // Core acknowledgement of the open predecessor did not release its
+        // distinct custody. Both observations still reject a second open take.
+        assert_eq!(cuts.peek_open().unwrap_err(), CutError::Consuming);
+        assert_eq!(cuts.begin_open().unwrap_err(), CutError::Consuming);
+        cuts.finish_open().unwrap();
+        assert_eq!(cuts.peek_open().unwrap_err(), CutError::NotReady);
+        assert_eq!(cuts.begin_open().unwrap_err(), CutError::NotReady);
+    }
+    #[test]
+    fn failed_peeks_and_retention_predictions_never_grant_normal_consumption() {
+        let mut cuts = CausalSegments::new(2);
+        cuts.reserve_cut(CutId(1), 1).unwrap();
+        cuts.reserve_cut(CutId(2), 1).unwrap();
+        cuts.push(proposal(3, 1));
+        cuts.seal_cut(CutId(1)).unwrap();
+        cuts.push(proposal(3, 2));
+        cuts.seal_cut(CutId(2)).unwrap();
+        cuts.begin_abandon(CutId(1)).unwrap();
+        assert_eq!(cuts.peek_cut(CutId(2)).unwrap_err(), CutError::Consuming);
+        assert_eq!(
+            cuts.begin_consume(CutId(2)).unwrap_err(),
+            CutError::Consuming
+        );
+        cuts.finish_abandon(CutId(1)).unwrap();
+        assert_eq!(cuts.peek_cut(CutId(2)).unwrap_err(), CutError::NotReady);
+        assert_eq!(
+            cuts.begin_consume(CutId(2)).unwrap_err(),
+            CutError::NotReady
+        );
+        assert_eq!(cuts.peek_open().unwrap_err(), CutError::NotReady);
+        assert_eq!(cuts.begin_open().unwrap_err(), CutError::NotReady);
+        let later = proposal(3, 3);
+        assert!(!cuts.will_retain(&later));
+        assert_eq!(cuts.push(later), Some(SourceId(3)));
+        // The normal peek does not weaken the separate failed-owner path.
+        assert_eq!(
+            cuts.begin_abandon(CutId(2))
+                .unwrap()
+                .candidate_sources()
+                .collect::<Vec<_>>(),
+            vec![SourceId(2)]
+        );
     }
 }

@@ -24,6 +24,15 @@ use novarocks_control_runtime_core::{
     scheduler::TurnBudget,
 };
 
+/// Immutable registration policy, outside the potentially damaged actor state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActorFailurePolicy {
+    #[default]
+    IsolateScope,
+    /// A process control actor cannot project its own failure as a query error.
+    ProcessFailStop,
+}
+
 /// Implementations contain only pure protocol state, never runnable or rich-source custody.
 pub trait Actor: Send + 'static {
     /// Neutral command values, containing no runnable, rich source or foreign destructor.
@@ -57,6 +66,7 @@ pub struct StepContext<'a, E> {
     reservations: std::collections::BTreeMap<ReservationId, crate::lease::StepGuard>,
     max_reservations: usize,
     failure_work: Option<WorkId>,
+    stop_producing: bool,
 }
 impl<'a, E> StepContext<'a, E> {
     pub(crate) fn new(
@@ -76,6 +86,7 @@ impl<'a, E> StepContext<'a, E> {
             reservations: std::collections::BTreeMap::new(),
             max_reservations: max_effects,
             failure_work: None,
+            stop_producing: false,
             batch: EffectBatchState::new(
                 scope.id(),
                 generation,
@@ -92,6 +103,12 @@ impl<'a, E> StepContext<'a, E> {
     /// registration owner retains this admitted cleanup lease until removal.
     pub fn failure_work(&self) -> Option<WorkId> {
         self.failure_work
+    }
+    /// Stage a stop of new business starts in this step's original scope.
+    /// The gate changes only when the driver commits the whole normal step.
+    /// This neither signals running tasks nor observes any work or capture exit.
+    pub fn stop_producing(&mut self) {
+        self.stop_producing = true;
     }
     /// Transfer a still-unbound synchronous reservation into the same atomic
     /// handoff as its neutral effect. No queue/capture may bind it beforehand.
@@ -158,11 +175,13 @@ impl<'a, E> StepContext<'a, E> {
             state: self.batch,
             payloads: self.payloads,
             reservations: self.reservations,
+            stop_producing: self.stop_producing,
         }
     }
 }
 pub(crate) struct StepEnvelope<E> {
     pub(crate) ordinal: Option<BatchId>,
+    pub(crate) stop_producing: bool,
     pub(crate) state: EffectBatchState,
     pub(crate) payloads:
         std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,

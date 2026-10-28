@@ -356,9 +356,11 @@ mod owner_tests {
             self.authority.observable().notify_observers();
         }
         pub(super) fn context(self: &Arc<Self>) -> FragmentPrepareContext {
-            self.context_with_control(crate::runtime::task_control::test_support::control_for(
-                self.spec.task,
+            let owner = crate::runtime::task_control::test_support::owner_for(self.spec.task);
+            self.context_with_control(Arc::new(
+                owner.view(novarocks_execution_contract::TaskFailurePhase::Execution),
             ))
+            .with_completion_roles(owner.admit_completion_roles())
         }
         fn context_with_control(
             self: &Arc<Self>,
@@ -494,10 +496,16 @@ mod owner_tests {
         assert!(prepare_compiled_fragment(root.submission(), missing).is_err());
         assert!(root.aborts.lock().unwrap().is_empty());
         let wrong = BoundedRootSession::new();
+        let owner = crate::runtime::task_control::test_support::owner_for(root.spec.task);
         assert!(
             prepare_compiled_fragment(
                 root.submission(),
-                wrong.context().with_result_identity(root.spec.task)
+                wrong
+                    .context_with_control(Arc::new(
+                        owner.view(novarocks_execution_contract::TaskFailurePhase::Execution)
+                    ))
+                    .with_result_identity(root.spec.task)
+                    .with_completion_roles(owner.admit_completion_roles())
             )
             .is_err()
         );
@@ -558,10 +566,13 @@ mod owner_tests {
         let task = crate::runtime::task_control::test_support::owner_for(root.spec.task);
         let control =
             Arc::new(task.view(novarocks_execution_contract::TaskFailurePhase::Execution));
-        let running =
-            prepare_compiled_fragment(root.submission(), root.context_with_control(control))
-                .unwrap()
-                .start();
+        let running = prepare_compiled_fragment(
+            root.submission(),
+            root.context_with_control(control)
+                .with_completion_roles(task.admit_completion_roles()),
+        )
+        .unwrap()
+        .start();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !root.finishing.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::yield_now();
@@ -760,6 +771,7 @@ mod owner_tests {
         let mut context = FragmentPrepareContext::default()
             .with_task_control(control)
             .with_result_identity(owner.identity())
+            .with_completion_roles(owner.admit_completion_roles())
             .with_execution_runtime(runtime)
             .with_exchange_receiver_port(port.clone());
         let input = if let Some(session) = session {
@@ -869,7 +881,9 @@ mod owner_tests {
         assert!(running.stopped_fact().is_none());
         let settled = Arc::new(Mutex::new(None));
         let seen = settled.clone();
-        owner.on_settled(Box::new(move |snapshot| *seen.lock().unwrap() = snapshot));
+        owner
+            .admit_barrier()
+            .register(Box::new(move |snapshot| *seen.lock().unwrap() = snapshot));
         owner.advance_all();
         let snapshot = settled.lock().unwrap().take().unwrap();
         assert_eq!(snapshot.neutral().generation().get(), 2);
@@ -901,7 +915,7 @@ mod owner_tests {
         assert!(port.snapshot(key).is_some());
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
-        owner.on_settled(Box::new(move |snapshot| {
+        owner.admit_barrier().register(Box::new(move |snapshot| {
             assert!(snapshot.is_none());
             seen.fetch_add(1, Ordering::SeqCst);
         }));
@@ -923,6 +937,11 @@ mod owner_tests {
         let (dormant, _, _) = deferred_fragment_with_receiver(id, &owner, None);
         let running = dormant.start();
         wait_for_fragment_probe(|| owner.pending_settlements() == 1);
+        assert!(
+            !running.inner.lifecycle.settle_after_stop(Ok(())),
+            "a repeated progress observation waits for the original admitted continuation"
+        );
+        assert_eq!(owner.pending_settlements(), 1);
         owner.advance_all();
         assert!(running.stopped_fact().is_some());
         assert_eq!(owner.pending_settlements(), 0);
@@ -2495,8 +2514,8 @@ pub struct DormantFragmentHandle {
     /// report the hierarchy the fragment actually charged against.
     mem_tracker: Option<Arc<MemTracker>>,
     start_failure: Option<StartFailurePoint>,
-    settlement: Option<novarocks_execution_contract::SettlementPermit<super::ExecutionFailure>>,
-    publisher_work: Option<novarocks_execution_contract::CompletionWork>,
+    settlement: novarocks_execution_contract::SettlementPermit<super::ExecutionFailure>,
+    publisher_work: novarocks_execution_contract::CompletionWork,
 }
 
 #[derive(Debug)]
@@ -2606,16 +2625,11 @@ impl DormantFragmentHandle {
                 terminal: None,
             }),
             terminal_cv: std::sync::Condvar::new(),
-            publisher: match publisher_work {
-                Some(work) => crate::exec::pipeline::global_driver_executor::once_role::OnceRole::from_admitted(
-                    crate::exec::pipeline::global_driver_executor::once_role::Role::TerminalPublisher,
-                    work,
-                ),
-                None => crate::exec::pipeline::global_driver_executor::once_role::OnceRole::new(
-                    crate::exec::pipeline::global_driver_executor::once_role::Role::TerminalPublisher,
-                ),
-            },
-            settlement: std::sync::Mutex::new(settlement),
+            publisher: crate::exec::pipeline::global_driver_executor::once_role::OnceRole::from_admitted(
+                crate::exec::pipeline::global_driver_executor::once_role::Role::TerminalPublisher,
+                publisher_work,
+            ),
+            settlement: std::sync::Mutex::new(Some(settlement)),
             finisher: Arc::downgrade(&finisher),
             query_id,
             fragment_instance_id,
@@ -2806,6 +2820,19 @@ impl RunningFragmentLifecycle {
 
     // Design: ADR-0193 (docs/adr/ADR-0193-task-conclusion-proposals-and-settled-points.md)
     fn settle_after_stop(self: &Arc<Self>, result: super::ExecutionResult<()>) -> bool {
+        let permit = self
+            .settlement
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(permit) = permit else {
+            return self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .terminal
+                .is_some();
+        };
         let lifecycle = Arc::clone(self);
         let continuation: novarocks_execution_contract::SettledContinuation<
             super::ExecutionFailure,
@@ -2814,16 +2841,7 @@ impl RunningFragmentLifecycle {
             // reading the current owner snapshot at the actual decision point.
             lifecycle.finish_from_stopped(result);
         });
-        let permit = self
-            .settlement
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(permit) = permit {
-            permit.register(continuation);
-        } else {
-            self.control.on_settled(continuation);
-        }
+        permit.register(continuation);
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())

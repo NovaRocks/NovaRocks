@@ -83,7 +83,14 @@ fn fixture<T: Send + 'static>() -> Fixture<T> {
         ],
     )
     .unwrap();
-    let (slot, token) = ContinuationSlot::from_admitted(work, capacity, report.clone());
+    let (slot, token) = ContinuationSlot::from_admitted(
+        novarocks_control_runtime::reported_work::ReportedWork::try_new(
+            work,
+            capacity,
+            report.clone(),
+        )
+        .unwrap(),
+    );
     Fixture {
         ledger,
         scope,
@@ -421,7 +428,14 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
             [(consumer, ConsumerKind::Observer)],
         )
         .unwrap();
-        let (slot, token) = ContinuationSlot::<()>::from_admitted(work, capacity, report.clone());
+        let (slot, token) = ContinuationSlot::<()>::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                work,
+                capacity,
+                report.clone(),
+            )
+            .unwrap(),
+        );
         token
             .register(Box::new(|_| {}))
             .unwrap_or_else(|_| panic!("one admitted callback"));

@@ -203,6 +203,8 @@ impl StorageNeed {
     /// A causal role has distinct prefix/event inputs, each with an atomic
     /// bounded batch. Its cut retains two rich proposal candidates; the role
     /// itself can retain one callback/input capture and one reliable exit.
+    /// Each candidate additionally owns its original cleanup Work and report;
+    /// a cleanup effect alone cannot account for its opaque source destructor.
     pub fn role(reply: bool) -> Self {
         Self {
             inputs: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
@@ -210,9 +212,9 @@ impl StorageNeed {
             effects: ContextCore::MAX_STEP_WORK * crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
             cuts: 1,
             replies: usize::from(reply),
-            completions: 1,
+            completions: 3,
             captures: 3,
-            work: 1,
+            work: 3,
         }
     }
 }
@@ -241,6 +243,7 @@ pub enum TaskLifecycleRole {
     Settlement,
     WallTime,
     TerminalPublisher,
+    TerminalAction,
     ContextClose,
     FailureProjection,
 }
@@ -274,16 +277,61 @@ impl ControlRuntimePolicy {
             .checked_add(crate::task_preparation::BODY_ROLES)
             .and_then(|n| n.checked_add(crate::task_preparation::STEPS))
             .ok_or(PolicyError::Overflow)?;
-        let mut task_base = StorageNeed::role(false).checked_mul(fixed_roles)?;
+        let mut task_base = StorageNeed::role(false)
+            .checked_mul(fixed_roles)?
+            .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?;
         // Protocol lifecycle roles are bounded input authors. The original
         // Task lifetime is a separate parent, not another notification author.
         task_base.work = task_base.work.checked_add(1).ok_or(PolicyError::Overflow)?;
-        let mut loading = StorageNeed::role(false).checked_mul(TaskLifecycleRole::LOADING.len())?;
-        loading.work = crate::control_runtime::loading::LOADING_WORK_POSITIONS;
-        loading.completions = crate::control_runtime::loading::LOADING_REPORT_POSITIONS;
-        // The open and consuming summary each have two candidate positions.
+        // A returned host refusal can retain its consumed creation input. Its
+        // original child remains counted until actual transfer or disposal.
+        task_base.work = task_base
+            .work
+            .checked_add(crate::control_runtime::preparation_refusal::HOST_REFUSAL_WORK_POSITIONS)
+            .ok_or(PolicyError::Overflow)?;
+        task_base.completions = task_base
+            .completions
+            .checked_add(crate::control_runtime::preparation_refusal::HOST_REFUSAL_REPORT_POSITIONS)
+            .ok_or(PolicyError::Overflow)?;
         task_base.captures = task_base
             .captures
+            .checked_add(
+                crate::control_runtime::preparation_refusal::HOST_REFUSAL_CAPTURE_POSITIONS,
+            )
+            .ok_or(PolicyError::Overflow)?;
+        let mut loading = StorageNeed::role(false)
+            .checked_mul(TaskLifecycleRole::LOADING.len())?
+            .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?;
+        // Loading's two real producer/input holders have their own original
+        // Work/report geometry. Keep the candidate positions of their actual
+        // cuts, and fund the Task's open/consuming candidates before exposing
+        // even its first port. Accepted acquires only the remaining inventory.
+        let loading_sources = TaskLifecycleRole::LOADING
+            .len()
+            .checked_mul(2)
+            .and_then(|cuts| cuts.checked_add(4))
+            .ok_or(PolicyError::Overflow)?;
+        loading.work = crate::control_runtime::loading::LOADING_WORK_POSITIONS
+            .checked_add(loading_sources)
+            .ok_or(PolicyError::Overflow)?;
+        loading.completions = crate::control_runtime::loading::LOADING_REPORT_POSITIONS
+            .checked_add(loading_sources)
+            .ok_or(PolicyError::Overflow)?;
+        loading.captures = loading
+            .captures
+            .checked_add(4)
+            .ok_or(PolicyError::Overflow)?;
+        // The open and consuming summary each have two candidate positions.
+        // This is per Task. Cut candidates are already included in role(false)
+        // and therefore follow the actual fixed/shared/root role inventories;
+        // max_task_cuts is only an addressing bound, never another Task charge.
+        task_base.captures = task_base
+            .captures
+            .checked_add(4)
+            .ok_or(PolicyError::Overflow)?;
+        task_base.work = task_base.work.checked_add(4).ok_or(PolicyError::Overflow)?;
+        task_base.completions = task_base
+            .completions
             .checked_add(4)
             .ok_or(PolicyError::Overflow)?;
         let accepted = task_base.checked_sub(loading)?;
@@ -391,12 +439,64 @@ mod tests {
         assert_eq!(two.replies, one.replies);
         assert_eq!(two.inputs - one.inputs, policy.task_base.inputs);
         assert_eq!(two.cuts - one.cuts, policy.task_base.cuts);
+        assert_eq!(two.work - one.work, policy.task_base.work);
+        assert_eq!(
+            two.completions - one.completions,
+            policy.task_base.completions
+        );
         let root = policy.process_task_storage(2, 1).unwrap();
         assert_eq!(root.cuts - two.cuts, 2);
+        assert_eq!(root.work - two.work, policy.root_read_pool_per_root.work);
+        assert_eq!(
+            root.completions - two.completions,
+            policy.root_read_pool_per_root.completions
+        );
         assert_eq!(
             policy.max_task_cuts,
             policy.task_base.cuts + policy.request_roles + 2
         );
+    }
+
+    #[test]
+    fn increasing_shared_ingress_does_not_charge_its_source_candidates_to_each_task() {
+        let small = ControlRuntimePolicy::try_new(ingress()).unwrap();
+        let mut expanded = ingress();
+        expanded.ordinary_running += 2;
+        let large = ControlRuntimePolicy::try_new(expanded).unwrap();
+        assert_eq!(small.task_base, large.task_base);
+        assert_eq!(small.loading, large.loading);
+        assert_eq!(small.accepted, large.accepted);
+        let extra_pool = large.request_pool.checked_sub(small.request_pool).unwrap();
+        for tasks in [0, 1, 9] {
+            let delta = large
+                .process_task_storage(tasks, 0)
+                .unwrap()
+                .checked_sub(small.process_task_storage(tasks, 0).unwrap())
+                .unwrap();
+            assert_eq!(
+                delta, extra_pool,
+                "the same actual request pool, including source Work/report, is funded once"
+            );
+        }
+    }
+
+    #[test]
+    fn loading_pays_one_open_notification_without_a_second_work_or_cut() {
+        let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
+        // InputLoaded and LoaderExited each own prefix/event positions. The
+        // Task also owns one independent coalesced open-summary position.
+        assert_eq!(policy.loading.inputs, 5);
+        assert_eq!(policy.loading.batches, 5);
+        assert_eq!(policy.loading.effects, 5 * ContextCore::MAX_STEP_WORK);
+        assert_eq!(policy.loading.cuts, 2);
+        assert_eq!(policy.loading.work, 11);
+        assert_eq!(policy.loading.completions, 10);
+        assert_eq!(policy.loading.captures, 10);
+        assert_eq!(
+            policy.loading.checked_add(policy.accepted).unwrap(),
+            policy.task_base
+        );
+        assert_eq!(policy.accepted.inputs, 64);
     }
 
     #[test]

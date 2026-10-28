@@ -25,9 +25,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 
 use bytes::Bytes;
+use novarocks_control_runtime::notify::Notify as RuntimeNotify;
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution::runtime::fragment::io::{
-    ResultWriteAdmission, ResultWriteCredit, RootProducerState, RootResultWriteSpec,
+    ResultWriteAdmission, ResultWriteCredit, RootFailureObservation, RootProducerState,
+    RootResultWriteSpec,
 };
 use novarocks_execution::runtime::observable::{
     BoundedNotification, Observable, ObserverSubscription,
@@ -66,6 +68,25 @@ pub struct RootOwnershipSnapshot {
     pub retained_reservations: usize,
     pub metadata_holders: usize,
     pub metadata_bytes: usize,
+}
+
+/// Readiness for rechecking a root's physical owners after a notification
+/// batch retires. The borrow cannot outlive the original root's prepaid
+/// metadata. It grants no rich source, capacity or physical-exit receipt.
+pub struct RootNotificationExitNotice<'a> {
+    ready: &'a RuntimeNotify,
+}
+impl RootNotificationExitNotice<'_> {
+    /// Sample before checking the complete physical-idle predicate. Sampling
+    /// after that check can miss the last notification batch's exit.
+    pub fn version(&self) -> u64 {
+        self.ready.version()
+    }
+    /// Wait only after sampling the version and rechecking physical owners.
+    /// A wake means recheck; another real batch may already hold the root.
+    pub fn wait_after(&self, observed: u64) {
+        self.ready.wait_after(observed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -545,6 +566,41 @@ impl Drop for RootNotificationRun {
     }
 }
 
+/// The closed bit and the original physical count share one modification
+/// order. Either seal follows the last release and supplies its wake, or that
+/// release observes sealed in its own RMW and supplies the final wake itself.
+struct RootReservationPositions(AtomicUsize);
+impl RootReservationPositions {
+    const CLOSED: usize = 1usize << (usize::BITS - 1);
+
+    fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+    fn try_admit(&self, limit: usize) -> bool {
+        assert!(limit < Self::CLOSED, "root position bound fits its count");
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if state & Self::CLOSED == 0 && state < limit {
+                    Some(state + 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+    fn close(&self) {
+        self.0.fetch_or(Self::CLOSED, Ordering::AcqRel);
+    }
+    fn release_is_last_closed(&self) -> bool {
+        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous & !Self::CLOSED > 0, "release owns a root position");
+        previous == (Self::CLOSED | 1)
+    }
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire) & !Self::CLOSED
+    }
+}
+
 struct PhysicalOwners {
     task: novarocks_execution_contract::TaskIdentity,
     health: Arc<ExecutionHealth>,
@@ -552,9 +608,10 @@ struct PhysicalOwners {
     notifying: AtomicBool,
     notification_pending: AtomicBool,
     metadata_notification_held: AtomicBool,
+    notification_exited: RuntimeNotify,
     segments: AtomicUsize,
     deliveries: AtomicUsize,
-    retained_reservations: AtomicUsize,
+    retained_reservations: RootReservationPositions,
     fixed_metadata_bytes: AtomicUsize,
     fixed_metadata_holders: AtomicUsize,
     changed: Notify,
@@ -645,6 +702,12 @@ impl PhysicalOwners {
             let failed = run.work.as_ref().is_none_or(|work| work.failed);
             run.completed = run.work.is_some();
             drop(run); // restore original batch before admitting another borrower
+            if !failed {
+                // The original callbacks and their captures have actually
+                // retired and the holder has been cleared. This concrete
+                // metadata wake cannot call a host or start another batch.
+                self.notification_exited.notify();
+            }
             self.notifying.store(false, Ordering::Release);
             if failed
                 || !self.notification_pending.load(Ordering::Acquire)
@@ -662,8 +725,8 @@ struct PhysicalSegmentPosition(Arc<PhysicalOwners>);
 struct PhysicalReservationPosition(Arc<PhysicalOwners>, bool);
 impl Drop for PhysicalReservationPosition {
     fn drop(&mut self) {
-        self.0.retained_reservations.fetch_sub(1, Ordering::AcqRel);
-        if self.1 {
+        let last_closed = self.0.retained_reservations.release_is_last_closed();
+        if self.1 || last_closed {
             self.0.wake();
         } else if let Some(source) = self.0.progress.get().and_then(Weak::upgrade) {
             // An unsuccessful tentative admission returned no usable
@@ -763,7 +826,7 @@ struct ChannelState {
     producer_started: bool,
     producer_exited: bool,
     finishing: bool,
-    failed: Option<novarocks_execution::runtime::fragment::ExecutionFailure>,
+    failed: Option<RootFailureObservation>,
     output_rows: u64,
     active_builder: bool,
 }
@@ -838,13 +901,17 @@ impl RootResultChannel {
             ))
             + positions * std::mem::size_of::<RetainedReservationOwner>();
         // Source-audited pinned std 1.98.1 Darwin Box<pal::Mutex>: one for each
-        // reservation's private credit lock, ChannelState and notification locks.
+        // reservation's private credit lock, ChannelState, notification batch
+        // and the common notification-exit version locks.
         // No concurrent initialization is possible for these private credits.
         #[cfg(target_vendor = "apple")]
         let bytes = bytes
-            + std::alloc::Layout::array::<(isize, [u8; 56])>(positions + 2)
+            + std::alloc::Layout::array::<(isize, [u8; 56])>(positions + 3)
                 .expect("finite root mutex layouts fit usize")
-                .size();
+                .size()
+            // The same pinned Darwin common Notify also boxes its separate
+            // pthread condvar. Its version mutex serializes initialization.
+            + std::alloc::Layout::new::<(isize, [u8; 40])>().size();
         bytes
     }
     fn bytes_owner_metadata_bytes() -> usize {
@@ -904,6 +971,9 @@ impl RootResultChannel {
             callback_arc_bytes(&budget_wake),
             Self::credit_control_backing_bytes(task),
             Self::bytes_owner_metadata_bytes(),
+            // The first failure retains one bounded neutral diagnostic, never
+            // its original source. Its text backing belongs to this root.
+            novarocks_execution_contract::status::SAFE_DETAIL_MAX_BYTES,
         ];
         let bytes = parts.into_iter().try_fold(0usize, |sum, part| {
             sum.checked_add(part).ok_or_else(overflow)
@@ -1003,9 +1073,10 @@ impl RootResultChannel {
             notifying: AtomicBool::new(false),
             notification_pending: AtomicBool::new(false),
             metadata_notification_held: AtomicBool::new(false),
+            notification_exited: RuntimeNotify::default(),
             segments: AtomicUsize::new(0),
             deliveries: AtomicUsize::new(0),
-            retained_reservations: AtomicUsize::new(0),
+            retained_reservations: RootReservationPositions::new(),
             fixed_metadata_bytes: AtomicUsize::new(metadata_bytes),
             fixed_metadata_holders: AtomicUsize::new(0),
             changed: Notify::new(),
@@ -1020,6 +1091,9 @@ impl RootResultChannel {
         // Realize the new platform notification mutex before publication. Its
         // backing is included in the same finite core-capacity calculation.
         drop(physical.notification.lock().unwrap());
+        // Realize the common version mutex and its platform condvar before
+        // publication. A readiness version carries no physical-exit proof.
+        physical.notification_exited.notify();
         let budget_wake =
             budget
                 .writable_observable()
@@ -1105,31 +1179,38 @@ impl RootResultChannel {
         Arc::clone(&self.physical.writable)
     }
     pub fn try_reserve(&self, bytes: usize) -> Result<ResultWriteAdmission, RootChannelError> {
-        if !self.state.lock().unwrap().lifetime.allows_read() {
-            return Err(RootChannelError::Closed);
-        }
-        // One scratch owner, one input and the exact independent send copies.
-        // Small reservations cannot grow an unbounded list of credit objects.
-        let positions = Self::retained_reservation_positions();
-        if self
-            .physical
-            .retained_reservations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < positions).then_some(n + 1)
-            })
-            .is_err()
-        {
-            return Ok(ResultWriteAdmission::Blocked);
-        }
-        let mut position = PhysicalReservationPosition(Arc::clone(&self.physical), false);
-        let granted = self
-            .budget
-            .try_reserve(
-                ResultBufferKey::Task(self.spec.task),
-                self.limits.per_root().get(),
-                bytes,
-            )
-            .map_err(RootChannelError::Funding)?;
+        self.try_reserve_funding(bytes, || {
+            self.budget
+                .try_reserve(
+                    ResultBufferKey::Task(self.spec.task),
+                    self.limits.per_root().get(),
+                    bytes,
+                )
+                .map_err(RootChannelError::Funding)
+        })
+    }
+    fn try_reserve_funding(
+        &self,
+        bytes: usize,
+        fund: impl FnOnce() -> Result<ResultWriteAdmission, RootChannelError>,
+    ) -> Result<ResultWriteAdmission, RootChannelError> {
+        // A borrower owns its physical position before leaving the same fence
+        // that closes admission. Funding and its foreign destructors remain
+        // outside this lock. A seal cannot observe idle between these steps.
+        let mut position = {
+            let state = self.state.lock().unwrap();
+            if !state.lifetime.allows_read() {
+                return Err(RootChannelError::Closed);
+            }
+            // One scratch owner, one input and the exact independent send copies.
+            // Small reservations cannot grow an unbounded list of credit objects.
+            let positions = Self::retained_reservation_positions();
+            if !self.physical.retained_reservations.try_admit(positions) {
+                return Ok(ResultWriteAdmission::Blocked);
+            }
+            PhysicalReservationPosition(Arc::clone(&self.physical), false)
+        };
+        let granted = fund()?;
         let ResultWriteAdmission::Granted(credit) = granted else {
             return Ok(ResultWriteAdmission::Blocked);
         };
@@ -1189,26 +1270,27 @@ impl RootResultChannel {
     }
     pub fn note_rows(&self, rows: u64) -> Result<(), RootChannelError> {
         let mut state = self.state.lock().unwrap();
-        if !state.lifetime.allows_read() || state.finishing {
+        if !state.lifetime.allows_read() || state.finishing || state.failed.is_some() {
             return Err(RootChannelError::Closed);
         }
         let Some(total) = state.output_rows.checked_add(rows) else {
-            if state.failed.is_none() {
-                state.failed = Some(
-                    novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
-                        RootProducerFailure::RowCount {
-                            committed: state.output_rows,
-                            requested: rows,
-                        },
-                    ),
-                );
-            }
+            use novarocks_execution_contract::failure::FailureProjection;
+            let failure = RootProducerFailure::RowCount {
+                committed: state.output_rows,
+                requested: rows,
+            };
+            // This local integer-only author freezes its own neutral facts.
+            // The original source is created and handed off once outside the
+            // lock; retained channel metadata never owns an error occurrence.
+            state.failed = Some(RootFailureObservation::new(
+                failure.failure_fact(),
+                novarocks_execution_contract::status::SafeDetail::truncating(
+                    "root output row count exceeds its u64 carrier",
+                ),
+            ));
+            drop(state);
             return Err(RootChannelError::Execution(
-                state
-                    .failed
-                    .as_ref()
-                    .expect("row failure was retained")
-                    .clone(),
+                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(failure),
             ));
         };
         state.output_rows = total;
@@ -1229,8 +1311,11 @@ impl RootResultChannel {
     }
     pub fn producer_state(&self) -> RootProducerState {
         let state = self.state.lock().unwrap();
-        if let Some(error) = &state.failed {
-            return RootProducerState::Failed(error.clone());
+        if let Some(observation) = &state.failed {
+            return RootProducerState::Failed(observation.clone());
+        }
+        if !state.lifetime.allows_read() {
+            return RootProducerState::AwaitTerminalControl;
         }
         if state.lifetime.root_finished() {
             RootProducerState::ContextHeld
@@ -1415,7 +1500,7 @@ impl RootResultChannel {
             payload_bytes: stream.payload_bytes,
             segments: self.physical.segments.load(Ordering::Acquire),
             deliveries: self.physical.deliveries.load(Ordering::Acquire),
-            retained_reservations: self.physical.retained_reservations.load(Ordering::Acquire),
+            retained_reservations: self.physical.retained_reservations.count(),
             metadata_holders: self.physical.fixed_metadata_holders.load(Ordering::Acquire)
                 + usize::from(
                     self.physical
@@ -1430,12 +1515,20 @@ impl RootResultChannel {
         (!state.producer_started || state.producer_exited)
             && self.physical.segments.load(Ordering::Acquire) == 0
             && self.physical.deliveries.load(Ordering::Acquire) == 0
-            && self.physical.retained_reservations.load(Ordering::Acquire) == 0
+            && self.physical.retained_reservations.count() == 0
             && self.physical.fixed_metadata_holders.load(Ordering::Acquire) == 0
             && !self
                 .physical
                 .metadata_notification_held
                 .load(Ordering::Acquire)
+    }
+    /// The host reaper must multiplex this readiness source with its other
+    /// admitted duties, including after Core failure. Obtain the version,
+    /// check physical_idle, then wait only if the predicate is still false.
+    pub fn notification_exit_notice(&self) -> RootNotificationExitNotice<'_> {
+        RootNotificationExitNotice {
+            ready: &self.physical.notification_exited,
+        }
     }
     pub fn close(&self, reason: RootRetentionClose) {
         self.seal_reads(reason);
@@ -1446,6 +1539,7 @@ impl RootResultChannel {
     pub fn seal_reads(&self, reason: RootRetentionClose) {
         let mut state = self.state.lock().unwrap();
         state.lifetime.close(reason);
+        self.physical.retained_reservations.close();
         state.stream.seal();
         if state.retiring_payloads.is_none() {
             state.retiring_payloads = Some(std::mem::take(&mut state.payloads));
@@ -1654,21 +1748,35 @@ impl RootProducerExit {
     /// destroyed its input, cursor, builder and encoder scratch. Cancellation,
     /// End publication and dropping this token do not satisfy that obligation.
     /// Whole-job exit remains the responsibility of its independent owner.
-    pub fn finish_encoder(self) {
+    #[must_use = "handoff the first encoder failure to its actual Task owner"]
+    pub fn finish_encoder(
+        self,
+    ) -> Option<novarocks_execution::runtime::fragment::ExecutionFailure> {
         let mut state = self.channel.state.lock().unwrap();
         state.producer_exited = true;
         state.lifetime.encoder_exited();
-        if state.lifetime.end().is_none() && state.lifetime.allows_read() && state.failed.is_none()
+        let failure = if state.lifetime.end().is_none()
+            && state.lifetime.allows_read()
+            && state.failed.is_none()
         {
-            state.failed = Some(
-                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
-                    RootProducerFailure::ExitedWithoutEnd,
+            use novarocks_execution_contract::failure::FailureProjection;
+            let cause = RootProducerFailure::ExitedWithoutEnd;
+            state.failed = Some(RootFailureObservation::new(
+                cause.failure_fact(),
+                novarocks_execution_contract::status::SafeDetail::truncating(
+                    "root producer exited without publishing End",
                 ),
-            );
-        }
+            ));
+            Some(cause)
+        } else {
+            None
+        };
         RootResultChannel::try_handoff(&mut state);
         drop(state);
+        let failure =
+            failure.map(novarocks_execution::runtime::fragment::ExecutionFailure::from_domain);
         self.channel.physical.wake();
+        failure
     }
 }
 /// Strong-only read ownership. The last handle frees its private Arc before
@@ -1796,6 +1904,62 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn sealed_channel_notifies_the_last_tentative_funding_exit() {
+        // Blocked, refused, unwound and granted-after-seal calls all retain
+        // the same physical position until their real funding stack exits.
+        for outcome in 0..4 {
+            let (channel, _) = channel(FrozenRootOutput::CountOnly);
+            let (entered, funding_entered) = std::sync::mpsc::sync_channel(0);
+            let (release, funding_release) = std::sync::mpsc::sync_channel(0);
+            let funded_channel = Arc::clone(&channel);
+            let worker = std::thread::spawn(move || {
+                funded_channel.try_reserve_funding(1, || {
+                    assert!(funded_channel.state.try_lock().is_ok());
+                    entered.send(()).unwrap();
+                    funding_release.recv().unwrap();
+                    match outcome {
+                        0 => Ok(ResultWriteAdmission::Blocked),
+                        1 => Err(RootChannelError::Closed),
+                        2 => panic!("original funding call did not return normally"),
+                        3 => {
+                            let on_release = Arc::clone(&funded_channel);
+                            Ok(ResultWriteAdmission::Granted(ResultWriteCredit::new(
+                                1,
+                                move |_| assert!(on_release.state.try_lock().is_ok()),
+                            )))
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+            });
+            funding_entered.recv().unwrap();
+            channel.close(RootRetentionClose::ContextAborted);
+            assert_eq!(channel.physical.retained_reservations.count(), 1);
+            let (notified, notification) = std::sync::mpsc::sync_channel(1);
+            let subscription = channel.writable_observable().subscribe(Arc::new(move || {
+                // One coalesced notification is enough for the original
+                // custodian to recheck the actual physical owners.
+                let _ = notified.try_send(());
+            }));
+            let observed = channel.writable_observable().generation();
+            assert!(!channel.physical_idle());
+            release.send(()).unwrap();
+            match (outcome, worker.join()) {
+                (0, Ok(Ok(ResultWriteAdmission::Blocked))) | (2, Err(_)) => {}
+                (1 | 3, Ok(Err(RootChannelError::Closed))) => {}
+                _ => panic!("unexpected funding result"),
+            }
+            assert!(channel.physical_idle());
+            assert!(
+                channel.writable_observable().generation() > observed,
+                "the last sealed borrower must wake its registered custodian"
+            );
+            assert!(notification.try_recv().is_ok());
+            drop(subscription);
+        }
+    }
+
+    #[test]
     fn closed_channel_is_a_stop_observation_not_an_originating_task_failure() {
         use novarocks_execution_contract::failure::{
             FailureClass, FailureEvidence, FailureProjection,
@@ -1837,7 +2001,7 @@ mod tests {
         );
         assert_eq!((before.segments, before.deliveries), (1, 1));
         drop(offered);
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         // End has sequence 2; ACK-only retires logical Data and End together.
         let ack = channel.read(&read(&channel, None, 2)).await.unwrap();
         drop(ack);
@@ -1925,6 +2089,156 @@ mod tests {
         .unwrap();
         (channel, budget)
     }
+    #[test]
+    fn notification_exit_wakes_after_an_early_physical_idle_check() {
+        let (channel, _) = channel(FrozenRootOutput::CountOnly);
+        let notice = channel.notification_exit_notice();
+        let (entered, callback_entered) = std::sync::mpsc::sync_channel(0);
+        let (release, callback_release) = std::sync::mpsc::sync_channel(0);
+        let callback_release = Mutex::new(callback_release);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let checked = Arc::downgrade(&channel);
+        let subscription = channel.writable_observable().subscribe(Arc::new(move || {
+            let root = checked.upgrade().unwrap();
+            assert!(root.state.try_lock().is_ok());
+            assert!(root.physical.notification.try_lock().is_ok());
+            seen.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).unwrap();
+            callback_release.lock().unwrap().recv().unwrap();
+        }));
+        std::thread::scope(|scope| {
+            let notification = scope.spawn(|| channel.physical.wake());
+            callback_entered.recv().unwrap();
+            // The real custodian ran while the callback still held its batch.
+            // Its check cannot claim idle, and no unrelated owner will wake it.
+            let observed = notice.version();
+            assert!(!channel.physical_idle());
+            release.send(()).unwrap();
+            notice
+                .ready
+                .wait_after_timeout(observed, Duration::from_secs(2));
+            let notified = notice.version() > observed;
+            let idle_before_join = channel.physical_idle();
+            notification.join().unwrap();
+            assert!(
+                notified,
+                "the last notification holder must signal readiness"
+            );
+            assert!(
+                idle_before_join,
+                "recheck must precede joining the notifier"
+            );
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no new callback batch");
+        drop(subscription);
+    }
+
+    #[test]
+    fn notification_exit_before_wait_retains_its_readiness() {
+        let (channel, _) = channel(FrozenRootOutput::CountOnly);
+        let notice = channel.notification_exit_notice();
+        let observed = notice.version();
+        let (entered, callback_entered) = std::sync::mpsc::sync_channel(0);
+        let (release, callback_release) = std::sync::mpsc::sync_channel(0);
+        let callback_release = Mutex::new(callback_release);
+        let subscription = channel.writable_observable().subscribe(Arc::new(move || {
+            entered.send(()).unwrap();
+            callback_release.lock().unwrap().recv().unwrap();
+        }));
+        let (finished, batch_finished) = std::sync::mpsc::sync_channel(0);
+        std::thread::scope(|scope| {
+            let notification = scope.spawn(|| {
+                channel.physical.wake();
+                finished.send(()).unwrap();
+            });
+            callback_entered.recv().unwrap();
+            assert!(!channel.physical_idle());
+            release.send(()).unwrap();
+            batch_finished.recv().unwrap();
+            // Exit precedes wait enrollment. The shared version order preserves
+            // the wake; the complete predicate already permits retirement.
+            let advanced_before_wait = notice.version() > observed;
+            let idle_before_join = channel.physical_idle();
+            notice
+                .ready
+                .wait_after_timeout(observed, Duration::from_millis(20));
+            notification.join().unwrap();
+            assert!(advanced_before_wait, "an exit cannot be an ephemeral wake");
+            assert!(idle_before_join);
+        });
+        drop(subscription);
+    }
+
+    #[test]
+    fn unresolved_notification_does_not_publish_positive_exit_readiness() {
+        let (channel, _) = channel(FrozenRootOutput::CountOnly);
+        let notice = channel.notification_exit_notice();
+        let observed = notice.version();
+        let subscription = channel.writable_observable().subscribe(Arc::new(|| {
+            panic!("original notification callback has unknown exit");
+        }));
+        channel.physical.wake();
+        assert_eq!(notice.version(), observed);
+        assert!(!channel.physical_idle());
+        assert!(!channel.physical.health.is_healthy());
+        drop(subscription);
+    }
+
+    #[test]
+    fn notification_exit_notice_borrows_original_root_metadata() {
+        let (channel, budget) = channel(FrozenRootOutput::CountOnly);
+        let charged = budget.retained_bytes_for_test();
+        assert!(charged > 0);
+        {
+            let notice = channel.notification_exit_notice();
+            let observed = notice.version();
+            channel.physical.wake();
+            assert!(notice.version() > observed);
+            assert_eq!(budget.retained_bytes_for_test(), charged);
+        }
+        drop(channel);
+        assert_eq!(budget.retained_bytes_for_test(), 0);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn darwin_credit_controls_cover_the_notification_exit_version_mutex() {
+        let (channel, _) = channel(FrozenRootOutput::CountOnly);
+        // Opening realizes all three root-owned mutexes and the common Notify
+        // condvar. Their Darwin pal backing is boxed outside the inline owner
+        // layouts. Private reservation locks have their own finite positions.
+        let notice = channel.notification_exit_notice();
+        let _ = notice.version();
+        assert!(channel.state.try_lock().is_ok());
+        assert!(channel.physical.notification.try_lock().is_ok());
+        let geometry = NativeResultSupportGeometry::V1;
+        let reservations = RootResultChannel::retained_reservation_positions();
+        let segments = (geometry.root_active_segment_positions
+            + geometry.root_queued_segment_positions
+            + geometry.root_retired_segment_tail_positions) as usize;
+        let funded_controls = (1 + segments + reservations)
+            * ResultRetainedBudget::stream_credit_control_backing_bytes(ResultBufferKey::Task(
+                channel.spec.task,
+            ));
+        let reservation_owners = reservations * std::mem::size_of::<RetainedReservationOwner>();
+        let private_mutexes = std::alloc::Layout::array::<(isize, [u8; 56])>(reservations)
+            .unwrap()
+            .size();
+        let root_mutexes = ["channel state", "notification batch", "exit version"];
+        let root_mutex_backing =
+            root_mutexes.len() * std::alloc::Layout::new::<(isize, [u8; 56])>().size();
+        let root_condvar_backing = std::alloc::Layout::new::<(isize, [u8; 40])>().size();
+        assert_eq!(
+            RootResultChannel::credit_control_backing_bytes(channel.spec.task),
+            funded_controls
+                + reservation_owners
+                + private_mutexes
+                + root_mutex_backing
+                + root_condvar_backing
+        );
+    }
+
     #[test]
     fn healthy_writable_epochs_reuse_original_slots_without_retaining_metadata() {
         let (channel, budget) = channel(FrozenRootOutput::CountOnly);
@@ -2129,7 +2443,7 @@ mod tests {
             let callback_thread = std::thread::spawn(move || producer.finish_encoder());
             if let Err(error) = receiver.recv_timeout(Duration::from_secs(5)) {
                 gate.release();
-                callback_thread.join().unwrap();
+                assert!(callback_thread.join().unwrap().is_none());
                 panic!("the actual payload Drop did not enter: {error}");
             }
             // Collect while the real destructor is blocked. Assert only after
@@ -2142,11 +2456,11 @@ mod tests {
             // the first owner's actual opaque destructor is blocked.
             sibling.request_finish().unwrap();
             sibling.publish_end().unwrap();
-            sibling_producer.finish_encoder();
+            assert!(sibling_producer.finish_encoder().is_none());
             let sibling_exited = sibling.physical_idle();
             let sibling_state = sibling.producer_state();
             gate.release();
-            callback_thread.join().unwrap();
+            assert!(callback_thread.join().unwrap().is_none());
             let fault = fault.expect("health was published before foreign payload Drop");
             assert_eq!(
                 fault.origin(),
@@ -2191,11 +2505,12 @@ mod tests {
                 panic!("metadata fault after the original row-count failure");
             }))
             .unwrap();
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         let RootProducerState::Failed(observed) = channel.producer_state() else {
             panic!("metadata cannot replace the domain failure");
         };
-        assert!(std::ptr::eq(original.cause(), observed.cause()));
+        use novarocks_execution_contract::failure::FailureProjection;
+        assert_eq!(original.failure_fact(), observed.fact());
         assert_eq!(
             channel
                 .physical
@@ -2459,13 +2774,7 @@ mod tests {
             generation,
             "failed tentative positions cannot cause a retry spin"
         );
-        assert_eq!(
-            channel
-                .physical
-                .retained_reservations
-                .load(Ordering::Acquire),
-            1
-        );
+        assert_eq!(channel.physical.retained_reservations.count(), 1);
         drop(credit);
         assert_ne!(
             observable.generation(),
@@ -2482,7 +2791,7 @@ mod tests {
         channel.request_finish().unwrap();
         publish(&channel, b"abc", true);
         assert_eq!(channel.producer_state(), RootProducerState::Finishing);
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         assert_eq!(channel.producer_state(), RootProducerState::ContextHeld);
         let first = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
         let replay = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
@@ -2773,7 +3082,7 @@ mod tests {
         channel.request_finish().unwrap();
         channel.publish_end().unwrap();
         assert_eq!(channel.producer_state(), RootProducerState::Finishing);
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         let end = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
         assert!(matches!(
             end.reply().outcome,
@@ -2788,7 +3097,7 @@ mod tests {
         let producer = empty.start_producer().unwrap();
         empty.request_finish().unwrap();
         empty.publish_end().unwrap();
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         assert_eq!(empty.producer_state(), RootProducerState::ContextHeld);
         let end = empty.read(&read(&empty, Some(1), 0)).await.unwrap();
         assert!(matches!(
@@ -2826,7 +3135,11 @@ mod tests {
         channel.mark_context_owned().unwrap();
         let producer = channel.start_producer().unwrap();
         assert!(!channel.physical_idle());
-        producer.finish_encoder();
+        let original = producer
+            .finish_encoder()
+            .expect("the actual missing-End source");
+        use novarocks_execution_contract::failure::FailureProjection;
+        assert_eq!(original.failure_fact().reason().code(), 11);
         assert!(matches!(
             channel.producer_state(),
             RootProducerState::Failed(_)
@@ -2887,7 +3200,7 @@ mod tests {
                 Err(RootChannelError::Producer)
             );
             assert!(channel.snapshot().end_sequence.is_none());
-            producer.finish_encoder();
+            assert!(producer.finish_encoder().is_none());
             assert!(!channel.state.lock().unwrap().lifetime.root_finished());
             let reply = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
             assert_eq!(reply.reply().outcome, RootReadOutcome::AwaitTerminalControl);
@@ -2902,13 +3215,7 @@ mod tests {
         };
         channel.close(RootRetentionClose::ContextReleased);
         assert!(!channel.physical_idle());
-        assert_eq!(
-            channel
-                .physical
-                .retained_reservations
-                .load(Ordering::Acquire),
-            1
-        );
+        assert_eq!(channel.physical.retained_reservations.count(), 1);
         credit.shrink_to(0).unwrap();
         assert!(
             !channel.physical_idle(),
@@ -2975,7 +3282,7 @@ mod tests {
         let RootProducerState::Failed(original) = root.producer_state() else {
             panic!("actual counter refusal is visible before producer exit")
         };
-        let fact = original.failure_fact();
+        let fact = original.fact();
         assert_eq!(fact.class(), FailureClass::Representation);
         assert_eq!(fact.reason().domain(), domain::WORKER.get());
         assert_eq!(fact.reason().code(), 10);
@@ -2986,16 +3293,61 @@ mod tests {
         assert_eq!(extent.representable_prefix, None);
         assert!(fact.resource().is_none());
         assert!(!root.state.lock().unwrap().producer_exited);
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         assert!(root.state.lock().unwrap().producer_exited);
         assert_eq!(root.producer_state(), RootProducerState::Failed(original));
         let (root, _) = channel(FrozenRootOutput::CountOnly);
-        root.start_producer().unwrap().finish_encoder();
+        let source = root
+            .start_producer()
+            .unwrap()
+            .finish_encoder()
+            .expect("the first missing-End cause is returned to its real owner");
         let RootProducerState::Failed(error) = root.producer_state() else {
             panic!("exit alone cannot publish success")
         };
-        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
-        assert_eq!(error.failure_fact().reason().code(), 11);
+        assert_eq!(error.fact().class(), FailureClass::Invariant);
+        assert_eq!(error.fact().reason().code(), 11);
+        assert_eq!(source.failure_fact(), error.fact());
+    }
+
+    #[test]
+    fn retained_root_metadata_does_not_hold_the_originating_failure_occurrence() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        #[derive(Debug)]
+        struct SourceExit(Arc<AtomicUsize>);
+        impl novarocks_execution_contract::SourceRetentionCapability for SourceExit {}
+        impl Drop for SourceExit {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (root, _) = channel(FrozenRootOutput::CountOnly);
+        let producer = root.start_producer().unwrap();
+        root.note_rows(u64::MAX).unwrap();
+        let source = root.note_rows(1).unwrap_err().into_execution();
+        let exits = Arc::new(AtomicUsize::new(0));
+        source.retain_source_lifetime(Box::new(SourceExit(exits.clone())));
+        let live_caller = source.clone();
+        let first_fact = source.failure_fact();
+        assert!(matches!(root.note_rows(1), Err(RootChannelError::Closed)));
+        assert!(producer.finish_encoder().is_none());
+        assert!(
+            matches!(root.producer_state(), RootProducerState::Failed(ref observation) if observation.fact() == first_fact)
+        );
+        drop(source);
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        drop(live_caller);
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        // A retained route and arbitrarily many neutral observations retain
+        // the first fact, without pinning or recreating its original source.
+        for _ in 0..3 {
+            assert!(
+                matches!(root.producer_state(), RootProducerState::Failed(ref observation) if observation.fact() == first_fact)
+            );
+        }
+        root.close(RootRetentionClose::ContextAborted);
+        assert!(root.physical_idle());
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3056,7 +3408,7 @@ mod tests {
             // empty End; that fact alone still cannot hand off the encoder.
             root.publish_end().unwrap();
             assert!(!root.state.lock().unwrap().producer_exited);
-            producer.finish_encoder();
+            assert!(producer.finish_encoder().is_none());
             assert!(root.state.lock().unwrap().producer_exited);
             if !context_first {
                 assert_eq!(root.producer_state(), RootProducerState::Finishing);
@@ -3104,7 +3456,7 @@ mod tests {
         );
         // A cancelled encoder still must actually relinquish its inputs and
         // then explicitly finish. Closed retention never grants ContextHeld.
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         assert!(root.state.lock().unwrap().producer_exited);
         assert!(!root.state.lock().unwrap().lifetime.root_finished());
         assert_ne!(root.producer_state(), RootProducerState::ContextHeld);

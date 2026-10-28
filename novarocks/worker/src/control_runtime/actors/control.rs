@@ -120,6 +120,7 @@ impl Actor for ControlActor {
             None => self.core.handle(now, command, &mut admission),
         }
         .expect("process control input preserves its frozen invariants");
+        let internal_ready = self.core.has_internal_work();
         assert!(
             step.charge(result.records_visited),
             "bounded process control traversal"
@@ -145,6 +146,18 @@ impl Actor for ControlActor {
         let mut released_admission = Vec::new();
         let mut route_publications = Vec::new();
         for effect in result.effects {
+            // These are pure continuation hints, not lifecycle facts. The
+            // same Core retains their cursors and chooses NextInternal. Host
+            // custody is one separately prepaid coalesced wake cell.
+            if matches!(
+                &effect,
+                ControlEffect::ContinueReplies { .. }
+                    | ControlEffect::ContinueRequestReplies { .. }
+                    | ControlEffect::ContinueMaintenance
+                    | ControlEffect::ContinueFence
+            ) {
+                continue;
+            }
             let mut dependencies = Vec::new();
             let admitted = match &effect {
                 ControlEffect::Materialize { reservation, .. } => Some(*reservation),
@@ -208,6 +221,22 @@ impl Actor for ControlActor {
                 panic!("bounded process control effect handoff: {error:?}")
             });
         }
+        if internal_ready {
+            next += 1;
+            step.effect(
+                EffectDescriptor {
+                    id: ActionId::new(next).unwrap(),
+                    work,
+                    kind: EffectKind::Publication,
+                    dependencies: Vec::new(),
+                },
+                WorkerAction::Control {
+                    effect: ControlEffect::WakeInternal,
+                    admitted: None,
+                },
+            )
+            .unwrap_or_else(|(error, _)| panic!("bounded internal wake handoff: {error:?}"));
+        }
         assert!(
             ticket_admission.is_none() || adopted_ticket,
             "every newly issued ticket transfers its actual guard in the grant body"
@@ -226,7 +255,7 @@ impl Actor for ControlActor {
                     kind: EffectKind::Reply,
                     dependencies,
                 },
-                WorkerAction::Reply(reply),
+                WorkerAction::ControlReply(reply),
             )
             .unwrap_or_else(|(error, _)| {
                 panic!("bounded process control reply handoff: {error:?}")

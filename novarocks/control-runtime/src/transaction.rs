@@ -126,6 +126,11 @@ impl LedgerState {
         SlotId::new(local.get().max(global)).ok_or(RuntimeError::IdentityExhausted)
     }
     pub(crate) fn reserve_slot(&mut self, owner: ScopeId, id: SlotId) -> Result<(), RuntimeError> {
+        // Report handles retain this ledger and identity after retirement.
+        // Neither another scope nor actor attachment may reissue that identity.
+        if id.get() <= self.last_slot {
+            return Err(RuntimeError::DuplicateSlot);
+        }
         self.scopes
             .get_mut(&owner)
             .ok_or(RuntimeError::UnknownScope)?
@@ -287,6 +292,149 @@ impl RuntimeLedger {
             })
             .transpose()?;
         self.open_scope_locked(&mut state, id, parent, generation, max_work, max_slots)
+    }
+    /// Bootstrap one child scope and its original root from a live parent.
+    /// Parent-link admission, root reservation and publication share one ledger
+    /// transaction, including when external intake has already closed. The
+    /// root owns a real zero-resource reservation; the caller retains the
+    /// original capacity payer for this finite header inventory. No quota is
+    /// acquired again or inferred from the parent lease alone.
+    ///
+    /// The child inherits the parent's closed/stopped/failed gates before it
+    /// becomes observable. A failed parent permits only its normal cleanup
+    /// kinds, and failing the new child advances `child_generation` once, just
+    /// like an existing scope failure. The original root remains admitted and
+    /// can bind for cleanup; it cannot derive new Business work after failure.
+    pub fn open_child_scope_with_root(
+        &self,
+        parent: &crate::lease::WorkLease,
+        child_generation: Generation,
+        max_work: usize,
+        max_slots: usize,
+        root_kind: WorkKind,
+    ) -> Result<(ScopeHandle, StepGuard), RuntimeError> {
+        if !Arc::ptr_eq(&self.shared, &parent.scope().runtime.shared) {
+            return Err(CapacityError::WrongOwner.into());
+        }
+        let mut state = self.shared.state.lock().expect("runtime ledger lock");
+        if state.scopes.len() >= state.max_scopes {
+            return Err(RuntimeError::ScopeCapacity);
+        }
+        let id = state
+            .last_scope
+            .checked_add(1)
+            .and_then(ScopeId::new)
+            .ok_or(RuntimeError::IdentityExhausted)?;
+        let parent_scope = parent.scope().id();
+        let (parent_generation, link, parent_closed, parent_stopped, parent_failed) = {
+            let owner = state
+                .scopes
+                .get(&parent_scope)
+                .ok_or(RuntimeError::UnknownScope)?;
+            let link = owner.next_work_id()?;
+            owner.check_admission(
+                owner.generation(),
+                link,
+                root_kind,
+                WorkAdmission::Derived(parent.id()),
+            )?;
+            (
+                owner.generation(),
+                link,
+                !owner.external_open(),
+                owner.stopped(),
+                owner.failed(),
+            )
+        };
+        // No fallible gate transition may remain after reserving the real
+        // root. Inherited failure uses the existing generation transition.
+        if parent_failed && child_generation.next().is_none() {
+            return Err(ScopeError::IdentityExhausted.into());
+        }
+        let mut child = ScopeState::new(
+            id,
+            Some(parent_scope),
+            child_generation,
+            max_work,
+            max_slots,
+        );
+        let root = child.next_work_id()?;
+        let reservation = state.ledger.next_reservation_id()?;
+        // The local scope is not published yet. Its initial root is authorized
+        // by the exact parent preflight above, rather than by opening a live
+        // external gate. A refusal mutates neither ledger nor parent scope.
+        state.ledger.try_reserve_bundle(
+            &mut child,
+            ReservationRequest {
+                id: reservation,
+                generation: child_generation,
+                guard: root,
+                resources: ResourceVector::default(),
+                admission: WorkAdmission::External,
+                kind: root_kind,
+            },
+        )?;
+        if parent_failed {
+            child
+                .fail()
+                .expect("inherited child failure generation was preflighted");
+        } else if parent_stopped {
+            child.request_stop();
+        } else if parent_closed || !state.external_open {
+            child.close_external();
+        }
+        // Only the private child and capacity ledger changed after preflight;
+        // the same locked parent transition cannot now ordinarily refuse.
+        state
+            .scopes
+            .get_mut(&parent_scope)
+            .expect("preflighted parent remains live")
+            .admit(
+                parent_generation,
+                link,
+                root_kind,
+                WorkAdmission::Derived(parent.id()),
+            )
+            .expect("same-transaction parent link admission was preflighted");
+        assert!(
+            state
+                .parent_links
+                .insert(id, (parent_scope, link))
+                .is_none()
+        );
+        let generation = child.generation();
+        assert!(state.scopes.insert(id, child).is_none());
+        state.last_scope = id.get();
+        self.shared.record(HistoryFact::WorkAdmitted {
+            scope: parent_scope,
+            work: link,
+        });
+        self.shared.record(HistoryFact::ScopeOpened {
+            scope: id,
+            generation: child_generation,
+        });
+        self.shared.record(HistoryFact::Admitted {
+            scope: id,
+            work: root,
+            reservation,
+        });
+        if parent_failed {
+            self.shared.record(HistoryFact::OwnerFailed {
+                scope: id,
+                generation,
+            });
+        } else if parent_stopped {
+            self.shared.record(HistoryFact::ScopeStopped { scope: id });
+        } else if parent_closed || !state.external_open {
+            self.shared.record(HistoryFact::ScopeClosed { scope: id });
+        }
+        let scope = ScopeHandle {
+            runtime: self.clone(),
+            id,
+        };
+        drop(state);
+        self.shared.changed.notify();
+        Ok((scope.clone(), StepGuard::new(scope, root, reservation)))
     }
     fn open_scope_locked(
         &self,
@@ -576,6 +724,45 @@ impl ScopeHandle {
             scope: self.id,
             slot,
         });
+        Ok(slot)
+    }
+    /// Attach a pure actor under its original live failure-cleanup authority.
+    /// External closure does not discard this existing responsibility. The
+    /// current scope and Work are rechecked in the same transaction as slot
+    /// admission, even if an earlier driver preflight already inspected them.
+    pub(crate) fn attach_admitted_actor_next(
+        &self,
+        failure_work: WorkId,
+    ) -> Result<SlotId, RuntimeError> {
+        let mut state = self
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let scope = state
+            .scopes
+            .get(&self.id)
+            .ok_or(RuntimeError::UnknownScope)?;
+        if scope.failed() {
+            return Err(ScopeError::Failed.into());
+        }
+        let work = scope.work(failure_work).ok_or(ScopeError::UnknownWork)?;
+        if work.kind != WorkKind::Cleanup
+            || work.unbound_guard
+            || work.body_exited
+            || work.captures_exited
+        {
+            return Err(ScopeError::InvalidTransition.into());
+        }
+        let slot = state.next_slot_id(self.id)?;
+        state.reserve_slot(self.id, slot)?;
+        self.runtime.shared.record(HistoryFact::SlotReserved {
+            scope: self.id,
+            slot,
+        });
+        drop(state);
+        self.runtime.shared.changed.notify();
         Ok(slot)
     }
     pub(crate) fn detach_actor(&self, slot: SlotId) -> Result<(), RuntimeError> {

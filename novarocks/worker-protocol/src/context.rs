@@ -17,8 +17,11 @@
 
 //! One context's pure protocol authority. Capacity is synchronously reserved
 //! in the same actor step; host work and publication are ordered effects.
+use crate::control::EstablishSemanticFacts;
 use crate::creation::RequestContext;
-use crate::domain::{ContextDomainInput, QueryContextDomains, TaskDomainInput, TaskDomains};
+use crate::domain::{
+    ContextDomainInput, CredentialState, QueryContextDomains, TaskDomainInput, TaskDomains,
+};
 use crate::observation::CoveredSubscriptionRequest;
 use crate::{
     conclusion::{adjudicate, terminal_state, terminating_state},
@@ -30,8 +33,8 @@ use crate::{
 use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId, WorkId};
 use novarocks_execution_contract::operation::DomainFailureOutcome;
 use novarocks_execution_contract::{
-    AbortCause, LeaseSequence, LeaseValidFor, OperationOutcome, QueryContextRef, QueryContextState,
-    TaskConclusion, TaskIdentity, TaskOperationId, TaskState, TerminationDetail,
+    AbortCause, AdmissionTicketId, LeaseSequence, LeaseValidFor, OperationOutcome, QueryContextRef,
+    QueryContextState, TaskConclusion, TaskIdentity, TaskOperationId, TaskState, TerminationDetail,
 };
 use novarocks_execution_contract::{
     CancelReason, DomainProgression, DomainVersion, ExchangeEdgeId, OperationDomainFailure,
@@ -43,6 +46,47 @@ use novarocks_execution_contract::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+/// The complete original Establish identity selected by the Root. Mutable
+/// Context domains never replace this record during replay or lease changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextEstablishment {
+    pub operation: TaskOperationId,
+    pub ticket: AdmissionTicketId,
+    pub payload: PayloadId,
+    pub semantics: EstablishSemanticFacts,
+    /// The Root's actual election time is also the initial lease origin.
+    pub elected_at: MonotonicInstant,
+}
+
+/// Actual neutral facts supplied by the successful materialization owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextMaterialized {
+    pub initial_credential_resource: u64,
+}
+
+/// Correlation with the original Root request; this probe creates no new RPC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EstablishReplayRequest {
+    pub request: RequestContext,
+    pub ticket: AdmissionTicketId,
+    pub payload: PayloadId,
+    pub semantics: EstablishSemanticFacts,
+}
+
+/// The credential owner measured material against this exact current resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EstablishCredentialComparison {
+    pub current: CredentialState,
+    pub same_material: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EstablishReplayResult {
+    AwaitMaterialization,
+    CompareCredential { expected: CredentialState },
+    Decided(OperationOutcome),
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ContextConfig {
@@ -189,12 +233,22 @@ pub enum ContextInput {
         task: TaskIdentity,
         facts: TaskOutputFacts,
     },
+    /// The original terminal action observed successful production. This
+    /// stores one bounded intent without accepting success or claiming exit.
+    /// `None` leaves output responsibility with the original result owner.
+    CompletionIntent {
+        task: TaskIdentity,
+        completed_output: Option<TaskOutputFacts>,
+    },
+    /// The original terminal action, its captures and its fact have actually
+    /// exited after receiving the runtime's real retired-resource proof.
+    /// Neither a Task terminal nor preparation whole-exit supplies this fact.
+    CompletionExited {
+        task: TaskIdentity,
+    },
     BindTaskShape {
         task: TaskIdentity,
         shape: TaskShape,
-    },
-    InstallContextDomains {
-        domains: QueryContextDomains,
     },
     Cancel {
         request: TaskOperationId,
@@ -255,7 +309,19 @@ pub enum ContextInput {
         generation: u64,
         position: CoveredSubscriptionRequest,
     },
-    Established,
+    MaterializationFinished {
+        result: Result<ContextMaterialized, AdmissionRefusal>,
+    },
+    /// The original admitted M returned all captures without invoking the
+    /// materialization I/O because the Context's release fence had already won.
+    MaterializationWithdrawn,
+    /// A pure entity-owner probe. Its original Root R owns waiting, comparison
+    /// custody, deadline handling and the single external reply.
+    ProbeEstablish {
+        context: QueryContextRef,
+        request: EstablishReplayRequest,
+        comparison: Option<EstablishCredentialComparison>,
+    },
     Create {
         request: TaskOperationId,
         task: TaskIdentity,
@@ -293,6 +359,13 @@ pub enum ContextInput {
     Finish {
         task: TaskIdentity,
     },
+    /// Completion of an already handed-off termination, preserving only
+    /// positive independent output facts from the original terminal action.
+    /// Its proposal/source precedes this event in the same Task causal FIFO.
+    FinishWithOutput {
+        task: TaskIdentity,
+        output: Option<TaskOutputFacts>,
+    },
     Physical {
         task: TaskIdentity,
         fact: PhysicalFact,
@@ -318,6 +391,21 @@ pub enum ContextInput {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextEffect {
+    EstablishProbed {
+        context: QueryContextRef,
+        request: RequestContext,
+        result: EstablishReplayResult,
+        /// Time of this owner observation. Only Decided is a final verdict.
+        decided_at: MonotonicInstant,
+    },
+    /// This is the Context's actual decision after its lease/close check,
+    /// rather than proof that the materialization host returned successfully.
+    EstablishmentDecided {
+        context: QueryContextRef,
+        /// Protocol close epoch, not the runtime scope incarnation.
+        close_epoch: Generation,
+        decision: ContextEstablishmentDecision,
+    },
     /// Admit one finite Task-close role and order it after this Task's cuts;
     /// another Task's pending predecessor cannot block the context scan.
     ApplyTaskClose {
@@ -348,10 +436,12 @@ pub enum ContextEffect {
         task: TaskIdentity,
         generation: Generation,
         cut: Option<CutId>,
+        diagnostics: crate::proposal_summary::Diagnostics,
     },
     PublishTaskConvergence {
         task: TaskIdentity,
         version: u64,
+        snapshot: crate::convergence::TaskConvergenceSnapshot,
     },
     ApplyTaskDomains {
         request: TaskOperationId,
@@ -434,6 +524,7 @@ pub enum ContextEffect {
         state: TaskState,
         installed: bool,
         snapshot: TaskStatus,
+        convergence: crate::convergence::TaskConvergenceSnapshot,
     },
     PublishConclusion {
         task: TaskIdentity,
@@ -479,6 +570,7 @@ pub enum ContextEffect {
         task: TaskIdentity,
         active: ReservationId,
         preparation: Option<ReservationId>,
+        convergence: crate::convergence::TaskConvergenceSnapshot,
     },
     RetainContext {
         context: QueryContextRef,
@@ -512,6 +604,13 @@ pub enum RequestResult {
     /// Only this reply role expires. The owner still holds the admitted work.
     TimeoutWhileAccepted,
 }
+/// The actual Context step authors both lifecycle state and the complete
+/// operation decision. Host success alone is never evidence of Active.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextEstablishmentDecision {
+    pub state: QueryContextState,
+    pub outcome: Result<OperationOutcome, DomainRefusal>,
+}
 #[derive(Clone, Copy, Debug)]
 struct PendingReply {
     outcome: OperationOutcome,
@@ -534,6 +633,7 @@ struct Closing {
 pub struct ContextCore {
     identity: QueryContextRef,
     generation: Generation,
+    establishment: ContextEstablishment,
     config: ContextConfig,
     state: QueryContextState,
     now: MonotonicInstant,
@@ -580,9 +680,8 @@ impl ContextCore {
     pub fn new(
         identity: QueryContextRef,
         generation: Generation,
+        establishment: ContextEstablishment,
         config: ContextConfig,
-        now: MonotonicInstant,
-        lease: InstalledLease,
     ) -> Result<Self, CoreError> {
         if config.max_tasks == 0
             || config.max_creation_waiters == 0
@@ -592,9 +691,16 @@ impl ContextCore {
         {
             return Err(CoreError::InvalidConfiguration);
         }
+        let now = establishment.elected_at;
+        let lease = InstalledLease::install_initial(
+            establishment.semantics.initial_lease_valid_for,
+            config.lease_bounds,
+            now,
+        );
         Ok(Self {
             identity,
             generation,
+            establishment,
             config,
             state: QueryContextState::Establishing,
             now,
@@ -629,6 +735,13 @@ impl ContextCore {
     }
     pub fn identity(&self) -> QueryContextRef {
         self.identity
+    }
+    pub const fn establishment(&self) -> ContextEstablishment {
+        self.establishment
+    }
+    /// Accepted neutral domain facts, never host material or an access right.
+    pub const fn current_credential(&self) -> Option<CredentialState> {
+        self.context_domains.credential()
     }
     pub fn state(&self) -> QueryContextState {
         self.state
@@ -809,16 +922,31 @@ impl ContextCore {
         if now < self.now {
             return Err(CoreError::TimeRegressed);
         }
+        if let ContextInput::ProbeEstablish { context, .. } = &input
+            && *context != self.identity
+        {
+            return Err(CoreError::WrongIdentity);
+        }
         self.now = now;
         let mut step = ContextStep::default();
-        // Expiry is checked against current input time, not only against an eventual
-        // timer delivery. Already late lifecycle facts still settle their holders.
-        if matches!(
-            self.state,
-            QueryContextState::Establishing
-                | QueryContextState::Active
-                | QueryContextState::Quiescing
-        ) && now.has_reached(self.lease.expires_at())
+        // A normal quiesce that already won establishment keeps the legacy
+        // completion verdict, even when this return reaches the lease deadline.
+        // A preceding Tick may already have upgraded it; never undo that fact.
+        let quiesced_materialization = self.state == QueryContextState::Quiescing
+            && matches!(
+                &input,
+                ContextInput::MaterializationFinished { .. }
+                    | ContextInput::MaterializationWithdrawn
+            );
+        // Other inputs still check current time before handling their fact.
+        if !quiesced_materialization
+            && matches!(
+                self.state,
+                QueryContextState::Establishing
+                    | QueryContextState::Active
+                    | QueryContextState::Quiescing
+            )
+            && now.has_reached(self.lease.expires_at())
         {
             self.begin_abort(None, AbortCause::LeaseExpired, &mut step)?;
         }
@@ -834,6 +962,7 @@ impl ContextCore {
                     return Err(CoreError::IllegalFact);
                 }
                 self.apply_close_to(task, &mut step)?;
+                self.try_finish_completion_intent(task, &mut step)?;
             }
             ContextInput::ContinueTaskDomain { task } => {
                 self.advance_task_domain(task, &mut step)?
@@ -879,6 +1008,7 @@ impl ContextCore {
                         .push(ContextEffect::DisposeSource { task, source });
                 }
                 self.flush(task, &mut step)?;
+                self.try_finish_completion_intent(task, &mut step)?;
             }
             ContextInput::ContinueQuiesce => self.advance_quiesce(&mut step)?,
             ContextInput::Summary {
@@ -896,10 +1026,17 @@ impl ContextCore {
                 }
                 self.flush(task, &mut step)?;
                 self.consume_summary(task, summary, &mut step)?;
+                self.try_finish_completion_intent(task, &mut step)?;
                 step.effects.push(ContextEffect::SummaryConsumed {
                     task,
                     generation,
                     cut,
+                    diagnostics: self
+                        .tasks
+                        .get(&task)
+                        .ok_or(CoreError::UnknownTask)?
+                        .diagnostics
+                        .clone(),
                 });
             }
             ContextInput::PreparationExitHold { task, role, held } => {
@@ -909,7 +1046,9 @@ impl ContextCore {
                     return Err(CoreError::IllegalFact);
                 }
                 t.preparation_exit_holds[role as usize] = held;
-                Self::apply_runtime_exit_receipts(t, &mut step)?;
+                let before = t.convergence.snapshot().version();
+                Self::apply_runtime_exit_receipts(t, before, &mut step)?;
+                self.try_finish_completion_intent(task, &mut step)?;
                 self.retire_if_ready(task, &mut step)?;
             }
             ContextInput::OutputFacts { task, facts } => {
@@ -919,6 +1058,38 @@ impl ContextCore {
                     return Err(CoreError::IllegalFact);
                 }
                 record.output = facts;
+                self.try_finish_completion_intent(task, &mut step)?;
+            }
+            ContextInput::CompletionIntent {
+                task,
+                completed_output,
+            } => {
+                self.flush(task, &mut step)?;
+                let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
+                if !record.accepted()
+                    || !record.installed
+                    || completed_output.is_some_and(|facts| !facts.responsibility_complete())
+                {
+                    return Err(CoreError::IllegalFact);
+                }
+                if let Some(facts) = completed_output {
+                    record.output = facts;
+                }
+                record.completion_success_pending = !record.state.is_terminal();
+                self.try_finish_completion_intent(task, &mut step)?;
+            }
+            ContextInput::CompletionExited { task } => {
+                self.flush(task, &mut step)?;
+                let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
+                if !record.accepted() {
+                    return Err(CoreError::IllegalFact);
+                }
+                record.runtime_actual_stopped_received = true;
+                record.runtime_resources_converged_received = true;
+                let before = record.convergence.snapshot().version();
+                Self::apply_runtime_exit_receipts(record, before, &mut step)?;
+                self.try_finish_completion_intent(task, &mut step)?;
+                self.retire_if_ready(task, &mut step)?;
             }
             ContextInput::BindTaskShape { task, shape } => {
                 let record = self.tasks.get(&task).ok_or(CoreError::UnknownTask)?;
@@ -933,12 +1104,6 @@ impl ContextCore {
                         shape.destinations,
                     ),
                 );
-            }
-            ContextInput::InstallContextDomains { domains } => {
-                if self.state != QueryContextState::Establishing {
-                    return Err(CoreError::IllegalFact);
-                }
-                self.context_domains = domains;
             }
             ContextInput::Cancel {
                 request,
@@ -957,6 +1122,7 @@ impl ContextCore {
                             diagnostic: None,
                         });
                         self.flush(task, &mut step)?;
+                        self.try_finish_completion_intent(task, &mut step)?;
                     }
                     step.effects.push(ContextEffect::Reply {
                         request,
@@ -1036,6 +1202,7 @@ impl ContextCore {
                     record.bump_version();
                     Self::publish(record, &mut step)?;
                 }
+                self.try_finish_completion_intent(task, &mut step)?;
             }
             ContextInput::OperatorStatistics {
                 task,
@@ -1048,9 +1215,10 @@ impl ContextCore {
                     if statistics.len() > FINAL_TASK_INFO_MAX_OPERATORS {
                         return Err(CoreError::IllegalFact);
                     }
-                    record.operator_statistics_truncated = truncated;
+                    record.operator_statistics_truncated |= truncated;
                     record.operator_statistics = statistics;
                 }
+                self.try_finish_completion_intent(task, &mut step)?;
             }
             ContextInput::Metrics {
                 task,
@@ -1086,9 +1254,11 @@ impl ContextCore {
                         }
                     }
                 }
+                self.try_finish_completion_intent(task, &mut step)?;
             }
             ContextInput::GetFinalInfo { request, task } => {
                 if self.task_request_cut(request, task, &mut step)? {
+                    self.try_finish_completion_intent(task, &mut step)?;
                     if !self.tasks[&task].state.is_terminal() {
                         step.effects.push(ContextEffect::Reply {
                             request,
@@ -1113,6 +1283,7 @@ impl ContextCore {
                 acknowledged,
             } => {
                 if self.task_request_cut(request, task, &mut step)? {
+                    self.try_finish_completion_intent(task, &mut step)?;
                     if let Some((version, payload)) = self
                         .dynamic_filters
                         .get(&task)
@@ -1159,10 +1330,94 @@ impl ContextCore {
                     });
                 }
             }
-            ContextInput::Established => {
-                if self.state == QueryContextState::Establishing {
-                    self.state = QueryContextState::Active;
+            ContextInput::MaterializationWithdrawn => {
+                if !matches!(
+                    self.state,
+                    QueryContextState::Quiescing
+                        | QueryContextState::Aborting
+                        | QueryContextState::Releasing
+                        | QueryContextState::TerminalRetained
+                ) {
+                    return Err(CoreError::IllegalFact);
                 }
+                step.effects.push(ContextEffect::EstablishmentDecided {
+                    context: self.identity,
+                    close_epoch: self.generation,
+                    decision: ContextEstablishmentDecision {
+                        state: self.state,
+                        outcome: Ok(self.closed_outcome()),
+                    },
+                });
+            }
+            ContextInput::MaterializationFinished { result } => {
+                if result.as_ref().err().is_some_and(|refusal| {
+                    matches!(
+                        refusal.outcome(),
+                        OperationOutcome::Accepted | OperationOutcome::Idempotent
+                    )
+                }) {
+                    return Err(CoreError::IllegalFact);
+                }
+                let outcome = if quiesced_materialization {
+                    Ok(OperationOutcome::ContextTerminalReceipt)
+                } else {
+                    match result {
+                        Ok(materialized) => {
+                            if self.state == QueryContextState::Establishing {
+                                let initial = self.establishment.semantics;
+                                self.context_domains = QueryContextDomains::install_initial(
+                                    initial.catalog,
+                                    initial.shared_filter,
+                                    CredentialState {
+                                        lease: initial.credential_lease,
+                                        epoch: initial.credential_epoch,
+                                        resource: materialized.initial_credential_resource,
+                                    },
+                                );
+                                self.state = QueryContextState::Active;
+                            }
+                            Ok(if self.state == QueryContextState::Active {
+                                OperationOutcome::Accepted
+                            } else {
+                                self.closed_outcome()
+                            })
+                        }
+                        Err(refusal) => {
+                            // Preserve an existing first-wins closing cause.
+                            // The operation's domain facts remain independent.
+                            if self.state != QueryContextState::Releasing {
+                                self.begin_abort(None, AbortCause::QueryFailed, &mut step)?;
+                            }
+                            match refusal {
+                                AdmissionRefusal::Verdict(outcome) => Ok(outcome),
+                                AdmissionRefusal::Domain(outcome, failure) => {
+                                    Err(DomainRefusal { outcome, failure })
+                                }
+                            }
+                        }
+                    }
+                };
+                step.effects.push(ContextEffect::EstablishmentDecided {
+                    context: self.identity,
+                    close_epoch: self.generation,
+                    decision: ContextEstablishmentDecision {
+                        state: self.state,
+                        outcome,
+                    },
+                });
+            }
+            ContextInput::ProbeEstablish {
+                context: _,
+                request,
+                comparison,
+            } => {
+                let result = self.probe_establish(request, comparison)?;
+                step.effects.push(ContextEffect::EstablishProbed {
+                    context: self.identity,
+                    request: request.request,
+                    result,
+                    decided_at: now,
+                });
             }
             ContextInput::Create {
                 request,
@@ -1192,6 +1447,7 @@ impl ContextCore {
                     t.bump_version();
                     Self::publish(t, &mut step)?;
                 }
+                self.try_finish_completion_intent(task, &mut step)?;
             }
             ContextInput::Running { task } | ContextInput::Flushing { task } => {
                 let target = if matches!(input, ContextInput::Running { .. }) {
@@ -1219,6 +1475,7 @@ impl ContextCore {
                         _ => return Err(CoreError::IllegalFact),
                     }
                 }
+                self.try_finish_completion_intent(task, &mut step)?;
             }
             ContextInput::Proposal { task, proposal } => {
                 let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
@@ -1234,49 +1491,33 @@ impl ContextCore {
             }
             ContextInput::Adjudicate { task } => {
                 self.flush(task, &mut step)?;
+                self.try_finish_completion_intent(task, &mut step)?;
             }
             ContextInput::Settle { task, work } => {
                 self.flush(task, &mut step)?;
+                self.try_finish_completion_intent(task, &mut step)?;
                 step.effects
                     .push(ContextEffect::SettlementBarrier { task, work });
             }
             ContextInput::Finish { task } => {
                 self.flush(task, &mut step)?;
-                let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
-                if t.conclusion.accepted.is_none() {
-                    return Err(CoreError::IllegalFact);
+                self.finish_task(task, &mut step)?;
+            }
+            ContextInput::FinishWithOutput { task, output } => {
+                self.flush(task, &mut step)?;
+                let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
+                if let Some(facts) = output {
+                    if !facts.responsibility_complete() {
+                        return Err(CoreError::IllegalFact);
+                    }
+                    record.output = facts;
                 }
-                if matches!(t.conclusion.accepted, Some(TaskConclusion::Succeeded))
-                    && (!t.actual_stopped || !t.output.responsibility_complete())
-                {
-                    return Err(CoreError::IllegalFact);
-                }
-                if !t.state.is_terminal() {
-                    t.state = terminal_state(t.conclusion.accepted.as_ref().unwrap());
-                    t.conclusion.sealed = true;
-                    t.convergence
-                        .note_conclusion_stable()
-                        .map_err(|_| CoreError::IllegalFact)?;
-                    t.bump_version();
-                    Self::publish(t, &mut step)?;
-                    self.final_info.insert(
-                        task,
-                        Arc::new(
-                            FinalTaskInfo::try_new(
-                                task,
-                                t.published.clone(),
-                                std::mem::take(&mut t.operator_statistics),
-                                t.operator_statistics_truncated,
-                            )
-                            .map_err(|_| CoreError::IllegalFact)?,
-                        ),
-                    );
-                }
-                self.retire_if_ready(task, &mut step)?;
+                self.finish_task(task, &mut step)?;
             }
             ContextInput::Physical { task, fact } => {
                 self.flush(task, &mut step)?;
                 let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
+                let before = t.convergence.snapshot().version();
                 match fact {
                     PhysicalFact::LoaderExited => t.loader_exited = true,
                     PhysicalFact::PreparationBodyExited => t.preparation_body_exited = true,
@@ -1301,7 +1542,8 @@ impl ContextCore {
                     }
                     PhysicalFact::RootIdle => t.root_idle = true,
                 }
-                Self::apply_runtime_exit_receipts(t, &mut step)?;
+                Self::apply_runtime_exit_receipts(t, before, &mut step)?;
+                self.try_finish_completion_intent(task, &mut step)?;
                 self.retire_if_ready(task, &mut step)?;
             }
             ContextInput::Renew {
@@ -1340,9 +1582,14 @@ impl ContextCore {
                     step.effects.push(ContextEffect::WaitQuiesce { request });
                 } else if matches!(
                     self.state,
-                    QueryContextState::Active | QueryContextState::Quiescing
+                    QueryContextState::Establishing
+                        | QueryContextState::Active
+                        | QueryContextState::Quiescing
                 ) {
-                    if self.state == QueryContextState::Active {
+                    if matches!(
+                        self.state,
+                        QueryContextState::Establishing | QueryContextState::Active
+                    ) {
                         self.state = QueryContextState::Quiescing;
                         step.effects.push(ContextEffect::CloseExternalAdmission {
                             context: self.identity,
@@ -1445,6 +1692,7 @@ impl ContextCore {
                                 now.saturating_add(self.config.metric_publish_interval),
                             );
                         }
+                        self.try_finish_completion_intent(task, &mut step)?;
                     }
                 }
             }
@@ -1499,6 +1747,7 @@ impl ContextCore {
             state: task.state,
             installed: task.installed,
             snapshot,
+            convergence: task.convergence.snapshot(),
         });
         Ok(())
     }
@@ -1737,9 +1986,89 @@ impl ContextCore {
                 task,
                 active: t.active_reservation,
                 preparation: t.preparation_reservation,
+                convergence: t.convergence.snapshot(),
             });
         }
         Ok(())
+    }
+    /// A single original completion intent has no admission or conclusion
+    /// authority of its own. Try it only after the causal prefix was flushed
+    /// and after applying each independent stop/output/publication-hold fact.
+    fn try_finish_completion_intent(
+        &mut self,
+        task: TaskIdentity,
+        step: &mut ContextStep,
+    ) -> Result<(), CoreError> {
+        let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
+        if record.state.is_terminal() {
+            record.completion_success_pending = false;
+            return Ok(());
+        }
+        if !record.completion_success_pending || !record.actual_stopped {
+            return Ok(());
+        }
+        if !matches!(
+            record.conclusion.accepted,
+            Some(TaskConclusion::Terminated(_))
+        ) {
+            if !record.output.responsibility_complete() {
+                return Ok(());
+            }
+            // The same strict preconditions as a direct Succeeded proposal
+            // apply. This is the original intent's first legal handoff, not a
+            // success accepted before physical stop and applied retroactively.
+            record.proposals.push(Proposal {
+                conclusion: TaskConclusion::Succeeded,
+                evidence: None,
+                source: None,
+                diagnostic: None,
+            });
+            self.flush(task, step)?;
+        }
+        // A winning cancellation/failure is completed as itself. In
+        // particular a stopped canceled root need not finish producing output
+        // merely to settle a successful-production intent that lost the race.
+        self.finish_task(task, step)
+    }
+    fn finish_task(&mut self, task: TaskIdentity, step: &mut ContextStep) -> Result<(), CoreError> {
+        let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
+        let accepted = record
+            .conclusion
+            .accepted
+            .as_ref()
+            .ok_or(CoreError::IllegalFact)?;
+        if matches!(accepted, TaskConclusion::Succeeded)
+            && (!record.actual_stopped || !record.output.responsibility_complete())
+        {
+            return Err(CoreError::IllegalFact);
+        }
+        if !record.state.is_terminal() {
+            if record.version == u64::MAX {
+                return Err(CoreError::VersionExhausted);
+            }
+            record.state = terminal_state(accepted);
+            record.conclusion.sealed = true;
+            record
+                .convergence
+                .note_conclusion_stable()
+                .map_err(|_| CoreError::IllegalFact)?;
+            record.bump_version();
+            Self::publish(record, step)?;
+            self.final_info.insert(
+                task,
+                Arc::new(
+                    FinalTaskInfo::try_new(
+                        task,
+                        record.published.clone(),
+                        std::mem::take(&mut record.operator_statistics),
+                        record.operator_statistics_truncated,
+                    )
+                    .map_err(|_| CoreError::IllegalFact)?,
+                ),
+            );
+        }
+        record.completion_success_pending = false;
+        self.retire_if_ready(task, step)
     }
     fn flush(&mut self, task: TaskIdentity, step: &mut ContextStep) -> Result<(), CoreError> {
         let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
@@ -2033,6 +2362,7 @@ impl ContextCore {
         if !self.task_request_cut(request, task, step)? {
             return Ok(());
         }
+        self.try_finish_completion_intent(task, step)?;
         if self.tasks[&task].state.is_terminal() {
             step.effects.push(ContextEffect::Reply {
                 request,
@@ -2079,6 +2409,7 @@ impl ContextCore {
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
         self.flush(task, step)?;
+        self.try_finish_completion_intent(task, step)?;
         let pending = self
             .pending_task_updates
             .get_mut(&task)
@@ -2113,6 +2444,7 @@ impl ContextCore {
     ) -> Result<(), CoreError> {
         use crate::domain::TaskDomainTransactionProgress as P;
         self.flush(task, step)?;
+        self.try_finish_completion_intent(task, step)?;
         let mut pending = self
             .pending_task_updates
             .remove(&task)
@@ -2164,6 +2496,55 @@ impl ContextCore {
             }
         }
         Ok(())
+    }
+    fn probe_establish(
+        &self,
+        candidate: EstablishReplayRequest,
+        comparison: Option<EstablishCredentialComparison>,
+    ) -> Result<EstablishReplayResult, CoreError> {
+        match self.state {
+            QueryContextState::Quiescing | QueryContextState::TerminalRetained => {
+                return Ok(EstablishReplayResult::Decided(
+                    OperationOutcome::ContextTerminalReceipt,
+                ));
+            }
+            QueryContextState::Aborting | QueryContextState::Releasing => {
+                return Ok(EstablishReplayResult::Decided(
+                    OperationOutcome::InvalidStateOrRequest,
+                ));
+            }
+            QueryContextState::Establishing | QueryContextState::Active => {}
+            _ => return Err(CoreError::IllegalFact),
+        }
+        if candidate.request.operation != self.establishment.operation
+            || candidate.ticket != self.establishment.ticket
+            || candidate.semantics != self.establishment.semantics
+        {
+            return Ok(EstablishReplayResult::Decided(
+                OperationOutcome::ContextConflict,
+            ));
+        }
+        // A new carrier's payload identity is not part of entity equality.
+        if self.state == QueryContextState::Establishing {
+            return Ok(EstablishReplayResult::AwaitMaterialization);
+        }
+        let current = self
+            .context_domains
+            .credential()
+            .ok_or(CoreError::IllegalFact)?;
+        let Some(comparison) = comparison.filter(|fact| fact.current == current) else {
+            return Ok(EstablishReplayResult::CompareCredential { expected: current });
+        };
+        Ok(EstablishReplayResult::Decided(
+            if candidate.semantics.credential_lease == current.lease
+                && candidate.semantics.credential_epoch == current.epoch
+                && comparison.same_material
+            {
+                OperationOutcome::Idempotent
+            } else {
+                OperationOutcome::ContextConflict
+            },
+        ))
     }
     fn update_context(
         &mut self,
@@ -2236,8 +2617,16 @@ impl ContextCore {
                     RootDrainVerdict::VersionExhausted
                 } else {
                     record.output = TaskOutputFacts::new(true);
-                    record.bump_version();
-                    Self::publish(record, step)?;
+                    let before = record.version;
+                    self.try_finish_completion_intent(task, step)?;
+                    let record = self.tasks.get_mut(&task).expect("located root");
+                    // A finished completion intent already published this
+                    // exact output fact with the final status. Otherwise
+                    // retain the existing output-only publication behavior.
+                    if record.version == before {
+                        record.bump_version();
+                        Self::publish(record, step)?;
+                    }
                     RootDrainVerdict::Published(record.version)
                 }
             }
@@ -2249,31 +2638,29 @@ impl ContextCore {
     }
     fn apply_runtime_exit_receipts(
         task: &mut TaskRecord,
+        before: u64,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
-        if task.preparation_exit_holds.iter().any(|held| *held) {
-            return Ok(());
-        }
-        if task.runtime_actual_stopped_received {
-            let before = task.convergence.snapshot().actual_stopped();
-            let snapshot = task
-                .convergence
+        let runtime_unheld = !task.preparation_exit_holds.iter().any(|held| *held);
+        if runtime_unheld && task.runtime_actual_stopped_received {
+            task.convergence
                 .note_actual_stopped()
-                .map_err(|_| CoreError::IllegalFact)?
-                .snapshot();
+                .map_err(|_| CoreError::IllegalFact)?;
             task.actual_stopped = true;
-            if !before {
-                step.effects.push(ContextEffect::PublishTaskConvergence {
-                    task: task.identity,
-                    version: snapshot.version(),
-                });
-            }
         }
-        if task.runtime_resources_converged_received {
+        if runtime_unheld && task.runtime_resources_converged_received {
             task.convergence
                 .note_resources_converged()
                 .map_err(|_| CoreError::IllegalFact)?;
             task.resources_converged = true;
+        }
+        let snapshot = task.convergence.snapshot();
+        if snapshot.version() != before {
+            step.effects.push(ContextEffect::PublishTaskConvergence {
+                task: task.identity,
+                version: snapshot.version(),
+                snapshot,
+            });
         }
         Ok(())
     }

@@ -127,7 +127,9 @@ impl SettlementRole {
         let work_id = work.id();
         notice.bind_work(work_id);
         let barrier = PublishedReply::new(&scope);
-        let (slot, token) = ContinuationSlot::from_admitted(work, capacity, completion);
+        let (slot, token) = ContinuationSlot::from_admitted(
+            crate::control_runtime::admitted_role::adopt_reported_work(work, capacity, completion),
+        );
         let permit = SettlementPermit::from_admitted_role(
             identity,
             Box::new(Registration { token, notice }),

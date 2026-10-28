@@ -1160,7 +1160,7 @@ fn prepaid_role_advances_cursor_after_global_external_close_without_new_credit()
 
 #[test]
 fn role_inflight_credit_waits_for_effect_retirement_and_never_reuses_input_id() {
-    use novarocks_control_runtime::{driver::EffectTicket, publication::PublishedSnapshot};
+    use novarocks_control_runtime::publication::PublishedSnapshot;
     use std::sync::Arc;
     let ledger = ledger();
     let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
@@ -1180,13 +1180,6 @@ fn role_inflight_credit_waits_for_effect_retirement_and_never_reuses_input_id() 
     runtime.poll_one(Tick(1)).unwrap();
     assert_eq!(role.fill(8).unwrap_err(), (DriverError::RoleBusy, 8));
     let old = runtime.take_effect(aid(1), first, action(1)).unwrap();
-    let obsolete = EffectTicket {
-        actor: old.actor,
-        input: old.input,
-        generation: old.generation,
-        descriptor: old.descriptor.clone(),
-        effect: old.effect,
-    };
     runtime.observe_external_publication(&old).unwrap();
     runtime.effect_completed(old).unwrap();
     assert_eq!(role.close_after_exit(), Err(DriverError::RoleBusy));
@@ -1208,11 +1201,10 @@ fn role_inflight_credit_waits_for_effect_retirement_and_never_reuses_input_id() 
     assert!(second > first);
     runtime.poll_one(Tick(2)).unwrap();
     let snapshot = PublishedSnapshot::new(&scope, Arc::new(0u64));
+    // The first unique ticket was consumed by its actual completion. Keeping
+    // its public input identity cannot reacquire authority for the later input.
     assert_eq!(
-        runtime
-            .commit_snapshot(&obsolete, &snapshot, Arc::new(999))
-            .unwrap_err()
-            .0,
+        runtime.take_effect(aid(1), first, action(1)).unwrap_err(),
         DriverError::UnknownInput
     );
     assert_eq!(*snapshot.read(), 0);

@@ -69,6 +69,8 @@ struct Owner {
     settlement: ContinuationSlot<Snapshot>,
     report: ReportSlot,
     health: ExecutionExitReporter,
+    #[cfg(test)]
+    after_initial_reap: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
 /// The original executor holds this driver, independently of settlement
@@ -81,7 +83,7 @@ struct Work {
     authority: Option<ExitAuthority>,
 }
 impl Work {
-    fn exited(mut self: Box<Self>) {
+    fn exited(mut self) {
         self.authority
             .take()
             .expect("original local role authority")
@@ -99,10 +101,10 @@ impl CompletionWorkCapability for Work {
             .expect("admitted local work starts");
     }
     fn completed(self: Box<Self>) {
-        self.exited();
+        (*self).exited();
     }
     fn unused_exited(self: Box<Self>) {
-        self.exited();
+        (*self).exited();
     }
     fn unresolved(mut self: Box<Self>) {
         // Drop records unknown exit; it is never positive body/capture proof.
@@ -184,11 +186,24 @@ impl LocalCompletionDriver {
             WorkKind::Settlement,
         );
         let child_report = report(&scope, &child);
-        let (settlement, token) =
-            ContinuationSlot::from_admitted(child, child_capacity, child_report.clone());
+        let (settlement, token) = ContinuationSlot::from_admitted(
+            novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                child,
+                child_capacity,
+                child_report.clone(),
+            )
+            .unwrap(),
+        );
         let finisher_report = report(&scope, &finisher);
         let make_role = |work, capacity, report: ReportSlot| {
-            let (slot, authority) = ExitRole::from_admitted(work, capacity, report.clone());
+            let (slot, authority) = ExitRole::from_admitted(
+                novarocks_control_runtime::reported_work::ReportedWork::try_new(
+                    work,
+                    capacity,
+                    report.clone(),
+                )
+                .unwrap(),
+            );
             (
                 Role {
                     slot,
@@ -225,6 +240,8 @@ impl LocalCompletionDriver {
             settlement,
             report: child_report,
             health,
+            #[cfg(test)]
+            after_initial_reap: Mutex::new(None),
         });
         let work = |authority| {
             Box::new(Work {
@@ -300,6 +317,14 @@ impl Owner {
         self.ledger
             .reap_scope_ready(self.scope.id(), RESPONSIBILITIES)
             .unwrap();
+        #[cfg(test)]
+        {
+            let gate = self.after_initial_reap.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.wait();
+                release.wait();
+            }
+        }
         for role in &mut state.roles {
             if role.slot.phase() != Phase::Exited {
                 continue;
@@ -318,6 +343,14 @@ impl Owner {
                 .iter()
                 .all(|role| role.slot.phase() == Phase::Retired)
         {
+            // An original can publish its real exit after the first reap and
+            // before the loop observes/retire its custody. All four custody
+            // roles are now retired and admission is already closed: drain
+            // their remaining pure Work records with the same finite bound
+            // before removing the Scope. No timeout or retry proves exit.
+            self.ledger
+                .reap_scope_ready(self.scope.id(), RESPONSIBILITIES)
+                .unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();
             state.removed = true;
         }
@@ -329,6 +362,28 @@ mod tests {
     use super::*;
     use crate::runtime::{execution_health::ExecutionHealth, task_control::ExecutionExitReporter};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ExitThreads {
+        release: Option<Arc<std::sync::Barrier>>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+    impl ExitThreads {
+        fn finish(&mut self) -> bool {
+            if let Some(release) = self.release.take() {
+                release.wait();
+            }
+            let mut exited = true;
+            for thread in self.threads.drain(..) {
+                exited &= thread.join().is_ok();
+            }
+            exited
+        }
+    }
+    impl Drop for ExitThreads {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
 
     fn fixture() -> (
         AdmittedFragmentRoles<ExecutionFailure>,
@@ -378,6 +433,48 @@ mod tests {
         assert!(driver.0.ledger.is_empty());
         driver.run();
         assert!(driver.0.ledger.is_empty());
+    }
+    #[test]
+    fn original_exit_after_the_initial_reap_is_reaped_before_its_scope_is_removed() {
+        use std::{
+            sync::Barrier,
+            time::{Duration, Instant},
+        };
+        let (roles, driver, health) = fixture();
+        let (finisher, wall_time, publisher) = roles.into_parts();
+        drop(finisher);
+        let publisher_slot = driver.0.state.lock().unwrap().roles[2].slot.clone();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *driver.0.after_initial_reap.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let wall = std::thread::spawn(move || drop(wall_time));
+        let mut exits = ExitThreads {
+            release: Some(release),
+            threads: vec![wall],
+        };
+        entered.wait();
+        // The first drain holds only its own metadata lock after its initial
+        // reap. The other original can still publish actual exit through the
+        // common runtime, then wait to enter this same owner drain.
+        exits
+            .threads
+            .push(std::thread::spawn(move || drop(publisher)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while publisher_slot.phase() != Phase::Exited && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let exited_after_reap = publisher_slot.phase() == Phase::Exited;
+        let joined = exits.finish();
+        assert!(
+            exited_after_reap,
+            "the second original must actually exit at the controlled point"
+        );
+        assert!(
+            joined,
+            "Scope retirement must not race its original Work record's retirement"
+        );
+        assert!(driver.0.ledger.is_empty());
+        assert!(health.failure().is_none());
     }
     #[test]
     fn a_local_continuation_panic_never_releases_its_original_capacity() {
