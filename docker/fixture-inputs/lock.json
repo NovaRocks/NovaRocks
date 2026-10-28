@@ -26,36 +26,6 @@
         }
       }
     },
-    "minio": {
-      "source": "quay.io/minio/minio",
-      "variants": {
-        "linux/arm64": {
-          "platform": "linux/arm64",
-          "manifest_digest": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
-          "alias": "novarocks/fixture-minio:14cea493d9a3"
-        },
-        "linux/amd64": {
-          "platform": "linux/amd64",
-          "manifest_digest": "sha256:a1a8bd4ac40ad7881a245bab97323e18f971e4d4cba2c2007ec1bedd21cbaba2",
-          "alias": "novarocks/fixture-minio:a1a8bd4ac40a"
-        }
-      }
-    },
-    "minio-mc": {
-      "source": "quay.io/minio/mc",
-      "variants": {
-        "linux/arm64": {
-          "platform": "linux/arm64",
-          "manifest_digest": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
-          "alias": "novarocks/fixture-minio-mc:a7fe349ef4bd"
-        },
-        "linux/amd64": {
-          "platform": "linux/amd64",
-          "manifest_digest": "sha256:eb4ea9884b77704230e2423e9004d2fa738dc272876b9cc41a297d29443b8780",
-          "alias": "novarocks/fixture-minio-mc:eb4ea9884b77"
-        }
-      }
-    },
     "iceberg-rest": {
       "source": "apache/iceberg-rest-fixture",
       "variants": {
@@ -83,6 +53,36 @@
           "platform": "linux/amd64",
           "manifest_digest": "sha256:b6db376528d71be79c82e173c2e85769b8cc78fccbf3dc6810b9a54706076b99",
           "alias": "novarocks/fixture-gradle-builder:b6db376528d7"
+        }
+      }
+    },
+    "minio-go-builder": {
+      "source": "golang",
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:e89daba6691cee7e338c17467e3d8777ff18d80ee62ff544808971fd51189282",
+          "alias": "novarocks/fixture-minio-go:amd64-e89daba6691c"
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:b3696ba11202489e0a20ab1b14727ce23c5a50b88e099fe8ada2abcf2bdb8b26",
+          "alias": "novarocks/fixture-minio-go:arm64-b3696ba11202"
+        }
+      }
+    },
+    "minio-runtime": {
+      "source": "alpine",
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f",
+          "alias": "novarocks/fixture-minio-runtime:amd64-2e0b81d60597"
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f",
+          "alias": "novarocks/fixture-minio-runtime:arm64-2e0b81d60597"
         }
       }
     }
@@ -122,6 +122,36 @@
       "url": "https://archive.apache.org/dist/iceberg/apache-iceberg-1.10.1/apache-iceberg-1.10.1.tar.gz",
       "bytes": 9216396,
       "sha1": "09690aa963fd38cefdba69a0d4c7b4eabe0d9ed1"
+    },
+    "minio-source.tar.gz": {
+      "url": "https://codeload.github.com/minio/minio/tar.gz/9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a",
+      "bytes": 24232282,
+      "sha1": "e0da54ffbde3a52844e594aab2bcf81f5a591982",
+      "sha256": "45521908307306e925c98d629e1c17d78c8b72b6ee242b1bfb1409f7d8ee5841"
+    },
+    "mc-linux-amd64": {
+      "url": "https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z",
+      "bytes": 30535864,
+      "sha1": "f287887779ebb2b069bdd76cab11b56f5c605f6b",
+      "sha256": "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891"
+    },
+    "mc-linux-arm64": {
+      "url": "https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-arm64.RELEASE.2025-08-13T08-35-41Z",
+      "bytes": 28704952,
+      "sha1": "f2a12e87ac27c21449f5e46c87788708ec4eba69",
+      "sha256": "14c8c9616cfce4636add161304353244e8de383b2e2752c0e9dad01d4c27c12c"
+    },
+    "mc-LICENSE": {
+      "url": "https://raw.githubusercontent.com/minio/mc/7394ce0dd2a80935aded936b09fa12cbb3cb8096/LICENSE",
+      "bytes": 34523,
+      "sha1": "4c665f87b5dc2e7d26279c4b48968d085e1ace32",
+      "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
+    },
+    "mc-CREDITS": {
+      "url": "https://raw.githubusercontent.com/minio/mc/7394ce0dd2a80935aded936b09fa12cbb3cb8096/CREDITS",
+      "bytes": 668850,
+      "sha1": "1268f3db6fcd914ffea4cbc80096c03b14772905",
+      "sha256": "4ead58181c478e2f449d5778165684f4fceb1e7b8b3ee150051c8e7adfe4f337"
     }
   },
   "derived_images": {
@@ -196,6 +226,58 @@
         "linux/amd64": {
           "platform": "linux/amd64",
           "alias": "novarocks/fixture-iceberg-rest-mv:amd64"
+        }
+      }
+    },
+    "minio": {
+      "bases": {
+        "GO_BASE": "minio-go-builder",
+        "RUNTIME_BASE": "minio-runtime"
+      },
+      "dockerfile": "docker/fixture-inputs/minio/Dockerfile",
+      "definition_files": [
+        "docker/fixture-inputs/minio/Dockerfile"
+      ],
+      "artifacts": [
+        "minio-source.tar.gz"
+      ],
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-minio:20251015-amd64"
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-minio:20251015-arm64"
+        }
+      }
+    },
+    "minio-mc": {
+      "bases": {
+        "RUNTIME_BASE": "minio-runtime"
+      },
+      "dockerfile": "docker/fixture-inputs/mc/Dockerfile",
+      "definition_files": [
+        "docker/fixture-inputs/mc/Dockerfile"
+      ],
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-minio-mc:20250813-amd64",
+          "artifacts": [
+            "mc-linux-amd64",
+            "mc-LICENSE",
+            "mc-CREDITS"
+          ]
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-minio-mc:20250813-arm64",
+          "artifacts": [
+            "mc-linux-arm64",
+            "mc-LICENSE",
+            "mc-CREDITS"
+          ]
         }
       }
     }

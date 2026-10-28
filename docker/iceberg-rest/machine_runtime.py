@@ -126,7 +126,7 @@ def input_facts(bom: dict[str, Any], backend: Any) -> tuple[dict, dict]:
         raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified input lock identity is missing")
     images, facts = {}, {"lock_sha256": bom["lock_sha256"], "platform": bom["platform"]}
     for service, group, logical in (
-        ("minio", "images", "minio"), ("mc", "images", "minio-mc"),
+        ("minio", "derived_images", "minio"), ("mc", "derived_images", "minio-mc"),
         ("rest", "images", "iceberg-rest"),
         ("spark", "derived_images", "iceberg-spark"),
         ("rest-mv", "derived_images", "rest-mv"),

@@ -333,7 +333,7 @@ def main() -> int:
     parser.add_argument("--repo-root", default=SCRIPT_DIR.parents[1])
     parser.add_argument("--lock", default=SCRIPT_DIR / "lock.json")
     parser.add_argument("--platform", help="explicit native target, checked against host and Docker daemon")
-    parser.add_argument("--consumer", choices=("all", "iceberg-rest"), default="all")
+    parser.add_argument("--consumer", choices=("all", "iceberg-rest", "object-store"), default="all")
     parser.add_argument("--context-only", metavar="NAME", help="prepare one derived image context without publishing a BOM")
     parser.add_argument("--out", type=Path, metavar="DIR", help="empty output directory for --context-only")
     parser.add_argument(

@@ -37,3 +37,17 @@ BOM schema 2 记录 platform、锁身份、镜像/派生定义和 artifact 证�
 传输 repository 可用 `--image-source logical-name=transport-repository` 配置。来源不是内容身份：digest、平台、artifact 长度/hash 不变。数据集 producer 的语义 key 使用对应平台的实际 recipe/基础镜像/artifact 子投影；无关镜像别名或传输变化不应改变 key，producer 源码变化仍按原规则产生新 key。
 
 镜像或平台变更由 fixture 维护者更新唯一源锁，保留上游 index、平台 manifest 和 config 的原始证据，再执行 provision 和实际消费者验证。仅修改 JSON 不能证明平台运行可用。单测入口：`bash docker/fixture-inputs/tests/run.sh`；machine、Paimon 和 benchmark reader 回归由各自原测试入口维护。
+
+## MinIO 官方源码与发布物
+
+MinIO公开镜像已无法可靠取得，服务端采用官方 `RELEASE.2025-10-15T17-29-55Z` 的未修改源码构建；mc使用官方GitHub `RELEASE.2025-08-13T08-35-41Z` 的静态二进制。实际URL/完整源码commit/工具链manifest/长度和hash在唯一源锁中维护，版本允许更新。MinIO与mc属于derived_images；运行层消费准确image_id/定义回执，不依赖旧公开镜像或机器缓存。新增源码/客户端资产同时按声明SHA256核验，Go保留原go.mod/go.sum与校验，不下载另一个工具链或修改依赖。
+
+```bash
+docker/fixture-inputs/provision.sh --consumer object-store --platform linux/amd64 \
+  --docker-pull-timeout-seconds 600
+docker/fixture-inputs/verify.sh --consumer object-store --platform linux/amd64
+```
+
+这只准备MinIO/mc及必要的Go/Alpine闭包；`verify --consumer iceberg-rest`仍要求完整REST/Spark输入，单独object-store BOM不能代表整栈ready。正式Linux准备入口仍显式选择iceberg-rest。旧 `--image-source minio=...` / `minio-mc=...` 不再适用；传输覆盖应对新的 `minio-go-builder` 或 `minio-runtime` 基础镜像，源码与客户端通过锁内官方URL取得。Go模块代理由构建recipe的GOPROXY设置选择，内容由原go.sum验证。
+
+更新官方版本时一并核对源归档、客户端/许可证、Go基础镜像及recipe自报元数据，并实际构建、读写和验证权限。已有共享fixture须按原显式upgrade切换；不自动认领或删除旧卷/旧输入。研究和原生运行材料按任务约定在库外保留。

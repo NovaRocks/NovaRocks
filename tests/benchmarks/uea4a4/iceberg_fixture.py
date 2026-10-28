@@ -133,12 +133,12 @@ def install_verified_images(store: Path, runtime: Any) -> dict[str, Any]:
     )
     bom = support.read_json(store / "bom.json")
     try:
-        mc_alias = bom["images"]["minio-mc"]["alias"]
+        mc_alias = bom["derived_images"]["minio-mc"]["image_id"]
         spark_id = bom["derived_images"]["iceberg-spark"]["image_id"]
     except (KeyError, TypeError) as error:
         raise support.FixtureError("verified input BOM lacks Iceberg Spark or MinIO mc") from error
     if not isinstance(mc_alias, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]+", mc_alias):
-        raise support.FixtureError("verified MinIO mc alias is invalid")
+        raise support.FixtureError("verified MinIO mc image ID is invalid")
     os.environ["MINIO_MC_IMAGE"] = mc_alias
     publication = support.read_json(runtime.env_file.with_name("manifest.json"))
     record = publication["runtime"]["machine"] if publication.get("shared_docker", "catalog" not in publication["runtime"]) else publication["runtime"]["catalog"]

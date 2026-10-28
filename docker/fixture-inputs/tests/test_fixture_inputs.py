@@ -299,7 +299,7 @@ class ConsumerClosureTests(unittest.TestCase):
         lock = {"schema": 2, "platform": "linux/arm64", "images": {}, "artifacts": {}, "derived_images": {}}
         bom = {"schema": 2, "platform": "linux/arm64", "artifact_dir": "artifacts", "images": {}, "artifacts": {}, "derived_images": {}}
         infos = {}
-        for name in ("minio", "minio-mc", "iceberg-rest", "iceberg-spark-base", "paimon-spark-base", "gradle-builder"):
+        for name in ("minio-runtime", "minio-go-builder", "iceberg-rest", "iceberg-spark-base", "paimon-spark-base", "gradle-builder"):
             item = {"alias": f"fixture/{name}:locked", "platform": "linux/arm64", "manifest_digest": f"sha256:{name}"}
             lock["images"][name] = item
             bom["images"][name] = item.copy()
@@ -309,7 +309,7 @@ class ConsumerClosureTests(unittest.TestCase):
             item = {"url": "https://example.invalid/" + name, "bytes": 7, "sha1": hashlib.sha1(b"fixture").hexdigest()}
             lock["artifacts"][name] = item
             bom["artifacts"][name] = fixture_inputs.validate_artifact(path, item)
-        for name, base, jar in (("iceberg-spark", "iceberg-spark-base", "spark.jar"), ("paimon-writer", "paimon-spark-base", "paimon.jar"), ("rest-mv", "gradle-builder", "source.tar.gz")):
+        for name, base, jar in (("iceberg-spark", "iceberg-spark-base", "spark.jar"), ("paimon-writer", "paimon-spark-base", "paimon.jar"), ("rest-mv", "gradle-builder", "source.tar.gz"), ("minio", "minio-go-builder", "source.tar.gz"), ("minio-mc", "minio-runtime", "source.tar.gz")):
             definition = repo / f"{name}.txt"; definition.write_text(name)
             item = {"alias": f"fixture/{name}:current", "platform": "linux/arm64", "bases": ({"BUILDER": base, "REST_BASE": "iceberg-rest"} if name == "rest-mv" else {"SPARK_BASE": base}), "artifacts": [jar], "definition_files": [definition.name]}
             lock["derived_images"][name] = item
@@ -330,9 +330,9 @@ class ConsumerClosureTests(unittest.TestCase):
     def test_actual_iceberg_consumer_closure_is_exact(self):
         lock, _ = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/amd64")
         images, artifacts, derived = fixture_inputs.required_input_names(lock, "iceberg-rest")
-        self.assertEqual(images, {"minio", "minio-mc", "iceberg-rest", "iceberg-spark-base", "gradle-builder"})
-        self.assertEqual(derived, {"iceberg-spark", "rest-mv"})
-        self.assertEqual(artifacts, set(lock["derived_images"]["iceberg-spark"]["artifacts"]) | set(lock["derived_images"]["rest-mv"]["artifacts"]))
+        self.assertEqual(images, {"minio-runtime", "minio-go-builder", "iceberg-rest", "iceberg-spark-base", "gradle-builder"})
+        self.assertEqual(derived, {"iceberg-spark", "rest-mv", "minio", "minio-mc"})
+        self.assertEqual(artifacts, set().union(*(lock["derived_images"][name]["artifacts"] for name in derived)))
         self.assertNotIn("paimon-writer", derived)
         self.assertNotIn("paimon-spark-base", images)
 
@@ -344,7 +344,7 @@ class ConsumerClosureTests(unittest.TestCase):
         self.assertIn("paimon-spark-base", images)
         self.assertIn("iceberg-spark-base", images)
         self.assertIn("paimon-s3.jar", artifacts)
-        self.assertEqual(derived, {"iceberg-spark", "rest-mv"})
+        self.assertEqual(derived, {"iceberg-spark", "rest-mv", "minio", "minio-mc"})
 
     def test_full_verifier_rejects_unrelated_drift_but_iceberg_consumer_does_not_read_it(self):
         store, repo, lock, infos = self.fixture()
@@ -352,7 +352,7 @@ class ConsumerClosureTests(unittest.TestCase):
         with mock.patch.object(verify_module, "inspect_image", side_effect=infos.__getitem__) as inspect:
             verified = verify_module.verify(store, repo, lock, consumer="iceberg-rest")
             self.assertEqual(verified["schema"], 2)
-            self.assertEqual(set(call.args[0] for call in inspect.call_args_list), {"fixture/minio:locked", "fixture/minio-mc:locked", "fixture/iceberg-rest:locked", "fixture/iceberg-spark-base:locked", "fixture/iceberg-spark:current", "fixture/gradle-builder:locked", "fixture/rest-mv:current"})
+            self.assertEqual(set(call.args[0] for call in inspect.call_args_list), {"fixture/minio-runtime:locked", "fixture/minio-go-builder:locked", "fixture/minio:current", "fixture/minio-mc:current", "fixture/iceberg-rest:locked", "fixture/iceberg-spark-base:locked", "fixture/iceberg-spark:current", "fixture/gradle-builder:locked", "fixture/rest-mv:current"})
             with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "definition mismatch: paimon-writer"):
                 verify_module.verify(store, repo, lock)
 
@@ -407,6 +407,7 @@ class ConsumerClosureTests(unittest.TestCase):
                 mock.patch.object(provision_module, "prepare_images") as images, \
                 mock.patch.object(provision_module, "prepare_artifacts") as artifacts, \
                 mock.patch.object(provision_module, "build_derived_images") as derived:
+            provision_module.provision(store, repo, lock, [], 30, consumer="object-store")
             provision_module.provision(store, repo, lock, [], 30, consumer="iceberg-rest")
             provision_module.provision(store, repo, lock, [], 30)
             verify_module.verify(store, repo, lock)
@@ -440,9 +441,35 @@ class ConsumerClosureTests(unittest.TestCase):
                 self.assertEqual((store / current["artifact_dir"] / name).read_bytes(), b"fixture")
             self.assertNotEqual(current["artifact_dir"], complete["artifact_dir"])
             original = (store / "bom.json").read_bytes()
+            provision_module.provision(store, repo, lock, [], 30, consumer="object-store")
             provision_module.provision(store, repo, lock, [], 30, consumer="iceberg-rest")
             provision_module.provision(store, repo, lock, [], 30)
             self.assertEqual((store / "bom.json").read_bytes(), original)
+
+
+class MinioSupplyTests(unittest.TestCase):
+    def test_object_store_resolves_native_source_and_client_without_rest(self):
+        for architecture in ("amd64", "arm64"):
+            lock, identity = fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/" + architecture,
+                                                      consumer="object-store")
+            self.assertEqual(set(lock["images"]), {"minio-go-builder", "minio-runtime"})
+            self.assertEqual(set(lock["derived_images"]), {"minio", "minio-mc"})
+            self.assertIn("mc-linux-" + architecture, lock["artifacts"])
+            other = "arm64" if architecture == "amd64" else "amd64"
+            self.assertNotIn("mc-linux-" + other, lock["artifacts"])
+            self.assertEqual(identity, fixture_inputs.load_lock(ROOT / "lock.json", platform="linux/" + architecture,
+                                                               consumer="iceberg-rest")[1])
+
+    def test_declared_sha256_is_required_even_when_size_and_sha1_match(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "binary"
+            path.write_bytes(b"verified binary")
+            item = {"bytes": path.stat().st_size, "sha1": hashlib.sha1(path.read_bytes()).hexdigest(),
+                    "sha256": "0" * 64}
+            with self.assertRaisesRegex(fixture_inputs.FixtureInputError, "integrity mismatch"):
+                fixture_inputs.validate_artifact(path, item)
+            item["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(fixture_inputs.validate_artifact(path, item)["sha256"], item["sha256"])
 
 
 class NativePlatformTests(unittest.TestCase):

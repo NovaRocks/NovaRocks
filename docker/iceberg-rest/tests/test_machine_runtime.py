@@ -37,10 +37,10 @@ import machine_runtime as machine
 def bom():
     return {"schema": 2, "platform": "linux/arm64", "lock_sha256": "locked-inputs", "images": {
         n: {"alias": n, "manifest_digest": "sha256:" + n, "platform": "linux/arm64"}
-        for n in ("minio", "minio-mc", "iceberg-rest")}, "derived_images": {
+        for n in ("iceberg-rest",)}, "derived_images": {
         n: {"alias": n + ":current", "image_id": "sha256:" + n,
             "definition_sha256": "definition-" + n, "platform": "linux/arm64"}
-        for n in ("iceberg-spark", "rest-mv")}}
+        for n in ("minio", "minio-mc", "iceberg-spark", "rest-mv")}}
 
 
 class Backend:
@@ -138,6 +138,39 @@ class Backend:
 
     def disconnect(self, record, container):
         self.events.append(("disconnect", container))
+
+
+class DerivedObjectStoreInputTests(unittest.TestCase):
+    def test_object_store_uses_exact_derived_ids_and_definition_facts(self):
+        inputs = bom()
+        inputs["derived_images"]["minio"]["alias"] = "mutable-minio-alias"
+        inputs["derived_images"]["minio-mc"]["alias"] = "mutable-mc-alias"
+        backend = Backend()
+        with mock.patch.object(backend, "image_id", wraps=backend.image_id) as inspect:
+            images, facts = machine.input_facts(inputs, backend)
+        self.assertEqual(images["minio"]["image_id"], "sha256:minio")
+        self.assertEqual(images["mc"]["image_id"], "sha256:minio-mc")
+        self.assertEqual(images["mc-init"], images["mc"])
+        self.assertEqual(facts["minio"]["receipt"]["definition_sha256"], "definition-minio")
+        self.assertEqual(facts["minio-mc"]["receipt"]["definition_sha256"], "definition-minio-mc")
+        self.assertIn(mock.call("sha256:minio"), inspect.call_args_list)
+        self.assertIn(mock.call("sha256:minio-mc"), inspect.call_args_list)
+        self.assertNotIn(mock.call("mutable-minio-alias"), inspect.call_args_list)
+        self.assertNotIn(mock.call("mutable-mc-alias"), inspect.call_args_list)
+
+    def test_object_store_requires_derived_definition_and_exact_installed_id(self):
+        for name in ("minio", "minio-mc"):
+            with self.subTest(name=name, fault="definition"):
+                inputs = bom()
+                inputs["derived_images"][name].pop("definition_sha256")
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "derived definition identity is missing"):
+                    machine.input_facts(inputs, Backend())
+            with self.subTest(name=name, fault="image"):
+                backend = Backend()
+                original = backend.image_id
+                with mock.patch.object(backend, "image_id", side_effect=lambda reference: "sha256:other" if reference == "sha256:" + name else original(reference)):
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, "derived image differs from verified receipt"):
+                        machine.input_facts(bom(), backend)
 
 
 class SupervisionPrerequisiteTests(unittest.TestCase):

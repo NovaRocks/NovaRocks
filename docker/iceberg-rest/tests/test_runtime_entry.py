@@ -755,6 +755,10 @@ class IsolatedEntryTests(RendererCase):
         self.assertIn('rest-mv-catalog:/tmp', model)
         record = result['record']
         self.assertEqual(record['images']['rest-mv']['image_id'], 'sha256:rest-mv')
+        self.assertEqual(record['images']['minio']['image_id'], 'sha256:minio')
+        self.assertEqual(record['images']['mc']['image_id'], 'sha256:minio-mc')
+        self.assertIn("MINIO_IMAGE='sha256:minio'", (self.entry / 'compose.env').read_text())
+        self.assertIn("MC_IMAGE='sha256:minio-mc'", (self.entry / 'compose.env').read_text())
         self.assertIn('rest-mv', record['required_services'])
         self.assertIn('nr-isolated-rest-test_rest-mv-catalog', record['volumes'])
         self.assertEqual(record['service_ports']['rest-mv'], {'8181/tcp': 24101})

@@ -94,7 +94,7 @@ def main() -> int:
     parser.add_argument("--lock", default=SCRIPT_DIR / "lock.json")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--platform", help="explicit native target, checked against host and Docker daemon")
-    parser.add_argument("--consumer", choices=("all", "iceberg-rest"), default="all")
+    parser.add_argument("--consumer", choices=("all", "iceberg-rest", "object-store"), default="all")
     args = parser.parse_args()
     try:
         bom = verify(fixture_store(args.store), Path(args.repo_root).resolve(), Path(args.lock).resolve(), consumer=args.consumer, platform=args.platform)

@@ -421,7 +421,7 @@ def render_isolated_stack(bom: dict, project: str, ports: dict, out: Path, confi
             services[name] = guard_service(services[name], config["writer_commands"][name], config["run_context"])
     text = templates["os"]["header"] + templates["os"]["x-owner-labels"] + "services:\n" + ''.join(services.values())
     text += "volumes:\n" + ("" if external else ''.join(blocks(templates["os"]["volumes"]).values())) + ''.join(blocks(templates["cat"]["volumes"]).values()) + templates["os"]["networks"]
-    images = {"minio": bom["images"]["minio"]["alias"], "mc": bom["images"]["minio-mc"]["alias"],
+    images = {"minio": bom["derived_images"]["minio"]["image_id"], "mc": bom["derived_images"]["minio-mc"]["image_id"],
               "rest": hook_image if profile == "publication-hook" else bom["images"]["iceberg-rest"]["alias"],
               "rest-mv": bom["derived_images"]["rest-mv"]["image_id"],
               "spark": bom["derived_images"]["iceberg-spark"]["image_id"]}
@@ -609,7 +609,7 @@ def start_private_stack(config, project, entry, profile, hook_image, bom, *, bud
         # The default image entrypoint is data, never a guessed Java command.
         references = {"rest": hook_image if profile == "publication-hook" else bom["images"]["iceberg-rest"]["alias"],
             "rest-mv": bom["derived_images"]["rest-mv"]["image_id"],
-            "spark": bom["derived_images"]["iceberg-spark"]["image_id"], "mc": bom["images"]["minio-mc"]["alias"]}
+            "spark": bom["derived_images"]["iceberg-spark"]["image_id"], "mc": bom["derived_images"]["minio-mc"]["image_id"]}
         config["writer_images"], config["writer_commands"] = {}, {}
         for service, reference in references.items():
             budget.check(work=True)

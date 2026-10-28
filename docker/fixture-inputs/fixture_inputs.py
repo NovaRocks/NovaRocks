@@ -159,9 +159,10 @@ def load_lock(
 
 # A consumer declares its runtime roots; build dependencies come from the lock.
 CONSUMER_INPUT_ROOTS = {
+    "object-store": (("derived_images", "minio"), ("derived_images", "minio-mc")),
     "iceberg-rest": (
-        ("images", "minio"),
-        ("images", "minio-mc"),
+        ("derived_images", "minio"),
+        ("derived_images", "minio-mc"),
         ("images", "iceberg-rest"),
         ("derived_images", "iceberg-spark"),
         ("derived_images", "rest-mv"),
@@ -339,6 +340,7 @@ def validate_artifact(path: Path, item: Mapping[str, Any]) -> dict[str, Any]:
     if not path.is_file():
         raise FixtureInputError(f"fixture artifact is missing: {path.name}")
     actual = artifact_entry(path)
-    if actual["bytes"] != item["bytes"] or actual["sha1"] != item["sha1"]:
+    if (actual["bytes"] != item["bytes"] or actual["sha1"] != item["sha1"]
+            or ("sha256" in item and actual["sha256"] != item["sha256"])):
         raise FixtureInputError(f"fixture artifact integrity mismatch: {path.name}")
     return actual
