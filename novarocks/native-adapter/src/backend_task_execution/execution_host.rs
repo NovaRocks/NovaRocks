@@ -274,6 +274,8 @@ struct TaskRuntime {
     /// The original registered preparation owner survives receiver removal and
     /// submit refusal until explicit runtime handoff or actual stopped drain.
     preparation: Arc<NativePreparationChild>,
+    /// The original Worker capability moves once into the dormant start.
+    start: Mutex<Option<novarocks_worker::TaskStartPermit>>,
     /// Physical ingress survives actual driver stop until the original
     /// capability owner closes its route. Taken synchronously on retirement.
     exchange_retirement: Mutex<Option<ExchangeReceiverRetirement>>,
@@ -888,6 +890,10 @@ impl NativeTaskExecutionHost {
                 novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(cause);
             HostRejection::from_failure(failure_category(&cause), cause)
         })?;
+        let start = preparation_scope.take_start_permit().map_err(|cause| {
+            let cause = ExecutionFailure::from_domain(cause);
+            HostRejection::from_failure(failure_category(&cause), cause)
+        })?;
         let kernel_control = Arc::clone(&task_control);
         let root_session = self.open_root_result_session(
             identity,
@@ -1055,6 +1061,7 @@ impl NativeTaskExecutionHost {
                 stop: task_stop,
                 sink_kind,
                 preparation: preparation_child,
+                start: Mutex::new(Some(start)),
                 exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
@@ -1685,10 +1692,16 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .preparation
             .offer()
             .map_err(|cause| HostRejection::from_failure(failure_category(&cause), cause))?;
+        let start = runtime
+            .start
+            .lock()
+            .expect("original Task start permit")
+            .take()
+            .expect("the same original prepared kernel owns one Worker start permit");
         task.prepare_start(PreparedNativeStart {
             kernel,
-            reporter,
             completion,
+            start,
             #[cfg(novarocks_dev_controls)]
             injected_execution_failure,
         });
@@ -1947,8 +1960,8 @@ struct RunnableState {
 
 struct PreparedNativeStart {
     kernel: PreparedKernelOffer,
-    reporter: TaskStatusReporter,
     completion: novarocks_worker::TaskCompletionReservation,
+    start: novarocks_worker::TaskStartPermit,
     #[cfg(novarocks_dev_controls)]
     injected_execution_failure: Option<crate::test_controls::NativeFaultClaim>,
 }
@@ -2049,8 +2062,8 @@ impl NativeRunnableTask {
             });
         let PreparedNativeStart {
             kernel,
-            reporter,
             completion,
+            start,
             #[cfg(novarocks_dev_controls)]
             injected_execution_failure,
         } = prepared;
@@ -2058,8 +2071,16 @@ impl NativeRunnableTask {
         // A stopped Task still drains the already prepared operators through
         // their real cleanup/exit protocol. The shared Task control prevents
         // provider activation; no synthetic stopped fact bypasses those jobs.
-        if !stopped_before_start {
-            reporter.running();
+        if stopped_before_start {
+            // Never started: withdraw only this unused Running input. The
+            // prepared runtime still owes its independent physical teardown.
+            drop(start);
+        } else {
+            start.handoff_running().unwrap_or_else(|_retained| {
+                // Original input/Work custody has recorded the unresolved
+                // handoff. Do not activate a kernel behind that failed owner.
+                std::panic::panic_any(NativePreparationUnresolved)
+            });
         }
         #[cfg(novarocks_dev_controls)]
         let initial_failure = if stopped_before_start {

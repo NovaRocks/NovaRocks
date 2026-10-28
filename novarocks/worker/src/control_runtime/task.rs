@@ -280,6 +280,7 @@ struct HostPreparationBinding {
     children: Arc<crate::task_preparation::TaskPreparationScope>,
     cadence: std::time::Duration,
     roles: AdmittedFragmentRoles<ExecutionFailure>,
+    start: crate::TaskStartPermit,
     pending: Arc<dyn TaskPendingNotice>,
     health: Arc<ExecutionHealth>,
 }
@@ -318,6 +319,7 @@ impl TaskPreparationJob {
                 &binding.children,
                 binding.cadence,
                 binding.roles,
+                binding.start,
             )
             .expect("original admitted role and child identities match the Task");
             let installed = host
@@ -1193,16 +1195,24 @@ impl TaskHostRecord {
         &self,
         job: &mut TaskPreparationJob,
         roles: AdmittedFragmentRoles<ExecutionFailure>,
+        start: crate::TaskStartPermit,
         cadence: std::time::Duration,
-    ) -> Result<(), AdmittedFragmentRoles<ExecutionFailure>> {
+    ) -> Result<
+        (),
+        (
+            AdmittedFragmentRoles<ExecutionFailure>,
+            crate::TaskStartPermit,
+        ),
+    > {
         if roles.identity() != Some(self.task)
+            || start.identity() != self.task
             || job.host.is_some()
             || !job
                 .request
                 .as_ref()
                 .is_some_and(|request| request.identity() == self.task)
         {
-            return Err(roles);
+            return Err((roles, start));
         }
         let preparation = self
             .resources
@@ -1219,6 +1229,7 @@ impl TaskHostRecord {
             children,
             cadence,
             roles,
+            start,
             pending: self.pending.clone(),
             health: self.health.clone(),
         });

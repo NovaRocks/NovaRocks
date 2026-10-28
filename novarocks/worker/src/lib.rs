@@ -92,7 +92,7 @@ pub use task_preparation::{
 mod task_registry;
 mod task_registry_config;
 mod task_registry_entry;
-pub use host::TaskPreparationContext;
+pub use host::{TaskCompletionRolesTaken, TaskPreparationContext, TaskStartPermitTaken};
 pub use task_registry_entry::TaskPreparationView;
 #[cfg(test)]
 mod task_registry_tests;

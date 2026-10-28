@@ -44,6 +44,7 @@ pub struct TaskPreparationContext<'a> {
     owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
     children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
     cadence: std::time::Duration,
+    start: Option<crate::TaskStartPermit>,
     roles: Option<
         novarocks_execution_contract::AdmittedFragmentRoles<
             novarocks_execution::runtime::fragment::ExecutionFailure,
@@ -58,8 +59,12 @@ impl<'a> TaskPreparationContext<'a> {
         roles: novarocks_execution_contract::AdmittedFragmentRoles<
             novarocks_execution::runtime::fragment::ExecutionFailure,
         >,
+        start: crate::TaskStartPermit,
     ) -> Result<Self, novarocks_execution::runtime::task_control::TaskControlIdentityMismatch> {
-        if roles.identity() != Some(owner.identity()) || children.identity() != owner.identity() {
+        if roles.identity() != Some(owner.identity())
+            || children.identity() != owner.identity()
+            || start.identity() != owner.identity()
+        {
             return Err(novarocks_execution::runtime::task_control::TaskControlIdentityMismatch);
         }
         Ok(Self {
@@ -67,6 +72,7 @@ impl<'a> TaskPreparationContext<'a> {
             children,
             cadence,
             roles: Some(roles),
+            start: Some(start),
         })
     }
     /// Registers before the provider child attaches kernel/root captures. The
@@ -103,6 +109,28 @@ impl<'a> TaskPreparationContext<'a> {
         TaskCompletionRolesTaken,
     > {
         self.roles.take().ok_or(TaskCompletionRolesTaken)
+    }
+    /// Transfer this original capability into the prepared dormant start.
+    /// The metadata view above cannot sign or recover another start role.
+    pub fn take_start_permit(&mut self) -> Result<crate::TaskStartPermit, TaskStartPermitTaken> {
+        self.start.take().ok_or(TaskStartPermitTaken)
+    }
+}
+#[derive(Debug)]
+pub struct TaskStartPermitTaken;
+impl std::fmt::Display for TaskStartPermitTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the original Task start permit was already transferred")
+    }
+}
+impl std::error::Error for TaskStartPermitTaken {}
+impl novarocks_execution_contract::failure::FailureProjection for TaskStartPermitTaken {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::CausalInputUnresolved.reason(),
+        )
     }
 }
 #[derive(Debug)]

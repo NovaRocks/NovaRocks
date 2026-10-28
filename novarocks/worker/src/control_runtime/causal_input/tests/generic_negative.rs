@@ -150,3 +150,130 @@ fn another_real_core_cannot_consume_a_generic_authors_original_core_leg() {
     f.finish();
     other.finish();
 }
+
+#[test]
+fn a_start_permit_dropped_after_scope_failure_withdraws_only_its_original_unused_role() {
+    let mut f = fixture_with_author(true);
+    let cut = f.custody.cut();
+    let start = crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap());
+    let funded = original_fees(&f);
+    let failed_generation = f.runtime.scope.fail().unwrap();
+    assert!(failed_generation > generation());
+    drop(start);
+
+    // This is a true unused Running input, not evidence that the failed Task,
+    // its loader/preparation bodies or the cut's Source holders have exited.
+    assert!(f.ingress.event_unused(cut).unwrap());
+    assert!(f.inbox.deliver_next().unwrap().is_none());
+    assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
+    assert!(f.custody.actual_exit_ready().unwrap());
+    assert!(!f.custody.try_retire().unwrap());
+    assert_eq!(original_fees(&f), funded);
+    assert_eq!(
+        f.custody.report().consumption(core()).unwrap(),
+        Consumption::Pending
+    );
+    assert_eq!(
+        f.custody.report().consumption(observer()).unwrap(),
+        Consumption::Pending
+    );
+    assert!(
+        f.ingress
+            .pair_inventory(PairRoute::Cut(cut))
+            .unwrap()
+            .iter()
+            .all(|position| { !position.custody.actual_exit_ready().unwrap() })
+    );
+    assert!(
+        f.runtime
+            .jobs
+            .values()
+            .any(|(work, _)| !work.actual_exit_ready().unwrap())
+    );
+    let still_failed = f.runtime.scope.snapshot().unwrap();
+    assert!(still_failed.failed);
+    assert!(!still_failed.join_ready);
+
+    // Only the original unused event's proved revocation and actual author
+    // exit authorize its own report legs. Every other original remains held.
+    assert!(f.custody.observe_consumers(&mut f.inbox).unwrap());
+    f.ingress.observe_cut_exit(cut, true, true).unwrap();
+    f.retire_cut(cut);
+    assert_eq!(f.custody.phase(), ExitRolePhase::Retired);
+    assert!(f.inbox.is_empty());
+    assert!(f.runtime.scope.gates().unwrap().failed);
+    assert!(!f.runtime.scope.join_ready().unwrap());
+    assert_eq!(
+        f.runtime.ledger.used(Dimension::ActiveTasks.id()) + 1,
+        funded[0]
+    );
+    assert!(f.health.failure().is_none());
+    // The standard fixture now supplies the remaining actual unused Source
+    // exits and real job/body/capture exits; scope failure supplied none.
+    f.finish();
+}
+
+#[test]
+fn a_late_start_handoff_after_scope_failure_retains_running_without_core_consumption() {
+    let mut f = ManuallyDrop::new(fixture_with_author(true));
+    let task = f.custody.task();
+    let cut = f.custody.cut();
+    let start = crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap());
+    let funded = original_fees(&f);
+    f.runtime.scope.fail().unwrap();
+
+    // Handoff seals the original Task's prefix without consulting current
+    // scope liveness. The paid runtime input has its separate failure fence.
+    start.handoff_running().unwrap();
+    assert!(!f.ingress.event_unused(cut).unwrap());
+    assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
+    assert!(f.custody.actual_exit_ready().unwrap());
+    assert!(matches!(
+        f.inbox.deliver_next(),
+        Err(CausalError::Driver(
+            novarocks_control_runtime::driver::DriverError::ActorFailed
+        ))
+    ));
+    assert!(!f.inbox.event_core_consumed(cut).unwrap());
+    // The actual observer can confirm this original author's physical exit;
+    // that does not acknowledge the Running input to the failed Core.
+    {
+        let original = &mut *f;
+        assert!(
+            !original
+                .custody
+                .observe_consumers(&mut original.inbox)
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        f.custody.report().consumption(observer()).unwrap(),
+        Consumption::Consumed
+    );
+    assert_eq!(
+        f.custody.report().consumption(core()).unwrap(),
+        Consumption::Pending
+    );
+    assert!(!f.custody.try_retire().unwrap());
+    assert_eq!(original_fees(&f), funded);
+    assert!(!f.inbox.is_empty());
+    let rejected = f
+        .inbox
+        .take_rejected(cut)
+        .expect("the failed runtime returns this original neutral input");
+    assert!(matches!(
+        &rejected,
+        (None, WorkerMessage::Context(ContextMessage::Command {
+            request: None,
+            command: ContextInput::Running { task: original_task },
+            ..
+        })) if *original_task == task
+    ));
+    assert!(!f.inbox.event_core_consumed(cut).unwrap());
+    assert!(f.runtime.scope.gates().unwrap().failed);
+    assert!(!f.runtime.scope.join_ready().unwrap());
+    // There is no failure-publication-drained proof or S8 takeover here.
+    // Retain the exact failed Core input and its same finite owner together;
+    // do not fabricate a CompletionExited, abandon or successful cleanup.
+    let _retained_original_failure = ManuallyDrop::new((f, rejected));
+}
