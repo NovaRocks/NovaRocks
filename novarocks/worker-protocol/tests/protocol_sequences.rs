@@ -36,8 +36,8 @@ use novarocks_worker_protocol::{
     },
     context::{
         ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
-        ContextEstablishmentDecision, ContextInput, ContextMaterialized, ContextStep, PhysicalFact,
-        RequestResult,
+        ContextEstablishmentDecision, ContextInput, ContextMaterialized, ContextReplyBody,
+        ContextRequestSettlement, ContextStep, PhysicalFact, RequestResult,
     },
     creation::{
         AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestContext,
@@ -236,7 +236,62 @@ fn create(core: &mut ContextCore, port: &mut Port, n: u8) {
     )
     .unwrap();
 }
-fn loaded(core: &mut ContextCore, port: &mut Port, n: u8) -> Vec<ContextEffect> {
+struct LoadedSteps {
+    steps: Vec<ContextStep>,
+}
+impl LoadedSteps {
+    fn iter(&self) -> impl Iterator<Item = &ContextEffect> {
+        self.steps.iter().flat_map(|step| &step.effects)
+    }
+    fn requests(&self) -> impl Iterator<Item = &ContextRequestSettlement> {
+        self.steps.iter().flat_map(|step| &step.requests)
+    }
+}
+fn has_verdict(
+    replies: &[ContextRequestSettlement],
+    token: InputId,
+    outcome: OperationOutcome,
+) -> bool {
+    replies.iter().any(|reply| reply.request.token == token
+        && reply.result == RequestResult::Outcome(outcome)
+        && matches!(reply.body.as_ref(), ContextReplyBody::Verdict(value) if *value == reply.result))
+}
+fn assert_domain_reply(
+    replies: &[ContextRequestSettlement],
+    token: InputId,
+    expected: &AdmissionRefusal,
+) {
+    let reply = replies
+        .iter()
+        .find(|reply| reply.request.token == token)
+        .expect("the original request has a complete typed reply");
+    let AdmissionRefusal::Domain(outcome, failure) = expected else {
+        panic!("this oracle requires the original typed domain refusal")
+    };
+    assert_eq!(reply.result, RequestResult::Outcome(outcome.outcome()));
+    assert!(
+        matches!(reply.body.as_ref(), ContextReplyBody::Domain(actual) if actual.outcome == *outcome && actual.failure == *failure)
+    );
+}
+fn final_info_reply(
+    step: &ContextStep,
+    token: InputId,
+) -> std::sync::Arc<novarocks_execution_contract::FinalTaskInfo> {
+    let reply = step
+        .requests
+        .iter()
+        .find(|reply| reply.request.token == token)
+        .expect("the actual request settled");
+    assert_eq!(
+        reply.result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    match reply.body.as_ref() {
+        ContextReplyBody::FinalInfo(info) => info.clone(),
+        _ => panic!("the same request retains the original final information"),
+    }
+}
+fn loaded(core: &mut ContextCore, port: &mut Port, n: u8) -> LoadedSteps {
     let mut all = Vec::new();
     let mut input = ContextInput::Loaded {
         task: task(n.into()),
@@ -249,9 +304,9 @@ fn loaded(core: &mut ContextCore, port: &mut Port, n: u8) -> Vec<ContextEffect> 
             .effects
             .iter()
             .any(|effect| matches!(effect, ContextEffect::ContinueReplies { .. }));
-        all.extend(step.effects);
+        all.push(step);
         if !more {
-            return all;
+            return LoadedSteps { steps: all };
         }
         input = ContextInput::ContinueReplies {
             task: task(n.into()),
@@ -397,22 +452,34 @@ fn exact_create_replays_share_one_loader_and_reserve_the_complete_preparation_co
         published < enqueue,
         "preparation starts only after the Accepted publication commits"
     );
+    let enqueue_step = effects
+        .steps
+        .iter()
+        .position(|step| {
+            step.effects
+                .iter()
+                .any(|effect| matches!(effect, ContextEffect::EnqueuePreparation { .. }))
+        })
+        .unwrap();
     let replies: Vec<_> = effects
+        .steps
         .iter()
         .enumerate()
-        .filter_map(|(i, e)| {
-            if let ContextEffect::Reply { request, outcome } = e {
-                Some((i, *request, *outcome))
-            } else {
-                None
-            }
-        })
+        .flat_map(|(index, step)| step.requests.iter().map(move |reply| (index, reply)))
         .collect();
     assert_eq!(replies.len(), 2);
-    assert!(
+    assert!(replies.iter().all(|(index, reply)| *index >= enqueue_step
+        && reply.result == RequestResult::Outcome(OperationOutcome::Accepted)
+        && reply.body.matches(reply.result)));
+    assert_eq!(
         replies
             .iter()
-            .all(|(i, _, outcome)| *i > enqueue && *outcome == OperationOutcome::Accepted)
+            .map(|(_, reply)| reply.request.token)
+            .collect::<Vec<_>>(),
+        vec![
+            port.request_token(operation(1)),
+            port.request_token(operation(2))
+        ]
     );
     assert_eq!(core.spent_identities(), 1);
 }
@@ -452,13 +519,10 @@ fn abort_predecessor_is_applied_before_a_late_loader_result() {
             | ContextEffect::PublishTaskConvergence { .. }
     )));
     assert!(core.status(task(1)).is_none());
-    assert!(effects.iter().any(|e| matches!(
-        e,
-        ContextEffect::Reply {
-            outcome: OperationOutcome::ContextTerminalReceipt,
-            ..
-        }
-    )));
+    assert!(effects.requests().any(|reply| reply.request.token
+        == port.request_token(operation(1))
+        && reply.result == RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt)
+        && reply.body.matches(reply.result)));
     assert!(!core.task(task(1)).unwrap().loader_exited);
     assert!(
         !effects
@@ -505,13 +569,11 @@ fn installed_and_body_exit_do_not_return_the_preparation_position() {
     )
     .unwrap();
     create(&mut core, &mut port, 2);
-    assert!(loaded(&mut core, &mut port, 2).iter().any(|e| matches!(
-        e,
-        ContextEffect::Reply {
-            outcome: OperationOutcome::PreparationBusy,
-            ..
-        }
-    )));
+    let settled = loaded(&mut core, &mut port, 2);
+    assert!(settled.requests().any(|reply| reply.request.token
+        == port.request_token(operation(2))
+        && reply.result == RequestResult::Outcome(OperationOutcome::PreparationBusy)
+        && reply.body.matches(reply.result)));
     core.handle(
         at(0),
         ContextInput::Physical {
@@ -522,13 +584,11 @@ fn installed_and_body_exit_do_not_return_the_preparation_position() {
     )
     .unwrap();
     create(&mut core, &mut port, 3);
-    assert!(loaded(&mut core, &mut port, 3).iter().any(|e| matches!(
-        e,
-        ContextEffect::Reply {
-            outcome: OperationOutcome::Accepted,
-            ..
-        }
-    )));
+    let settled = loaded(&mut core, &mut port, 3);
+    assert!(settled.requests().any(|reply| reply.request.token
+        == port.request_token(operation(3))
+        && reply.result == RequestResult::Outcome(OperationOutcome::Accepted)
+        && reply.body.matches(reply.result)));
 }
 #[test]
 fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
@@ -576,13 +636,11 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     let refused = core
         .apply_fixture(at(0), rpc(operation(7), ContextCommand::Release), &mut port)
         .unwrap();
-    assert!(refused.effects.iter().any(|e| matches!(
-        e,
-        ContextEffect::Reply {
-            outcome: OperationOutcome::ReleaseNotReady,
-            ..
-        }
-    )));
+    assert!(has_verdict(
+        &refused.requests,
+        port.request_token(operation(7)),
+        OperationOutcome::ReleaseNotReady
+    ));
     let exited = core
         .handle(
             at(0),
@@ -608,18 +666,20 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
             .iter()
             .any(|e| matches!(e, ContextEffect::ReleaseHost { .. }))
     );
-    assert!(!releasing.effects.iter().any(|e| matches!(
-        e,
-        ContextEffect::Reply {
-            outcome: OperationOutcome::Accepted,
-            ..
-        }
-    )));
+    assert!(!has_verdict(
+        &releasing.requests,
+        port.request_token(operation(7)),
+        OperationOutcome::Accepted
+    ));
     let released = core
         .handle(at(0), ContextInput::HostReleased, &mut port)
         .unwrap();
     assert_eq!(core.state(), QueryContextState::TerminalRetained);
-    assert!(released.effects.iter().any(|e|matches!(e,ContextEffect::Reply{request,outcome:OperationOutcome::Accepted} if *request == port.request_token(operation(7)))));
+    assert!(has_verdict(
+        &released.requests,
+        port.request_token(operation(7)),
+        OperationOutcome::Accepted
+    ));
 }
 #[test]
 fn current_input_time_expires_a_lease_before_a_delayed_timer_arrives() {
@@ -641,13 +701,11 @@ fn current_input_time_expires_a_lease_before_a_delayed_timer_arrives() {
         .unwrap();
     assert_eq!(core.state(), QueryContextState::Aborting);
     assert_eq!(core.generation().get(), 2);
-    assert!(step.effects.iter().any(|e| matches!(
-        e,
-        ContextEffect::Reply {
-            outcome: OperationOutcome::LeaseExpired,
-            ..
-        }
-    )));
+    assert!(has_verdict(
+        &step.requests,
+        port.request_token(operation(7)),
+        OperationOutcome::LeaseExpired
+    ));
     assert!(core.handle(at(29), ContextInput::Tick, &mut port).is_err());
 }
 #[test]
@@ -1465,7 +1523,12 @@ fn final_info_freezes_the_real_status_writer_and_operator_facts() {
             &mut port,
         )
         .unwrap();
-    let ContextEffect::FinalInfoReply { info, .. } = &final_step.effects[0] else {
+    assert_eq!(final_step.requests.len(), 1);
+    assert_eq!(
+        final_step.requests[0].request.token,
+        port.request_token(operation(3))
+    );
+    let ContextReplyBody::FinalInfo(info) = final_step.requests[0].body.as_ref() else {
         panic!("frozen final information");
     };
     assert_eq!(info.final_status(), &core.task(task(1)).unwrap().published);
@@ -2587,12 +2650,7 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
     assert_ne!(first_token, second_token);
     assert!(waiting.charged_work() <= ContextCore::MAX_STEP_WORK);
     assert!(waiting.requests.is_empty());
-    assert!(
-        !waiting
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, ContextEffect::QuiesceReply { .. }))
-    );
+    assert!(waiting.requests.is_empty());
     for now in [at(1), at(2)] {
         let late = context_core
             .handle(
@@ -2634,12 +2692,15 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
         RequestResult::Outcome(OperationOutcome::Accepted)
     );
     let first_receipt = completed
-        .effects
+        .requests
         .iter()
-        .find_map(|effect| match effect {
-            ContextEffect::QuiesceReply {
-                request, receipt, ..
-            } if *request == first_token => Some(receipt.clone()),
+        .find_map(|reply| match reply.body.as_ref() {
+            ContextReplyBody::Quiesce { receipt, outcome }
+                if reply.request.token == first_token
+                    && RequestResult::Outcome(*outcome) == reply.result =>
+            {
+                Some(receipt.clone())
+            }
             _ => None,
         })
         .expect("the first request retains its complete neutral fence receipt");
@@ -2654,12 +2715,15 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
         RequestResult::Outcome(OperationOutcome::Idempotent)
     );
     let second_receipt = idempotent
-        .effects
+        .requests
         .iter()
-        .find_map(|effect| match effect {
-            ContextEffect::QuiesceReply {
-                request, receipt, ..
-            } if *request == second_token => Some(receipt.clone()),
+        .find_map(|reply| match reply.body.as_ref() {
+            ContextReplyBody::Quiesce { receipt, outcome }
+                if reply.request.token == second_token
+                    && RequestResult::Outcome(*outcome) == reply.result =>
+            {
+                Some(receipt.clone())
+            }
             _ => None,
         })
         .expect("a pending second token needs no host RPC replay");
@@ -3058,7 +3122,12 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
                 &mut port,
             )
             .unwrap();
-        assert!(!begin.effects.iter().any(|effect| matches!(effect, ContextEffect::Reply { request, .. } if *request == port.request_token(operation(5)))));
+        assert!(
+            !begin
+                .requests
+                .iter()
+                .any(|reply| reply.request.token == port.request_token(operation(5)))
+        );
         let a = core
             .handle(at(0), ContextInput::ContinueClose, &mut port)
             .unwrap();
@@ -3087,12 +3156,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
                 &mut port,
             )
             .unwrap();
-        assert!(
-            !another_abort
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, ContextEffect::Reply { .. }))
-        );
+        assert!(another_abort.requests.is_empty());
         let b_applied = core
             .handle(
                 at(0),
@@ -3113,12 +3177,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
                 AbortCause::QueryFailed
             )))
         ));
-        assert!(
-            !b_applied
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, ContextEffect::Reply { .. }))
-        );
+        assert!(b_applied.requests.is_empty());
         assert_eq!(
             core.task(task(1)).unwrap().applied_close_generation.get(),
             1
@@ -3151,19 +3210,21 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             )
             .unwrap();
         assert_eq!(core.task(task(1)).unwrap().conclusion.accepted, Some(first));
-        assert!(a_applied.effects.contains(&ContextEffect::Reply {
-            request: port.request_token(operation(5)),
-            outcome: OperationOutcome::Accepted
-        }));
+        assert!(has_verdict(
+            &a_applied.requests,
+            port.request_token(operation(5)),
+            OperationOutcome::Accepted
+        ));
         assert!(!core.task(task(1)).unwrap().loader_exited);
         assert!(!core.task(task(1)).unwrap().actual_stopped);
         let replay = core
             .handle(at(0), ContextInput::ContinueClose, &mut port)
             .unwrap();
-        assert!(replay.effects.contains(&ContextEffect::Reply {
-            request: port.request_token(operation(6)),
-            outcome: OperationOutcome::Idempotent
-        }));
+        assert!(has_verdict(
+            &replay.requests,
+            port.request_token(operation(6)),
+            OperationOutcome::Idempotent
+        ));
         let failure = TaskFailure::new(
             FailureFact::new(
                 FailureClass::Data,
@@ -3337,10 +3398,11 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
         task: task(1),
         source: SourceId(17)
     }));
-    assert!(closed.effects.contains(&ContextEffect::Reply {
-        request: port.request_token(operation(5)),
-        outcome: OperationOutcome::Accepted
-    }));
+    assert!(has_verdict(
+        &closed.requests,
+        port.request_token(operation(5)),
+        OperationOutcome::Accepted
+    ));
     assert!(!core.task(task(1)).unwrap().actual_stopped);
     assert!(!core.task(task(1)).unwrap().resources_converged);
 }
@@ -3388,12 +3450,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
             admitted.requests.is_empty(),
             "live RPC admission owns the waiter; expired predecessors cannot exhaust it"
         );
-        assert!(
-            !admitted
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, ContextEffect::Reply { .. }))
-        );
+        assert!(admitted.requests.is_empty());
         let timeout = core
             .handle(at(now + 1), ContextInput::Tick, &mut port)
             .unwrap();
@@ -3734,14 +3791,7 @@ fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay(
             &mut port,
         )
         .unwrap();
-    assert!(
-        rejected
-            .effects
-            .contains(&ContextEffect::DomainFailureReply {
-                request: InputId::new(1).unwrap(),
-                refusal: expected.clone()
-            })
-    );
+    assert_domain_reply(&rejected.requests, InputId::new(1).unwrap(), &refusal);
     assert_eq!(
         rejected.requests[0].result,
         RequestResult::Outcome(outcome.outcome())
@@ -3814,11 +3864,6 @@ fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay(
                 replay.effects.is_empty(),
                 "an expired unadmitted request publishes no host effect"
             );
-        } else {
-            assert!(replay.effects.contains(&ContextEffect::DomainFailureReply {
-                request: InputId::new(token).unwrap(),
-                refusal: expected.clone()
-            }));
         }
         assert_eq!(
             replay.requests[0].result,
@@ -3851,9 +3896,7 @@ fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_b
             &mut port,
         )
         .unwrap();
-    assert!(
-        matches!(&first.effects[0], ContextEffect::DomainFailureReply { refusal: value, .. } if value.outcome.outcome() == refusal.outcome())
-    );
+    assert_domain_reply(&first.requests, port.request_token(operation(1)), &refusal);
     assert!(
         core.task(task(1)).is_none(),
         "a failed active reservation cannot create an uncharged entity record"
@@ -3870,10 +3913,7 @@ fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_b
             &mut port,
         )
         .unwrap();
-    assert!(matches!(
-        &loaded.effects[0],
-        ContextEffect::DomainFailureReply { .. }
-    ));
+    assert_domain_reply(&loaded.requests, port.request_token(operation(1)), &refusal);
     assert_eq!(core.task(task(1)).unwrap().creation_refusal, Some(refusal));
     assert_eq!(
         port.calls.len(),
@@ -4027,16 +4067,18 @@ fn a_single_task_byte_refusal_keeps_precedence_over_a_full_preparation_position(
             &mut port,
         )
         .unwrap();
-    assert!(rejected.effects.contains(&ContextEffect::Reply {
-        request: port.request_token(operation(2)),
-        outcome: OperationOutcome::ResourceExhausted
-    }));
+    assert!(has_verdict(
+        &rejected.requests,
+        port.request_token(operation(2)),
+        OperationOutcome::ResourceExhausted
+    ));
     create(&mut core, &mut port, 3);
     let full = loaded(&mut core, &mut port, 3);
-    assert!(full.contains(&ContextEffect::Reply {
-        request: port.request_token(operation(3)),
-        outcome: OperationOutcome::PreparationBusy
-    }));
+    assert!(full.requests().any(
+        |reply| reply.request.token == port.request_token(operation(3))
+            && reply.result == RequestResult::Outcome(OperationOutcome::PreparationBusy)
+            && reply.body.matches(reply.result)
+    ));
 }
 #[test]
 fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection() {
@@ -4095,14 +4137,17 @@ fn aggregate_preparation_capacity_refusal_remains_preparation_busy() {
             &mut port,
         )
         .unwrap();
-    assert!(step.effects.contains(&ContextEffect::Reply {
-        request: port.request_token(operation(1)),
-        outcome: OperationOutcome::PreparationBusy
-    }));
-    assert!(!step.effects.iter().any(|effect| matches!(
-        effect,
-        ContextEffect::DomainFailureReply { .. } | ContextEffect::EnqueuePreparation { .. }
-    )));
+    assert!(has_verdict(
+        &step.requests,
+        port.request_token(operation(1)),
+        OperationOutcome::PreparationBusy
+    ));
+    assert!(
+        !step
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ContextEffect::EnqueuePreparation { .. }))
+    );
     assert!(!core.task(task(1)).unwrap().loader_exited);
     assert_eq!(port.calls.len(), 2);
 }
@@ -4812,11 +4857,33 @@ fn successful_root_production_waits_for_output_and_drain_reply_follows_the_termi
     );
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Finished);
-    let terminal = drained.effects.iter().position(|effect| matches!(effect,
-        ContextEffect::PublishTask { state: TaskState::Finished, snapshot, .. } if snapshot.output().responsibility_complete())).unwrap();
-    let reply = drained.effects.iter().position(|effect| matches!(effect,
-        ContextEffect::RootDrainReply { result: RootDrainVerdict::Published(version), .. } if *version == record.version)).unwrap();
-    assert!(terminal < reply);
+    let terminal_version = drained
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ContextEffect::PublishTask {
+                state: TaskState::Finished,
+                snapshot,
+                version,
+                ..
+            } if snapshot.output().responsibility_complete() => Some(*version),
+            _ => None,
+        })
+        .expect("the original terminal publication is still a real ordered effect");
+    assert_eq!(terminal_version, record.version);
+    let reply = drained
+        .requests
+        .iter()
+        .find(|reply| reply.request.token == port.request_token(operation(10)))
+        .expect("the original drain request settled in this atomic step");
+    assert_eq!(reply.task, Some(task(1)));
+    assert_eq!(
+        reply.result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    assert!(
+        matches!(reply.body.as_ref(), ContextReplyBody::RootDrain(RootDrainVerdict::Published(version)) if *version == terminal_version)
+    );
     assert!(record.output.responsibility_complete());
     assert!(
         !record.output_released,
@@ -5313,10 +5380,18 @@ fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abo
         record.published.output().responsibility_complete(),
         "the same operation's positive output must be in its terminal publication"
     );
+    let reply = drained
+        .requests
+        .iter()
+        .find(|reply| reply.request.token == port.request_token(operation(10)))
+        .expect("the original drain token settled");
+    assert_eq!(reply.task, Some(task(1)));
+    assert_eq!(
+        reply.result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
     assert!(
-        matches!(drained.effects.last(), Some(ContextEffect::RootDrainReply {
-        result: RootDrainVerdict::Published(version), ..
-    }) if *version == record.version)
+        matches!(reply.body.as_ref(), ContextReplyBody::RootDrain(RootDrainVerdict::Published(version)) if *version == record.version)
     );
 }
 
@@ -5602,14 +5677,7 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
             ContextCommand::GetFinalInfo { task: task(1) },
         ),
     );
-    let info = read
-        .effects
-        .iter()
-        .find_map(|effect| match effect {
-            ContextEffect::FinalInfoReply { info, .. } => Some(info),
-            _ => None,
-        })
-        .expect("real final information is frozen at the terminal publication");
+    let info = final_info_reply(&read, port.request_token(operation(11)));
     assert_eq!(
         info.operator_statistics(),
         statistics(2),
@@ -5637,14 +5705,7 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
             ContextCommand::GetFinalInfo { task: task(1) },
         ),
     );
-    let later = reread
-        .effects
-        .iter()
-        .find_map(|effect| match effect {
-            ContextEffect::FinalInfoReply { info, .. } => Some(info),
-            _ => None,
-        })
-        .unwrap();
+    let later = final_info_reply(&reread, port.request_token(operation(12)));
     assert_eq!(later, info);
 }
 

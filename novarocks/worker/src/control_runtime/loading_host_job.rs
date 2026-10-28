@@ -118,7 +118,7 @@ mod tests {
         TaskCreationInput, TaskDescriptor,
     };
     use novarocks_types::UniqueId;
-    use novarocks_worker_protocol::{context::ContextEffect, creation::PayloadId};
+    use novarocks_worker_protocol::creation::PayloadId;
     use std::{
         any::Any,
         num::NonZeroUsize,
@@ -258,10 +258,11 @@ mod tests {
         let outputs = f.drain(loaded.event);
         assert!(outputs.iter().any(|effect| matches!(
             effect,
-            WorkerAction::Context(ContextEffect::Reply {
-                outcome: OperationOutcome::ResourceExhausted,
-                ..
-            })
+            WorkerAction::Reply(reply)
+                if matches!(reply.body.as_ref(),
+                    novarocks_worker_protocol::context::ContextReplyBody::Verdict(
+                        novarocks_worker_protocol::context::RequestResult::Outcome(
+                            OperationOutcome::ResourceExhausted)))
         )));
         assert!(host.loader().unwrap().take_input_disposal().unwrap().run());
         f.ledger.reap_scope_ready(f.scope.id(), 64).unwrap();

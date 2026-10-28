@@ -1186,10 +1186,11 @@ mod tests {
         let effects = f.drain(loaded.event);
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            WorkerAction::Context(ContextEffect::Reply {
-                outcome: OperationOutcome::LeaseExpired,
-                ..
-            })
+            WorkerAction::Reply(reply)
+                if matches!(reply.body.as_ref(),
+                    novarocks_worker_protocol::context::ContextReplyBody::Verdict(
+                        novarocks_worker_protocol::context::RequestResult::Outcome(
+                            OperationOutcome::LeaseExpired)))
         )));
         assert!(!host.observe_loading_exit().unwrap());
         assert_eq!(drops.load(Ordering::SeqCst), 0);

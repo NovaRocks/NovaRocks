@@ -370,14 +370,9 @@ fn equal_wire_operations_for_different_observations_keep_each_complete_typed_bod
         },
     );
     let final_step = m.command(final_info, ContextCommand::GetFinalInfo { task: task(1) });
-    let original_info = final_step
-        .effects
-        .iter()
-        .find_map(|effect| match effect {
-            ContextEffect::FinalInfoReply { info, .. } => Some(info.clone()),
-            _ => None,
-        })
-        .expect("the actual final-info effect owns this immutable projection");
+    assert!(filters_step.effects.iter().any(|effect| matches!(effect,
+        ContextEffect::PrepareReadPayload { request, task: original_task, version: original_version, payload: original_payload }
+            if *request == filters.token && *original_task == task(1) && *original_version == version && *original_payload == payload)));
     let filter_replies = m.settle(filters_step);
     let final_replies = m.settle(final_step);
     assert_eq!(filter_replies.len(), 1);
@@ -400,7 +395,11 @@ fn equal_wire_operations_for_different_observations_keep_each_complete_typed_bod
     let ContextReplyBody::FinalInfo(info) = final_replies[0].body.as_ref() else {
         panic!("an equal wire operation cannot substitute the filter body")
     };
-    assert!(Arc::ptr_eq(info, &original_info));
+    assert_eq!(
+        info.final_status(),
+        &m.core.task(task(1)).unwrap().published
+    );
+    let original_info = info.clone();
     assert_eq!(info.final_status().identity(), task(1));
     assert_eq!(info.final_status().state(), TaskState::Canceled);
 
@@ -429,6 +428,20 @@ fn equal_wire_operations_for_different_observations_keep_each_complete_typed_bod
             .matches(RequestResult::Outcome(OperationOutcome::Accepted)),
         "the earlier decided body is immutable"
     );
+    let replay_info = request(23, shared, 20);
+    let final_step = m.command(replay_info, ContextCommand::GetFinalInfo { task: task(1) });
+    let repeated_info = m.settle(final_step);
+    assert_eq!(repeated_info.len(), 1);
+    assert_reply(
+        &repeated_info[0],
+        replay_info,
+        Some(task(1)),
+        RequestResult::Outcome(OperationOutcome::Accepted),
+    );
+    let ContextReplyBody::FinalInfo(info) = repeated_info[0].body.as_ref() else {
+        panic!("replay preserves the original final-info body")
+    };
+    assert!(Arc::ptr_eq(info, &original_info));
 }
 
 #[test]
@@ -468,7 +481,6 @@ fn an_expired_context_host_token_cannot_complete_a_new_create_with_the_same_wire
         request: old.token,
         result: Ok(()),
     });
-    assert!(host_returned.effects.iter().any(|effect| matches!(effect, ContextEffect::ContextDomainReply { request, .. } if *request == old.token)));
     assert!(
         m.settle(host_returned).is_empty(),
         "the old actual host return cannot answer a new original reply token"
@@ -611,6 +623,9 @@ fn equal_wire_operations_for_two_filter_cuts_keep_both_original_body_versions() 
             acknowledged: None,
         },
     );
+    assert!(step.effects.iter().any(|effect| matches!(effect,
+        ContextEffect::PrepareReadPayload { request, task: original_task, version, payload }
+            if *request == first.token && *original_task == task(1) && *version == v1 && *payload == p1)));
     let first_replies = m.settle(step);
     assert_eq!(first_replies.len(), 1);
     let original_body = first_replies[0].body.clone();
@@ -630,6 +645,9 @@ fn equal_wire_operations_for_two_filter_cuts_keep_both_original_body_versions() 
             acknowledged: None,
         },
     );
+    assert!(step.effects.iter().any(|effect| matches!(effect,
+        ContextEffect::PrepareReadPayload { request, task: original_task, version, payload }
+            if *request == second.token && *original_task == task(1) && *version == v2 && *payload == p2)));
     let second_replies = m.settle(step);
     assert_eq!(second_replies.len(), 1);
     assert_reply(

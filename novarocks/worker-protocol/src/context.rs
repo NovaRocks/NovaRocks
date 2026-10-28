@@ -38,7 +38,7 @@ use novarocks_execution_contract::{
 };
 use novarocks_execution_contract::{
     CancelReason, DomainProgression, DomainVersion, ExchangeEdgeId, OperationDomainFailure,
-    PlanNodeId, QueryContextDomainReceipt, TaskDomainReceipt, TaskOutputFacts, TaskResourceFacts,
+    PlanNodeId, TaskOutputFacts, TaskResourceFacts,
 };
 use novarocks_execution_contract::{
     DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS, FinalTaskInfo, OperatorStatistics,
@@ -446,11 +446,6 @@ pub enum ContextEffect {
         request: InputId,
     },
     WakeQuiesce,
-    QuiesceReply {
-        request: InputId,
-        outcome: OperationOutcome,
-        receipt: Arc<novarocks_execution_contract::QuiesceQueryContextReceipt>,
-    },
     SummaryConsumed {
         task: TaskIdentity,
         generation: Generation,
@@ -468,15 +463,6 @@ pub enum ContextEffect {
         payload: PayloadId,
         progressions: Arc<Vec<DomainProgression>>,
     },
-    TaskDomainReply {
-        request: InputId,
-        outcome: OperationOutcome,
-        receipts: Arc<Vec<TaskDomainReceipt>>,
-    },
-    DomainFailureReply {
-        request: InputId,
-        refusal: DomainRefusal,
-    },
     WaitTaskDomain {
         request: InputId,
         task: TaskIdentity,
@@ -491,26 +477,19 @@ pub enum ContextEffect {
         payload: PayloadId,
         progression: DomainProgression,
     },
-    ContextDomainReply {
-        request: InputId,
-        outcome: OperationOutcome,
-        receipt: QueryContextDomainReceipt,
-    },
     WaitContextDomain {
         request: InputId,
         payload: PayloadId,
         update: ContextDomainInput,
     },
     WakeContextDomains,
-    RootDrainReply {
+    /// Pin the selected version through the original request's paid read role.
+    /// This is synchronous metadata preparation, never a getter or wire action.
+    PrepareReadPayload {
         request: InputId,
-        result: RootDrainVerdict,
-    },
-    ReadPayload {
-        request: InputId,
+        task: TaskIdentity,
         version: DomainVersion,
         payload: PayloadId,
-        outcome: OperationOutcome,
     },
     Subscribe {
         request: InputId,
@@ -523,10 +502,6 @@ pub enum ContextEffect {
         facts: TaskResourceFacts,
         writer: Option<TaskWriterFacts>,
         snapshot: TaskStatus,
-    },
-    FinalInfoReply {
-        request: InputId,
-        info: Arc<FinalTaskInfo>,
     },
     LoadInput {
         task: TaskIdentity,
@@ -572,10 +547,6 @@ pub enum ContextEffect {
         context: QueryContextRef,
         generation: Generation,
     },
-    Reply {
-        request: InputId,
-        outcome: OperationOutcome,
-    },
     ContinueClose {
         generation: Generation,
     },
@@ -598,6 +569,9 @@ pub enum ContextEffect {
 }
 #[derive(Debug, Default)]
 pub struct ContextStep {
+    // Consumed before this step is handed to the runtime. These are pure
+    // decisions, not independently dispatched body-publication actions.
+    decisions: Vec<(InputId, Arc<ContextReplyBody>)>,
     pub effects: Vec<ContextEffect>,
     pub requests: Vec<ContextRequestSettlement>,
     /// Distinct protocol records visited by this slice. Fixed-size summary
@@ -605,6 +579,9 @@ pub struct ContextStep {
     pub records_visited: usize,
 }
 impl ContextStep {
+    fn reply(&mut self, request: InputId, body: ContextReplyBody) {
+        self.decisions.push((request, Arc::new(body)));
+    }
     /// Total admission/verification cost, including each output. A runtime
     /// adapter that calls Turn::effect for each effect/reply separately charges
     /// only `records_visited` as additional pure work; never charge this total
@@ -1111,22 +1088,21 @@ impl ContextCore {
                 match result {
                     Ok(()) => {
                         self.context_domains = pending.domains;
-                        step.effects.push(ContextEffect::ContextDomainReply {
+                        step.reply(
                             request,
-                            outcome: if pending.progression == DomainProgression::Apply {
-                                OperationOutcome::Accepted
-                            } else {
-                                OperationOutcome::Idempotent
+                            ContextReplyBody::ContextDomain {
+                                outcome: if pending.progression == DomainProgression::Apply {
+                                    OperationOutcome::Accepted
+                                } else {
+                                    OperationOutcome::Idempotent
+                                },
+                                receipt: self
+                                    .context_domains
+                                    .receipt(pending.update, pending.progression),
                             },
-                            receipt: self
-                                .context_domains
-                                .receipt(pending.update, pending.progression),
-                        });
+                        );
                     }
-                    Err(failure) => step.effects.push(ContextEffect::DomainFailureReply {
-                        request,
-                        refusal: failure,
-                    }),
+                    Err(failure) => step.reply(request, ContextReplyBody::Domain(failure)),
                 }
                 step.effects.push(ContextEffect::WakeContextDomains);
             }
@@ -1424,10 +1400,12 @@ impl ContextCore {
                 self.host_releasing = false;
                 self.state = QueryContextState::TerminalRetained;
                 if let Some(request) = self.release_request.take() {
-                    step.effects.push(ContextEffect::Reply {
+                    step.reply(
                         request,
-                        outcome: OperationOutcome::Accepted,
-                    });
+                        ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::Accepted,
+                        )),
+                    );
                 }
                 step.effects.push(ContextEffect::RetainContext {
                     context: self.identity,
@@ -1485,8 +1463,8 @@ impl ContextCore {
                 generation: self.generation,
             });
         }
-        self.settle_effect_requests(&mut step);
-        step.records_visited = 1 + usize::from(!step.requests.is_empty());
+        let decisions_visited = self.settle_request_decisions(&mut step);
+        step.records_visited = 1 + decisions_visited + usize::from(!step.requests.is_empty());
         Ok(step)
     }
     fn handle_command(
@@ -1513,10 +1491,12 @@ impl ContextCore {
                         self.flush(task, step)?;
                         self.try_finish_completion_intent(task, step)?;
                     }
-                    step.effects.push(ContextEffect::Reply {
+                    step.reply(
                         request,
-                        outcome: OperationOutcome::Accepted,
-                    });
+                        ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::Accepted,
+                        )),
+                    );
                 }
             }
             ContextCommand::UpdateTask {
@@ -1532,20 +1512,21 @@ impl ContextCore {
                 if self.task_request_cut(request, task, step)? {
                     self.try_finish_completion_intent(task, step)?;
                     if !self.tasks[&task].state.is_terminal() {
-                        step.effects.push(ContextEffect::Reply {
+                        step.reply(
                             request,
-                            outcome: OperationOutcome::InvalidStateOrRequest,
-                        });
+                            ContextReplyBody::Verdict(RequestResult::Outcome(
+                                OperationOutcome::InvalidStateOrRequest,
+                            )),
+                        );
                     } else if let Some(info) = self.final_info.get(&task) {
-                        step.effects.push(ContextEffect::FinalInfoReply {
-                            request,
-                            info: info.clone(),
-                        });
+                        step.reply(request, ContextReplyBody::FinalInfo(info.clone()));
                     } else {
-                        step.effects.push(ContextEffect::Reply {
+                        step.reply(
                             request,
-                            outcome: OperationOutcome::Idempotent,
-                        });
+                            ContextReplyBody::Verdict(RequestResult::Outcome(
+                                OperationOutcome::Idempotent,
+                            )),
+                        );
                     }
                 }
             }
@@ -1557,21 +1538,31 @@ impl ContextCore {
                         .get(&task)
                         .filter(|_| self.tasks[&task].phase != CreationPhase::Retained)
                     {
-                        step.effects.push(ContextEffect::ReadPayload {
+                        step.effects.push(ContextEffect::PrepareReadPayload {
                             request,
+                            task,
                             version: *version,
                             payload: *payload,
-                            outcome: if acknowledged.is_none_or(|ack| ack < *version) {
-                                OperationOutcome::Accepted
-                            } else {
-                                OperationOutcome::Idempotent
-                            },
                         });
-                    } else {
-                        step.effects.push(ContextEffect::Reply {
+                        step.reply(
                             request,
-                            outcome: OperationOutcome::Idempotent,
-                        });
+                            ContextReplyBody::ReadPayload {
+                                version: *version,
+                                payload: *payload,
+                                outcome: if acknowledged.is_none_or(|ack| ack < *version) {
+                                    OperationOutcome::Accepted
+                                } else {
+                                    OperationOutcome::Idempotent
+                                },
+                            },
+                        );
+                    } else {
+                        step.reply(
+                            request,
+                            ContextReplyBody::Verdict(RequestResult::Outcome(
+                                OperationOutcome::Idempotent,
+                            )),
+                        );
                     }
                 }
             }
@@ -1586,10 +1577,12 @@ impl ContextCore {
                     || position.convergence.len() > self.config.max_tasks
                     || position.required.len() > self.config.max_tasks
                 {
-                    step.effects.push(ContextEffect::Reply {
+                    step.reply(
                         request,
-                        outcome: OperationOutcome::InvalidStateOrRequest,
-                    });
+                        ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::InvalidStateOrRequest,
+                        )),
+                    );
                 } else {
                     step.effects.push(ContextEffect::Subscribe {
                         request,
@@ -1629,7 +1622,10 @@ impl ContextCore {
                         }
                     }
                 };
-                step.effects.push(ContextEffect::Reply { request, outcome });
+                step.reply(
+                    request,
+                    ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+                );
             }
             ContextCommand::Quiesce => {
                 if !matches!(
@@ -1638,10 +1634,10 @@ impl ContextCore {
                         | QueryContextState::Active
                         | QueryContextState::Quiescing
                 ) {
-                    step.effects.push(ContextEffect::Reply {
+                    step.reply(
                         request,
-                        outcome: self.closed_outcome(),
-                    });
+                        ContextReplyBody::Verdict(RequestResult::Outcome(self.closed_outcome())),
+                    );
                 } else if self.pending_quiesce.is_some() {
                     // Only the entity owns this membership scan. Each original
                     // RPC retains a separate bounded reply position.
@@ -1649,11 +1645,13 @@ impl ContextCore {
                 } else if self.state == QueryContextState::Quiescing
                     && let Some(decision) = self.quiesce_decision.as_ref()
                 {
-                    step.effects.push(ContextEffect::QuiesceReply {
+                    step.reply(
                         request,
-                        outcome: OperationOutcome::Idempotent,
-                        receipt: decision.receipt.clone(),
-                    });
+                        ContextReplyBody::Quiesce {
+                            outcome: OperationOutcome::Idempotent,
+                            receipt: decision.receipt.clone(),
+                        },
+                    );
                 } else {
                     if matches!(
                         self.state,
@@ -1676,10 +1674,12 @@ impl ContextCore {
             ContextCommand::Abort { cause } => self.begin_abort(Some(request), cause, step)?,
             ContextCommand::Release => {
                 if self.state == QueryContextState::TerminalRetained {
-                    step.effects.push(ContextEffect::Reply {
+                    step.reply(
                         request,
-                        outcome: OperationOutcome::ContextTerminalReceipt,
-                    });
+                        ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::ContextTerminalReceipt,
+                        )),
+                    );
                 } else if self.state != QueryContextState::Quiescing
                     || self.closing.is_some()
                     || self.quiesce_decision.is_none()
@@ -1688,10 +1688,12 @@ impl ContextCore {
                     || !self.pending_task_updates.is_empty()
                     || self.pending_context_update.is_some()
                 {
-                    step.effects.push(ContextEffect::Reply {
+                    step.reply(
                         request,
-                        outcome: OperationOutcome::ReleaseNotReady,
-                    });
+                        ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::ReleaseNotReady,
+                        )),
+                    );
                 } else {
                     self.state = QueryContextState::Releasing;
                     self.release_request = Some(request);
@@ -1763,10 +1765,12 @@ impl ContextCore {
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
         if task.verify_query_context(self.identity).is_err() {
-            step.effects.push(ContextEffect::Reply {
+            step.reply(
                 request,
-                outcome: OperationOutcome::IdentityMismatch,
-            });
+                ContextReplyBody::Verdict(RequestResult::Outcome(
+                    OperationOutcome::IdentityMismatch,
+                )),
+            );
             return Ok(());
         }
         if let Some(t) = self.tasks.get_mut(&task) {
@@ -1775,28 +1779,31 @@ impl ContextCore {
                     return Ok(());
                 }
                 if t.waiting_replies.len() >= self.config.max_creation_waiters {
-                    step.effects.push(ContextEffect::Reply {
+                    step.reply(
                         request,
-                        outcome: OperationOutcome::ResourceExhausted,
-                    });
+                        ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::ResourceExhausted,
+                        )),
+                    );
                 } else {
                     t.waiting_replies.insert(request);
                 }
             } else if let Some(refusal) = &t.creation_refusal {
                 Self::refusal_reply(request, refusal.clone(), step);
             } else {
-                step.effects.push(ContextEffect::Reply {
+                step.reply(
                     request,
-                    outcome: if t
-                        .pending_reply_outcome
-                        .is_some_and(|outcome| outcome != OperationOutcome::Accepted)
-                    {
-                        t.pending_reply_outcome
-                            .expect("retained creation verdict exists")
-                    } else {
-                        OperationOutcome::Idempotent
-                    },
-                });
+                    ContextReplyBody::Verdict(RequestResult::Outcome(
+                        if t.pending_reply_outcome
+                            .is_some_and(|outcome| outcome != OperationOutcome::Accepted)
+                        {
+                            t.pending_reply_outcome
+                                .expect("retained creation verdict exists")
+                        } else {
+                            OperationOutcome::Idempotent
+                        },
+                    )),
+                );
             }
             return Ok(());
         }
@@ -1812,7 +1819,10 @@ impl ContextCore {
             None
         };
         if let Some(outcome) = rejection {
-            step.effects.push(ContextEffect::Reply { request, outcome });
+            step.reply(
+                request,
+                ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+            );
             return Ok(());
         }
         match capacity.try_reserve(AdmissionNeed::ActiveTask {
@@ -1934,15 +1944,14 @@ impl ContextCore {
     }
     fn refusal_reply(request: InputId, refusal: AdmissionRefusal, step: &mut ContextStep) {
         match refusal {
-            AdmissionRefusal::Verdict(outcome) => {
-                step.effects.push(ContextEffect::Reply { request, outcome })
-            }
-            AdmissionRefusal::Domain(outcome, failure) => {
-                step.effects.push(ContextEffect::DomainFailureReply {
-                    request,
-                    refusal: DomainRefusal { outcome, failure },
-                })
-            }
+            AdmissionRefusal::Verdict(outcome) => step.reply(
+                request,
+                ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+            ),
+            AdmissionRefusal::Domain(outcome, failure) => step.reply(
+                request,
+                ContextReplyBody::Domain(DomainRefusal { outcome, failure }),
+            ),
         }
     }
     fn reply_creation(
@@ -1951,21 +1960,12 @@ impl ContextCore {
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
         let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
-        let outcome = t.pending_reply_outcome.ok_or(CoreError::IllegalFact)?;
+        t.pending_reply_outcome.ok_or(CoreError::IllegalFact)?;
         let decided_at = t.creation_decided_at.ok_or(CoreError::IllegalFact)?;
         let reply = t.waiting_replies.pop_first().map(|request| {
             let body = Self::creation_reply_body(t);
             (request, body)
         });
-        if let Some((request, _)) = &reply {
-            match &t.creation_refusal {
-                Some(refusal) => Self::refusal_reply(*request, refusal.clone(), step),
-                None => step.effects.push(ContextEffect::Reply {
-                    request: *request,
-                    outcome,
-                }),
-            }
-        }
         if !t.waiting_replies.is_empty() {
             step.effects.push(ContextEffect::ContinueReplies { task });
         }
@@ -2159,20 +2159,24 @@ impl ContextCore {
             QueryContextState::TerminalRetained | QueryContextState::Gone
         ) {
             if let Some(request) = request {
-                step.effects.push(ContextEffect::Reply {
+                step.reply(
                     request,
-                    outcome: OperationOutcome::ContextTerminalReceipt,
-                });
+                    ContextReplyBody::Verdict(RequestResult::Outcome(
+                        OperationOutcome::ContextTerminalReceipt,
+                    )),
+                );
             }
             return Ok(());
         }
         if let Some(closing) = self.closing {
             if let Some(request) = request {
                 if self.close_applied {
-                    step.effects.push(ContextEffect::Reply {
+                    step.reply(
                         request,
-                        outcome: OperationOutcome::Idempotent,
-                    });
+                        ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::Idempotent,
+                        )),
+                    );
                 } else if closing.request != Some(request) && !self.abort_waiters.contains(&request)
                 {
                     // Only live reply roles contribute a later Abort waiter.
@@ -2265,10 +2269,10 @@ impl ContextCore {
         }
         self.close_applied = true;
         if let Some(request) = closing.request.take() {
-            step.effects.push(ContextEffect::Reply {
+            step.reply(
                 request,
-                outcome: OperationOutcome::Accepted,
-            });
+                ContextReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::Accepted)),
+            );
         }
         if !self.abort_waiters.is_empty() {
             step.effects.push(ContextEffect::ContinueClose {
@@ -2283,10 +2287,10 @@ impl ContextCore {
         };
         if self.close_applied {
             if let Some(request) = self.abort_waiters.pop_first() {
-                step.effects.push(ContextEffect::Reply {
+                step.reply(
                     request,
-                    outcome: OperationOutcome::Idempotent,
-                });
+                    ContextReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::Idempotent)),
+                );
             }
             if !self.abort_waiters.is_empty() {
                 step.effects.push(ContextEffect::ContinueClose {
@@ -2347,15 +2351,20 @@ impl ContextCore {
             None
         };
         if let Some(outcome) = outcome {
-            step.effects.push(ContextEffect::Reply { request, outcome });
+            step.reply(
+                request,
+                ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+            );
             return Ok(false);
         }
         self.flush(task, step)?;
         if self.tasks[&task].phase == CreationPhase::Loading {
-            step.effects.push(ContextEffect::Reply {
+            step.reply(
                 request,
-                outcome: OperationOutcome::InvalidStateOrRequest,
-            });
+                ContextReplyBody::Verdict(RequestResult::Outcome(
+                    OperationOutcome::InvalidStateOrRequest,
+                )),
+            );
             return Ok(false);
         }
         Ok(true)
@@ -2372,10 +2381,10 @@ impl ContextCore {
             self.state,
             QueryContextState::Active | QueryContextState::Quiescing
         ) {
-            step.effects.push(ContextEffect::Reply {
+            step.reply(
                 request,
-                outcome: self.closed_outcome(),
-            });
+                ContextReplyBody::Verdict(RequestResult::Outcome(self.closed_outcome())),
+            );
             return Ok(());
         }
         if !self.task_request_cut(request, task, step)? {
@@ -2383,10 +2392,12 @@ impl ContextCore {
         }
         self.try_finish_completion_intent(task, step)?;
         if self.tasks[&task].state.is_terminal() {
-            step.effects.push(ContextEffect::Reply {
+            step.reply(
                 request,
-                outcome: OperationOutcome::TerminalRejected,
-            });
+                ContextReplyBody::Verdict(RequestResult::Outcome(
+                    OperationOutcome::TerminalRejected,
+                )),
+            );
             return Ok(());
         }
         if self.pending_task_updates.contains_key(&task) {
@@ -2399,10 +2410,12 @@ impl ContextCore {
             return Ok(());
         }
         let Some(domains) = self.task_domains.remove(&task) else {
-            step.effects.push(ContextEffect::Reply {
+            step.reply(
                 request,
-                outcome: OperationOutcome::InvalidStateOrRequest,
-            });
+                ContextReplyBody::Verdict(RequestResult::Outcome(
+                    OperationOutcome::InvalidStateOrRequest,
+                )),
+            );
             return Ok(());
         };
         self.pending_task_updates.insert(
@@ -2491,26 +2504,30 @@ impl ContextCore {
             P::RolledBack(conflict) => {
                 let (domains, _, _) = pending.transaction.into_result();
                 self.task_domains.insert(task, domains);
-                step.effects.push(ContextEffect::DomainFailureReply {
-                    request: pending.request,
-                    refusal: pending
-                        .refusal
-                        .unwrap_or_else(|| DomainRefusal::policy(conflict)),
-                });
+                step.reply(
+                    pending.request,
+                    ContextReplyBody::Domain(
+                        pending
+                            .refusal
+                            .unwrap_or_else(|| DomainRefusal::policy(conflict)),
+                    ),
+                );
                 step.effects.push(ContextEffect::WakeTaskDomains { task });
             }
             P::Complete => {
                 let (domains, receipts, applied) = pending.transaction.into_result();
                 self.task_domains.insert(task, domains);
-                step.effects.push(ContextEffect::TaskDomainReply {
-                    request: pending.request,
-                    outcome: if applied {
-                        OperationOutcome::Accepted
-                    } else {
-                        OperationOutcome::Idempotent
+                step.reply(
+                    pending.request,
+                    ContextReplyBody::TaskDomain {
+                        outcome: if applied {
+                            OperationOutcome::Accepted
+                        } else {
+                            OperationOutcome::Idempotent
+                        },
+                        receipts: Arc::new(receipts),
                     },
-                    receipts: Arc::new(receipts),
-                });
+                );
                 step.effects.push(ContextEffect::WakeTaskDomains { task });
             }
         }
@@ -2576,10 +2593,10 @@ impl ContextCore {
             self.state,
             QueryContextState::Active | QueryContextState::Quiescing
         ) {
-            step.effects.push(ContextEffect::Reply {
+            step.reply(
                 request,
-                outcome: self.closed_outcome(),
-            });
+                ContextReplyBody::Verdict(RequestResult::Outcome(self.closed_outcome())),
+            );
             return Ok(());
         }
         if self.pending_context_update.is_some() {
@@ -2594,10 +2611,10 @@ impl ContextCore {
         let progression = match domains.apply(update) {
             Ok(value) => value,
             Err(conflict) => {
-                step.effects.push(ContextEffect::DomainFailureReply {
+                step.reply(
                     request,
-                    refusal: DomainRefusal::policy(conflict),
-                });
+                    ContextReplyBody::Domain(DomainRefusal::policy(conflict)),
+                );
                 return Ok(());
             }
         };
@@ -2650,8 +2667,7 @@ impl ContextCore {
                 }
             }
         };
-        step.effects
-            .push(ContextEffect::RootDrainReply { request, result });
+        step.reply(request, ContextReplyBody::RootDrain(result));
         self.retire_if_ready(task, step)?;
         Ok(())
     }
@@ -2693,11 +2709,7 @@ impl ContextCore {
                     .ok_or(CoreError::IllegalFact)?;
                 let receipt = decision.receipt.clone();
                 let decided_at = decision.decided_at;
-                step.effects.push(ContextEffect::QuiesceReply {
-                    request,
-                    outcome: OperationOutcome::Idempotent,
-                    receipt: receipt.clone(),
-                });
+
                 self.complete_request_at(
                     request,
                     Arc::new(ContextReplyBody::Quiesce {
@@ -2750,11 +2762,7 @@ impl ContextCore {
                 receipt: receipt.clone(),
                 decided_at: self.now,
             });
-            step.effects.push(ContextEffect::QuiesceReply {
-                request: pending.request,
-                outcome,
-                receipt: receipt.clone(),
-            });
+
             self.complete_request_at(
                 pending.request,
                 Arc::new(ContextReplyBody::Quiesce { outcome, receipt }),
@@ -2884,18 +2892,16 @@ impl ContextCore {
             RequestResult::TimeoutWhileAccepted,
         ));
     }
-    fn settle_effect_requests(&mut self, step: &mut ContextStep) {
-        let ready: Vec<_> = step
-            .effects
-            .iter()
-            .filter_map(ContextReplyBody::from_effect)
-            .collect();
-        for (token, body) in ready {
-            self.complete_request(token, Arc::new(body), step);
+    fn settle_request_decisions(&mut self, step: &mut ContextStep) -> usize {
+        let decisions = std::mem::take(&mut step.decisions);
+        let visited = decisions.len();
+        for (token, body) in decisions {
+            self.complete_request(token, body, step);
         }
         if let Some((&operation, _)) = self.pending_replies.first_key_value() {
             step.effects
                 .push(ContextEffect::ContinueRequestReplies { operation });
         }
+        visited
     }
 }

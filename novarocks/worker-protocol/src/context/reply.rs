@@ -18,9 +18,8 @@
 //! Immutable neutral Context decisions retained with each exact request.
 //! Shared receipts are borrowed by Arc, never reconstructed from later state.
 
-use super::{ContextEffect, DomainRefusal, RequestResult, RequestSettlement, RootDrainVerdict};
+use super::{DomainRefusal, RequestResult, RequestSettlement, RootDrainVerdict};
 use crate::creation::{PayloadId, RequestContext};
-use novarocks_control_runtime_core::identity::InputId;
 use novarocks_execution_contract::{
     DomainVersion, FinalTaskInfo, OperationOutcome, QueryContextDomainReceipt,
     QuiesceQueryContextReceipt, TaskDomainReceipt, TaskIdentity,
@@ -72,71 +71,6 @@ impl ContextReplyBody {
             | Self::ReadPayload { outcome, .. }
             | Self::Quiesce { outcome, .. } => RequestResult::Outcome(*outcome),
             Self::Domain(refusal) => RequestResult::Outcome(refusal.outcome.outcome()),
-        }
-    }
-    pub(super) fn from_effect(effect: &ContextEffect) -> Option<(InputId, Self)> {
-        match effect {
-            ContextEffect::Reply { request, outcome } => {
-                Some((*request, Self::Verdict(RequestResult::Outcome(*outcome))))
-            }
-            ContextEffect::FinalInfoReply { request, info } => {
-                Some((*request, Self::FinalInfo(info.clone())))
-            }
-            ContextEffect::RootDrainReply { request, result } => {
-                Some((*request, Self::RootDrain(*result)))
-            }
-            ContextEffect::TaskDomainReply {
-                request,
-                outcome,
-                receipts,
-            } => Some((
-                *request,
-                Self::TaskDomain {
-                    outcome: *outcome,
-                    receipts: receipts.clone(),
-                },
-            )),
-            ContextEffect::ContextDomainReply {
-                request,
-                outcome,
-                receipt,
-            } => Some((
-                *request,
-                Self::ContextDomain {
-                    outcome: *outcome,
-                    receipt: receipt.clone(),
-                },
-            )),
-            ContextEffect::DomainFailureReply { request, refusal } => {
-                Some((*request, Self::Domain(refusal.clone())))
-            }
-            ContextEffect::ReadPayload {
-                request,
-                version,
-                payload,
-                outcome,
-            } => Some((
-                *request,
-                Self::ReadPayload {
-                    version: *version,
-                    payload: *payload,
-                    outcome: *outcome,
-                },
-            )),
-            ContextEffect::QuiesceReply {
-                request,
-                outcome,
-                receipt,
-            } => Some((
-                *request,
-                Self::Quiesce {
-                    outcome: *outcome,
-                    receipt: receipt.clone(),
-                },
-            )),
-            // Subscribe opens no stream here. Only its actual later owner
-            // completion can supply a request verdict; this body grants none.
-            _ => None,
         }
     }
 }
@@ -192,10 +126,6 @@ mod tests {
         TaskOperationId::try_from_bytes(bytes).unwrap()
     }
 
-    fn input() -> InputId {
-        InputId::new(71).unwrap()
-    }
-
     #[test]
     fn root_drain_preserves_typed_verdict_and_its_exact_operation_result() {
         for (verdict, outcome) in [
@@ -213,17 +143,11 @@ mod tests {
                 OperationOutcome::InvalidStateOrRequest,
             ),
         ] {
-            let (op, body) = ContextReplyBody::from_effect(&ContextEffect::RootDrainReply {
-                request: input(),
-                result: verdict,
-            })
-            .unwrap();
-            assert_eq!(op, input());
+            let body = ContextReplyBody::RootDrain(verdict);
             assert!(matches!(body, ContextReplyBody::RootDrain(original) if original == verdict));
             assert!(body.matches(RequestResult::Outcome(outcome)));
             assert!(!body.matches(RequestResult::TimeoutWhileAccepted));
         }
-        assert!(ContextReplyBody::from_effect(&ContextEffect::WakeQuiesce).is_none());
     }
 
     #[test]
@@ -232,13 +156,11 @@ mod tests {
             accepted_version: Some(DomainVersion::FIRST),
             progression: DomainProgression::Apply,
         }]);
-        let (op, body) = ContextReplyBody::from_effect(&ContextEffect::TaskDomainReply {
-            request: input(),
+        let original = ContextReplyBody::TaskDomain {
             outcome: OperationOutcome::Idempotent,
             receipts: receipts.clone(),
-        })
-        .unwrap();
-        assert_eq!(op, input());
+        };
+        let body = original.clone();
         let ContextReplyBody::TaskDomain {
             receipts: same_receipts,
             ..
@@ -248,18 +170,16 @@ mod tests {
         };
         assert!(
             Arc::ptr_eq(same_receipts, &receipts),
-            "reply projection never walks or clones the receipt vector"
+            "cloning a reply body preserves the original receipt allocation"
         );
         assert!(body.matches(RequestResult::Outcome(OperationOutcome::Idempotent)));
         let version = DomainVersion::new(31).unwrap();
         let payload = PayloadId(37);
-        let (_, body) = ContextReplyBody::from_effect(&ContextEffect::ReadPayload {
-            request: input(),
+        let body = ContextReplyBody::ReadPayload {
             version,
             payload,
             outcome: OperationOutcome::Accepted,
-        })
-        .unwrap();
+        };
         assert!(
             matches!(body, ContextReplyBody::ReadPayload { version: same_version, payload: same_payload, outcome: OperationOutcome::Accepted } if same_version == version && same_payload == payload)
         );

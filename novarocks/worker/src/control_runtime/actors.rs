@@ -177,7 +177,7 @@ impl Actor for ContextActor {
         }
         let mut next = 0u64;
         let mut publications = BTreeMap::<TaskIdentity, ActionId>::new();
-        let mut reply_bodies = BTreeMap::<InputId, Vec<ActionId>>::new();
+        let mut reply_preparations = BTreeMap::<InputId, Vec<ActionId>>::new();
         for effect in result.effects {
             let mut dependencies = Vec::new();
             let mut effect_work = work;
@@ -246,24 +246,14 @@ impl Actor for ContextActor {
                 }
                 _ => {}
             }
-            let reply = match &effect {
-                ContextEffect::Reply { request, .. }
-                | ContextEffect::TaskDomainReply { request, .. }
-                | ContextEffect::DomainFailureReply { request, .. }
-                | ContextEffect::ContextDomainReply { request, .. }
-                | ContextEffect::QuiesceReply { request, .. }
-                | ContextEffect::RootDrainReply { request, .. }
-                | ContextEffect::ReadPayload { request, .. }
-                | ContextEffect::FinalInfoReply { request, .. }
-                | ContextEffect::Subscribe { request, .. } => Some(*request),
-                _ => None,
-            };
-            if let Some(token) = reply {
-                // A reply body or covered read cannot run ahead of the
-                // snapshots this same Core step promised to make visible.
-                // Opaque source disposal is deliberately not a predecessor.
-                dependencies.extend(publications.values().copied());
-                reply_bodies.entry(token).or_default().push(id);
+            if let ContextEffect::PrepareReadPayload { request, task, .. } = &effect {
+                // This is an actual mechanical read preparation, not a second
+                // copy of the Core-authored reply body. A real loan pin must be
+                // established before the corresponding reply can start.
+                if let Some(publication) = publications.get(task) {
+                    dependencies.push(*publication);
+                }
+                reply_preparations.entry(*request).or_default().push(id);
             }
             step.effect(
                 EffectDescriptor {
@@ -278,10 +268,16 @@ impl Actor for ContextActor {
         }
         for reply in result.requests {
             next += 1;
-            let dependencies = reply_bodies
-                .get(&reply.request.token)
-                .cloned()
+            let mut dependencies = reply_preparations
+                .remove(&reply.request.token)
                 .unwrap_or_default();
+            // The immutable complete reply is already authored by this Core
+            // step. Only actual publication and read preparation gate delivery.
+            if let Some(task) = reply.task {
+                dependencies.extend(publications.get(&task).copied());
+            } else {
+                dependencies.extend(publications.values().copied());
+            }
             step.effect(
                 EffectDescriptor {
                     id: ActionId::new(next).unwrap(),

@@ -32,8 +32,8 @@ use novarocks_types::identity::{
 use novarocks_worker_protocol::{
     context::{
         ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
-        ContextInput, ContextMaterialized, ContextStep, CoreError, PhysicalFact, TerminalIntent,
-        TerminalObservation, TerminalStatistics,
+        ContextInput, ContextMaterialized, ContextReplyBody, ContextStep, CoreError, PhysicalFact,
+        TerminalIntent, TerminalObservation, TerminalStatistics,
     },
     control::EstablishSemanticFacts,
     creation::{
@@ -203,10 +203,15 @@ impl Model {
             operation(request),
             ContextCommand::GetFinalInfo { task: task() },
         )
-        .effects
+        .requests
         .into_iter()
-        .find_map(|effect| match effect {
-            ContextEffect::FinalInfoReply { info, .. } => Some(info),
+        .find_map(|reply| match reply.body.as_ref() {
+            ContextReplyBody::FinalInfo(info) => {
+                assert_eq!(reply.request.operation, operation(request));
+                assert_eq!(reply.task, Some(task()));
+                assert!(reply.body.matches(reply.result));
+                Some(info.clone())
+            }
             _ => None,
         })
         .expect("the model's terminal status froze final information")

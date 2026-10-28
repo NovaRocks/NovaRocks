@@ -194,6 +194,9 @@ impl EffectDispatch {
                 | ContextEffect::RetireTask { task, .. }
                 | ContextEffect::SettlementBarrier { task, .. },
             ) => Some((LaneKey::Task(*task), Release::Published)),
+            WorkerAction::Context(ContextEffect::PrepareReadPayload { task, .. }) => {
+                Some((LaneKey::Task(*task), Release::Completed))
+            }
             // Only the preceding publications gate dispatch. The original
             // started stop job retains its own actual exit/capture liability.
             WorkerAction::Context(ContextEffect::StopTask { task, .. }) => {
@@ -380,15 +383,31 @@ impl EffectDispatch {
     /// A synchronous metadata owner calls this after actual handoff completion,
     /// before retiring that input. An absent record is never a completion fact.
     pub(crate) fn completion_observed(&mut self, effect: EffectRef) -> Result<(), DispatchError> {
-        let runtime = self
-            .completion_runtime
-            .as_ref()
-            .ok_or(DispatchError::MissingMetadata)?;
         let key = if self.control {
             LaneKey::ControlMetadata
         } else {
             LaneKey::ContextMetadata
         };
+        self.complete_lane(key, effect)
+    }
+    /// Only the original synchronous preparation's actual completion releases
+    /// this Task ordering position. Getter I/O and delivery captures keep their
+    /// own original roles; this method neither pins payloads nor signs exits.
+    pub(crate) fn task_preparation_completed(
+        &mut self,
+        task: TaskIdentity,
+        effect: EffectRef,
+    ) -> Result<(), DispatchError> {
+        if self.control {
+            return Err(DispatchError::InvalidPublication);
+        }
+        self.complete_lane(LaneKey::Task(task), effect)
+    }
+    fn complete_lane(&mut self, key: LaneKey, effect: EffectRef) -> Result<(), DispatchError> {
+        let runtime = self
+            .completion_runtime
+            .as_ref()
+            .ok_or(DispatchError::MissingMetadata)?;
         let lane = self.lanes.get(&key).ok_or(DispatchError::MissingMetadata)?;
         if lane.in_flight != Some(effect)
             || lane
@@ -408,6 +427,20 @@ impl EffectDispatch {
             descriptor.id != effect.action || *state != EffectState::Completed
         }) {
             return Err(DispatchError::InvalidPublication);
+        }
+        // The actual completed predecessor, not caller-supplied success,
+        // acknowledges the same committed batch's original reply dependency.
+        for (descriptor, state) in
+            runtime.effect_inventory(self.actor, effect.input, None, ContextCore::MAX_STEP_WORK)?
+        {
+            if state == EffectState::Pending && descriptor.dependencies.contains(&effect.action) {
+                runtime.acknowledge_dependency(
+                    self.actor,
+                    effect.input,
+                    descriptor.id,
+                    effect.action,
+                )?;
+            }
         }
         self.pop_lane(key, effect);
         Ok(())

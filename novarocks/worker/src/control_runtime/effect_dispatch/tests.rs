@@ -173,6 +173,11 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
         2,
     );
     f.runtime.poll_one(Tick(2)).unwrap();
+    let request_effects = f
+        .runtime
+        .effect_inventory(actor(), request, None, ContextCore::MAX_STEP_WORK)
+        .unwrap()
+        .len();
     let mut dispatch =
         EffectDispatch::context(f.runtime.clone(), actor(), ContextCore::MAX_STEP_WORK * 4);
     dispatch.index_committed(&f.runtime, 64).unwrap();
@@ -187,10 +192,10 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
     };
     let mut held_replies = Vec::new();
     let mut premature = false;
-    let mut body_exits_proven = true;
-    // Body completion is a separate actual predecessor of the reply. The
-    // dispatch lane alone does not acknowledge that original dependency.
-    let complete_body = |ticket: EffectTicket<WorkerAction>| {
+    let mut auxiliary_exits_proven = true;
+    // Complete any unrelated actual effects while retaining the original
+    // publication and reply tickets. No synthetic body effect is introduced.
+    let complete_auxiliary = |ticket: EffectTicket<WorkerAction>| {
         let input = ticket.input;
         let predecessor = ticket.descriptor.id;
         f.runtime.effect_completed(ticket).unwrap();
@@ -217,7 +222,7 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
             premature = true;
             held_replies.push(ticket);
         } else {
-            body_exits_proven &= complete_body(ticket);
+            auxiliary_exits_proven &= complete_auxiliary(ticket);
         }
     }
     let target = PublishedSnapshot::new(&f.scope, Arc::new(TaskStatus::created(task)));
@@ -233,9 +238,19 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
         if matches!(&ticket.effect, WorkerAction::Reply(reply) if reply.request.token == request) {
             held_replies.push(ticket);
         } else {
-            body_exits_proven &= complete_body(ticket);
+            auxiliary_exits_proven &= complete_auxiliary(ticket);
         }
     }
+    let complete_body = held_replies.iter().all(|ticket| {
+        matches!(
+            &ticket.effect,
+            WorkerAction::Reply(reply)
+                if matches!(reply.body.as_ref(),
+                    novarocks_worker_protocol::context::ContextReplyBody::Verdict(
+                        novarocks_worker_protocol::context::RequestResult::Outcome(
+                            novarocks_execution_contract::OperationOutcome::Idempotent)))
+        )
+    });
     let reply_requests: Vec<_> = held_replies
         .iter()
         .filter_map(|ticket| match &ticket.effect {
@@ -272,12 +287,20 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
         "a later reply cannot precede actual Task publication"
     );
     assert!(
-        body_exits_proven,
-        "only actual Completed body facts release dependencies"
+        auxiliary_exits_proven,
+        "only actual Completed auxiliary facts release dependencies"
     );
     assert!(
         cleanup_outputs.is_empty(),
         "the ordering exercise must itself finish every original effect"
+    );
+    assert_eq!(
+        request_effects, 1,
+        "a complete reply needs no separate body effect"
+    );
+    assert!(
+        complete_body,
+        "the unique reply retains the Core-authored complete body"
     );
     assert_eq!(reply_requests.len(), 1);
     assert_eq!(reply_requests[0].token, request);
@@ -289,5 +312,227 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
     assert!(
         ordering_drained,
         "the started reply cannot retain the Task ordering lane"
+    );
+}
+
+#[test]
+fn original_read_preparation_gates_task_order_until_actual_completion_only() {
+    use crate::control_runtime::actors::tests::task;
+    use novarocks_control_runtime::publication::PublishedSnapshot;
+    use novarocks_execution_contract::{
+        CancelReason, DomainVersion, OperationOutcome, TaskConclusion, TaskStatus,
+    };
+    use novarocks_worker_protocol::{
+        context::{ContextCommand, ContextReplyBody},
+        creation::{CreationCost, PayloadId},
+    };
+    use std::sync::Arc;
+
+    // These are actual actor inputs and original effect tickets. The fixture's
+    // Installed/RF facts are a pure protocol model: completing Prepare below
+    // models only a synchronous mechanical pin, not an actual RF loan issuer,
+    // getter, codec, transport, Native exit or S8 recovery proof.
+    let mut f = Fixture::new();
+    let task = task(f.identity, 1);
+    for (command, request, class) in [
+        (
+            ContextInput::Request(ContextCommand::Create {
+                task,
+                payload: PayloadId(81),
+            }),
+            Some(operation(81)),
+            InputClass::Ordinary,
+        ),
+        (
+            ContextInput::Loaded {
+                task,
+                result: Ok(CreationCost {
+                    input_retained_bytes: 1,
+                    ingress_retained_bytes: 1,
+                    structural_bytes: 1,
+                    inbound_records: 0,
+                    inbound_bytes: 0,
+                }),
+            },
+            None,
+            InputClass::Lifecycle,
+        ),
+        (
+            ContextInput::Installed { task },
+            None,
+            InputClass::Lifecycle,
+        ),
+        (
+            ContextInput::DynamicFilterPublished {
+                task,
+                version: DomainVersion::FIRST,
+                payload: PayloadId(82),
+                domain_count: 1,
+            },
+            None,
+            InputClass::Lifecycle,
+        ),
+    ] {
+        let input = f.send(command, request, class, 2);
+        f.runtime.poll_one(Tick(2)).unwrap();
+        f.drain(input);
+    }
+    let read = f.send(
+        ContextInput::Request(ContextCommand::GetDynamicFilters {
+            task,
+            acknowledged: None,
+        }),
+        Some(operation(82)),
+        InputClass::Ordinary,
+        2,
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
+    let newer = f.send(
+        ContextInput::DynamicFilterPublished {
+            task,
+            version: DomainVersion::new(2).unwrap(),
+            payload: PayloadId(83),
+            domain_count: 1,
+        },
+        None,
+        InputClass::Lifecycle,
+        2,
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
+    let cancel = f.send(
+        ContextInput::Request(ContextCommand::Cancel {
+            task,
+            reason: CancelReason::UpstreamNoLongerNeeded,
+        }),
+        Some(operation(83)),
+        InputClass::Control,
+        2,
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
+
+    let read_effects = f
+        .runtime
+        .effect_inventory(actor(), read, None, ContextCore::MAX_STEP_WORK)
+        .unwrap()
+        .len();
+    let mut dispatch =
+        EffectDispatch::context(f.runtime.clone(), actor(), ContextCore::MAX_STEP_WORK * 4);
+    dispatch.index_committed(&f.runtime, 64).unwrap();
+    let prepare = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
+    let exact_prepare = matches!(&prepare.effect,
+        WorkerAction::Context(ContextEffect::PrepareReadPayload {
+            request, task: same_task, version, payload,
+        }) if *request == read && *same_task == task
+            && *version == DomainVersion::FIRST && *payload == PayloadId(82));
+    let prepare_ref = EffectRef {
+        input: prepare.input,
+        action: prepare.descriptor.id,
+    };
+    let rejected_early = dispatch
+        .task_preparation_completed(task, prepare_ref)
+        .is_err();
+    let rejected_wrong_task = dispatch
+        .task_preparation_completed(
+            crate::control_runtime::actors::tests::task(f.identity, 2),
+            prepare_ref,
+        )
+        .is_err();
+    let overtaken = dispatch.take_ready(&f.runtime, 32).unwrap();
+    let blocked = overtaken.is_none();
+    f.runtime.effect_completed(prepare).unwrap();
+    let released = dispatch
+        .task_preparation_completed(task, prepare_ref)
+        .is_ok();
+    let stale_rejected = dispatch
+        .task_preparation_completed(task, prepare_ref)
+        .is_err();
+
+    let status = PublishedSnapshot::new(&f.scope, Arc::new(TaskStatus::created(task)));
+    let conclusion = PublishedSnapshot::new(&f.scope, Arc::new(None::<TaskConclusion>));
+    let mut held = Vec::new();
+    let mut next = overtaken;
+    let mut read_replies = 0;
+    let mut exact_body = false;
+    let mut newer_after_started_reply = false;
+    let mut stopped_after_started_reply = false;
+    let mut cancel_replied = false;
+    while let Some(ticket) = next
+        .take()
+        .or_else(|| dispatch.take_ready(&f.runtime, 32).unwrap())
+    {
+        match &ticket.effect {
+            WorkerAction::Reply(reply) if reply.request.token == read => {
+                read_replies += 1;
+                exact_body = matches!(reply.body.as_ref(), ContextReplyBody::ReadPayload {
+                    version, payload, outcome: OperationOutcome::Accepted,
+                } if *version == DomainVersion::FIRST && *payload == PayloadId(82));
+            }
+            WorkerAction::Reply(reply) if reply.request.token == cancel => {
+                cancel_replied = read_replies == 1;
+            }
+            WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) => {
+                if ticket.input == newer {
+                    newer_after_started_reply = read_replies == 1;
+                }
+                drop(
+                    f.runtime
+                        .commit_snapshot(&ticket, &status, Arc::new(snapshot.clone()))
+                        .unwrap(),
+                );
+                dispatch.publication_committed(&f.runtime, &ticket).unwrap();
+            }
+            WorkerAction::Context(ContextEffect::PublishConclusion {
+                conclusion: value, ..
+            }) => {
+                drop(
+                    f.runtime
+                        .commit_snapshot(&ticket, &conclusion, Arc::new(Some(value.clone())))
+                        .unwrap(),
+                );
+                dispatch.publication_committed(&f.runtime, &ticket).unwrap();
+            }
+            WorkerAction::Context(ContextEffect::StopTask { .. }) => {
+                stopped_after_started_reply = read_replies == 1;
+            }
+            _ => {}
+        }
+        // In particular, retain the actual started read reply across the newer
+        // publication, stop and cancel reply. Its wire/captures cannot hold the
+        // Task ordering lane after the mechanical preparation really completed.
+        held.push(ticket);
+    }
+    let ordering_empty = dispatch.is_empty();
+    for ticket in held {
+        f.runtime.effect_completed(ticket).unwrap();
+    }
+    let mut cleanup = f.drain(read);
+    cleanup.extend(f.drain(newer));
+    cleanup.extend(f.drain(cancel));
+    drop(status);
+    drop(conclusion);
+    f.finish();
+
+    // Preserve real cleanup even when an ordering oracle fails; a second
+    // driver Drop panic must not obscure the original failed observation.
+    assert_eq!(read_effects, 2, "one preparation and one complete reply");
+    assert!(exact_prepare && rejected_early && rejected_wrong_task);
+    assert!(
+        blocked,
+        "same Task publication, stop and replies wait for actual preparation"
+    );
+    assert!(released && stale_rejected);
+    assert_eq!(read_replies, 1);
+    assert!(
+        exact_body,
+        "later v2 state cannot replace the original v1 read selection"
+    );
+    assert!(newer_after_started_reply && stopped_after_started_reply && cancel_replied);
+    assert!(
+        ordering_empty,
+        "slow delivery/captures do not retain the Task lane"
+    );
+    assert!(
+        cleanup.is_empty(),
+        "the exercise itself completed every original effect"
     );
 }

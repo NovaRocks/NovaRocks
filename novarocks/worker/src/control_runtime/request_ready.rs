@@ -22,27 +22,29 @@ use super::{actors::WorkerActor, control_request::ControlRequestError};
 use novarocks_control_runtime::{
     driver::ActorRuntime, notify::Notify, publication::PublishedReply,
 };
-use novarocks_control_runtime_core::identity::{InputId, WorkId};
+use novarocks_control_runtime_core::identity::{InputId, ScopeId, WorkId};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     num::NonZeroUsize,
-    ops::Bound::{Excluded, Unbounded},
     sync::{Arc, Mutex, Weak},
 };
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum Address {
     Control(InputId),
-    // Context inputs have actor-local IDs. Only the original Root request
-    // Work identifies their actual process-wide ingress position here.
-    Context(WorkId),
+    // Context Work IDs are local to their actual scope. This compound
+    // address routes a notification and grants no Work or access authority.
+    Context { scope: ScopeId, work: WorkId },
+}
+struct RegisteredSlot {
+    original: Weak<RequestReadySlot>,
+    queued: Option<u64>,
 }
 struct ReadyState {
-    slots: BTreeMap<Address, Weak<RequestReadySlot>>,
-    control_ready: BTreeSet<InputId>,
-    context_ready: BTreeSet<WorkId>,
-    control_cursor: Option<InputId>,
-    context_cursor: Option<WorkId>,
+    slots: BTreeMap<Address, RegisteredSlot>,
+    control_ready: BTreeMap<u64, InputId>,
+    context_ready: BTreeMap<u64, (ScopeId, WorkId)>,
+    next_ready: u64,
 }
 struct ReadyShared {
     limit: NonZeroUsize,
@@ -63,10 +65,9 @@ impl ControlRequestReady {
                 limit,
                 state: Mutex::new(ReadyState {
                     slots: BTreeMap::new(),
-                    control_ready: BTreeSet::new(),
-                    context_ready: BTreeSet::new(),
-                    control_cursor: None,
-                    context_cursor: None,
+                    control_ready: BTreeMap::new(),
+                    context_ready: BTreeMap::new(),
+                    next_ready: 0,
                 }),
                 changed: Notify::default(),
                 runtime,
@@ -87,9 +88,10 @@ impl ControlRequestReady {
     }
     pub(crate) fn register_context(
         &self,
+        scope: ScopeId,
         work: WorkId,
     ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
-        self.register(Address::Context(work))
+        self.register(Address::Context { scope, work })
     }
     fn register(&self, address: Address) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
         let mut state = self.shared.state.lock().expect("request ready index");
@@ -103,7 +105,13 @@ impl ControlRequestReady {
             shared: Arc::downgrade(&self.shared),
             address,
         });
-        state.slots.insert(address, Arc::downgrade(&slot));
+        state.slots.insert(
+            address,
+            RegisteredSlot {
+                original: Arc::downgrade(&slot),
+                queued: None,
+            },
+        );
         Ok(slot)
     }
     pub(crate) fn unregister(
@@ -114,17 +122,22 @@ impl ControlRequestReady {
         if !state
             .slots
             .get(&slot.address)
-            .is_some_and(|original| Weak::ptr_eq(original, &Arc::downgrade(slot)))
+            .is_some_and(|registered| Weak::ptr_eq(&registered.original, &Arc::downgrade(slot)))
         {
             return Err(ControlRequestError::UnknownReadySlot);
         }
-        state.slots.remove(&slot.address);
-        match slot.address {
-            Address::Control(input) => {
-                state.control_ready.remove(&input);
-            }
-            Address::Context(work) => {
-                state.context_ready.remove(&work);
+        let registered = state
+            .slots
+            .remove(&slot.address)
+            .expect("original registered slot");
+        if let Some(ordinal) = registered.queued {
+            match slot.address {
+                Address::Control(_) => {
+                    state.control_ready.remove(&ordinal);
+                }
+                Address::Context { .. } => {
+                    state.context_ready.remove(&ordinal);
+                }
             }
         }
         Ok(())
@@ -133,40 +146,38 @@ impl ControlRequestReady {
     pub(crate) fn change_version(&self) -> u64 {
         self.shared.changed.version()
     }
-    /// Consume at most one Control address, without visiting Context entries.
+    /// Consume at most one Control address in actual ready-enqueue order.
     pub(crate) fn next_ready(&self) -> Option<InputId> {
         let mut state = self.shared.state.lock().expect("request ready index");
-        let next = state
-            .control_cursor
-            .and_then(|cursor| {
-                state
-                    .control_ready
-                    .range((Excluded(cursor), Unbounded))
-                    .next()
-                    .copied()
-            })
-            .or_else(|| state.control_ready.first().copied())?;
-        state.control_ready.remove(&next);
-        state.control_cursor = Some(next);
-        Some(next)
+        let (ordinal, input) = state.control_ready.pop_first()?;
+        let registered = state
+            .slots
+            .get_mut(&Address::Control(input))
+            .expect("original queued control slot");
+        assert_eq!(
+            registered.queued,
+            Some(ordinal),
+            "one original queued ready mark"
+        );
+        registered.queued = None;
+        Some(input)
     }
-    /// Consume at most one original Root Work address, independently of the
-    /// other domain's ready population and wrap cursor.
-    pub(crate) fn next_context_ready(&self) -> Option<WorkId> {
+    /// Consume at most one Context scope/Work address in actual ready-enqueue
+    /// order, without visiting or consuming the other domain's queue.
+    pub(crate) fn next_context_ready(&self) -> Option<(ScopeId, WorkId)> {
         let mut state = self.shared.state.lock().expect("request ready index");
-        let next = state
-            .context_cursor
-            .and_then(|cursor| {
-                state
-                    .context_ready
-                    .range((Excluded(cursor), Unbounded))
-                    .next()
-                    .copied()
-            })
-            .or_else(|| state.context_ready.first().copied())?;
-        state.context_ready.remove(&next);
-        state.context_cursor = Some(next);
-        Some(next)
+        let (ordinal, (scope, work)) = state.context_ready.pop_first()?;
+        let registered = state
+            .slots
+            .get_mut(&Address::Context { scope, work })
+            .expect("original queued context slot");
+        assert_eq!(
+            registered.queued,
+            Some(ordinal),
+            "one original queued ready mark"
+        );
+        registered.queued = None;
+        Some((scope, work))
     }
     pub(crate) fn registered(&self) -> usize {
         self.shared
@@ -193,19 +204,32 @@ impl RequestReadySlot {
             return;
         };
         let mut state = shared.state.lock().expect("request ready index");
-        if !state
-            .slots
-            .get(&self.address)
-            .is_some_and(|original| Weak::ptr_eq(original, &Arc::downgrade(self)))
-        {
+        let Some(registered) = state.slots.get(&self.address) else {
+            return;
+        };
+        if !Weak::ptr_eq(&registered.original, &Arc::downgrade(self)) {
             return;
         }
-        match self.address {
-            Address::Control(input) => {
-                state.control_ready.insert(input);
-            }
-            Address::Context(work) => {
-                state.context_ready.insert(work);
+        if registered.queued.is_none() {
+            // This is only bounded ready ordering, never a business identity,
+            // Work author or resource credit. Exhaustion cannot wrap silently.
+            let ordinal = state
+                .next_ready
+                .checked_add(1)
+                .expect("request ready ordering exhausted");
+            state.next_ready = ordinal;
+            state
+                .slots
+                .get_mut(&self.address)
+                .expect("original registered slot")
+                .queued = Some(ordinal);
+            match self.address {
+                Address::Control(input) => {
+                    state.control_ready.insert(ordinal, input);
+                }
+                Address::Context { scope, work } => {
+                    state.context_ready.insert(ordinal, (scope, work));
+                }
             }
         }
         drop(state);
