@@ -485,6 +485,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：crate 结构表达依赖事实，编译器拒绝未声明的 crate 使用；哪些边可以新增、optional/feature/target 与传递能力是否符合 owner 边界，由 review 判断。CI 保留供应链与通用 lint，不增加依赖边界、源码形状或产品前提检查。迁移期临时检查随迁移完成一并删除。
 
+- [ADR-0200](ADR-0200-advisory-discovery-is-independent-of-admission.md) — 公告发现为何独立于准入、保留真实失败与动态输入追溯，并报告传递 unsound（active）
 - [ADR-0190](ADR-0190-dependency-direction-by-structure-and-review.md) — 依赖方向为何由 crate 结构与 review 维持、CI 为何保留通用检查，第三方资源预留为何按准入估计理解（active；部分替代 ADR-0140/0150/0168/0179 的具名检查与验收门规则；全局 Clippy warning-only 现状由 ADR-0194 替代，依赖治理与资源估计仍有效）
 - [ADR-0194](ADR-0194-strict-clippy-ci-baseline.md) — Clippy 为何只在 CI 阶段严格阻止警告、哪些放宽项与局部例外构成最小基线（active；仅替代 ADR-0190 的全局 Clippy warning-only 现状）
 
