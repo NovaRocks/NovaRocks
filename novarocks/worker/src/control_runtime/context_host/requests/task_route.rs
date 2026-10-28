@@ -17,7 +17,8 @@
 
 //! Task-causal leg of the original Context RPC. Reply and physical main-R
 //! completion stay in ContextRequestCustody; this leg retains the exact cut,
-//! delayed input receipt and the original outer/source storage.
+//! delayed input receipt and R outer storage. Source-slot payments follow the
+//! bank's actual holders, including future open sources after this R retires.
 
 use super::*;
 use crate::control_runtime::{

@@ -1527,3 +1527,6 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
         "wrong_runtime={wrong_runtime}, guard_preserved={guard_preserved}, foreign_not_owned={foreign_not_owned}"
     );
 }
+
+#[path = "tests/source_slot_lifetime.rs"]
+mod source_slot_lifetime;

@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One original Task-causal R payment. The main author can retire before
-//! causal headers, Source2 and external storage. Their unique outer bundle
-//! remains paid until the containing request observes all those real exits.
+//! One original Task-causal R payment. The main author, request outer storage
+//! and two source-slot fees leave the original admission as separate owners.
+//! Each source fee follows its actual bank slot across generations; a future
+//! source may outlive this request without retaining its R position.
 
 use super::*;
 use crate::control_runtime::{
@@ -39,8 +40,9 @@ const AUTHOR_STORAGE: StorageNeed = StorageNeed {
 };
 
 /// These are the actual admitted originals, not a promise to fund Source2
-/// after it captures a producer. The main owner must retain `outer` through
-/// cut/source/input/delivery retirement, including after the author retires.
+/// after it captures a producer. The main owner retains `outer` through its
+/// cut/input/delivery retirement, including after the author retires. Each
+/// source admission separately carries its original slot payment into the bank.
 #[must_use = "The original Task request must retain its outer funding and source holders"]
 pub(crate) struct TaskRequestFunding {
     pub author: AdmittedCompletionRole,
