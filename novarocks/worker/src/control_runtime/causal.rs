@@ -75,6 +75,7 @@ pub(crate) enum CausalError {
     Source(SourcePositionError),
     UnknownSource,
     InvalidRequestClass,
+    RequestAdmissionClosed,
     WrongAuthor,
 }
 impl From<CutError> for CausalError {

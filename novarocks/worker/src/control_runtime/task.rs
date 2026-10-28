@@ -22,7 +22,10 @@
 use super::{
     actors::{WorkerAction, WorkerActor},
     admitted_role::{dispose_unused_completion, reserve_reported_role},
-    causal::{CausalAdmissionRefusal, CausalError, TaskCausalInbox},
+    causal::{
+        CausalAdmissionRefusal, CausalError, RpcAuthorAdmission, RpcAuthorAdmissionError,
+        RpcAuthorAdmissionRefusal, TaskCausalInbox,
+    },
     causal_input::{CausalInputBinding, CausalInputCustody, CausalInputError, InputAuthor},
     completion_action::CompletionActionCustody,
     host_executor::{HostExecutorHandle, HostSubmitError},
@@ -46,7 +49,7 @@ use crate::{
     settlement::RegistrationNotice,
     task_completion_roles::{AdmittedCompletionRole, TaskCompletionRoles},
     task_port::{TaskPendingNotice, TaskRuntimePort},
-    task_proposal_ingress::{CutSourceAdmission, TaskProposalIngress},
+    task_proposal_ingress::{CutSourceAdmission, RequestMetadata, TaskProposalIngress},
 };
 use novarocks_control_runtime::{
     completion::ReportSlot,
@@ -58,6 +61,7 @@ use novarocks_control_runtime::{
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
     identity::{ActorId, Generation, ReservationId},
+    mailbox::InputClass,
     scope::WorkKind,
 };
 use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
@@ -427,6 +431,7 @@ pub(crate) struct TaskHostRecord {
     completion_action_issued: bool,
     settlement_notice_issued: bool,
     loader_issued: bool,
+    request_admission_open: bool,
     lifecycle_issued: [bool; TaskLifecycleRole::COUNT],
 }
 impl TaskHostRecord {
@@ -547,8 +552,46 @@ impl TaskHostRecord {
             completion_action_issued: false,
             settlement_notice_issued: false,
             loader_issued: false,
+            request_admission_open: true,
             lifecycle_issued: [false; TaskLifecycleRole::COUNT],
         })
+    }
+    pub(crate) fn task_id(&self) -> TaskIdentity {
+        self.task
+    }
+    pub(crate) fn request_admission_open(&self) -> bool {
+        self.request_admission_open
+    }
+    /// Fence only new RPC authors. Already admitted cuts and original holder
+    /// exits continue independently; this supplies no cancellation or exit fact.
+    pub(crate) fn close_request_admission(&mut self) {
+        self.request_admission_open = false;
+    }
+    /// Bind one original Context R through this exact Task's inbox and pending
+    /// notice. Callers provide the paid originals, never replacement callbacks.
+    pub(crate) fn bind_request_author(
+        &mut self,
+        admitted: AdmittedCompletionRole,
+        request: RequestMetadata,
+        class: InputClass,
+        consumers: u64,
+        admission: CutSourceAdmission,
+    ) -> Result<RpcAuthorAdmission, RpcAuthorAdmissionRefusal> {
+        if !self.request_admission_open {
+            return Err(RpcAuthorAdmissionRefusal::BeforeCut {
+                error: RpcAuthorAdmissionError::Causal(CausalError::RequestAdmissionClosed),
+                admitted,
+                admission,
+            });
+        }
+        self.resources.causal.admit_rpc_author(
+            admitted,
+            request,
+            class,
+            consumers,
+            self.pending.clone(),
+            admission,
+        )
     }
     pub(crate) fn port(&self) -> Arc<TaskRuntimePort> {
         self.resources.port.clone()
@@ -1359,6 +1402,7 @@ fn dispose_fresh_source_refusal(refusal: CausalAdmissionRefusal) -> CausalError 
 
 #[cfg(test)]
 mod tests {
+    mod task_rpc_binding;
     use super::*;
     use novarocks_control_runtime::{exit_role::ExitRole, transaction::RuntimeLedger};
     use novarocks_control_runtime_core::identity::ConsumerId;

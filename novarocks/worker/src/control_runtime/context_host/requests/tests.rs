@@ -19,6 +19,11 @@
 //! has not run Native materialization: Renew receives the actual Establishing
 //! verdict. These tests prove neither RF loans nor full S8 recovery.
 
+#[path = "tests/task_prefix.rs"]
+mod task_prefix;
+#[path = "tests/task_routing.rs"]
+mod task_routing;
+
 use super::*;
 use crate::control_runtime::{
     actors::ContextMessage,
@@ -844,4 +849,545 @@ fn task_funding_in_a_cleanup_epoch_keeps_the_original_core_consumer_generation()
     outer.release(&outer.resources().unwrap()).unwrap();
     finish(f);
     assert!(original_core_legs && no_invented_physical_exit && retired);
+}
+
+// This is the actual Context/Task/R owner graph with modeled neutral
+// materialization and an unstarted loader. It claims no Native I/O or RF loan.
+struct RpcTaskPending;
+impl crate::task_port::TaskPendingNotice for RpcTaskPending {
+    fn pending(&self) {}
+}
+fn model_fact(f: &mut Harness, fact: ContextInput, at: u64) -> InputId {
+    let work = f.service.context(f.identity).unwrap().resources.roles[TIMER]
+        .work
+        .id();
+    let input = f
+        .runtime
+        .reserve_input(
+            context_actor(),
+            ActorId::new(88).unwrap(),
+            InputClass::Lifecycle,
+        )
+        .unwrap()
+        .fill(crate::control_runtime::actors::WorkerMessage::Context(
+            ContextMessage::Command {
+                work,
+                request: None,
+                command: fact,
+            },
+        ))
+        .unwrap();
+    f.runtime.poll_one(Tick(at)).unwrap();
+    input
+}
+fn complete_model_effects(f: &mut Harness, input: InputId) {
+    complete_model_effects_with_preparation(f, input, None);
+}
+fn complete_model_effects_with_preparation(
+    f: &mut Harness,
+    input: InputId,
+    mut preparation: Option<&mut Option<ContextMetadataRole>>,
+) {
+    use novarocks_control_runtime_core::effect::EffectState;
+    loop {
+        let inventory = f
+            .runtime
+            .effect_inventory(context_actor(), input, None, ContextCore::MAX_STEP_WORK)
+            .unwrap();
+        for (action, phase) in &inventory {
+            if *phase == EffectState::Pending {
+                for predecessor in &action.dependencies {
+                    if inventory.iter().any(|(actual, state)| {
+                        actual.id == *predecessor && *state == EffectState::Completed
+                    }) {
+                        f.runtime
+                            .acknowledge_dependency(context_actor(), input, action.id, *predecessor)
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        let ready = f
+            .runtime
+            .ready_effects(context_actor(), input, ContextCore::MAX_STEP_WORK)
+            .unwrap();
+        if ready.is_empty() {
+            break;
+        }
+        for action in ready {
+            let ticket = f
+                .runtime
+                .take_effect(context_actor(), input, action)
+                .unwrap();
+            if let WorkerAction::Context(ContextEffect::EnqueuePreparation {
+                reservation, ..
+            }) = &ticket.effect
+            {
+                let slot = preparation
+                    .as_deref_mut()
+                    .expect("the fixture must retain the actual preparation guard");
+                let guard = f
+                    .runtime
+                    .take_step_reservation(&ticket, *reservation)
+                    .unwrap();
+                let (work, capacity) = guard.bind(WorkKind::Business).unwrap();
+                assert!(
+                    slot.replace(ContextMetadataRole { work, capacity })
+                        .is_none()
+                );
+                f.runtime.effect_completed(ticket).unwrap();
+            } else if matches!(ticket.effect, WorkerAction::Reply(_)) {
+                f.service
+                    .context(f.identity)
+                    .unwrap()
+                    .publish_request_reply(ticket)
+                    .unwrap();
+            } else {
+                // Neutral component publications only. Never use this helper
+                // to claim a Native callback, pin, body or opaque disposal exit.
+                f.runtime.effect_completed(ticket).unwrap();
+            }
+        }
+    }
+}
+fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
+    let mut f = Harness::new_with_request_and_task_capacity(
+        CONTEXT_BOOTSTRAP_STORAGE,
+        1,
+        StorageNeed::role(true),
+        1,
+    );
+    let materialize = f.materialize();
+    let binding = f.binding(context_actor(), &materialize);
+    f.service.adopt_context(&materialize, binding).unwrap();
+    f.complete_materialize_handoff(materialize);
+    let activated = model_fact(
+        &mut f,
+        ContextInput::MaterializationFinished {
+            result: Ok(crate::control_runtime::actors::tests::initial_materialized()),
+        },
+        2,
+    );
+    complete_model_effects(&mut f, activated);
+    f.runtime.retire_input(context_actor(), activated).unwrap();
+    let task = crate::control_runtime::actors::tests::task(f.identity, 1);
+    let ready = ready(&f, 1);
+    let (work, mut create) = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .admit_request(
+            &ready,
+            ActorId::new(87).unwrap(),
+            InputClass::Ordinary,
+            operation(79),
+            MonotonicInstant::from_origin(Duration::from_nanos(4)),
+        )
+        .unwrap();
+    let input = create.request().token;
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .submit_request(
+            work,
+            ContextCommand::Create {
+                task,
+                payload: novarocks_worker_protocol::creation::PayloadId(1),
+            },
+        )
+        .unwrap();
+    f.runtime.poll_one(Tick(3)).unwrap();
+    let load_action = f
+        .runtime
+        .ready_effects(context_actor(), input, ContextCore::MAX_STEP_WORK)
+        .unwrap()[0];
+    let load = f
+        .runtime
+        .take_effect(context_actor(), input, load_action)
+        .unwrap();
+    assert!(matches!(
+        load.effect,
+        WorkerAction::Context(ContextEffect::LoadInput { .. })
+    ));
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .adopt_task(
+            &f.runtime,
+            &load,
+            crate::control_runtime::task::TaskHostBinding {
+                context: f.identity,
+                task_source: ActorId::new(86).unwrap(),
+                protocol_generation: generation(),
+                max_cuts: 4,
+                pending: Arc::new(RpcTaskPending),
+                health: Arc::new(
+                    novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
+                ),
+            },
+        )
+        .unwrap();
+    f.runtime.effect_completed(load).unwrap();
+    assert!(
+        !f.service
+            .context(f.identity)
+            .unwrap()
+            .advance_request(work)
+            .unwrap()
+    );
+    assert!(
+        f.runtime
+            .input_custody(context_actor(), input)
+            .unwrap()
+            .is_none()
+    );
+    // The Create waiter expires; its elected Task/loader responsibility stays.
+    // No timeout or reply is used to claim that the loader actually exited.
+    let tick = model_fact(&mut f, ContextInput::Tick, 5);
+    complete_model_effects(&mut f, tick);
+    f.runtime.retire_input(context_actor(), tick).unwrap();
+    let delivered = create.try_take().expect("original Create timeout reply");
+    assert!(matches!(
+        delivered.body(),
+        ContextReplyBody::Verdict(RequestResult::TimeoutWhileAccepted)
+    ));
+    drop((create, delivered));
+    assert!(advance(&mut f, work));
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
+    (f, task)
+}
+fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
+    use crate::task_proposal_ingress::PairRoute;
+    let host = f.service.context(f.identity).unwrap();
+    host.close_task_request_admission(task).unwrap();
+    let owner = host
+        .take_task(task)
+        .expect("original requests and cuts have drained");
+    let crate::control_runtime::task::TaskHostOwner::Ready(task) = owner else {
+        panic!("same actual ready Task");
+    };
+    let mut resources = task.into_resources();
+    assert!(resources.causal.is_empty());
+    let ingress = resources.port.ingress().clone();
+    ingress.seal_source_admission();
+    for route in [PairRoute::Open, PairRoute::ConsumingOpen] {
+        for holder in ingress
+            .take_unused_pair(route)
+            .unwrap()
+            .into_iter()
+            .flatten()
+        {
+            holder.exit();
+        }
+        for source in ingress.pair_inventory(route).unwrap() {
+            assert!(source.source.is_none());
+            assert!(source.custody.try_retire().unwrap());
+        }
+    }
+    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
+    resources.lifetime.body_exited().unwrap();
+    resources.lifetime.captures_exited().unwrap();
+    if let Some(open) = &mut resources.open_summary {
+        open.close_after_exit(&resources.lifetime).unwrap();
+    }
+    resources
+        .active
+        .release(&resources.active.resources().unwrap())
+        .unwrap();
+    f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
+    drop((resources, ingress));
+    finish(f);
+}
+
+#[test]
+fn actual_task_r_repeats_at_r_one_and_retains_the_original_delivery_and_real_delayed_token() {
+    let (mut f, task) = live_loading_task_fixture();
+    let ready = ready(&f, 1);
+    let mut prior_input = None;
+    for sequence in 0..3 {
+        let operation = operation(80 + sequence);
+        let (work, mut handle) = f
+            .service
+            .context(f.identity)
+            .unwrap()
+            .admit_task_request(
+                &ready,
+                task,
+                InputClass::Control,
+                operation,
+                MonotonicInstant::from_origin(Duration::from_secs(5)),
+            )
+            .unwrap();
+        assert_eq!(handle.request().operation, operation);
+        f.service
+            .context(f.identity)
+            .unwrap()
+            .submit_request(work, ContextCommand::GetFinalInfo { task })
+            .unwrap();
+        let delivery = f
+            .service
+            .context(f.identity)
+            .unwrap()
+            .deliver_task_event(task)
+            .unwrap()
+            .unwrap();
+        assert_ne!(prior_input, Some(delivery.event));
+        prior_input = Some(delivery.event);
+        f.runtime.poll_one(Tick(6 + u64::from(sequence))).unwrap();
+        let ticket = reply(&f, delivery.event);
+        let original_token = match &ticket.effect {
+            WorkerAction::Reply(reply) => {
+                reply.request.token == delivery.event
+                    && reply.request.operation == operation
+                    && reply.task == Some(task)
+            }
+            _ => false,
+        };
+        f.service
+            .context(f.identity)
+            .unwrap()
+            .publish_request_reply(ticket)
+            .unwrap();
+        let delivered = handle.try_take().unwrap();
+        assert!(matches!(
+            delivered.body(),
+            ContextReplyBody::Verdict(RequestResult::Outcome(
+                OperationOutcome::InvalidStateOrRequest
+            ))
+        ));
+        drop(handle);
+        assert!(
+            !f.service
+                .context(f.identity)
+                .unwrap()
+                .advance_request(work)
+                .unwrap()
+        );
+        assert_eq!(f.ledger.used(Dimension::Requests.id()), 1);
+        assert!(
+            f.runtime
+                .input_custody(context_actor(), delivery.event)
+                .unwrap()
+                .is_none()
+        );
+        assert!(original_token);
+        drop(delivered);
+        // Progress uses only the original real ready address, including the
+        // retry emitted when a bounded reaper first visits another sibling.
+        let mut retired = false;
+        for _ in 0..8 {
+            let (scope, actual) = ready
+                .next_context_ready()
+                .expect("same original R must remain ready");
+            assert_eq!(scope, f.service.context(f.identity).unwrap().scope().id());
+            assert_eq!(actual, work);
+            if f.service
+                .context(f.identity)
+                .unwrap()
+                .advance_request(actual)
+                .unwrap()
+            {
+                retired = true;
+                break;
+            }
+        }
+        assert!(retired);
+        assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
+        assert_eq!(ready.registered(), 0);
+    }
+    finish_task_fixture(f, task);
+}
+
+#[test]
+fn task_input_admission_pressure_keeps_the_original_unexposed_partial_and_refunds_without_task_exit()
+ {
+    let (mut f, task) = live_loading_task_fixture();
+    let ready = ready(&f, 1);
+    // Explicit unused mailbox probes occupy actual actor positions. They
+    // attach no command/body and are revoked by this fixture owner below.
+    let mut probes = Vec::new();
+    while let Ok(permit) = f.runtime.reserve_input(
+        context_actor(),
+        ActorId::new(85).unwrap(),
+        InputClass::Control,
+    ) {
+        probes.push(permit);
+    }
+    assert!(!probes.is_empty());
+    let refusal = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .admit_task_request(
+            &ready,
+            task,
+            InputClass::Control,
+            operation(110),
+            MonotonicInstant::from_origin(Duration::from_secs(5)),
+        )
+        .err()
+        .expect("the actual Task causal input pool is occupied");
+    let partial = refusal
+        .partial
+        .expect("same admitted main, Source2 and outer remain owned");
+    let actual_input_refusal = matches!(refusal.error, ContextRequestError::Causal(_));
+    assert_eq!(ready.registered(), 0);
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 1);
+    assert!(
+        f.service
+            .context(f.identity)
+            .unwrap()
+            .task(task)
+            .unwrap()
+            .causal()
+            .is_empty()
+    );
+    // Cleanup of those never-exposed originals does not wait for the mailbox
+    // probes, another RPC, Task close, or an invented input consumption fact.
+    let retired = advance(&mut f, partial);
+    let original_task_still_owned = f.service.context(f.identity).unwrap().task(task).is_some();
+    let refunded = f.ledger.used(Dimension::Requests.id()) == 0;
+    for permit in probes {
+        permit.revoke_unused().unwrap();
+    }
+    let (work, handle) = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .admit_task_request(
+            &ready,
+            task,
+            InputClass::Control,
+            operation(111),
+            MonotonicInstant::from_origin(Duration::from_secs(5)),
+        )
+        .unwrap();
+    drop(handle);
+    assert!(advance(&mut f, work));
+    finish_task_fixture(f, task);
+    assert!(actual_input_refusal && retired && original_task_still_owned && refunded);
+}
+
+fn accepted_task_fixture() -> (Harness, TaskIdentity, ContextMetadataRole) {
+    let (mut f, task) = live_loading_task_fixture();
+    // This neutral model has no measured Native input. Its explicit cost is
+    // accepted by the real synchronous port, which owns the actual P/bytes
+    // reservation below. No state flag or fabricated Installed fact is used.
+    let loaded = model_fact(
+        &mut f,
+        ContextInput::Loaded {
+            task,
+            result: Ok(novarocks_worker_protocol::creation::CreationCost {
+                input_retained_bytes: 1,
+                ingress_retained_bytes: 1,
+                structural_bytes: 1,
+                inbound_records: 0,
+                inbound_bytes: 0,
+            }),
+        },
+        6,
+    );
+    let mut preparation = None;
+    complete_model_effects_with_preparation(&mut f, loaded, Some(&mut preparation));
+    f.runtime.retire_input(context_actor(), loaded).unwrap();
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
+    assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), 3);
+    (
+        f,
+        task,
+        preparation.expect("original Accepted queue reservation"),
+    )
+}
+fn finish_accepted_task_fixture(
+    mut f: Harness,
+    task: TaskIdentity,
+    mut preparation: ContextMetadataRole,
+) {
+    // The test never starts this original queued preparation or captures a
+    // host input/body. Its actual unused holder exits here before Task close.
+    preparation.work.body_exited().unwrap();
+    preparation.work.captures_exited().unwrap();
+    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
+    preparation
+        .capacity
+        .release(&preparation.capacity.resources().unwrap())
+        .unwrap();
+    drop(preparation);
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 0);
+    assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), 0);
+    finish_task_fixture(f, task);
+}
+
+#[test]
+fn accepted_task_request_retires_its_own_r_without_refunding_the_still_queued_preparation() {
+    let (mut f, task, preparation) = accepted_task_fixture();
+    let ready = ready(&f, 1);
+    let (work, mut handle) = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .admit_task_request(
+            &ready,
+            task,
+            InputClass::Ordinary,
+            operation(112),
+            MonotonicInstant::from_origin(Duration::from_secs(5)),
+        )
+        .unwrap();
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .submit_request(
+            work,
+            ContextCommand::GetDynamicFilters {
+                task,
+                acknowledged: None,
+            },
+        )
+        .unwrap();
+    let delivery = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .deliver_task_event(task)
+        .unwrap()
+        .unwrap();
+    f.runtime.poll_one(Tick(7)).unwrap();
+    let ticket = reply(&f, delivery.event);
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .publish_request_reply(ticket)
+        .unwrap();
+    let delivered = handle.try_take().unwrap();
+    assert!(matches!(
+        delivered.body(),
+        ContextReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::Idempotent))
+    ));
+    drop((handle, delivered));
+    let mut retired = false;
+    for _ in 0..8 {
+        let (scope, actual) = ready
+            .next_context_ready()
+            .expect("actual R ready or bounded-reaper retry");
+        assert_eq!(actual, work);
+        assert_eq!(scope, f.service.context(f.identity).unwrap().scope().id());
+        if f.service
+            .context(f.identity)
+            .unwrap()
+            .advance_request(work)
+            .unwrap()
+        {
+            retired = true;
+            break;
+        }
+    }
+    let own_r_returned = retired && f.ledger.used(Dimension::Requests.id()) == 0;
+    let queued_preparation_still_paid = f.ledger.used(Dimension::PreparingTasks.id()) == 1
+        && f.ledger.used(Dimension::PreparingBytes.id()) == 3
+        && f.ledger.used(Dimension::ActiveTasks.id()) == 1;
+    finish_accepted_task_fixture(f, task, preparation);
+    assert!(own_r_returned && queued_preparation_still_paid);
 }

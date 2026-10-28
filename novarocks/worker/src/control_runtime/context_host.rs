@@ -102,6 +102,8 @@ pub(crate) enum ContextHostError {
     BootstrapUnfunded,
     TaskAlreadyOwned,
     TaskTableFull,
+    TaskNotOwned,
+    TaskStillOwned,
     Driver(DriverError),
     Runtime(RuntimeError),
     AdmissionBindInvariant(RuntimeError),
@@ -135,8 +137,10 @@ pub(crate) struct ContextHostResources {
     io_attempted: bool,
     pub requests:
         BTreeMap<novarocks_control_runtime_core::identity::WorkId, requests::ContextRequestCustody>,
-    pub request_partials:
-        BTreeMap<novarocks_control_runtime_core::identity::WorkId, requests::ContextRequestPartial>,
+    pub request_partials: BTreeMap<
+        novarocks_control_runtime_core::identity::WorkId,
+        requests::ContextRequestAdmissionPartial,
+    >,
 }
 
 pub(crate) struct ContextHostRefusal {
@@ -170,6 +174,13 @@ pub(crate) struct ContextHostRecord {
     max_routes: usize,
     pub dispatch: EffectDispatch,
     request_inputs: BTreeMap<InputId, novarocks_control_runtime_core::identity::WorkId>,
+    task_request_cuts: BTreeMap<
+        (
+            TaskIdentity,
+            novarocks_worker_protocol::proposal_summary::CutId,
+        ),
+        novarocks_control_runtime_core::identity::WorkId,
+    >,
 }
 impl ContextHostRecord {
     #[cfg(test)]
@@ -391,6 +402,7 @@ impl ContextHostRecord {
             max_routes,
             dispatch: EffectDispatch::context(runtime.clone(), binding.actor, effect_limit),
             request_inputs: BTreeMap::new(),
+            task_request_cuts: BTreeMap::new(),
         })
     }
     pub(crate) fn identity(&self) -> QueryContextRef {
@@ -774,8 +786,31 @@ impl ContextHostRecord {
     }
     /// Moves the same actual inventory to its original host cleanup lane.
     /// Removal supplies no terminal/source/body/report or quota-release proof.
-    pub(crate) fn take_task(&mut self, task: TaskIdentity) -> Option<TaskHostOwner> {
-        self.tasks.remove(&task)
+    pub(crate) fn take_task(
+        &mut self,
+        task: TaskIdentity,
+    ) -> Result<TaskHostOwner, ContextHostError> {
+        if self
+            .task_request_cuts
+            .range((task, novarocks_worker_protocol::proposal_summary::CutId(0))..)
+            .next()
+            .is_some_and(|((identity, _), _)| *identity == task)
+        {
+            return Err(ContextHostError::TaskStillOwned);
+        }
+        match self.tasks.get_mut(&task) {
+            Some(TaskHostOwner::Ready(host) | TaskHostOwner::Initializing(host)) => {
+                if host.request_admission_open() || !host.causal().is_empty() {
+                    return Err(ContextHostError::TaskStillOwned);
+                }
+            }
+            Some(TaskHostOwner::Unpublished(_)) => {}
+            None => return Err(ContextHostError::TaskNotOwned),
+        }
+        Ok(self
+            .tasks
+            .remove(&task)
+            .expect("same serial Context owns the original Task"))
     }
     pub(crate) fn into_resources(
         self,
@@ -787,7 +822,7 @@ impl ContextHostRecord {
 mod requests;
 pub(crate) use requests::{
     ContextRequestAdmissionRefusal, ContextRequestError, ContextRequestHandle,
-    ContextRequestPublishRefusal, ContextRequestSubmitRefusal,
+    ContextRequestPublishRefusal, ContextRequestSubmitRefusal, TaskContextRequestHandle,
 };
 
 #[cfg(test)]
@@ -893,7 +928,14 @@ mod tests {
             requests: usize,
             profile: StorageNeed,
         ) -> Self {
-            let request_storage = profile.checked_mul(requests).unwrap();
+            Self::new_with_request_and_task_capacity(context_storage, requests, profile, 0)
+        }
+        fn new_with_request_and_task_capacity(
+            context_storage: StorageNeed,
+            requests: usize,
+            profile: StorageNeed,
+            task_positions: usize,
+        ) -> Self {
             let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
                 ordinary_running: 1,
                 ordinary_waiting: 0,
@@ -903,6 +945,11 @@ mod tests {
                 root_read_holders: 1,
             })
             .unwrap();
+            let request_storage = profile
+                .checked_mul(requests)
+                .unwrap()
+                .checked_add(policy.task_base.checked_mul(task_positions).unwrap())
+                .unwrap();
             // Control owns its three actual roles, a timer and one sequential
             // return/request position. The ticket and Context pay separately.
             let mut limits = Vec::new();

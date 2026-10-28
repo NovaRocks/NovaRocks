@@ -18,15 +18,22 @@
 //! Original direct Context RPC custody. A command handoff, Core consumption,
 //! reply publication and the actual external delivery exit are separate facts.
 
+mod endpoint;
 mod task_funding;
+mod task_route;
+
+use endpoint::ContextRequestEndpoint;
+use task_route::TaskRequestRoute;
 
 use super::ContextHostRecord;
 use crate::control_runtime::{
     actors::{ContextMessage, RequestMetadata, WorkerAction, WorkerActor, WorkerMessage},
     admitted_role::dispose_unused_completion,
+    causal::CausalError,
     control_request::ControlRequestError,
     request_endpoint::{RequestEndpoint, RequestHandle},
     request_ready::{ControlRequestReady, RequestExternalLeg},
+    task::TaskHostRecord,
 };
 use crate::control_runtime_policy::{PolicyError, StorageNeed};
 use crate::task_completion_roles::AdmittedCompletionRole;
@@ -35,7 +42,7 @@ use novarocks_control_runtime::{
     driver::{
         ActorRuntime, DriverError, EffectCompletionRefusal, EffectTicket, InputPermit, InputPhase,
     },
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError},
+    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
     lease::{CapacityBundle, WorkLease, WorkRetirementObserver},
     publication::{FailurePublicationSession, PublishedReply},
     reported_work::{ReportedWork, ReportedWorkBindingError},
@@ -77,6 +84,7 @@ fn external_consumer() -> ConsumerId {
 }
 
 pub(crate) type ContextRequestHandle = RequestHandle<ContextReplyBody>;
+pub(crate) type TaskContextRequestHandle = RequestHandle<ContextReplyBody, RequestMetadata>;
 
 #[derive(Debug)]
 pub(crate) enum ContextRequestError {
@@ -94,6 +102,10 @@ pub(crate) enum ContextRequestError {
     MissingCoreReceipt,
     SubmissionUnresolved,
     TaskPredecessorRequired,
+    Causal(CausalError),
+    TaskNotReady,
+    TaskUnpublished,
+    UnknownTask,
     BodyResultMismatch,
 }
 
@@ -138,6 +150,26 @@ pub(crate) struct ContextRequestPartial {
     unresolved: bool,
     outer: Option<CapacityBundle>,
     sources: Vec<UnusedRequestSource>,
+}
+
+pub(crate) enum ContextRequestAdmissionPartial {
+    Unused(ContextRequestPartial),
+    BoundTask(Box<TaskRequestBindPartial>),
+}
+impl ContextRequestAdmissionPartial {
+    fn try_retire(&mut self) -> Result<bool, ContextRequestError> {
+        match self {
+            Self::Unused(partial) => partial.try_retire(),
+            Self::BoundTask(_) => Err(ContextRequestError::SubmissionUnresolved),
+        }
+    }
+}
+/// An unexpected whole-binding refusal can already own a real cut/sender.
+/// Retain it for the actual failed-owner inventory; never revoke it as an
+/// untouched source or invent a replacement main role to make cleanup pass.
+pub(crate) struct TaskRequestBindPartial {
+    refusal: crate::control_runtime::causal::RpcAuthorAdmissionRefusal,
+    outer: CapacityBundle,
 }
 
 struct UnusedRequestSource {
@@ -253,7 +285,9 @@ pub(crate) struct ContextRequestCustody {
     actor: ActorId,
     generation: Generation,
     work: WorkId,
-    endpoint: Arc<RequestEndpoint<ContextReplyBody>>,
+    endpoint: ContextRequestEndpoint,
+    request: Option<RequestContext>,
+    task_route: Option<TaskRequestRoute>,
     permit: Option<InputPermit<WorkerActor>>,
     role: ExitRole,
     authority: Option<ExitAuthority>,
@@ -406,7 +440,9 @@ impl ContextRequestCustody {
                 actor: host.actor,
                 generation,
                 work,
-                endpoint,
+                endpoint: ContextRequestEndpoint::Direct(endpoint),
+                request: Some(request),
+                task_route: None,
                 permit,
                 role,
                 authority: Some(authority),
@@ -429,12 +465,19 @@ impl ContextRequestCustody {
         ))
     }
     pub(crate) fn request(&self) -> RequestContext {
-        self.endpoint.request
+        self.request
+            .expect("the original RPC has its actual input receipt")
     }
     pub(crate) fn work(&self) -> WorkId {
         self.work
     }
     fn submit(&mut self, command: ContextCommand) -> Result<(), ContextRequestSubmitRefusal> {
+        if self.task_route.is_some() {
+            return Err(ContextRequestSubmitRefusal {
+                error: ContextRequestError::TaskPredecessorRequired,
+                command: Some(command),
+            });
+        }
         let reject = |error, command| ContextRequestSubmitRefusal {
             error,
             command: Some(command),
@@ -524,7 +567,7 @@ impl ContextRequestCustody {
         } else {
             if let Err((error, body)) =
                 self.runtime
-                    .commit_reply(&ticket, &self.endpoint.reply, body)
+                    .commit_reply(&ticket, self.endpoint.reply(), body)
             {
                 return Err(ContextRequestPublishRefusal::Publication {
                     error,
@@ -538,7 +581,7 @@ impl ContextRequestCustody {
             .effect_completed(ticket)
             .map_err(ContextRequestPublishRefusal::Completion)?;
         self.reply_completed = true;
-        self.endpoint.external.notify();
+        self.endpoint.external().notify();
         Ok(())
     }
     /// S8 supplies the actual same-scope failure publication session. An
@@ -547,17 +590,17 @@ impl ContextRequestCustody {
         &mut self,
         session: &mut FailurePublicationSession<WorkerActor>,
     ) -> Result<bool, ContextRequestError> {
-        if self.endpoint.reply.is_committed() {
+        if self.endpoint.reply().is_committed() {
             return Ok(false);
         }
         let body = Arc::new(ContextReplyBody::Verdict(RequestResult::Outcome(
             OperationOutcome::OwnerFailed,
         )));
         session
-            .commit_reply(&self.endpoint.reply, body)
+            .commit_reply(self.endpoint.reply(), body)
             .map_err(|(error, _)| ContextRequestError::Driver(error))?;
         self.reply_completed = true;
-        self.endpoint.external.notify();
+        self.endpoint.external().notify();
         Ok(true)
     }
     fn observe_core(&mut self) -> Result<bool, ContextRequestError> {
@@ -576,7 +619,30 @@ impl ContextRequestCustody {
         };
         Ok(true)
     }
-    fn try_retire(&mut self) -> Result<bool, ContextRequestError> {
+    fn try_retire(
+        &mut self,
+        task: Option<&mut TaskHostRecord>,
+    ) -> Result<bool, ContextRequestError> {
+        let mut route = self.task_route.take();
+        let result = self.try_retire_with_route(route.as_mut(), task);
+        self.task_route = route;
+        result
+    }
+    fn try_retire_with_route(
+        &mut self,
+        mut route: Option<&mut TaskRequestRoute>,
+        mut task: Option<&mut TaskHostRecord>,
+    ) -> Result<bool, ContextRequestError> {
+        if let Some(route) = route.as_mut() {
+            route.prepare(
+                self,
+                task.as_deref_mut()
+                    .ok_or(ContextRequestError::UnknownTask)?,
+            )?;
+            if self.submitted && self.request.is_none() {
+                return Ok(false);
+            }
+        }
         if self.failed_message.is_some() || self.unresolved_revocation {
             return Err(ContextRequestError::SubmissionUnresolved);
         }
@@ -616,7 +682,7 @@ impl ContextRequestCustody {
             if !self.reply_completed || !self.endpoint.external_ended() {
                 return Ok(false);
             }
-            drop(self.endpoint.reply.take_once());
+            drop(self.endpoint.reply().take_once());
             if !self.exit_observed {
                 self.authority
                     .take()
@@ -651,16 +717,24 @@ impl ContextRequestCustody {
                 .reap_scope_ready(self.scope.id(), 1)
                 .map_err(ContextRequestError::Runtime)?;
             if !self.work_retirement.is_retired() {
-                self.endpoint.external.notify();
+                self.endpoint.external().notify();
                 return Ok(false);
             }
         }
-        if !self.role.try_retire().map_err(ContextRequestError::Exit)? {
+        if self.role.phase() != ExitRolePhase::Retired
+            && !self.role.try_retire().map_err(ContextRequestError::Exit)?
+        {
             return Ok(false);
         }
+        if let Some(route) = route {
+            let task = task.ok_or(ContextRequestError::UnknownTask)?;
+            if !route.finish(self, task)? {
+                return Ok(false);
+            }
+        }
         self.endpoint
-            .ready
-            .unregister(self.endpoint.external.slot())
+            .ready()
+            .unregister(self.endpoint.external().slot())
             .map_err(ContextRequestError::Ready)?;
         Ok(true)
     }
@@ -677,7 +751,7 @@ impl ContextHostRecord {
             assert!(
                 self.resources
                     .request_partials
-                    .insert(work, partial)
+                    .insert(work, ContextRequestAdmissionPartial::Unused(partial))
                     .is_none()
             );
             if let Some(notice) = &self.resources.notice {
@@ -717,7 +791,28 @@ impl ContextHostRecord {
         command: ContextCommand,
     ) -> Result<(), ContextRequestSubmitRefusal> {
         match self.resources.requests.get_mut(&work) {
-            Some(original) => original.submit(command),
+            Some(original) => {
+                if let Some(mut route) = original.task_route.take() {
+                    let task = match self.tasks.get_mut(&route.task()) {
+                        Some(
+                            super::TaskHostOwner::Ready(host)
+                            | super::TaskHostOwner::Initializing(host),
+                        ) => host.as_mut(),
+                        _ => {
+                            original.task_route = Some(route);
+                            return Err(ContextRequestSubmitRefusal {
+                                error: ContextRequestError::UnknownTask,
+                                command: Some(command),
+                            });
+                        }
+                    };
+                    let result = route.submit(original, task, command);
+                    original.task_route = Some(route);
+                    result
+                } else {
+                    original.submit(command)
+                }
+            }
             None => Err(ContextRequestSubmitRefusal {
                 error: ContextRequestError::UnknownRequest,
                 command: Some(command),
@@ -743,12 +838,29 @@ impl ContextHostRecord {
     /// One original ready address per call, without scanning another Context.
     pub(crate) fn advance_request(&mut self, work: WorkId) -> Result<bool, ContextRequestError> {
         if let Some(original) = self.resources.requests.get_mut(&work) {
-            let input = original.request().token;
-            if !original.try_retire()? {
+            let task_identity = original.task_route.as_ref().map(|route| route.task());
+            let task = match task_identity {
+                Some(task) => match self.tasks.get_mut(&task) {
+                    Some(
+                        super::TaskHostOwner::Ready(host)
+                        | super::TaskHostOwner::Initializing(host),
+                    ) => Some(host.as_mut()),
+                    _ => return Err(ContextRequestError::UnknownTask),
+                },
+                None => None,
+            };
+            if !original.try_retire(task)? {
                 return Ok(false);
             }
+            let input = original.request.map(|request| request.token);
+            let cut = original.task_route.as_ref().map(|route| route.cut());
             self.resources.requests.remove(&work);
-            self.request_inputs.remove(&input);
+            if let Some(input) = input {
+                self.request_inputs.remove(&input);
+            }
+            if let (Some(task), Some(cut)) = (task_identity, cut) {
+                self.task_request_cuts.remove(&(task, cut));
+            }
             return Ok(true);
         }
         if let Some(original) = self.resources.request_partials.get_mut(&work) {
