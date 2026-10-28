@@ -663,7 +663,7 @@ mod tests {
     fn source_roles<const N: usize>(
         scope: &ScopeHandle,
         parent: ReservationId,
-    ) -> [AdmittedCompletionRole; N] {
+    ) -> [crate::control_runtime::source_positions::SourceSlotAdmission; N] {
         std::array::from_fn(|_| {
             let guard = scope
                 .reserve_child_next(generation(), parent, empty(), WorkKind::Cleanup)
@@ -679,11 +679,9 @@ mod tests {
             )
             .unwrap();
             let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
-            AdmittedCompletionRole {
-                work,
-                capacity,
-                report,
-            }
+            crate::control_runtime::source_positions::SourceSlotAdmission::protocol_model(
+                crate::control_runtime::admitted_role::adopt_reported_work(work, capacity, report),
+            )
         })
     }
     fn fixture() -> Fixture {
@@ -892,9 +890,13 @@ mod tests {
                 .prepare_owned_pair_reap(&retired.pair)
                 .unwrap()
                 .map(|probe| probe.observe_reaped().unwrap());
-            self.ingress
+            for mut storage in self
+                .ingress
                 .release_owned_pair(&retired.pair, witnesses)
-                .unwrap_or_else(|_| panic!("the same returned pair really retired"));
+                .unwrap_or_else(|_| panic!("the same returned pair really retired"))
+            {
+                storage.release().unwrap();
+            }
         }
         fn retire_cut(&mut self, cut: CutId) {
             let retired = self

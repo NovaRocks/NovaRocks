@@ -28,8 +28,9 @@ pub(crate) use storage::{
 };
 
 use super::source_custody::{SourceCustody, SourcePermit};
-use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
+use crate::task_port::TaskPendingNotice;
 use novarocks_control_runtime::exit_role::ExitRolePhase;
+use novarocks_control_runtime::{reported_work::ReportedWork, transaction::RuntimeError};
 use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
 use novarocks_execution_contract::{RetainedTaskSource, TaskFailurePhase, TaskIdentity};
 use novarocks_worker_protocol::proposal_summary::SourceId;
@@ -38,6 +39,7 @@ use std::{
     mem::ManuallyDrop,
     sync::{Arc, Mutex},
 };
+use storage::SourceSlotStorage;
 
 type RetainedSource = RetainedTaskSource<ExecutionFailure>;
 
@@ -97,6 +99,7 @@ pub(crate) enum SourcePositionError {
     SourceUnresolved,
     SourceStillHeld,
     IdentityExhausted,
+    SlotDetached,
 }
 
 struct InventoryIdentity {
@@ -149,6 +152,7 @@ struct Position {
     id: SourcePositionId,
     generation: u64,
     custody: SourceCustody,
+    storage: Mutex<Option<SourceSlotStorage>>,
     state: Mutex<PositionState>,
     retained: Mutex<Option<Arc<Self>>>,
 }
@@ -157,16 +161,19 @@ impl Position {
         identity: Arc<InventoryIdentity>,
         id: SourcePositionId,
         generation: u64,
-        role: AdmittedCompletionRole,
+        reported: ReportedWork,
+        storage: SourceSlotStorage,
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
     ) -> Arc<Self> {
-        let (custody, permit) = SourceCustody::from_admitted(identity.task, role, pending, health);
+        let (custody, permit) =
+            SourceCustody::from_reported(identity.task, reported, pending, health);
         let position = Arc::new(Self {
             identity,
             id,
             generation,
             custody,
+            storage: Mutex::new(Some(storage)),
             state: Mutex::new(PositionState {
                 source: None,
                 payload: Payload::Available(ManuallyDrop::new(permit)),
@@ -267,8 +274,8 @@ impl SourcePositions {
     }
     pub(crate) fn append_admitted(
         &mut self,
-        role: AdmittedCompletionRole,
-    ) -> Result<SourcePositionKey, (SourcePositionError, AdmittedCompletionRole)> {
+        role: SourceSlotAdmission,
+    ) -> Result<SourcePositionKey, (SourcePositionError, SourceSlotAdmission)> {
         if self.positions.len() >= self.limit {
             return Err((SourcePositionError::Full, role));
         }
@@ -276,11 +283,13 @@ impl SourcePositions {
             return Err((SourcePositionError::IdentityExhausted, role));
         };
         let id = SourcePositionId(self.next_position);
+        let (reported, storage) = role.into_slot_parts();
         let position = Position::from_admitted(
             self.identity.clone(),
             id,
             1,
-            role,
+            reported,
+            storage,
             self.pending.clone(),
             self.health.clone(),
         );
@@ -290,8 +299,8 @@ impl SourcePositions {
     }
     pub(crate) fn append_pair(
         &mut self,
-        roles: [AdmittedCompletionRole; 2],
-    ) -> Result<SourcePositionPair, (SourcePositionError, [AdmittedCompletionRole; 2])> {
+        roles: [SourceSlotAdmission; 2],
+    ) -> Result<SourcePositionPair, (SourcePositionError, [SourceSlotAdmission; 2])> {
         if self
             .positions
             .len()
@@ -612,11 +621,19 @@ impl SourcePositions {
             return Err(SourcePositionError::SourceStillHeld);
         }
         drop(state);
+        if current
+            .storage
+            .lock()
+            .expect("source slot storage")
+            .is_none()
+        {
+            return Err(SourcePositionError::SlotDetached);
+        }
         Ok(current)
     }
-    /// The witness was observed against this exact original role outside the
-    /// ingress lock. No ledger inspection or opaque destructor occurs here.
-    pub(crate) fn release_reaped(
+    /// Retire only the actual generation. Its row and unique original fee
+    /// remain resident so a later validated generation can reuse this slot.
+    pub(crate) fn mark_generation_retired(
         &mut self,
         reaped: ReapedPosition,
     ) -> Result<(), (SourcePositionError, ReapedPosition)> {
@@ -632,33 +649,77 @@ impl SourcePositions {
         if let Some(source) = source {
             self.sources.remove(&source);
         }
-        self.positions.remove(&current.id);
-        current.release_retention();
         Ok(())
     }
-    /// Supply a new original paid role only after the old role/report AND
+    /// The witness was observed against this exact original role outside the
+    /// ingress lock. No ledger inspection or opaque destructor occurs here.
+    pub(crate) fn release_reaped(
+        &mut self,
+        reaped: ReapedPosition,
+    ) -> Result<DetachedSourceSlotStorage, (SourcePositionError, ReapedPosition)> {
+        let current = match self.validate_reaped(&reaped) {
+            Ok(current) => current,
+            Err(error) => return Err((error, reaped)),
+        };
+        let source = {
+            let mut state = current.state.lock().expect("original source position");
+            state.payload = Payload::Retired;
+            state.source.take()
+        };
+        if let Some(source) = source {
+            self.sources.remove(&source);
+        }
+        self.positions.remove(&current.id);
+        let storage = current
+            .storage
+            .lock()
+            .expect("source slot storage")
+            .take()
+            .expect("same validated original slot storage");
+        current.release_retention();
+        Ok(DetachedSourceSlotStorage { storage })
+    }
+    /// Supply a new original role only after the old role/report AND
     /// common Work header have retired. The original role is returned intact
-    /// on every refusal; this function never obtains replacement capacity.
+    /// on every refusal; this function moves the same original slot fee and
+    /// never obtains replacement capacity.
     pub(crate) fn replace_after_reap(
         &mut self,
         reaped: ReapedPosition,
-        role: AdmittedCompletionRole,
-    ) -> Result<SourcePositionKey, (SourcePositionError, AdmittedCompletionRole)> {
+        role: ReportedWork,
+    ) -> Result<SourcePositionKey, (SourcePositionError, ReportedWork)> {
         let old = match self.validate_reaped(&reaped) {
             Ok(position) => position,
             Err(error) => return Err((error, role)),
         };
+        if !old
+            .storage
+            .lock()
+            .expect("source slot storage")
+            .as_ref()
+            .expect("same validated original slot storage")
+            .matches_scope(role.work().scope())
+        {
+            return Err((SourcePositionError::ForeignInventory, role));
+        }
         let Some(generation) = old.generation.checked_add(1) else {
             return Err((SourcePositionError::IdentityExhausted, role));
         };
         if !self.positions.contains_key(&old.id) && self.positions.len() >= self.limit {
             return Err((SourcePositionError::Full, role));
         }
+        let storage = old
+            .storage
+            .lock()
+            .expect("source slot storage")
+            .take()
+            .expect("same validated original slot storage");
         let replacement = Position::from_admitted(
             self.identity.clone(),
             old.id,
             generation,
             role,
+            storage,
             self.pending.clone(),
             self.health.clone(),
         );
@@ -679,25 +740,38 @@ impl SourcePositions {
     }
 
     /// Re-arm the same two addresses only after both original roles were
-    /// actually reaped. All validation precedes consuming either paid role;
+    /// actually reaped. All validation precedes consuming either new role;
     /// failure returns the complete original group without partial mutation.
     /// The host obtains the witnesses and new roles outside the ingress lock.
     pub(crate) fn rearm_pair(
         &mut self,
         pair: SourcePositionPair,
         reaped: [ReapedPosition; 2],
-        roles: [AdmittedCompletionRole; 2],
+        roles: [ReportedWork; 2],
     ) -> Result<
         SourcePositionPair,
         (
             SourcePositionError,
             SourcePositionPair,
             [ReapedPosition; 2],
-            [AdmittedCompletionRole; 2],
+            [ReportedWork; 2],
         ),
     > {
         let validation = (|| {
             self.validate_reaped_pair(&pair, &reaped)?;
+            for (key, reported) in pair.positions.iter().zip(&roles) {
+                if !key
+                    .position
+                    .storage
+                    .lock()
+                    .expect("source slot storage")
+                    .as_ref()
+                    .expect("same validated original pair storage")
+                    .matches_scope(reported.work().scope())
+                {
+                    return Err(SourcePositionError::ForeignInventory);
+                }
+            }
             let missing = pair
                 .positions
                 .iter()
@@ -727,15 +801,23 @@ impl SourcePositions {
         };
         let [first, second] = roles;
         let replacements = [
-            (first, pair.positions[0].address(), generations[0]),
-            (second, pair.positions[1].address(), generations[1]),
+            (first, &pair.positions[0], generations[0]),
+            (second, &pair.positions[1], generations[1]),
         ]
-        .map(|(role, id, generation)| {
+        .map(|(role, key, generation)| {
+            let storage = key
+                .position
+                .storage
+                .lock()
+                .expect("source slot storage")
+                .take()
+                .expect("same validated original pair storage");
             Position::from_admitted(
                 self.identity.clone(),
-                id,
+                key.address(),
                 generation,
                 role,
+                storage,
                 self.pending.clone(),
                 self.health.clone(),
             )
@@ -791,12 +873,36 @@ impl Drop for SourcePositions {
         // Normal cleanup must explicitly move original holders out. A lost
         // inventory is an owner invariant failure, not a shutdown shortcut.
         for position in self.positions.values() {
-            if position.custody.phase() == ExitRolePhase::Retired {
+            if position.custody.phase() == ExitRolePhase::Retired
+                && position
+                    .storage
+                    .lock()
+                    .expect("source slot storage")
+                    .is_none()
+            {
                 position.release_retention();
             } else {
                 position.note_abandoned();
             }
         }
+    }
+}
+
+/// Final slot removal transfers this same unique payment out of the bank.
+/// Only the caller outside the handoff lock may actually return its units.
+#[must_use = "Release detached SourceSlot storage only after leaving the bank lock"]
+pub(crate) struct DetachedSourceSlotStorage {
+    storage: SourceSlotStorage,
+}
+impl DetachedSourceSlotStorage {
+    pub(crate) fn release(&mut self) -> Result<(), RuntimeError> {
+        self.storage.release()
+    }
+}
+impl std::fmt::Debug for DetachedSourceSlotStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DetachedSourceSlotStorage")
+            .finish_non_exhaustive()
     }
 }
 
@@ -968,7 +1074,13 @@ impl RetirementProbe {
             .expect("original source position")
             .payload
             .permits_retirement();
-        if no_payload && self.position.custody.reusable() {
+        let storage_present = self
+            .position
+            .storage
+            .lock()
+            .expect("source slot storage")
+            .is_some();
+        if no_payload && storage_present && self.position.custody.reusable() {
             Ok(ReapedPosition {
                 position: self.position,
             })
@@ -1002,7 +1114,9 @@ metadata_debug!(
 #[cfg(test)]
 mod tests {
     mod residency;
+    mod slot_storage;
     use super::*;
+    use crate::task_completion_roles::AdmittedCompletionRole;
     use novarocks_control_runtime::{
         completion::ReportSlot,
         lease::{CapacityBundle, WorkLease},
@@ -1030,6 +1144,29 @@ mod tests {
         },
     };
 
+    // Empty-vector protocol fixtures explicitly opt into Model payment.
+    fn reported(role: AdmittedCompletionRole) -> ReportedWork {
+        super::super::admitted_role::adopt_reported_work(role.work, role.capacity, role.report)
+    }
+    fn model(role: AdmittedCompletionRole) -> SourceSlotAdmission {
+        SourceSlotAdmission::protocol_model(reported(role))
+    }
+    fn raw_reported(role: ReportedWork) -> AdmittedCompletionRole {
+        let (work, capacity, report) = role.into_parts();
+        AdmittedCompletionRole {
+            work,
+            capacity,
+            report,
+        }
+    }
+    fn raw_admission(admission: SourceSlotAdmission) -> AdmittedCompletionRole {
+        let (role, payment) = admission.into_originals();
+        assert!(
+            payment.is_none(),
+            "this fixture explicitly uses Model payment"
+        );
+        raw_reported(role)
+    }
     struct Pending(AtomicUsize);
     impl TaskPendingNotice for Pending {
         fn pending(&self) {
@@ -1068,7 +1205,7 @@ mod tests {
         let roles = [f.role(), f.role()];
         let pair = f
             .bank_mut()
-            .append_pair(roles)
+            .append_pair(roles.map(model))
             .unwrap_or_else(|_| panic!("original paid pair"));
         let key = pair.keys()[0].clone();
         let version = f.ledger.change_version();
@@ -1192,7 +1329,7 @@ mod tests {
         fn append(&mut self) -> SourcePositionId {
             let role = self.role();
             self.bank_mut()
-                .append_admitted(role)
+                .append_admitted(model(role))
                 .map(|key| key.address())
                 .unwrap_or_else(|_| panic!("original paid position"))
         }
@@ -1237,8 +1374,16 @@ mod tests {
             assert_eq!(self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap(), 1);
             assert!(custody.reusable());
         }
-        fn retire(&mut self, id: SourcePositionId) {
+        fn reap_generation(&mut self, id: SourcePositionId) -> ReapedPosition {
             let custody = self.bank().custody(id).unwrap();
+            if custody.phase() == ExitRolePhase::Retired {
+                return self
+                    .bank()
+                    .retirement_probe(id)
+                    .unwrap()
+                    .observe_reaped()
+                    .unwrap();
+            }
             assert_eq!(custody.phase(), ExitRolePhase::Exited);
             if self.bank().phase(id).unwrap() == SourcePositionPhase::Unused {
                 assert_unused_report(&custody);
@@ -1264,13 +1409,20 @@ mod tests {
                     .is_err()
             );
             assert_eq!(self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap(), 1);
-            let reaped = self
-                .bank()
+            self.bank()
                 .retirement_probe(id)
                 .unwrap()
                 .observe_reaped()
-                .unwrap();
-            self.bank_mut().release_reaped(reaped).unwrap();
+                .unwrap()
+        }
+        fn retire_generation(&mut self, id: SourcePositionId) {
+            let reaped = self.reap_generation(id);
+            self.bank_mut().mark_generation_retired(reaped).unwrap();
+        }
+        fn retire(&mut self, id: SourcePositionId) {
+            let reaped = self.reap_generation(id);
+            let mut detached = self.bank_mut().release_reaped(reaped).unwrap();
+            detached.release().unwrap();
         }
         fn finish(mut self) {
             let resident = self.bank().positions.keys().copied().collect::<Vec<_>>();
@@ -1284,6 +1436,15 @@ mod tests {
                 }
                 if self.bank().phase(id).unwrap() != SourcePositionPhase::Retired {
                     self.retire(id);
+                } else {
+                    let reaped = self
+                        .bank()
+                        .retirement_probe(id)
+                        .unwrap()
+                        .observe_reaped()
+                        .unwrap();
+                    let mut detached = self.bank_mut().release_reaped(reaped).unwrap();
+                    detached.release().unwrap();
                 }
             }
             self.parent.body_exited().unwrap();
@@ -1512,12 +1673,16 @@ mod tests {
             .unwrap();
         let role = f.role();
         f.bank_mut()
-            .replace_after_reap(first, role)
+            .replace_after_reap(first, reported(role))
             .unwrap_or_else(|_| panic!("same original reaped position"));
         assert_eq!(f.bank().phase(id).unwrap(), SourcePositionPhase::Available);
         let role = f.role();
         let original_work = role.work.id();
-        let (error, returned) = f.bank_mut().replace_after_reap(stale, role).unwrap_err();
+        let (error, returned) = f
+            .bank_mut()
+            .replace_after_reap(stale, reported(role))
+            .unwrap_err();
+        let returned = raw_reported(returned);
         assert_eq!(error, SourcePositionError::WrongGeneration);
         assert_eq!(returned.work.id(), original_work);
         f.dispose_role(returned);
@@ -1685,12 +1850,12 @@ mod tests {
         let roles = [f.role(), f.role()];
         let mut open = f
             .bank_mut()
-            .append_pair(roles)
+            .append_pair(roles.map(model))
             .unwrap_or_else(|_| panic!("paid open pair"));
         let roles = [f.role(), f.role()];
         let mut cut = f
             .bank_mut()
-            .append_pair(roles)
+            .append_pair(roles.map(model))
             .unwrap_or_else(|_| panic!("paid cut pair"));
         let original_open = open.positions();
         let original_cut = cut.positions();
@@ -1711,7 +1876,8 @@ mod tests {
         );
         let roles = [f.role(), f.role()];
         let ids = roles.each_ref().map(|role| role.work.id());
-        let (error, returned) = f.bank_mut().append_pair(roles).unwrap_err();
+        let (error, returned) = f.bank_mut().append_pair(roles.map(model)).unwrap_err();
+        let returned = returned.map(raw_admission);
         assert_eq!(error, SourcePositionError::Full);
         assert_eq!(returned.each_ref().map(|role| role.work.id()), ids);
         for role in returned {
@@ -1728,7 +1894,7 @@ mod tests {
         let roles = [f.role(), f.role()];
         let mut pair = f
             .bank_mut()
-            .append_pair(roles)
+            .append_pair(roles.map(model))
             .unwrap_or_else(|_| panic!("paid pair admission"));
         let addresses = pair.positions();
         let original_key = pair.keys()[0].clone();
@@ -1747,7 +1913,7 @@ mod tests {
                 f.bank_mut().install(bound).unwrap();
                 drop(f.bank_mut().take_source(source_id).unwrap());
                 assert_eq!(dropped.load(Ordering::SeqCst), 1);
-                f.retire(key.address());
+                f.retire_generation(key.address());
             }
             assert_eq!(f.scope.snapshot().unwrap().work, 5);
             let witnesses = pair.keys().map(|key| {
@@ -1762,7 +1928,7 @@ mod tests {
             let version = f.ledger.change_version();
             pair = f
                 .bank_mut()
-                .rearm_pair(pair, witnesses, roles)
+                .rearm_pair(pair, witnesses, roles.map(reported))
                 .unwrap_or_else(|_| panic!("reaped pair replacement"));
             assert_eq!(
                 f.ledger.change_version(),
@@ -1800,12 +1966,12 @@ mod tests {
         let roles = [f.role(), f.role()];
         let pair = f
             .bank_mut()
-            .append_pair(roles)
+            .append_pair(roles.map(model))
             .unwrap_or_else(|_| panic!("paid pair admission"));
         let addresses = pair.positions();
         let keys = pair.keys().map(Clone::clone);
         f.bank_mut().take_unused(&keys[0]).unwrap().exit();
-        f.retire(addresses[0]);
+        f.retire_generation(addresses[0]);
         assert!(
             f.bank()
                 .retirement_probe_for(pair.keys()[1])
@@ -1825,12 +1991,15 @@ mod tests {
         let roles = [f.role(), f.role()];
         let ids = roles.each_ref().map(|role| role.work.id());
         let before = f.scope.snapshot().unwrap();
-        let (error, pair, witnesses, returned) =
-            f.bank_mut().rearm_pair(pair, witnesses, roles).unwrap_err();
+        let (error, pair, witnesses, returned) = f
+            .bank_mut()
+            .rearm_pair(pair, witnesses, roles.map(reported))
+            .unwrap_err();
+        let returned = returned.map(raw_reported);
         assert_eq!(error, SourcePositionError::WrongGeneration);
         assert_eq!(returned.each_ref().map(|role| role.work.id()), ids);
         assert_eq!(f.scope.snapshot().unwrap(), before);
-        assert!(!f.bank().positions.contains_key(&addresses[0]));
+        assert!(f.bank().positions.contains_key(&addresses[0]));
         assert_eq!(
             f.bank().inspect(&keys[0]).unwrap().phase,
             SourcePositionPhase::Retired
@@ -1844,7 +2013,7 @@ mod tests {
             SourcePositionPhase::Available
         );
         f.bank_mut().take_unused(&keys[1]).unwrap().exit();
-        f.retire(addresses[1]);
+        f.retire_generation(addresses[1]);
         let [first, _duplicate] = witnesses;
         let second = f
             .bank()
@@ -1854,7 +2023,7 @@ mod tests {
             .unwrap();
         let pair = f
             .bank_mut()
-            .rearm_pair(pair, [first, second], returned)
+            .rearm_pair(pair, [first, second], returned.map(reported))
             .unwrap_or_else(|_| panic!("reaped pair replacement"));
         for key in pair.keys() {
             assert_eq!(key.position.generation, 2);
@@ -1869,7 +2038,7 @@ mod tests {
         let id = f.append();
         let stale = f.key(id);
         f.bank_mut().take_unused(&stale).unwrap().exit();
-        f.retire(id);
+        f.retire_generation(id);
         let reaped = f
             .bank()
             .retirement_probe_for(&stale)
@@ -1879,7 +2048,7 @@ mod tests {
         let role = f.role();
         let fresh = f
             .bank_mut()
-            .replace_after_reap(reaped, role)
+            .replace_after_reap(reaped, reported(role))
             .unwrap_or_else(|_| panic!("reaped replacement"));
         let version = f.ledger.change_version();
         assert!(matches!(
@@ -1920,7 +2089,7 @@ mod tests {
         let roles = [f.role(), f.role()];
         let pair = f
             .bank_mut()
-            .append_pair(roles)
+            .append_pair(roles.map(model))
             .unwrap_or_else(|_| panic!("paid pair admission"));
         let addresses = pair.positions();
         let key = pair.keys()[0].clone();
@@ -1950,7 +2119,7 @@ mod tests {
         );
         let late = accepted.originating_failure().unwrap().clone();
         f.bank_mut().take_unused(pair.keys()[1]).unwrap().exit();
-        f.retire(addresses[1]);
+        f.retire_generation(addresses[1]);
         assert!(
             f.bank()
                 .retirement_probe_for(pair.keys()[0])
@@ -1996,7 +2165,7 @@ mod tests {
         let roles = [f.role(), f.role()];
         let fresh = f
             .bank_mut()
-            .rearm_pair(pair, witnesses, roles)
+            .rearm_pair(pair, witnesses, roles.map(reported))
             .unwrap_or_else(|_| panic!("reaped pair replacement"));
         assert_eq!(fresh.positions(), addresses);
         assert_eq!(f.bank().len(), 2);
@@ -2012,12 +2181,12 @@ mod tests {
         let roles = [f.role(), f.role()];
         let pair = f
             .bank_mut()
-            .append_pair(roles)
+            .append_pair(roles.map(model))
             .unwrap_or_else(|_| panic!("paid pair"));
         let addresses = pair.positions();
         for key in pair.keys() {
             f.bank_mut().take_unused(key).unwrap().exit();
-            f.retire(key.address());
+            f.retire_generation(key.address());
         }
         let witnesses = pair.keys().map(|key| {
             f.bank()
@@ -2035,13 +2204,16 @@ mod tests {
         let role = f.role();
         let fresh = f
             .bank_mut()
-            .replace_after_reap(replacement_witness, role)
+            .replace_after_reap(replacement_witness, reported(role))
             .unwrap_or_else(|_| panic!("one original replacement"));
         let roles = [f.role(), f.role()];
         let original_work = roles.each_ref().map(|role| role.work.id());
         let before = f.scope.snapshot().unwrap();
-        let (error, _original_pair, _witnesses, returned) =
-            f.bank_mut().rearm_pair(pair, witnesses, roles).unwrap_err();
+        let (error, _original_pair, _witnesses, returned) = f
+            .bank_mut()
+            .rearm_pair(pair, witnesses, roles.map(reported))
+            .unwrap_err();
+        let returned = returned.map(raw_reported);
         assert_eq!(error, SourcePositionError::WrongGeneration);
         assert_eq!(
             returned.each_ref().map(|role| role.work.id()),

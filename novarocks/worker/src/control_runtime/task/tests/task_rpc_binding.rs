@@ -36,9 +36,8 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     let initial_open = host.request_admission_open() && host.task_id() == identity;
     let admitted =
         reserve_reported_role(&f.scope, parent, WorkKind::Settlement, Some(generation())).unwrap();
-    let admission = CutSourceAdmission::Fresh(
-        reserve_source_roles::<2>(&f.scope, parent, generation()).unwrap(),
-    );
+    let admission =
+        CutSourceAdmission::Fresh(test_model_source_slots::<2>(&f.scope, parent, generation()));
     let request = RequestMetadata {
         operation: operation(92),
         deadline: MonotonicInstant::from_origin(Duration::from_nanos(99)),
@@ -64,12 +63,11 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     let work = rejected.work.id();
     let capacity = rejected.capacity.id();
     let report = rejected.report.clone();
-    let source_roles = reserve_source_roles::<2>(&f.scope, parent, generation()).unwrap();
+    let source_roles = test_model_source_slots::<2>(&f.scope, parent, generation());
     let sources = source_roles.each_ref().map(|source| {
         (
-            source.work.id(),
-            source.capacity.id(),
-            source.report.clone(),
+            source.reported().work().id(),
+            source.reported().report().clone(),
         )
     });
     let before_reject = f.scope.snapshot().unwrap();
@@ -99,17 +97,26 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
             .each_ref()
             .iter()
             .zip(&sources)
-            .all(|(source, (work, capacity, report))| {
-                source.work.id() == *work
-                    && source.capacity.id() == *capacity
-                    && source.report.same_slot(report)
+            .all(|(source, (work, report))| {
+                source.reported().work().id() == *work
+                    && source.reported().report().same_slot(report)
             });
     let no_new_cut_or_stop = f.scope.snapshot().unwrap() == before_reject
         && host.causal().cut_inventory(None, 4) == vec![cut];
     dispose_unused_completion(rejected);
-    for source in source_roles {
-        dispose_unused_completion(source);
+    let mut unused =
+        crate::control_runtime::source_slot_issuer::SourceSlotIssuePartial::from_admissions(
+            &f.scope,
+            source_roles,
+        );
+    let mut unused_retired = false;
+    for _ in 0..128 {
+        if unused.try_retire(&f.ledger).unwrap() {
+            unused_retired = true;
+            break;
+        }
     }
+    assert!(unused_retired);
 
     // The original already-admitted sender still really returns after closure.
     // This neither exits its main R nor fabricates a Core event/consumption.
@@ -141,7 +148,9 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
         .prepare_owned_pair_reap(&retired.pair)
         .unwrap()
         .map(|probe| probe.observe_reaped().unwrap());
-    ingress.release_owned_pair(&retired.pair, reaped).unwrap();
+    for mut storage in ingress.release_owned_pair(&retired.pair, reaped).unwrap() {
+        storage.release().unwrap();
+    }
     drop(retired);
     let mut resources = host.into_resources();
     finish_source_routes(&f, &ingress);

@@ -38,10 +38,11 @@ pub(super) struct TaskRequestRoute {
     prefix_retired: bool,
     cut_consumed: bool,
     retired: Option<RetiredCut>,
-    funding_restored: bool,
     sources_exited: bool,
     reaped: [Option<ReapedPosition>; 2],
+    prefix_reaped: [Option<ReapedPosition>; 2],
     sources_released: bool,
+    detached: Option<[crate::control_runtime::source_positions::DetachedSourceSlotStorage; 2]>,
 }
 impl TaskRequestRoute {
     pub(super) fn new(
@@ -61,10 +62,11 @@ impl TaskRequestRoute {
             prefix_retired: false,
             cut_consumed: false,
             retired: None,
-            funding_restored: false,
             sources_exited: false,
             reaped: [None, None],
+            prefix_reaped: [None, None],
             sources_released: false,
+            detached: None,
         }
     }
     pub(super) fn task(&self) -> TaskIdentity {
@@ -239,19 +241,70 @@ impl TaskRequestRoute {
                     .map_err(|error| ContextRequestError::Causal(error.into()))?;
                 self.cut_consumed = true;
             }
-            match task
+            let result = task
                 .causal()
-                .retire_after_exit(self.cut, CausalSourceRetirement::Unclaimed)
-            {
+                .retire_after_exit(self.cut, CausalSourceRetirement::Unclaimed);
+            match result {
                 Ok(retired) => self.retired = Some(retired),
                 Err(refusal) => match refusal.error {
                     CausalError::Cut(
-                        novarocks_worker_protocol::proposal_summary::CutError::NotReady
-                        | novarocks_worker_protocol::proposal_summary::CutError::Consuming
-                        | novarocks_worker_protocol::proposal_summary::CutError::ExitUnobserved,
+                        novarocks_worker_protocol::proposal_summary::CutError::ExitUnobserved,
                     )
                     | CausalError::Source(
                         SourcePositionError::NotAvailable | SourcePositionError::SourceStillHeld,
+                    ) => {
+                        // A real candidate source is independent of main-R
+                        // exit. Only its original holder/report/reap facts can
+                        // retire this prefix. Never turn a claim into unused.
+                        let ingress = task.port().ingress().clone();
+                        let route = crate::task_proposal_ingress::PairRoute::Cut(self.cut);
+                        for source in ingress
+                            .pair_inventory(route)
+                            .map_err(|error| ContextRequestError::Causal(error.into()))?
+                        {
+                            if !source
+                                .custody
+                                .try_retire()
+                                .map_err(ContextRequestError::Exit)?
+                            {
+                                return Ok(false);
+                            }
+                        }
+                        original
+                            .ledger
+                            .reap_scope_ready(original.scope.id(), 1)
+                            .map_err(ContextRequestError::Runtime)?;
+                        let probes = ingress
+                            .prepare_pair_reap(route)
+                            .map_err(|error| ContextRequestError::Causal(error.into()))?;
+                        for (saved, probe) in self.prefix_reaped.iter_mut().zip(probes) {
+                            if saved.is_none() {
+                                *saved = probe.observe_reaped().ok();
+                            }
+                        }
+                        if self.prefix_reaped.iter().any(Option::is_none) {
+                            original.endpoint.external().notify();
+                            return Ok(false);
+                        }
+                        let reaped = self.prefix_reaped.each_mut().map(|saved| {
+                            saved.take().expect("both actual prefix source witnesses")
+                        });
+                        match task
+                            .causal()
+                            .retire_after_exit(self.cut, CausalSourceRetirement::Reaped(reaped))
+                        {
+                            Ok(retired) => self.retired = Some(retired),
+                            Err(refusal) => {
+                                if let CausalSourceRetirement::Reaped(reaped) = refusal.retirement {
+                                    self.prefix_reaped = reaped.map(Some);
+                                }
+                                return Err(ContextRequestError::Causal(refusal.error));
+                            }
+                        }
+                    }
+                    CausalError::Cut(
+                        novarocks_worker_protocol::proposal_summary::CutError::NotReady
+                        | novarocks_worker_protocol::proposal_summary::CutError::Consuming,
                     )
                     | CausalError::Driver(DriverError::RoleBusy) => return Ok(false),
                     error => return Err(ContextRequestError::Causal(error)),
@@ -259,30 +312,6 @@ impl TaskRequestRoute {
             }
         }
         let ingress = task.port().ingress().clone();
-        if !self.funding_restored {
-            let retired = self.retired.take().expect("original retired Task RPC cut");
-            match ingress.restore_retired_funding_pair(retired) {
-                Ok(retired) => {
-                    self.retired = Some(retired);
-                    self.funding_restored = true;
-                }
-                Err((error, retired)) => {
-                    self.retired = Some(retired);
-                    match error {
-                        crate::task_proposal_ingress::IngressError::Cut(
-                            novarocks_worker_protocol::proposal_summary::CutError::NotReady,
-                        )
-                        | crate::task_proposal_ingress::IngressError::Source(
-                            SourcePositionError::NotAvailable
-                            | SourcePositionError::SourceStillHeld,
-                        ) => {
-                            return Ok(false);
-                        }
-                        error => return Err(ContextRequestError::Causal(error.into())),
-                    }
-                }
-            }
-        }
         let retired = self.retired.as_ref().expect("same original paid pair");
         if !self.sources_exited {
             let unused = ingress
@@ -328,12 +357,22 @@ impl TaskRequestRoute {
                 .reaped
                 .each_mut()
                 .map(|saved| saved.take().expect("both actual reap witnesses"));
-            if let Err((error, reaped)) = ingress.release_owned_pair(&retired.pair, reaped) {
-                self.reaped = reaped.map(Some);
-                return Err(ContextRequestError::Causal(error.into()));
-            }
+            let detached = match ingress.release_owned_pair(&retired.pair, reaped) {
+                Ok(storage) => storage,
+                Err((error, reaped)) => {
+                    self.reaped = reaped.map(Some);
+                    return Err(ContextRequestError::Causal(error.into()));
+                }
+            };
+            self.detached = Some(detached);
             self.sources_released = true;
         }
+        if let Some(detached) = &mut self.detached {
+            for storage in detached {
+                storage.release().map_err(ContextRequestError::Runtime)?;
+            }
+        }
+        self.detached = None;
         if !self.outer.is_released() {
             let resources = self
                 .outer
@@ -353,6 +392,7 @@ impl ContextRequestPartial {
         ledger: RuntimeLedger,
     ) -> Self {
         let work_retirement = funding.author.work.retirement_observer();
+        let scope = funding.author.work.scope().clone();
         Self {
             ledger,
             work: funding.author.work,
@@ -364,14 +404,10 @@ impl ContextRequestPartial {
             exited: false,
             unresolved: false,
             outer: Some(funding.outer),
-            sources: funding
-                .sources
-                .into_iter()
-                .map(|admitted| UnusedRequestSource {
-                    retirement: admitted.work.retirement_observer(),
-                    admitted: Some(admitted),
-                })
-                .collect(),
+            sources: Some(SourceSlotIssuePartial::from_admissions(
+                &scope,
+                funding.sources,
+            )),
         }
     }
 }

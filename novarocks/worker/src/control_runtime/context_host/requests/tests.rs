@@ -30,6 +30,9 @@ use crate::control_runtime::{
     context_host::requests::{ContextRequestError, ContextRequestPublishRefusal},
     request_ready::ControlRequestReady,
 };
+use crate::control_runtime::{
+    source_positions::SOURCE_SLOT_STORAGE, source_slot_issuer::SourceSlotIssuePartial,
+};
 use novarocks_control_runtime::completion::ReportSlot;
 use novarocks_control_runtime_core::{
     completion::{ConsumerKind, Consumption},
@@ -680,7 +683,7 @@ fn task_request_source_siblings_and_outer_keep_shared_r_after_the_original_autho
         let main_retirement = author.work.retirement_observer();
         let source_retirements = sources
             .each_ref()
-            .map(|source| source.work.retirement_observer());
+            .map(|source| source.reported().work().retirement_observer());
         let (main, authority) = ExitRole::from_admitted(adopt_reported_work(
             author.work,
             author.capacity,
@@ -696,9 +699,18 @@ fn task_request_source_siblings_and_outer_keep_shared_r_after_the_original_autho
             && main.phase() == ExitRolePhase::Retired;
         all_sources_still_live &= source_retirements.iter().all(|source| !source.is_retired());
         let original_outer = outer.resources().unwrap();
+        assert_eq!(original_outer.get(Dimension::Work.id()), 0);
+        let original_source_payment = SOURCE_SLOT_STORAGE
+            .checked_mul(2)
+            .unwrap()
+            .resources()
+            .unwrap();
+        let retained = original_outer
+            .checked_add(&original_source_payment)
+            .unwrap();
         for (index, dimension) in dimensions.iter().enumerate() {
-            original_outer_preserved &= f.ledger.used(dimension.id())
-                == baseline[index] + original_outer.get(dimension.id());
+            original_outer_preserved &=
+                f.ledger.used(dimension.id()) == baseline[index] + retained.get(dimension.id());
         }
         let refusal = f
             .service
@@ -711,9 +723,15 @@ fn task_request_source_siblings_and_outer_keep_shared_r_after_the_original_autho
         if let Some(partial) = refusal.partial {
             assert!(advance(&mut f, partial));
         }
-        for source in sources {
-            dispose_unused_completion(source);
+        let mut partial = SourceSlotIssuePartial::from_admissions(&scope, sources);
+        let mut source_exit = false;
+        for _ in 0..8 {
+            if partial.try_retire(&f.ledger).unwrap() {
+                source_exit = true;
+                break;
+            }
         }
+        assert!(source_exit);
         f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
         assert!(source_retirements.iter().all(|source| source.is_retired()));
         // Main Work has already gone; the same original outer is still the
@@ -822,8 +840,8 @@ fn task_funding_in_a_cleanup_epoch_keeps_the_original_core_consumer_generation()
         .unwrap();
     let reports = [
         funding.author.report.clone(),
-        funding.sources[0].report.clone(),
-        funding.sources[1].report.clone(),
+        funding.sources[0].reported().report().clone(),
+        funding.sources[1].reported().report().clone(),
     ];
     let mut original_core_legs = true;
     for report in &reports {
@@ -840,9 +858,15 @@ fn task_funding_in_a_cleanup_epoch_keeps_the_original_core_consumer_generation()
     ));
     let no_invented_physical_exit = !main.body_exited() && !main.captures_exited();
     authority.withdraw_unpublished_and_exit().unwrap();
-    for source in funding.sources {
-        dispose_unused_completion(source);
+    let mut partial = SourceSlotIssuePartial::from_admissions(&scope, funding.sources);
+    let mut source_exit = false;
+    for _ in 0..8 {
+        if partial.try_retire(&f.ledger).unwrap() {
+            source_exit = true;
+            break;
+        }
     }
+    assert!(source_exit);
     f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
     let retired = main.try_retire().unwrap();
     let mut outer = funding.outer;
@@ -1029,6 +1053,7 @@ fn live_loading_task_fixture() -> (Harness, TaskIdentity) {
             &f.runtime,
             &load,
             crate::control_runtime::task::TaskHostBinding {
+                source_storage_model: false,
                 context: f.identity,
                 task_source: ActorId::new(86).unwrap(),
                 protocol_generation: generation(),
@@ -1108,6 +1133,18 @@ fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
     }
     let scope = f.service.context(f.identity).unwrap().scope().clone();
     f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
+    for route in [PairRoute::Open, PairRoute::ConsumingOpen] {
+        let reaped = ingress
+            .prepare_pair_reap(route)
+            .unwrap()
+            .map(|probe| probe.observe_reaped().unwrap());
+        let storage = ingress
+            .release_closed_route_pair(route, reaped)
+            .unwrap_or_else(|_| panic!("actual source and summary teardown"));
+        for mut payment in storage {
+            payment.release().unwrap();
+        }
+    }
     resources.lifetime.body_exited().unwrap();
     resources.lifetime.captures_exited().unwrap();
     if let Some(open) = &mut resources.open_summary {
@@ -1427,6 +1464,7 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
         .unwrap();
     assert_eq!(before.len(), 1);
     let binding = || crate::control_runtime::task::TaskHostBinding {
+        source_storage_model: false,
         context: original.identity,
         task_source: ActorId::new(86).unwrap(),
         protocol_generation: generation(),

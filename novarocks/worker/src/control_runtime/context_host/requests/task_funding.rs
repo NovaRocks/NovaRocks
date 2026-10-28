@@ -20,7 +20,11 @@
 //! remains paid until the containing request observes all those real exits.
 
 use super::*;
-use crate::control_runtime::admitted_role::reserve_reported_role;
+use crate::control_runtime::{
+    source_positions::SourceSlotAdmission,
+    source_slot_issuer::{SourceSlotPayer, reserve_source_slots},
+};
+use crate::task_completion_roles::AdmittedCompletionRole;
 
 const AUTHOR_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
@@ -40,7 +44,7 @@ const AUTHOR_STORAGE: StorageNeed = StorageNeed {
 #[must_use = "The original Task request must retain its outer funding and source holders"]
 pub(crate) struct TaskRequestFunding {
     pub author: AdmittedCompletionRole,
-    pub sources: [AdmittedCompletionRole; 2],
+    pub sources: [SourceSlotAdmission; 2],
     pub outer: CapacityBundle,
 }
 impl ContextHostRecord {
@@ -91,7 +95,7 @@ impl ContextHostRecord {
             exited: false,
             unresolved: false,
             outer: None,
-            sources: Vec::with_capacity(2),
+            sources: None,
         };
         partial.outer = match partial.capacity.split_next(&outer) {
             Ok(outer) => Some(outer),
@@ -119,28 +123,21 @@ impl ContextHostRecord {
             Ok(report) => Some(report),
             Err(e) => return Err((ContextRequestError::Runtime(e), Some(partial))),
         };
-        for _ in 0..2 {
-            let admitted = match reserve_reported_role(
-                scope,
-                parent,
-                WorkKind::Cleanup,
-                Some(self.initial_generation),
-            ) {
-                Ok(admitted) => admitted,
-                Err(e) => return Err((ContextRequestError::Runtime(e), Some(partial))),
-            };
-            partial.sources.push(UnusedRequestSource {
-                retirement: admitted.work.retirement_observer(),
-                admitted: Some(admitted),
-            });
-        }
-        let sources = partial
-            .sources
-            .into_iter()
-            .map(|source| source.admitted.expect("original unexposed source"))
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("the original Task R always funds Source2"));
+        let sources = match reserve_source_slots::<2>(
+            scope,
+            parent,
+            self.initial_generation,
+            SourceSlotPayer::Retained(partial.outer.as_mut().expect("original R outer")),
+        ) {
+            Ok(slots) => slots,
+            Err(refusal) => {
+                partial.sources = Some(refusal.partial);
+                return Err((
+                    ContextRequestError::SourceSlots(refusal.error),
+                    Some(partial),
+                ));
+            }
+        };
         Ok(TaskRequestFunding {
             author: AdmittedCompletionRole {
                 work: partial.work,

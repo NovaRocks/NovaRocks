@@ -796,15 +796,19 @@ mod tests {
         // only the host observer, never a fictitious Core InputId consumer.
         let roles = std::array::from_fn(|index| {
             let role = admitted_source(&scope, capacity.id());
+            let mut role = role;
             if prestart_first_source && index == 0 {
-                let mut role = role;
                 // Deliberate custody fault: the original binder must reject
                 // this already-started header and preserve Unknown custody.
                 role.work.start().unwrap();
-                role
-            } else {
-                role
             }
+            crate::control_runtime::source_positions::SourceSlotAdmission::protocol_model(
+                crate::control_runtime::admitted_role::adopt_reported_work(
+                    role.work,
+                    role.capacity,
+                    role.report,
+                ),
+            )
         });
         let health = Arc::new(ExecutionHealth::default());
         let ingress = Arc::new(

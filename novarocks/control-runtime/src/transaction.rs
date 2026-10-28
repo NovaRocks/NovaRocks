@@ -677,6 +677,13 @@ impl ScopeHandle {
     pub const fn id(&self) -> ScopeId {
         self.id
     }
+    /// Identity of the same original scope, independent of its current gates
+    /// or generation. Matching numbers in another ledger do not match. This
+    /// read grants no admission, start, publication or capacity authority.
+    pub fn same_scope(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.runtime.shared, &other.runtime.shared)
+    }
+
     pub(crate) fn attach_actor(&self, slot: SlotId) -> Result<(), RuntimeError> {
         let mut state = self
             .runtime

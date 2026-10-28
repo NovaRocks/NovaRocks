@@ -222,6 +222,33 @@ impl TaskOpenSummaryInbox {
         }
         Ok(delivered)
     }
+    /// Take an original queued summary which never filled this input. Only
+    /// the actual drained failure session can name its Core leg abandoned.
+    /// No new input, report, producer or storage credit is admitted here.
+    pub(crate) fn take_failed_queued(
+        &mut self,
+        drained: &ScopePublicationsDrained<'_>,
+    ) -> Result<Option<crate::task_proposal_ingress::SummaryInput>, OpenSummaryError> {
+        drained.validate(&self.runtime, self.actor)?;
+        if self.closed || self.delivered.is_some() || self.input.in_flight()?.is_some() {
+            return Err(OpenSummaryError::Busy);
+        }
+        self.ingress.fail();
+        let original = self.ingress.take_failed_open_summary()?;
+        if let Some(original) = &original {
+            let mut sources = [None, None];
+            for (target, source) in sources.iter_mut().zip(original.summary.candidate_sources()) {
+                *target = Some(source);
+            }
+            self.delivered = Some(Delivered {
+                input: None,
+                sources,
+                consumption: Consumption::AbandonedByOwnerFailure,
+                rejected: None,
+            });
+        }
+        Ok(original)
+    }
     /// Only the real failed-owner publication session can abandon the Core
     /// leg. A refused fill proves that no input transferred; a transferred one
     /// must have the actual runtime abandonment phase before takeover.

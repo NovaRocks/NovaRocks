@@ -62,24 +62,32 @@ fn reap_without_releasing(f: &Fixture, key: &SourcePositionKey) -> ReapedPositio
 }
 
 #[test]
-fn a_second_old_witness_cannot_revive_a_replacement_after_its_row_was_released() {
+fn a_second_old_witness_cannot_revive_a_replacement_after_final_slot_detach() {
     let mut f = Fixture::new(1);
     let id = f.append();
     let old_key = f.key(id);
-    // Distinct non-Clone probes observe the same actual original, not an ID
-    // synthesized after its resident row disappeared.
-    let probes =
-        std::array::from_fn::<_, 2, _>(|_| f.bank().retirement_probe_for(&old_key).unwrap());
     exit_used_source(&mut f, &old_key, SourceId(8101));
-    f.retire(id);
-    assert_eq!(f.bank().len(), 0);
-    let [first_witness, second_witness] = probes.map(|probe| probe.observe_reaped().unwrap());
+    let first = reap_without_releasing(&f, &old_key);
+    let stale = f
+        .bank()
+        .retirement_probe_for(&old_key)
+        .unwrap()
+        .observe_reaped()
+        .unwrap();
+    f.bank_mut().mark_generation_retired(first).unwrap();
+    assert_eq!(f.bank().len(), 1, "a reusable slot retains its row and fee");
+    let first = f
+        .bank()
+        .retirement_probe_for(&old_key)
+        .unwrap()
+        .observe_reaped()
+        .unwrap();
     let role = f.role();
     let replacement_report = role.report.clone();
     let replacement = f
         .bank_mut()
-        .replace_after_reap(first_witness, role)
-        .unwrap_or_else(|_| panic!("the original reaped role may be replaced once"));
+        .replace_after_reap(first, reported(role))
+        .unwrap_or_else(|_| panic!("one real retired generation retains its paid slot"));
     assert_eq!(replacement.address(), old_key.address());
     assert!(!replacement.same_original(&old_key));
     assert!(
@@ -90,8 +98,6 @@ fn a_second_old_witness_cannot_revive_a_replacement_after_its_row_was_released()
             .report()
             .same_slot(&replacement_report)
     );
-    assert_eq!(f.bank().len(), 1);
-
     exit_used_source(&mut f, &replacement, SourceId(8102));
     f.retire(replacement.address());
     assert_eq!(f.bank().len(), 0);
@@ -104,117 +110,76 @@ fn a_second_old_witness_cannot_revive_a_replacement_after_its_row_was_released()
     let version = f.ledger.change_version();
     let (error, returned) = f
         .bank_mut()
-        .replace_after_reap(second_witness, role)
+        .replace_after_reap(stale, reported(role))
         .unwrap_err();
-    assert_eq!(error, SourcePositionError::WrongGeneration);
-    assert_eq!(f.bank().len(), 0, "no retired original Arc was resurrected");
-    assert_eq!(returned.work.id(), work);
-    assert_eq!(returned.capacity.id(), reservation);
-    assert!(returned.report.same_slot(&report));
-    assert!(!retired.is_retired());
-    assert_eq!(f.scope.snapshot().unwrap(), before);
-    assert_eq!(f.ledger.change_version(), version);
+    let returned = raw_reported(returned);
+    let refused = error == SourcePositionError::WrongGeneration
+        && returned.work.id() == work
+        && returned.capacity.id() == reservation
+        && returned.report.same_slot(&report)
+        && !retired.is_retired();
+    let unchanged = f.bank().len() == 0
+        && f.scope.snapshot().unwrap() == before
+        && f.ledger.change_version() == version;
     f.dispose_role(returned);
-    assert!(retired.is_retired());
     f.finish();
+    assert!(refused && unchanged && retired.is_retired());
 }
 
 #[test]
-fn a_mixed_resident_pair_returns_whole_originals_on_full_and_retries_after_real_release() {
+fn a_pair_with_one_finally_detached_leg_returns_all_originals_even_when_residency_is_available() {
     let mut f = Fixture::new(2);
     let roles = [f.role(), f.role()];
-    let pair = f
-        .bank_mut()
-        .append_pair(roles)
-        .unwrap_or_else(|_| panic!("original paid pair"));
+    let pair = f.bank_mut().append_pair(roles.map(model)).unwrap();
     let addresses = pair.positions();
     let keys = pair.keys().map(Clone::clone);
-    let released_probe = f.bank().retirement_probe_for(&keys[1]).unwrap();
     exit_used_source(&mut f, &keys[0], SourceId(8201));
-    let resident_witness = reap_without_releasing(&f, &keys[0]);
+    let resident = reap_without_releasing(&f, &keys[0]);
     exit_used_source(&mut f, &keys[1], SourceId(8202));
-    f.retire(keys[1].address());
-    let released_witness = released_probe.observe_reaped().unwrap();
+    let old = reap_without_releasing(&f, &keys[1]);
+    let detached = f
+        .bank()
+        .retirement_probe_for(&keys[1])
+        .unwrap()
+        .observe_reaped()
+        .unwrap();
+    let mut storage = f.bank_mut().release_reaped(detached).unwrap();
+    storage.release().unwrap();
+    let new_probe_refused = f
+        .bank()
+        .retirement_probe_for(&keys[1])
+        .unwrap()
+        .observe_reaped()
+        .is_err();
     assert_eq!(f.bank().len(), 1);
-    assert_eq!(
-        f.bank().inspect(&keys[0]).unwrap().phase,
-        SourcePositionPhase::Taken
-    );
-    assert_eq!(
-        f.bank().inspect(&keys[1]).unwrap().phase,
-        SourcePositionPhase::Retired
-    );
-    let blocker = f.append();
-    assert!(
-        !addresses.contains(&blocker),
-        "fresh residency has its own monotonic address"
-    );
-    assert_eq!(f.bank().len(), 2);
-
     let roles = [f.role(), f.role()];
     let work_ids = roles.each_ref().map(|role| role.work.id());
     let reservations = roles.each_ref().map(|role| role.capacity.id());
     let reports = roles.each_ref().map(|role| role.report.clone());
-    let retired = roles.each_ref().map(|role| role.work.retirement_observer());
     let before = f.scope.snapshot().unwrap();
     let version = f.ledger.change_version();
-    let (error, pair, witnesses, returned) = f
+    let (error, pair, _witnesses, returned) = f
         .bank_mut()
-        .rearm_pair(pair, [resident_witness, released_witness], roles)
+        .rearm_pair(pair, [resident, old], roles.map(reported))
         .unwrap_err();
-    assert_eq!(error, SourcePositionError::Full);
-    assert_eq!(pair.positions(), addresses);
-    for (key, original) in pair.keys().into_iter().zip(&keys) {
-        assert!(key.same_original(original));
+    let returned = returned.map(raw_reported);
+    let rejected = error == SourcePositionError::SlotDetached
+        && pair.positions() == addresses
+        && returned.each_ref().map(|role| role.work.id()) == work_ids
+        && returned.each_ref().map(|role| role.capacity.id()) == reservations
+        && returned
+            .iter()
+            .zip(&reports)
+            .all(|(role, report)| role.report.same_slot(report));
+    let unchanged = f.scope.snapshot().unwrap() == before
+        && f.ledger.change_version() == version
+        && f.bank().len() == 1;
+    for role in returned {
+        f.dispose_role(role);
     }
-    assert_eq!(returned.each_ref().map(|role| role.work.id()), work_ids);
-    assert_eq!(
-        returned.each_ref().map(|role| role.capacity.id()),
-        reservations
-    );
-    for (role, report) in returned.iter().zip(&reports) {
-        assert!(role.report.same_slot(report));
-    }
-    assert!(retired.iter().all(|observer| !observer.is_retired()));
-    assert_eq!(f.scope.snapshot().unwrap(), before);
-    assert_eq!(f.ledger.change_version(), version);
-    assert_eq!(f.bank().len(), 2);
-
-    // Remove the actual competing resident only after its unused permit,
-    // report and Work genuinely exit. Keep the complete refused pair,
-    // witnesses and newly admitted roles intact for this same retry.
-    f.take_unused(blocker).unwrap().exit();
-    f.retire(blocker);
-    assert_eq!(f.bank().len(), 1);
-    let pair = f
-        .bank_mut()
-        .rearm_pair(pair, witnesses, returned)
-        .unwrap_or_else(|_| {
-            panic!("one missing row fits; Full consumed neither original replacement")
-        });
-    assert_eq!(pair.positions(), addresses);
-    assert_eq!(
-        f.bank().len(),
-        2,
-        "only the missing leg adds a resident row"
-    );
-    for ((key, old_key), report) in pair.keys().into_iter().zip(&keys).zip(&reports) {
-        assert!(!key.same_original(old_key));
-        assert!(
-            f.bank()
-                .inspect(key)
-                .unwrap()
-                .custody
-                .report()
-                .same_slot(report)
-        );
-    }
-    assert!(retired.iter().all(|observer| !observer.is_retired()));
-    for key in pair.keys() {
-        f.bank_mut().take_unused(key).unwrap().exit();
-        f.retire(key.address());
-    }
-    assert!(retired.iter().all(|observer| observer.is_retired()));
-    assert_eq!(f.bank().len(), 0);
+    // Only a fresh whole admission can acquire the free resident address.
+    let fresh = f.append();
+    let monotonic = !addresses.contains(&fresh);
     f.finish();
+    assert!(new_probe_refused && rejected && unchanged && monotonic);
 }

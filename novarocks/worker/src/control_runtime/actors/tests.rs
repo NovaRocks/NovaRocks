@@ -270,6 +270,22 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
 fn empty() -> ResourceVector {
     ResourceVector::default()
 }
+fn retire_source_partials(
+    fixture: &Fixture,
+    partials: &mut [crate::control_runtime::source_slot_issuer::SourceSlotIssuePartial],
+) {
+    for partial in partials {
+        let mut retired = false;
+        for _ in 0..256 {
+            if partial.try_retire(&fixture.ledger).unwrap() {
+                retired = true;
+                break;
+            }
+        }
+        assert!(retired);
+        assert!(partial.is_empty());
+    }
+}
 fn source_role(
     scope: &ScopeHandle,
     parent: ReservationId,
@@ -302,6 +318,19 @@ fn source_role(
         report,
     }
 }
+fn model_source_slot(
+    scope: &ScopeHandle,
+    parent: ReservationId,
+) -> crate::control_runtime::source_positions::SourceSlotAdmission {
+    let admitted = source_role(scope, parent);
+    crate::control_runtime::source_positions::SourceSlotAdmission::protocol_model(
+        crate::control_runtime::admitted_role::adopt_reported_work(
+            admitted.work,
+            admitted.capacity,
+            admitted.report,
+        ),
+    )
+}
 fn paid_ingress(
     fixture: &Fixture,
     task: TaskIdentity,
@@ -312,7 +341,7 @@ fn paid_ingress(
         crate::task_proposal_ingress::TaskProposalIngress::from_admitted(
             task,
             cuts,
-            std::array::from_fn(|_| source_role(&fixture.scope, parent)),
+            std::array::from_fn(|_| model_source_slot(&fixture.scope, parent)),
             std::sync::Arc::new(CausalPending),
             std::sync::Arc::new(
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
@@ -325,21 +354,8 @@ fn dispose_retired_pair(
     fixture: &Fixture,
     ingress: &crate::task_proposal_ingress::TaskProposalIngress,
     retired: crate::task_proposal_ingress::RetiredCut,
-) {
+) -> usize {
     let crate::task_proposal_ingress::RetiredCut { pair, funding } = retired;
-    let observations = ingress.owned_pair_inventory(&pair).unwrap();
-    if observations.iter().all(|observation| {
-        observation.phase == crate::control_runtime::source_positions::SourcePositionPhase::Retired
-    }) {
-        assert!(
-            observations
-                .iter()
-                .all(|observation| observation.custody.reusable())
-        );
-        drop(pair);
-        drop(funding);
-        return;
-    }
     for holder in ingress
         .take_unused_owned_pair(&pair)
         .unwrap()
@@ -364,12 +380,18 @@ fn dispose_retired_pair(
         .prepare_owned_pair_reap(&pair)
         .unwrap()
         .map(|probe| probe.observe_reaped().unwrap());
-    ingress.release_owned_pair(&pair, witnesses).unwrap();
+    let detached = ingress.release_owned_pair(&pair, witnesses).unwrap();
+    let detached_count = detached.len();
+    for mut storage in detached {
+        storage.release().unwrap();
+    }
     drop(pair);
     // Funding can refer to a different still-live pair after seal rotation.
     // Dropping these observers returns no reservation or inferred quota.
     drop(funding);
+    detached_count
 }
+
 fn dispose_unused_admission(
     fixture: &Fixture,
     task: TaskIdentity,
@@ -378,9 +400,10 @@ fn dispose_unused_admission(
     let crate::task_proposal_ingress::CutSourceAdmission::Fresh(roles) = admission else {
         panic!("this fixture reserved two original fresh source roles");
     };
-    for role in roles {
+    for slot in roles {
+        let (role, mut payment) = slot.into_originals();
         let (custody, permit) =
-            crate::control_runtime::source_custody::SourceCustody::from_admitted(
+            crate::control_runtime::source_custody::SourceCustody::from_reported(
                 task,
                 role,
                 std::sync::Arc::new(CausalPending),
@@ -396,6 +419,9 @@ fn dispose_unused_admission(
             .reap_scope_ready(fixture.scope.id(), 256)
             .unwrap();
         assert!(custody.reusable());
+        if let Some(payment) = &mut payment {
+            payment.release(&payment.resources().unwrap()).unwrap();
+        }
     }
 }
 pub(in crate::control_runtime) fn finish_source_routes(
@@ -429,9 +455,11 @@ pub(in crate::control_runtime) fn finish_source_routes(
             .prepare_pair_reap(route)
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
-        // The complete bank is about to be destroyed, not rearmed. Every
-        // original body, report and common Work header really retired first.
-        drop(witnesses);
+        // Final detachment follows actual body/report/Work retirement and
+        // the same bank's closed admission. Return storage outside its lock.
+        for mut storage in ingress.release_closed_route_pair(route, witnesses).unwrap() {
+            storage.release().unwrap();
+        }
     }
 }
 const STORAGE_DIMENSIONS: [Dimension; 8] = [
@@ -664,6 +692,7 @@ impl Fixture {
                 task_source: ActorId::new(2).unwrap(),
                 protocol_generation: generation(),
                 max_cuts,
+                source_storage_model: self.policy.is_none(),
                 pending: std::sync::Arc::new(CausalPending),
                 health: std::sync::Arc::new(
                     novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
@@ -853,6 +882,7 @@ fn source_bootstrap_slot_refusal_returns_the_original_paid_unpublished_task_unti
             task_source: ActorId::new(2).unwrap(),
             protocol_generation: generation(),
             max_cuts: 1,
+            source_storage_model: false,
             pending: Arc::new(CausalPending),
             health: Arc::new(
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
@@ -863,7 +893,11 @@ fn source_bootstrap_slot_refusal_returns_the_original_paid_unpublished_task_unti
     .expect("the actual fourth Source report exceeds this Scope's slot capacity");
     assert!(matches!(
         refusal.error,
-        TaskHostError::Runtime(RuntimeError::Scope(ScopeError::SlotCapacity))
+        TaskHostError::SourceSlots(
+            crate::control_runtime::source_slot_issuer::SourceSlotIssueError::Runtime(
+                RuntimeError::Scope(ScopeError::SlotCapacity)
+            )
+        )
     ));
     let mut unpublished = refusal
         .unpublished
@@ -871,10 +905,17 @@ fn source_bootstrap_slot_refusal_returns_the_original_paid_unpublished_task_unti
     assert_eq!(unpublished.task, task);
     assert_eq!(unpublished.lifetime.id(), task_work);
     assert_eq!(unpublished.active.id(), reservation);
+    let remaining_loading = policy
+        .loading
+        .checked_sub(
+            crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                .checked_mul(3)
+                .unwrap(),
+        )
+        .unwrap();
     assert_eq!(
         unpublished.active.resources().unwrap(),
-        policy
-            .loading
+        remaining_loading
             .resources()
             .unwrap()
             .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
@@ -884,8 +925,9 @@ fn source_bootstrap_slot_refusal_returns_the_original_paid_unpublished_task_unti
     f.assert_storage_paid(policy.loading);
     let partial = f.scope.snapshot().unwrap();
     assert_eq!(
-        partial.storage, original.storage,
-        "only truly unused reports were revoked and retired"
+        partial.storage,
+        original.storage + 3,
+        "three actual unexposed Source reports remain in the original partial"
     );
     assert_eq!(
         partial.work,
@@ -907,20 +949,20 @@ fn source_bootstrap_slot_refusal_returns_the_original_paid_unpublished_task_unti
     f.runtime.effect_completed(ticket).unwrap();
     f.drain(create);
 
-    // No input, loader callback, E, or host capture was ever attached. The
-    // successful partial Source roles exited via their real unused path;
-    // reaping those exact children still does not release the original payer.
-    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 3).unwrap(), 3);
+    // No input, loader callback or host capture was ever attached. Retire
+    // those exact partial holders before returning their detached slot fees.
+    retire_source_partials(&f, &mut unpublished.source_partials);
+    assert_eq!(f.scope.snapshot().unwrap().storage, original.storage);
     assert_eq!(f.scope.snapshot().unwrap().work, elected.work);
     assert!(!observer.is_retired());
-    f.assert_storage_paid(policy.loading);
+    f.assert_storage_paid(remaining_loading);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     unpublished.lifetime.body_exited().unwrap();
     assert!(!unpublished.lifetime.actual_exit_ready().unwrap());
     unpublished.lifetime.captures_exited().unwrap();
     assert!(unpublished.lifetime.actual_exit_ready().unwrap());
     assert!(!observer.is_retired());
-    f.assert_storage_paid(policy.loading);
+    f.assert_storage_paid(remaining_loading);
     let resources = unpublished.active.resources().unwrap();
     unpublished.active.release(&resources).unwrap();
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 0);
@@ -1028,7 +1070,11 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     };
     assert!(matches!(
         error,
-        TaskHostError::Runtime(RuntimeError::Scope(ScopeError::SlotCapacity))
+        TaskHostError::SourceSlots(
+            crate::control_runtime::source_slot_issuer::SourceSlotIssueError::Runtime(
+                RuntimeError::Scope(ScopeError::SlotCapacity)
+            )
+        )
     ));
     assert_eq!(returned.id, PayloadId(1));
     assert_eq!(returned.ingress_retained_bytes, 2);
@@ -1045,7 +1091,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     f.assert_storage_paid(policy.loading);
     let refused = f.scope.snapshot().unwrap();
-    assert_eq!(refused.storage, 7);
+    assert_eq!(refused.storage, 8);
     assert_eq!(
         refused.work,
         elected.work + 5,
@@ -1073,13 +1119,6 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
             .is_empty()
     );
 
-    // The factory's unused loader/input and partial Source1 really exited.
-    // Their reports have retired; only the original common reaper can remove
-    // their three Work headers. The admitted first cut remains in this Task.
-    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 3).unwrap(), 3);
-    assert_eq!(f.scope.snapshot().unwrap().work, elected.work + 2);
-    assert_eq!(f.scope.snapshot().unwrap().storage, 7);
-    f.assert_storage_paid(policy.loading);
     let TaskHostResources {
         mut lifetime,
         mut active,
@@ -1090,6 +1129,9 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         pending_loading,
         preparation,
         preparation_remainder,
+        accepted_source_storage,
+        pending_preparation_adoption,
+        mut source_partials,
         completion,
         completion_action,
         lifecycle_inputs,
@@ -1101,6 +1143,12 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         active.resources().unwrap(),
         policy
             .loading
+            .checked_sub(
+                crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                    .checked_mul(7)
+                    .unwrap(),
+            )
+            .unwrap()
             .resources()
             .unwrap()
             .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
@@ -1112,6 +1160,16 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert!(loading_events.is_none());
     assert!(loading_return.is_none());
     assert!(pending_loading.is_none());
+    assert!(accepted_source_storage.is_none());
+    assert!(pending_preparation_adoption.is_none());
+    retire_source_partials(&f, &mut source_partials);
+    assert_eq!(f.scope.snapshot().unwrap().work, elected.work + 2);
+    assert_eq!(f.scope.snapshot().unwrap().storage, 7);
+    let live_after_partial = policy
+        .loading
+        .checked_sub(crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE)
+        .unwrap();
+    f.assert_storage_paid(live_after_partial);
     assert!(preparation.is_none());
     assert!(preparation_remainder.is_none());
     assert!(completion.is_none());
@@ -1181,14 +1239,27 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         .prepare_owned_pair_reap(&retired.pair)
         .unwrap()
         .map(|probe| probe.observe_reaped().unwrap());
-    port.ingress()
+    for mut storage in port
+        .ingress()
         .release_owned_pair(&retired.pair, reaped)
-        .unwrap();
+        .unwrap()
+    {
+        storage.release().unwrap();
+    }
     drop(retired);
     drop(funding);
     drop(causal);
     assert_eq!(f.scope.snapshot().unwrap().work, elected.work);
-    f.assert_storage_paid(policy.loading);
+    f.assert_storage_paid(
+        policy
+            .loading
+            .checked_sub(
+                crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                    .checked_mul(3)
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
 
     // This unit destroys an empty bank after its real original Source4 exit;
@@ -1220,7 +1291,16 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert!(!lifetime.actual_exit_ready().unwrap());
     lifetime.captures_exited().unwrap();
     assert!(lifetime.actual_exit_ready().unwrap());
-    f.assert_storage_paid(policy.loading);
+    f.assert_storage_paid(
+        policy
+            .loading
+            .checked_sub(
+                crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                    .checked_mul(7)
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     active.release(&active.resources().unwrap()).unwrap();
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 0);
@@ -2137,6 +2217,7 @@ fn exercise_fragment_roles_with_preparation(
     }
     let mut f = Fixture::with_policy_byte_limits(4096);
     let policy = f.policy.expect("actual fixed Task aggregate policy");
+    let mut detached_source_slots = 0;
     assert_eq!(
         policy.loading.checked_add(policy.accepted).unwrap(),
         policy.task_base
@@ -2171,6 +2252,7 @@ fn exercise_fragment_roles_with_preparation(
             task_source: ActorId::new(2).unwrap(),
             protocol_generation: generation(),
             max_cuts: 4,
+            source_storage_model: false,
             pending: Arc::new(Pending),
             health: Arc::new(
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
@@ -2271,7 +2353,16 @@ fn exercise_fragment_roles_with_preparation(
         2,
     );
     f.runtime.poll_one(Tick(2)).unwrap();
-    f.assert_storage_paid(policy.task_base);
+    f.assert_storage_paid(
+        policy
+            .task_base
+            .checked_sub(
+                crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                    .checked_mul(detached_source_slots)
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
     let mut dispatch = EffectDispatch::new(actor(), 15);
     dispatch.index_committed(&f.runtime, 32).unwrap();
     let publication = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
@@ -2332,7 +2423,16 @@ fn exercise_fragment_roles_with_preparation(
         assert!(finalizer.seal_for_terminal(None).is_none());
         assert!(host.statistics().unwrap().advance().unwrap().retired);
         f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
-        f.assert_storage_paid(policy.task_base);
+        f.assert_storage_paid(
+            policy
+                .task_base
+                .checked_sub(
+                    crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                        .checked_mul(detached_source_slots)
+                        .unwrap(),
+                )
+                .unwrap(),
+        );
     } else if let Some(kind) = lifecycle_role {
         // Actual typed permits have no common public issuer or clone. This
         // test erases only their local destructor after recording identity.
@@ -2372,7 +2472,7 @@ fn exercise_fragment_roles_with_preparation(
                 crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
             )
             .unwrap();
-        dispose_retired_pair(&f, port.ingress(), retired);
+        detached_source_slots += dispose_retired_pair(&f, port.ingress(), retired);
         f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
         assert_eq!(
             host.lifecycle_input(kind).unwrap().phase(),
@@ -2385,7 +2485,16 @@ fn exercise_fragment_roles_with_preparation(
                 .unwrap()
                 .is_empty()
         );
-        f.assert_storage_paid(policy.task_base);
+        f.assert_storage_paid(
+            policy
+                .task_base
+                .checked_sub(
+                    crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                        .checked_mul(detached_source_slots)
+                        .unwrap(),
+                )
+                .unwrap(),
+        );
     }
     let before_source2 = f.scope.snapshot().unwrap();
     let (cut, notice) = host.admit_settlement_notice(1).unwrap();
@@ -2401,7 +2510,16 @@ fn exercise_fragment_roles_with_preparation(
             .all(|role| role.phase()
                 == novarocks_control_runtime::exit_role::ExitRolePhase::Admitted)
     );
-    f.assert_storage_paid(policy.task_base);
+    f.assert_storage_paid(
+        policy
+            .task_base
+            .checked_sub(
+                crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                    .checked_mul(detached_source_slots)
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
     assert!(matches!(
         host.admit_settlement_notice(1),
         Err(crate::control_runtime::task::TaskHostError::CompletionAlreadyIssued)
@@ -2661,7 +2779,16 @@ fn exercise_fragment_roles_with_preparation(
     assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), 0);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     assert_eq!(f.ledger.used(Dimension::InboundBytes.id()), inbound_bytes);
-    f.assert_storage_paid(policy.task_base);
+    f.assert_storage_paid(
+        policy
+            .task_base
+            .checked_sub(
+                crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                    .checked_mul(detached_source_slots)
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
     let completion = host.completion().unwrap().clone();
     assert!(
         !completion.try_retire(),
@@ -2695,10 +2822,19 @@ fn exercise_fragment_roles_with_preparation(
                     crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
                 )
                 .unwrap();
-            dispose_retired_pair(&f, port.ingress(), retired);
+            detached_source_slots += dispose_retired_pair(&f, port.ingress(), retired);
         }
         f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
-        f.assert_storage_paid(policy.task_base);
+        f.assert_storage_paid(
+            policy
+                .task_base
+                .checked_sub(
+                    crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                        .checked_mul(detached_source_slots)
+                        .unwrap(),
+                )
+                .unwrap(),
+        );
     }
     let failed = matches!(
         settlement,
@@ -2882,7 +3018,7 @@ fn exercise_fragment_roles_with_preparation(
             crate::control_runtime::causal::CausalSourceRetirement::Unclaimed,
         )
         .unwrap();
-    dispose_retired_pair(&f, port.ingress(), retired);
+    detached_source_slots += dispose_retired_pair(&f, port.ingress(), retired);
     assert!(host.causal().is_empty());
     for role in [
         TaskLifecycleRole::Finisher,
@@ -2921,6 +3057,9 @@ fn exercise_fragment_roles_with_preparation(
         pending_loading,
         preparation,
         mut preparation_remainder,
+        mut accepted_source_storage,
+        pending_preparation_adoption,
+        mut source_partials,
         completion,
         completion_action,
         lifecycle_inputs,
@@ -2934,6 +3073,8 @@ fn exercise_fragment_roles_with_preparation(
     );
     assert!(loading_return.is_none());
     assert!(pending_loading.is_none());
+    assert!(pending_preparation_adoption.is_none());
+    retire_source_partials(&f, &mut source_partials);
     if transfer_bundle {
         assert_eq!(
             completion_action.as_ref().unwrap().phase(),
@@ -2980,6 +3121,12 @@ fn exercise_fragment_roles_with_preparation(
     let retained = preparation_remainder.as_mut().unwrap();
     let expected_active = policy
         .loading
+        .checked_sub(
+            crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                .checked_mul(4)
+                .unwrap(),
+        )
+        .unwrap()
         .resources()
         .unwrap()
         .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
@@ -2987,9 +3134,17 @@ fn exercise_fragment_roles_with_preparation(
     assert_eq!(
         active.resources().unwrap(),
         expected_active,
-        "the same elected Task bundle retains loading Source4 storage"
+        "the original Task retains its remainder while Source4 owns its paid storage"
     );
-    assert_bundle_storage(retained, policy.accepted);
+    let retained_profile = policy
+        .accepted
+        .checked_sub(
+            crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                .checked_mul((TaskLifecycleRole::COUNT - 2) * 2)
+                .unwrap(),
+        )
+        .unwrap();
+    assert_bundle_storage(retained, retained_profile);
     assert_eq!(
         retained
             .resources()
@@ -3011,7 +3166,16 @@ fn exercise_fragment_roles_with_preparation(
             .get(Dimension::InboundBytes.id()),
         inbound_bytes
     );
-    f.assert_storage_paid(policy.task_base);
+    f.assert_storage_paid(
+        policy
+            .task_base
+            .checked_sub(
+                crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                    .checked_mul(detached_source_slots)
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
     lifetime.body_exited().unwrap();
     lifetime.captures_exited().unwrap();
     assert!(
@@ -3019,13 +3183,30 @@ fn exercise_fragment_roles_with_preparation(
         "original Source4/cut2 children still prevent Task header retirement"
     );
     finish_source_routes(&f, port.ingress());
+    detached_source_slots += 4;
+    if let Some(storage) = &mut accepted_source_storage {
+        let resources = storage.resources().unwrap();
+        detached_source_slots += usize::try_from(resources.get(Dimension::Work.id())).unwrap();
+        storage.release(&resources).unwrap();
+    }
+    drop(accepted_source_storage);
+    drop(source_partials);
     drop(port);
     f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
     assert!(lifetime.actual_exit_ready().unwrap());
-    f.assert_storage_paid(policy.task_base);
+    f.assert_storage_paid(
+        policy
+            .task_base
+            .checked_sub(
+                crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
+                    .checked_mul(detached_source_slots)
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
     active.release(&active.resources().unwrap()).unwrap();
-    f.assert_storage_paid(policy.accepted);
-    assert_bundle_storage(retained, policy.accepted);
+    f.assert_storage_paid(retained_profile);
+    assert_bundle_storage(retained, retained_profile);
     retained.release(&retained.resources().unwrap()).unwrap();
     f.assert_storage_paid(StorageNeed::default());
     f.finish();
@@ -3167,7 +3348,7 @@ impl CausalHarness {
     }
     fn admission(&self) -> crate::task_proposal_ingress::CutSourceAdmission {
         crate::task_proposal_ingress::CutSourceAdmission::Fresh(std::array::from_fn(|_| {
-            source_role(&self.fixture.scope, self.source_parent)
+            model_source_slot(&self.fixture.scope, self.source_parent)
         }))
     }
     fn work(&mut self) -> WorkId {
@@ -3473,7 +3654,7 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
     let crate::task_proposal_ingress::CutSourceAdmission::Fresh(ref roles) = admission else {
         unreachable!();
     };
-    let original_work = roles.each_ref().map(|role| role.work.id());
+    let original_work = roles.each_ref().map(|role| role.reported().work().id());
     let refusal = h
         .inbox
         .admit_settlement(1, std::sync::Arc::new(CausalPending), admission)
@@ -3484,7 +3665,10 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
     else {
         panic!("refusal preserves the original paid roles");
     };
-    assert_eq!(roles.each_ref().map(|role| role.work.id()), original_work);
+    assert_eq!(
+        roles.each_ref().map(|role| role.reported().work().id()),
+        original_work
+    );
     dispose_unused_admission(&h.fixture, h.task, refusal.admission);
     assert_eq!(
         h.fixture
@@ -3593,7 +3777,7 @@ fn a_runtime_input_refusal_returns_the_same_two_paid_source_roles() {
     let CutSourceAdmission::Fresh(ref roles) = admission else {
         unreachable!()
     };
-    let original = roles.each_ref().map(|role| role.work.id());
+    let original = roles.each_ref().map(|role| role.reported().work().id());
     let refusal = h
         .inbox
         .admit_settlement(1, std::sync::Arc::new(CausalPending), admission)
@@ -3606,7 +3790,10 @@ fn a_runtime_input_refusal_returns_the_same_two_paid_source_roles() {
     let CutSourceAdmission::Fresh(ref roles) = refusal.admission else {
         panic!("runtime refusal preserves the original source roles");
     };
-    assert_eq!(roles.each_ref().map(|role| role.work.id()), original);
+    assert_eq!(
+        roles.each_ref().map(|role| role.reported().work().id()),
+        original
+    );
     dispose_unused_admission(&h.fixture, h.task, refusal.admission);
     for role in &mut occupied {
         role.close_after_exit().unwrap();

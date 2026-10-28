@@ -22,7 +22,9 @@
 
 use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
-    lease::CapacityBundle, reported_work::ReportedWork, transaction::RuntimeError,
+    lease::CapacityBundle,
+    reported_work::ReportedWork,
+    transaction::{RuntimeError, ScopeHandle},
 };
 
 pub(crate) const SOURCE_SLOT_STORAGE: StorageNeed = StorageNeed {
@@ -74,6 +76,7 @@ impl std::fmt::Debug for SourceSlotAdmission {
 // Only the bank can separate this unique storage owner from its validated
 // generation. Other callers receive or return the whole admission.
 pub(super) struct SourceSlotStorage {
+    scope: ScopeHandle,
     payment: Payment,
 }
 enum Payment {
@@ -84,6 +87,11 @@ enum Payment {
     Model,
 }
 impl SourceSlotAdmission {
+    /// Borrow the validated original generation before handoff. This neither
+    /// clones its permit nor changes storage, exit or consumer authority.
+    pub(crate) fn reported(&self) -> &ReportedWork {
+        &self.reported
+    }
     pub(crate) fn from_paid(
         reported: ReportedWork,
         mut storage: CapacityBundle,
@@ -117,9 +125,11 @@ impl SourceSlotAdmission {
                 storage,
             });
         }
+        let scope = reported.work().scope().clone();
         Ok(Self {
             reported,
             storage: SourceSlotStorage {
+                scope,
                 payment: Payment::Paid(Some(storage)),
             },
         })
@@ -136,15 +146,22 @@ impl SourceSlotAdmission {
     /// as production quota evidence or as an implicit missing-payment fallback.
     #[cfg(test)]
     pub(crate) fn protocol_model(reported: ReportedWork) -> Self {
+        let scope = reported.work().scope().clone();
         Self {
             reported,
             storage: SourceSlotStorage {
+                scope,
                 payment: Payment::Model,
             },
         }
     }
 }
 impl SourceSlotStorage {
+    /// A neutral origin comparison is safe under the bank fence. It does not
+    /// lock the Common ledger or authorize a replacement generation.
+    pub(super) fn matches_scope(&self, scope: &ScopeHandle) -> bool {
+        self.scope.same_scope(scope)
+    }
     /// The parent bank already detached the real slot and observed its exact
     /// exits. Idempotence releases no replacement fee; errors retain this same
     /// original bundle. No opaque destructor or callback runs here.

@@ -491,6 +491,7 @@ mod tests {
                                 task_source: ActorId::new(2).unwrap(),
                                 protocol_generation: generation(),
                                 max_cuts: 4,
+                                source_storage_model: true,
                                 pending: Arc::new(Pending),
                                 health: Arc::new(ExecutionHealth::default()),
                             },
@@ -594,6 +595,9 @@ mod tests {
                 pending_loading,
                 preparation,
                 preparation_remainder,
+                accepted_source_storage,
+                pending_preparation_adoption,
+                mut source_partials,
                 completion,
                 completion_action,
                 lifecycle_inputs,
@@ -615,6 +619,19 @@ mod tests {
                 open_summary.is_none(),
                 "this component issued no open-summary role"
             );
+            assert!(accepted_source_storage.is_none());
+            assert!(pending_preparation_adoption.is_none());
+            for partial in &mut source_partials {
+                let mut retired = false;
+                for _ in 0..64 {
+                    if partial.try_retire(&self.ledger).unwrap() {
+                        retired = true;
+                        break;
+                    }
+                }
+                assert!(retired);
+            }
+            assert!(source_partials.iter().all(|partial| partial.is_empty()));
             assert!(causal.is_empty());
             assert_eq!(
                 Arc::strong_count(&port),

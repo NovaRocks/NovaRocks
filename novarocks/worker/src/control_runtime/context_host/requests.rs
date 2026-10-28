@@ -26,9 +26,9 @@ use endpoint::ContextRequestEndpoint;
 use task_route::TaskRequestRoute;
 
 use super::ContextHostRecord;
+use crate::control_runtime::source_slot_issuer::{SourceSlotIssueError, SourceSlotIssuePartial};
 use crate::control_runtime::{
     actors::{ContextMessage, RequestMetadata, WorkerAction, WorkerActor, WorkerMessage},
-    admitted_role::dispose_unused_completion,
     causal::CausalError,
     control_request::ControlRequestError,
     request_endpoint::{RequestEndpoint, RequestHandle},
@@ -36,7 +36,6 @@ use crate::control_runtime::{
     task::TaskHostRecord,
 };
 use crate::control_runtime_policy::{PolicyError, StorageNeed};
-use crate::task_completion_roles::AdmittedCompletionRole;
 use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::{
@@ -103,6 +102,7 @@ pub(crate) enum ContextRequestError {
     SubmissionUnresolved,
     TaskPredecessorRequired,
     Causal(CausalError),
+    SourceSlots(SourceSlotIssueError),
     TaskNotReady,
     TaskUnpublished,
     UnknownTask,
@@ -149,11 +149,11 @@ pub(crate) struct ContextRequestPartial {
     exited: bool,
     unresolved: bool,
     outer: Option<CapacityBundle>,
-    sources: Vec<UnusedRequestSource>,
+    sources: Option<SourceSlotIssuePartial>,
 }
 
 pub(crate) enum ContextRequestAdmissionPartial {
-    Unused(ContextRequestPartial),
+    Unused(Box<ContextRequestPartial>),
     BoundTask(Box<TaskRequestBindPartial>),
 }
 impl ContextRequestAdmissionPartial {
@@ -172,38 +172,17 @@ pub(crate) struct TaskRequestBindPartial {
     outer: CapacityBundle,
 }
 
-struct UnusedRequestSource {
-    admitted: Option<AdmittedCompletionRole>,
-    retirement: WorkRetirementObserver,
-}
-
 impl ContextRequestPartial {
     fn try_retire(&mut self) -> Result<bool, ContextRequestError> {
         if self.unresolved {
             return Err(ContextRequestError::SubmissionUnresolved);
         }
-        for source in &mut self.sources {
-            if let Some(admitted) = source.admitted.take() {
-                // These exact originals were never exposed to an ingress or
-                // source producer. This call observes their actual empty exit.
-                dispose_unused_completion(admitted);
-            }
-        }
-        if self
-            .sources
-            .iter()
-            .any(|source| !source.retirement.is_retired())
+        if let Some(sources) = &mut self.sources
+            && !sources
+                .try_retire(&self.ledger)
+                .map_err(ContextRequestError::SourceSlots)?
         {
-            self.ledger
-                .reap_scope_ready(self.work.scope().id(), 1)
-                .map_err(ContextRequestError::Runtime)?;
-            if self
-                .sources
-                .iter()
-                .any(|source| !source.retirement.is_retired())
-            {
-                return Ok(false);
-            }
+            return Ok(false);
         }
         if let Some(permit) = self.permit.take()
             && let Err(error) = permit.revoke_unused()
@@ -353,7 +332,7 @@ impl ContextRequestCustody {
             exited: false,
             unresolved: false,
             outer: None,
-            sources: Vec::new(),
+            sources: None,
         };
         let report = match ReportSlot::reserve_next(
             scope,
@@ -416,7 +395,7 @@ impl ContextRequestCustody {
                         exited: false,
                         unresolved: false,
                         outer: None,
-                        sources: Vec::new(),
+                        sources: None,
                     }),
                 ));
             }
@@ -751,7 +730,10 @@ impl ContextHostRecord {
             assert!(
                 self.resources
                     .request_partials
-                    .insert(work, ContextRequestAdmissionPartial::Unused(partial))
+                    .insert(
+                        work,
+                        ContextRequestAdmissionPartial::Unused(Box::new(partial))
+                    )
                     .is_none()
             );
             if let Some(notice) = &self.resources.notice {

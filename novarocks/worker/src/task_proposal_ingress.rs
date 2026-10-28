@@ -22,14 +22,15 @@ use crate::{
     control_runtime::{
         source_custody::SourceCustody,
         source_positions::{
-            BoundSource, ReapedPosition, RetirementProbe, SourcePositionError, SourcePositionKey,
-            SourcePositionObservation, SourcePositionPair, SourcePositionPhase, SourcePositions,
-            UnusedPosition,
+            BoundSource, DetachedSourceSlotStorage, ReapedPosition, RetirementProbe,
+            SourcePositionError, SourcePositionKey, SourcePositionObservation, SourcePositionPair,
+            SourcePositionPhase, SourcePositions, SourceSlotAdmission, UnusedPosition,
         },
     },
     task_completion_roles::AdmittedCompletionRole,
     task_port::TaskPendingNotice,
 };
+use novarocks_control_runtime::reported_work::ReportedWork;
 use novarocks_control_runtime_core::{
     completion::Consumption,
     identity::{Generation, WorkId},
@@ -77,11 +78,11 @@ impl From<SourcePositionError> for IngressError {
 
 /// Original paid roles or a unique pair owner, never a source-credit count.
 pub(crate) enum CutSourceAdmission {
-    Fresh([AdmittedCompletionRole; 2]),
+    Fresh([SourceSlotAdmission; 2]),
     Rearm {
         pair: SourcePositionPair,
         reaped: [ReapedPosition; 2],
-        roles: [AdmittedCompletionRole; 2],
+        roles: [ReportedWork; 2],
     },
     Unclaimed(SourcePositionPair),
 }
@@ -346,10 +347,10 @@ impl TaskProposalIngress {
     pub(crate) fn from_admitted(
         task: TaskIdentity,
         max_cuts: usize,
-        roles: [AdmittedCompletionRole; 4],
+        roles: [SourceSlotAdmission; 4],
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
-    ) -> Result<Self, (IngressError, [AdmittedCompletionRole; 4])> {
+    ) -> Result<Self, (IngressError, [SourceSlotAdmission; 4])> {
         let Some(limit) = max_cuts.checked_add(2).and_then(|n| n.checked_mul(2)) else {
             return Err((IngressError::Geometry, roles));
         };
@@ -832,6 +833,27 @@ impl TaskProposalIngress {
             Err(error) => Err(error),
         }
     }
+    /// The original failure owner takes neutral open custody without filling
+    /// an input for the dead Core. Its caller validates the drained failure
+    /// session; actual source/report exit is still required independently.
+    pub(crate) fn take_failed_open_summary(&self) -> Result<Option<SummaryInput>, IngressError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        if !state.failed || state.open_consuming {
+            return Err(CutError::NotReady.into());
+        }
+        if state.segments.open_is_empty() {
+            return Ok(None);
+        }
+        let summary = state.segments.begin_abandon_open()?;
+        let State { open, spare, .. } = &mut *state;
+        open.as_mut()
+            .expect("original failed open pair")
+            .swap_with(spare.as_mut().expect("original failed spare pair"))
+            .expect("same original source bank");
+        state.open_consuming = true;
+        state.open_core_consumed = false;
+        Ok(Some(SummaryInput { cut: None, summary }))
+    }
     /// Core consumption alone releases the predecessor gate, never its pair.
     pub(crate) fn summary_consumed(&self, cut: Option<CutId>) -> Result<(), IngressError> {
         let mut state = self.state.lock().expect("task proposal handoff lock");
@@ -963,18 +985,58 @@ impl TaskProposalIngress {
         &self,
         pair: &SourcePositionPair,
         reaped: [ReapedPosition; 2],
-    ) -> Result<(), (IngressError, [ReapedPosition; 2])> {
+    ) -> Result<[DetachedSourceSlotStorage; 2], (IngressError, [ReapedPosition; 2])> {
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if let Err(error) = state.sources.validate_reaped_pair(pair, &reaped) {
             return Err((error.into(), reaped));
         }
-        for witness in reaped {
+        Ok(reaped.map(|witness| {
             state
                 .sources
                 .release_reaped(witness)
-                .expect("same-lock validated original pair");
+                .expect("same-lock validated original pair")
+        }))
+    }
+    /// Final teardown of this exact closed routing pair. Current generation
+    /// witnesses prove real Work/report exit; the owned storage leaves the
+    /// handoff lock with the caller and is refunded only outside it.
+    pub(crate) fn release_closed_route_pair(
+        &self,
+        route: PairRoute,
+        reaped: [ReapedPosition; 2],
+    ) -> Result<[DetachedSourceSlotStorage; 2], (IngressError, [ReapedPosition; 2])> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        let checked = (|| {
+            if !state.source_closed
+                || state.open_consuming
+                || !state.segments.open_is_empty()
+                || !state.cuts.is_empty()
+                || matches!(route, PairRoute::Cut(_))
+            {
+                return Err(IngressError::Cut(CutError::NotReady));
+            }
+            state
+                .sources
+                .validate_reaped_pair(state.pair(route)?, &reaped)
+                .map_err(Into::into)
+        })();
+        if let Err(error) = checked {
+            return Err((error, reaped));
         }
-        Ok(())
+        let original = match route {
+            PairRoute::Open => state.open.take(),
+            PairRoute::ConsumingOpen => state.spare.take(),
+            PairRoute::Cut(_) => unreachable!("the original routing pair was validated"),
+        }
+        .expect("same closed original routing pair");
+        let storage = reaped.map(|witness| {
+            state
+                .sources
+                .release_reaped(witness)
+                .expect("same-lock validated original source slot")
+        });
+        drop(original);
+        Ok(storage)
     }
     pub(crate) fn cut_funding(&self, cut: CutId) -> Result<SourceFunding, IngressError> {
         Ok(self
@@ -1195,7 +1257,7 @@ impl TaskProposalIngress {
         for witness in reaped {
             state
                 .sources
-                .release_reaped(witness)
+                .mark_generation_retired(witness)
                 .expect("same-lock validated original pair");
         }
         state.open_consuming = false;
@@ -1208,15 +1270,8 @@ impl TaskProposalIngress {
     pub(crate) fn rearm_open_spare(
         &self,
         reaped: [ReapedPosition; 2],
-        roles: [AdmittedCompletionRole; 2],
-    ) -> Result<
-        (),
-        (
-            IngressError,
-            [ReapedPosition; 2],
-            [AdmittedCompletionRole; 2],
-        ),
-    > {
+        roles: [ReportedWork; 2],
+    ) -> Result<(), (IngressError, [ReapedPosition; 2], [ReportedWork; 2])> {
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if state.failed || state.source_closed || state.open_consuming {
             return Err((CutError::NotReady.into(), reaped, roles));
@@ -1273,7 +1328,7 @@ impl TaskProposalIngress {
         for witness in reaped {
             state
                 .sources
-                .release_reaped(witness)
+                .mark_generation_retired(witness)
                 .expect("same-lock validated original pair");
         }
         let cell = state.cuts.remove(&cut).expect("original retired cut");
@@ -1341,6 +1396,7 @@ mod tests {
     use super::*;
     use novarocks_control_runtime::{
         completion::ReportSlot,
+        exit_role::ExitRolePhase,
         lease::WorkLease,
         transaction::{RuntimeLedger, ScopeHandle},
     };
@@ -1364,6 +1420,22 @@ mod tests {
         },
     };
 
+    fn reported(role: AdmittedCompletionRole) -> ReportedWork {
+        crate::control_runtime::admitted_role::adopt_reported_work(
+            role.work,
+            role.capacity,
+            role.report,
+        )
+    }
+    fn slot(role: AdmittedCompletionRole) -> SourceSlotAdmission {
+        // Finite empty-resource protocol model, not production slot funding.
+        SourceSlotAdmission::protocol_model(reported(role))
+    }
+    fn release_storage(storage: [DetachedSourceSlotStorage; 2]) {
+        for mut original in storage {
+            original.release().unwrap();
+        }
+    }
     #[derive(Default)]
     struct Pending(AtomicUsize);
     impl TaskPendingNotice for Pending {
@@ -1418,7 +1490,7 @@ mod tests {
             parent.start().unwrap();
             let pending = Arc::new(Pending::default());
             let health = Arc::new(ExecutionHealth::default());
-            let roles = std::array::from_fn(|_| Self::make_role(&scope, capacity.id()));
+            let roles = std::array::from_fn(|_| slot(Self::make_role(&scope, capacity.id())));
             let ingress = Arc::new(
                 TaskProposalIngress::from_admitted(
                     task,
@@ -1471,9 +1543,42 @@ mod tests {
         fn roles(&self) -> [AdmittedCompletionRole; 2] {
             std::array::from_fn(|_| Self::make_role(&self.scope, self.capacity.id()))
         }
+        fn slot_roles(&self) -> [SourceSlotAdmission; 2] {
+            self.roles().map(slot)
+        }
+        fn reported_roles(&self) -> [ReportedWork; 2] {
+            self.roles().map(reported)
+        }
+        fn dispose_admissions<const N: usize>(&self, roles: [SourceSlotAdmission; N]) {
+            self.dispose_roles(roles.map(|slot| {
+                let (reported, payment) = slot.into_originals();
+                assert!(
+                    payment.is_none(),
+                    "only this explicit protocol model is unpaid"
+                );
+                let (work, capacity, report) = reported.into_parts();
+                AdmittedCompletionRole {
+                    work,
+                    capacity,
+                    report,
+                }
+            }));
+        }
+        fn detach_retired(&self, retired: RetiredCut) {
+            let reaped = self
+                .ingress
+                .prepare_owned_pair_reap(&retired.pair)
+                .unwrap()
+                .map(|probe| probe.observe_reaped().unwrap());
+            let storage = self
+                .ingress
+                .release_owned_pair(&retired.pair, reaped)
+                .unwrap_or_else(|_| panic!("the same marked generation actually reaped"));
+            release_storage(storage);
+        }
         fn reserve(&self, cut: CutId) {
             self.ingress
-                .reserve_cut(cut, 0, CutSourceAdmission::Fresh(self.roles()))
+                .reserve_cut(cut, 0, CutSourceAdmission::Fresh(self.slot_roles()))
                 .unwrap_or_else(|_| panic!("actual paid cut"));
         }
         fn dispose_roles<const N: usize>(&self, roles: [AdmittedCompletionRole; N]) {
@@ -1511,10 +1616,12 @@ mod tests {
             let observations = self.ingress.pair_inventory(route).unwrap();
             for observation in observations {
                 assert!(observation.custody.actual_exit_ready().unwrap());
-                if observation.source.is_some() {
-                    observation.custody.report().consume(observer()).unwrap();
+                if observation.custody.phase() != ExitRolePhase::Retired {
+                    if observation.source.is_some() {
+                        observation.custody.report().consume(observer()).unwrap();
+                    }
+                    assert!(observation.custody.try_retire().unwrap());
                 }
-                assert!(observation.custody.try_retire().unwrap());
             }
             self.ledger.reap_scope_ready(self.scope.id(), 2).unwrap();
             self.ingress
@@ -1525,12 +1632,28 @@ mod tests {
         fn finish(mut self) {
             self.ingress.seal_source_admission();
             assert!(self.ingress.state.lock().unwrap().cuts.is_empty());
+            let failed_queued = {
+                let state = self.ingress.state.lock().unwrap();
+                state.failed && !state.open_consuming && !state.segments.open_is_empty()
+            };
+            if failed_queued {
+                let original = self.ingress.take_failed_open_summary().unwrap().unwrap();
+                assert!(!original.summary.is_empty());
+                assert!(self.ingress.open_summary_consumed().is_err());
+                let reaped = self.reap(PairRoute::ConsumingOpen);
+                self.ingress
+                    .finish_open_after_reap(reaped)
+                    .unwrap_or_else(|_| {
+                        panic!("only failed Core abandonment and true source exit")
+                    });
+            }
             for route in [PairRoute::Open, PairRoute::ConsumingOpen] {
                 let witnesses = self.reap(route);
-                let mut state = self.ingress.state.lock().unwrap();
-                for witness in witnesses {
-                    state.sources.release_reaped(witness).unwrap();
-                }
+                let storage = self
+                    .ingress
+                    .release_closed_route_pair(route, witnesses)
+                    .unwrap_or_else(|_| panic!("the actual closed route and summary have retired"));
+                release_storage(storage);
             }
             assert_eq!(self.ingress.retained_sources(), 0);
             self.parent.body_exited().unwrap();
@@ -1652,9 +1775,11 @@ mod tests {
             .prepare_owned_pair_reap(&retired.pair)
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
-        f.ingress
+        let storage = f
+            .ingress
             .release_owned_pair(&retired.pair, reaped)
             .unwrap_or_else(|_| panic!("the exact retired cut pair"));
+        release_storage(storage);
         drop(retired.funding);
         f.ingress.seal_source_admission();
         assert!(f.ingress.open_summary_drained());
@@ -1664,8 +1789,8 @@ mod tests {
     #[test]
     fn invalid_geometry_and_full_cut_return_the_same_original_paid_roles() {
         let f = Fixture::new(1);
-        let roles = std::array::from_fn(|_| Fixture::make_role(&f.scope, f.capacity.id()));
-        let ids = roles.each_ref().map(|role| role.work.id());
+        let roles = std::array::from_fn(|_| slot(Fixture::make_role(&f.scope, f.capacity.id())));
+        let ids = roles.each_ref().map(|role| role.reported().work().id());
         let (error, returned) = match TaskProposalIngress::from_admitted(
             f.task,
             usize::MAX,
@@ -1677,11 +1802,14 @@ mod tests {
             Ok(_) => panic!("overflow must refuse"),
         };
         assert_eq!(error, IngressError::Geometry);
-        assert_eq!(returned.each_ref().map(|role| role.work.id()), ids);
-        f.dispose_roles(returned);
+        assert_eq!(
+            returned.each_ref().map(|role| role.reported().work().id()),
+            ids
+        );
+        f.dispose_admissions(returned);
         f.reserve(CutId(1));
-        let roles = f.roles();
-        let ids = roles.each_ref().map(|role| role.work.id());
+        let roles = f.slot_roles();
+        let ids = roles.each_ref().map(|role| role.reported().work().id());
         let version = f.ledger.change_version();
         let (error, admission) = f
             .ingress
@@ -1692,8 +1820,11 @@ mod tests {
         let CutSourceAdmission::Fresh(returned) = admission else {
             panic!("same paid group")
         };
-        assert_eq!(returned.each_ref().map(|role| role.work.id()), ids);
-        f.dispose_roles(returned);
+        assert_eq!(
+            returned.each_ref().map(|role| role.reported().work().id()),
+            ids
+        );
+        f.dispose_admissions(returned);
         f.ingress.observe_cut_exit(CutId(1), true, true).unwrap();
         f.ingress.revoke_unregistered_cut(CutId(1)).unwrap();
         let reaped = f.reap(PairRoute::Cut(CutId(1)));
@@ -1701,7 +1832,7 @@ mod tests {
             .ingress
             .revoke_unused_cut(CutId(1), reaped)
             .unwrap_or_else(|_| panic!("unused source pair reaped"));
-        drop(retired);
+        f.detach_retired(retired);
         f.finish();
     }
     #[test]
@@ -1770,7 +1901,7 @@ mod tests {
                 f.task,
                 CausalEventKind::Input,
                 0,
-                CutSourceAdmission::Fresh(f.roles()),
+                CutSourceAdmission::Fresh(f.slot_roles()),
             )
             .unwrap_or_else(|_| panic!("actual input pair"));
         f.ingress.bind_event_work(cut, f.parent.id()).unwrap();
@@ -1808,7 +1939,7 @@ mod tests {
         f.ingress.summary_consumed(Some(cut)).unwrap();
         f.ingress.observe_cut_exit(cut, true, true).unwrap();
         let reaped = f.reap(PairRoute::Cut(cut));
-        drop(
+        f.detach_retired(
             f.ingress
                 .retire_cut(cut, reaped)
                 .unwrap_or_else(|_| panic!("source pair actually reaped")),
@@ -1910,7 +2041,7 @@ mod tests {
                 .all(|custody| !custody.reusable()),
             "prefix exit cannot return the original funding roles now in open"
         );
-        drop(retired);
+        f.detach_retired(retired);
         f.finish();
     }
     #[test]
@@ -1985,8 +2116,8 @@ mod tests {
             .prepare_pair_reap(PairRoute::ConsumingOpen)
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
-        let roles = f.roles();
-        let ids = roles.each_ref().map(|role| role.report.id());
+        let roles = f.reported_roles();
+        let ids = roles.each_ref().map(|role| role.report().id());
         f.ingress
             .rearm_open_spare(reaped, roles)
             .unwrap_or_else(|_| panic!("same base addresses"));
@@ -2097,7 +2228,7 @@ mod tests {
     #[test]
     fn unclaimed_cut_handoff_reuses_six_addresses_and_retains_original_funding_observation() {
         let f = Fixture::new(1);
-        let mut admission = CutSourceAdmission::Fresh(f.roles());
+        let mut admission = CutSourceAdmission::Fresh(f.slot_roles());
         let before = f.scope.snapshot().unwrap();
         let version = f.ledger.change_version();
         for n in 1..=64 {
@@ -2129,7 +2260,7 @@ mod tests {
         f.ingress.revoke_unregistered_cut(CutId(65)).unwrap();
         f.ingress.observe_cut_exit(CutId(65), true, true).unwrap();
         let reaped = f.reap(PairRoute::Cut(CutId(65)));
-        drop(
+        f.detach_retired(
             f.ingress
                 .revoke_unused_cut(CutId(65), reaped)
                 .unwrap_or_else(|_| panic!("original unused source roles actually reaped")),
@@ -2165,9 +2296,11 @@ mod tests {
             .prepare_owned_pair_reap(&retired.pair)
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
-        f.ingress
+        let storage = f
+            .ingress
             .release_owned_pair(&retired.pair, witnesses)
             .unwrap_or_else(|_| panic!("same owned pair actually reaped"));
+        release_storage(storage);
         assert!(retired.funding.custody.iter().all(|role| role.reusable()));
         drop(retired);
         f.finish();

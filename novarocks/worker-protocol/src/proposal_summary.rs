@@ -411,6 +411,21 @@ impl CausalSegments {
             Some(novarocks_control_runtime_core::completion::Consumption::Pending);
         Ok(std::mem::take(&mut self.open))
     }
+    /// Failure teardown takes the actual never-dispatched open segment. All
+    /// earlier cut holders must retire first; this is abandonment, not Core
+    /// consumption, and no future producer may reuse the failed target.
+    pub fn begin_abandon_open(&mut self) -> Result<ProposalSummary, CutError> {
+        if self.consuming_open.is_some() || self.consuming_cut.is_some() {
+            return Err(CutError::Consuming);
+        }
+        if !self.cells.is_empty() || self.open.is_empty() {
+            return Err(CutError::NotReady);
+        }
+        self.failed = true;
+        self.consuming_open =
+            Some(novarocks_control_runtime_core::completion::Consumption::AbandonedByOwnerFailure);
+        Ok(std::mem::take(&mut self.open))
+    }
     /// Records only the successful Core leg. It neither releases original
     /// source custody nor acknowledges publication/disposal capture exit.
     pub fn observe_open_consumed(&mut self) -> Result<(), CutError> {
@@ -1260,5 +1275,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![SourceId(2)]
         );
+    }
+    #[test]
+    fn queued_failed_open_abandons_without_a_positive_core_receipt_or_new_source_credit() {
+        let mut segments = CausalSegments::new(0);
+        segments.push(proposal(3, 1));
+        assert!(!segments.open_is_empty());
+        let original = segments.begin_abandon_open().unwrap();
+        assert!(!original.is_empty() && segments.open_is_empty());
+        assert_eq!(segments.observe_open_consumed(), Err(CutError::NotReady));
+        assert_eq!(segments.reserve_cut(CutId(1), 0), Err(CutError::NotReady));
+        segments.abandon_open().unwrap();
+        assert!(matches!(segments.begin_open(), Err(CutError::NotReady)));
+    }
+    #[test]
+    fn failed_open_takeover_cannot_bypass_an_earlier_reserved_cut_holder() {
+        let mut segments = CausalSegments::new(1);
+        segments.reserve_cut(CutId(1), 0).unwrap();
+        segments.push(proposal(3, 1));
+        assert!(matches!(
+            segments.begin_abandon_open(),
+            Err(CutError::NotReady)
+        ));
+        assert!(!segments.open_is_empty());
+        segments.observe_captures_exit(CutId(1)).unwrap();
+        segments.observe_effects_exit(CutId(1)).unwrap();
+        segments.revoke_unused(CutId(1)).unwrap();
+        let original = segments.begin_abandon_open().unwrap();
+        assert!(!original.is_empty());
+        segments.abandon_open().unwrap();
     }
 }

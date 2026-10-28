@@ -730,7 +730,10 @@ mod tests {
             .prepare_owned_pair_reap(&retired.pair)
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
-        ingress.release_owned_pair(&retired.pair, reaped).unwrap();
+        let detached = ingress.release_owned_pair(&retired.pair, reaped).unwrap();
+        for mut storage in detached {
+            storage.release().unwrap();
+        }
         drop(retired);
     }
     fn retire(f: &Fixture, host: &mut TaskHostRecord, cut: CutId) {
@@ -758,6 +761,13 @@ mod tests {
         assert!(resources.loader.as_ref().unwrap().is_retired());
         let ingress = resources.port.ingress().clone();
         finish_source_routes(&f, &ingress);
+        // The closed original routes cannot issue another lifecycle Source.
+        // Return only the Accepted pool's still-unbound original remainder.
+        if let Some(mut storage) = resources.accepted_source_storage.take() {
+            storage.release(&storage.resources().unwrap()).unwrap();
+        }
+        assert!(resources.source_partials.is_empty());
+        assert!(resources.pending_preparation_adoption.is_none());
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());

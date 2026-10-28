@@ -57,3 +57,4 @@ pub(crate) mod loading_events;
 pub(crate) mod loading_host_job;
 pub(crate) mod source_custody;
 pub(crate) mod source_positions;
+pub(crate) mod source_slot_issuer;

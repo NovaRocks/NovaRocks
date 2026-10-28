@@ -87,6 +87,19 @@ fn source_role(scope: &ScopeHandle, parent: ReservationId) -> AdmittedCompletion
     }
 }
 
+fn model_source_slot(
+    scope: &ScopeHandle,
+    parent: ReservationId,
+) -> crate::control_runtime::source_positions::SourceSlotAdmission {
+    let admitted = source_role(scope, parent);
+    crate::control_runtime::source_positions::SourceSlotAdmission::protocol_model(
+        crate::control_runtime::admitted_role::adopt_reported_work(
+            admitted.work,
+            admitted.capacity,
+            admitted.report,
+        ),
+    )
+}
 struct Harness {
     fixture: Fixture,
     task: TaskIdentity,
@@ -143,7 +156,7 @@ impl Harness {
             TaskProposalIngress::from_admitted(
                 task,
                 1,
-                std::array::from_fn(|_| source_role(&fixture.scope, parent)),
+                std::array::from_fn(|_| model_source_slot(&fixture.scope, parent)),
                 Arc::new(Pending),
                 health.clone(),
             )
@@ -190,7 +203,7 @@ impl Harness {
     }
     fn admission(&self) -> CutSourceAdmission {
         CutSourceAdmission::Fresh(std::array::from_fn(|_| {
-            source_role(&self.fixture.scope, self.parent)
+            model_source_slot(&self.fixture.scope, self.parent)
         }))
     }
     fn admit(&self, request: RequestMetadata, class: InputClass) -> (CutId, TaskCausalSender) {
@@ -233,9 +246,13 @@ impl Harness {
             .prepare_owned_pair_reap(&retired.pair)
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
-        self.ingress
+        for mut storage in self
+            .ingress
             .release_owned_pair(&retired.pair, witnesses)
-            .unwrap();
+            .unwrap()
+        {
+            storage.release().unwrap();
+        }
     }
     fn retire(&mut self, delivery: CausalDelivery) -> Vec<WorkerAction> {
         assert_eq!(
@@ -427,11 +444,10 @@ fn check_admission_refusal(
     };
     let originals = roles.each_ref().map(|role| {
         (
-            role.work.id(),
-            role.work.scope().id(),
-            role.capacity.id(),
-            role.report.clone(),
-            role.work.retirement_observer(),
+            role.reported().work().id(),
+            role.reported().work().scope().id(),
+            role.reported().report().clone(),
+            role.reported().work().retirement_observer(),
         )
     });
     let actor_before = h.fixture.runtime.snapshot(actor()).unwrap();
@@ -462,14 +478,14 @@ fn check_admission_refusal(
     let CutSourceAdmission::Fresh(roles) = refusal.admission else {
         panic!("return the original fresh Source2")
     };
-    for (role, (work, scope, capacity, report, retired)) in roles.into_iter().zip(originals) {
-        assert_eq!(role.work.id(), work);
-        assert_eq!(role.work.scope().id(), scope);
-        assert_eq!(role.capacity.id(), capacity);
-        assert!(role.report.same_slot(&report));
+    for (slot, (work, scope, report, retired)) in roles.into_iter().zip(originals) {
+        assert_eq!(slot.reported().work().id(), work);
+        assert_eq!(slot.reported().work().scope().id(), scope);
+        assert!(slot.reported().report().same_slot(&report));
         assert!(!retired.is_retired());
+        let (role, mut payment) = slot.into_originals();
         let (custody, unused) =
-            crate::control_runtime::source_custody::SourceCustody::from_admitted(
+            crate::control_runtime::source_custody::SourceCustody::from_reported(
                 h.task,
                 role,
                 Arc::new(Pending),
@@ -486,6 +502,9 @@ fn check_admission_refusal(
             .unwrap();
         assert!(retired.is_retired());
         assert!(custody.reusable());
+        if let Some(payment) = &mut payment {
+            payment.release(&payment.resources().unwrap()).unwrap();
+        }
     }
 }
 

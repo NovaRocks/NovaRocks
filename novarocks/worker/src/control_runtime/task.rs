@@ -40,9 +40,16 @@ use super::{
     operator_statistics::{StatisticsBinding, StatisticsError, TaskStatisticsInbox},
     preparation::{
         PreparationAdoptionError, PreparationBinding, PreparationCustody, PreparationJob,
-        PreparationOutcome, PreparationParent, QueuedPreparation, RunningPreparation,
+        PreparationOutcome, PreparationParent, PreparationStorageSplitError, QueuedPreparation,
+        RunningPreparation,
     },
     preparation_refusal::{HostPreparationRefusal, RefusalPosition},
+};
+use super::{
+    source_positions::{SOURCE_SLOT_STORAGE, SourceSlotAdmission},
+    source_slot_issuer::{
+        SourceSlotIssueError, SourceSlotIssuePartial, SourceSlotPayer, reserve_source_slots,
+    },
 };
 use crate::control_runtime_policy::TaskLifecycleRole;
 use crate::{
@@ -78,10 +85,16 @@ pub(crate) struct TaskHostBinding {
     pub max_cuts: usize,
     pub pending: Arc<dyn TaskPendingNotice>,
     pub health: Arc<ExecutionHealth>,
+    /// Explicit finite scope/header-only component fixture; absent from production.
+    #[cfg(test)]
+    pub source_storage_model: bool,
 }
 
 #[derive(Debug)]
 pub(crate) enum TaskHostError {
+    SourceSlots(SourceSlotIssueError),
+    SourceStorage(PreparationStorageSplitError),
+    SourceInventoryPending,
     WrongEffect,
     WrongTaskOrPayload,
     InvalidGeometry,
@@ -108,6 +121,13 @@ impl From<RuntimeError> for TaskHostError {
 impl std::fmt::Display for TaskHostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SourceSlots(error) => write!(f, "source slot admission failed: {error:?}"),
+            Self::SourceStorage(error) => {
+                write!(f, "original source storage transfer failed: {error:?}")
+            }
+            Self::SourceInventoryPending => {
+                f.write_str("an original source admission still requires unused retirement")
+            }
             Self::WrongEffect => {
                 f.write_str("Task host adoption requires its original LoadInput effect")
             }
@@ -167,6 +187,7 @@ pub(crate) struct UnpublishedTask {
     pub task: TaskIdentity,
     pub lifetime: WorkLease,
     pub active: CapacityBundle,
+    pub source_partials: Vec<SourceSlotIssuePartial>,
 }
 pub(crate) struct TaskAdoptionRefusal {
     pub error: TaskHostError,
@@ -223,6 +244,9 @@ pub(crate) struct TaskHostResources {
     pub pending_loading: Option<LoadingHostJob>,
     pub preparation: Option<PreparationCustody>,
     pub preparation_remainder: Option<CapacityBundle>,
+    pub accepted_source_storage: Option<CapacityBundle>,
+    pub pending_preparation_adoption: Option<TaskPreparationJob>,
+    pub source_partials: Vec<SourceSlotIssuePartial>,
     pub completion: Option<Arc<TaskCompletionRoles>>,
     pub completion_action: Option<CompletionActionCustody>,
     pub lifecycle_inputs: BTreeMap<TaskLifecycleRole, CausalInputCustody>,
@@ -236,7 +260,12 @@ impl TaskHostResources {
     /// a Task terminal or a stopped execution borrow gate is insufficient.
     pub(crate) fn seal_read_observation(&self) -> Result<Arc<TaskReadSnapshot>, TaskReadError> {
         use novarocks_control_runtime::exit_role::ExitRolePhase;
-        if !self.causal.is_empty()
+        if self
+            .source_partials
+            .iter()
+            .any(|partial| !partial.is_empty())
+            || self.pending_preparation_adoption.is_some()
+            || !self.causal.is_empty()
             || self
                 .statistics
                 .as_ref()
@@ -432,6 +461,8 @@ pub(crate) struct TaskHostRecord {
     settlement_notice_issued: bool,
     loader_issued: bool,
     request_admission_open: bool,
+    #[cfg(test)]
+    source_storage_model: bool,
     lifecycle_issued: [bool; TaskLifecycleRole::COUNT],
 }
 impl TaskHostRecord {
@@ -464,21 +495,31 @@ impl TaskHostRecord {
         // Admission already committed in the Core step. Bind performs no new
         // capacity/gate decision; a structural refusal is a shared runtime
         // invariant failure, never an ordinary Task loading refusal.
-        let (lifetime, active) = guard
+        let (lifetime, mut active) = guard
             .bind(WorkKind::Business)
             .map_err(TaskHostError::AdmissionBindInvariant)?;
         // These are the elected Task's four already paid base positions.
         // Their parent is the original Task lifetime, not a short preparation
         // or settlement role whose join could depend on the retained source.
-        let sources = match reserve_source_roles::<4>(&scope, active.id(), ticket.generation) {
+        let parent = active.id();
+        #[cfg(test)]
+        let payer = if binding.source_storage_model {
+            SourceSlotPayer::ProtocolModel
+        } else {
+            SourceSlotPayer::Retained(&mut active)
+        };
+        #[cfg(not(test))]
+        let payer = SourceSlotPayer::Retained(&mut active);
+        let sources = match reserve_source_slots::<4>(&scope, parent, ticket.generation, payer) {
             Ok(sources) => sources,
-            Err(error) => {
+            Err(refusal) => {
                 return Err(TaskAdoptionRefusal {
-                    error: TaskHostError::Runtime(error),
+                    error: TaskHostError::SourceSlots(refusal.error),
                     unpublished: Some(Box::new(UnpublishedTask {
                         task,
                         lifetime,
                         active,
+                        source_partials: vec![refusal.partial],
                     })),
                 });
             }
@@ -492,15 +533,14 @@ impl TaskHostRecord {
         ) {
             Ok(ingress) => Arc::new(ingress),
             Err((_error, sources)) => {
-                for source in sources {
-                    dispose_unused_completion(source);
-                }
+                let partial = SourceSlotIssuePartial::from_admissions(&scope, sources);
                 return Err(TaskAdoptionRefusal {
                     error: TaskHostError::InvalidGeometry,
                     unpublished: Some(Box::new(UnpublishedTask {
                         task,
                         lifetime,
                         active,
+                        source_partials: vec![partial],
                     })),
                 });
             }
@@ -533,6 +573,9 @@ impl TaskHostRecord {
                 pending_loading: None,
                 preparation: None,
                 preparation_remainder: None,
+                accepted_source_storage: None,
+                pending_preparation_adoption: None,
+                source_partials: Vec::new(),
                 completion: None,
                 completion_action: None,
                 lifecycle_inputs: BTreeMap::new(),
@@ -553,6 +596,8 @@ impl TaskHostRecord {
             settlement_notice_issued: false,
             loader_issued: false,
             request_admission_open: true,
+            #[cfg(test)]
+            source_storage_model: binding.source_storage_model,
             lifecycle_issued: [false; TaskLifecycleRole::COUNT],
         })
     }
@@ -655,11 +700,7 @@ impl TaskHostRecord {
         if self.settlement_notice_issued {
             return Err(TaskHostError::CompletionAlreadyIssued);
         }
-        let sources = reserve_source_roles::<2>(
-            &self.scope,
-            self.resources.active.id(),
-            self.core_generation,
-        )?;
+        let sources = self.reserve_source_slots::<2>(false)?;
         let admitted = self
             .resources
             .causal
@@ -668,9 +709,53 @@ impl TaskHostRecord {
                 self.pending.clone(),
                 CutSourceAdmission::Fresh(sources),
             )
-            .map_err(|refusal| TaskHostError::Causal(dispose_fresh_source_refusal(refusal)))?;
+            .map_err(|refusal| self.retain_source_refusal(refusal))?;
         self.settlement_notice_issued = true;
         Ok(admitted)
+    }
+    fn reserve_source_slots<const N: usize>(
+        &mut self,
+        loading: bool,
+    ) -> Result<[SourceSlotAdmission; N], TaskHostError> {
+        if self
+            .resources
+            .source_partials
+            .iter()
+            .any(|partial| !partial.is_empty())
+        {
+            return Err(TaskHostError::SourceInventoryPending);
+        }
+        let parent = self.resources.active.id();
+        #[cfg(test)]
+        let payer = if self.source_storage_model {
+            SourceSlotPayer::ProtocolModel
+        } else if loading {
+            SourceSlotPayer::Retained(&mut self.resources.active)
+        } else {
+            SourceSlotPayer::Pool(&mut self.resources.accepted_source_storage)
+        };
+        #[cfg(not(test))]
+        let payer = if loading {
+            SourceSlotPayer::Retained(&mut self.resources.active)
+        } else {
+            SourceSlotPayer::Pool(&mut self.resources.accepted_source_storage)
+        };
+        match reserve_source_slots::<N>(&self.scope, parent, self.core_generation, payer) {
+            Ok(slots) => Ok(slots),
+            Err(refusal) => {
+                self.resources.source_partials.push(refusal.partial);
+                Err(TaskHostError::SourceSlots(refusal.error))
+            }
+        }
+    }
+    fn retain_source_refusal(&mut self, refusal: CausalAdmissionRefusal) -> TaskHostError {
+        let CutSourceAdmission::Fresh(slots) = refusal.admission else {
+            unreachable!("this fixed-role issuer supplies original fresh source slots");
+        };
+        self.resources
+            .source_partials
+            .push(SourceSlotIssuePartial::from_admissions(&self.scope, slots));
+        TaskHostError::Causal(refusal.error)
     }
     pub(crate) fn causal(&mut self) -> &mut TaskCausalInbox {
         &mut self.resources.causal
@@ -830,13 +915,7 @@ impl TaskHostRecord {
         };
         let mut authors = Vec::with_capacity(2);
         for _ in 0..2 {
-            let result = reserve_source_roles::<2>(
-                &self.scope,
-                self.resources.active.id(),
-                self.core_generation,
-            )
-            .map_err(TaskHostError::Runtime)
-            .and_then(|sources| {
+            let result = self.reserve_source_slots::<2>(true).and_then(|sources| {
                 self.resources
                     .causal
                     .admit_input(
@@ -845,7 +924,7 @@ impl TaskHostRecord {
                         self.pending.clone(),
                         CutSourceAdmission::Fresh(sources),
                     )
-                    .map_err(|refusal| TaskHostError::Causal(dispose_fresh_source_refusal(refusal)))
+                    .map_err(|refusal| self.retain_source_refusal(refusal))
             });
             match result {
                 Ok(author) => authors.push(author),
@@ -985,6 +1064,14 @@ impl TaskHostRecord {
         if self.resources.preparation.is_some() {
             return Err(TaskHostError::DuplicatePreparation);
         }
+        let accepted_slots = TaskLifecycleRole::COUNT
+            .checked_sub(2)
+            .and_then(|roles| roles.checked_mul(2))
+            .ok_or(TaskHostError::InvalidGeometry)?;
+        let source_storage = SOURCE_SLOT_STORAGE
+            .checked_mul(accepted_slots)
+            .and_then(|need| need.resources())
+            .map_err(|_| TaskHostError::InvalidGeometry)?;
         let loader = self
             .resources
             .loader
@@ -1011,13 +1098,26 @@ impl TaskHostRecord {
                 return Err(TaskHostError::Preparation(error));
             }
         };
-        self.resources.preparation = Some(owner);
+        self.resources.preparation = Some(owner.clone());
         let job = TaskPreparationJob {
             job: Some(job),
             request: Some(request),
             host: None,
         };
         loader.input_transferred();
+        #[cfg(test)]
+        let detach = !self.source_storage_model;
+        #[cfg(not(test))]
+        let detach = true;
+        if detach {
+            match owner.take_task_source_storage(&source_storage) {
+                Ok(storage) => self.resources.accepted_source_storage = Some(storage),
+                Err(error) => {
+                    self.resources.pending_preparation_adoption = Some(job);
+                    return Err(TaskHostError::SourceStorage(error));
+                }
+            }
+        }
         Ok(job)
     }
     pub(crate) fn preparation(&self) -> Option<&PreparationCustody> {
@@ -1138,15 +1238,11 @@ impl TaskHostRecord {
             },
             Some(self.core_generation),
         )?;
-        let sources = match reserve_source_roles::<2>(
-            &self.scope,
-            self.resources.active.id(),
-            self.core_generation,
-        ) {
+        let sources = match self.reserve_source_slots::<2>(false) {
             Ok(sources) => sources,
             Err(error) => {
                 dispose_unused_completion(role);
-                return Err(error.into());
+                return Err(error);
             }
         };
         let (cut, sender) = match self.resources.causal.admit_input(
@@ -1157,9 +1253,9 @@ impl TaskHostRecord {
         ) {
             Ok(admitted) => admitted,
             Err(refusal) => {
-                let error = dispose_fresh_source_refusal(refusal);
+                let error = self.retain_source_refusal(refusal);
                 dispose_unused_completion(role);
-                return Err(TaskHostError::Causal(error));
+                return Err(error);
             }
         };
         let (custody, author) = CausalInputCustody::from_admitted(
@@ -1273,15 +1369,11 @@ impl TaskHostRecord {
             WorkKind::Cleanup,
             Some(self.core_generation),
         )?;
-        let sources = match reserve_source_roles::<2>(
-            &self.scope,
-            self.resources.active.id(),
-            self.core_generation,
-        ) {
+        let sources = match self.reserve_source_slots::<2>(false) {
             Ok(sources) => sources,
             Err(error) => {
                 dispose_unused_completion(role);
-                return Err(error.into());
+                return Err(error);
             }
         };
         let (cut, sender) = match self.resources.causal.admit_input(
@@ -1292,9 +1384,9 @@ impl TaskHostRecord {
         ) {
             Ok(admitted) => admitted,
             Err(refusal) => {
-                let error = dispose_fresh_source_refusal(refusal);
+                let error = self.retain_source_refusal(refusal);
                 dispose_unused_completion(role);
-                return Err(TaskHostError::Causal(error));
+                return Err(error);
             }
         };
         let (custody, notice) = CompletionActionCustody::from_admitted(
@@ -1369,35 +1461,26 @@ impl TaskHostRecord {
     }
 }
 
-fn reserve_source_roles<const N: usize>(
+#[cfg(test)]
+fn test_model_source_roles<const N: usize>(
     scope: &ScopeHandle,
     parent: ReservationId,
     core_generation: Generation,
-) -> Result<[AdmittedCompletionRole; N], RuntimeError> {
-    let mut roles = Vec::with_capacity(N);
-    for _ in 0..N {
-        match reserve_reported_role(scope, parent, WorkKind::Cleanup, Some(core_generation)) {
-            Ok(role) => roles.push(role),
-            Err(error) => {
-                for role in roles {
-                    dispose_unused_completion(role);
-                }
-                return Err(error);
-            }
-        }
-    }
-    Ok(roles
-        .try_into()
-        .unwrap_or_else(|_| unreachable!("the original source role arity is fixed")))
+) -> [novarocks_control_runtime::reported_work::ReportedWork; N] {
+    std::array::from_fn(|_| {
+        let role =
+            reserve_reported_role(scope, parent, WorkKind::Cleanup, Some(core_generation)).unwrap();
+        super::admitted_role::adopt_reported_work(role.work, role.capacity, role.report)
+    })
 }
-fn dispose_fresh_source_refusal(refusal: CausalAdmissionRefusal) -> CausalError {
-    let CutSourceAdmission::Fresh(roles) = refusal.admission else {
-        unreachable!("Task host receives the same original fresh source admission")
-    };
-    for role in roles {
-        dispose_unused_completion(role);
-    }
-    refusal.error
+#[cfg(test)]
+fn test_model_source_slots<const N: usize>(
+    scope: &ScopeHandle,
+    parent: ReservationId,
+    core_generation: Generation,
+) -> [SourceSlotAdmission; N] {
+    test_model_source_roles::<N>(scope, parent, core_generation)
+        .map(SourceSlotAdmission::protocol_model)
 }
 
 #[cfg(test)]

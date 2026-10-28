@@ -239,7 +239,10 @@ mod tests {
             .prepare_owned_pair_reap(&retired.pair)
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
-        ingress.release_owned_pair(&retired.pair, reaped).unwrap();
+        let detached = ingress.release_owned_pair(&retired.pair, reaped).unwrap();
+        for mut storage in detached {
+            storage.release().unwrap();
+        }
         drop(retired);
     }
     fn complete_rejected(f: &mut Fixture, host: &mut TaskHostRecord) {

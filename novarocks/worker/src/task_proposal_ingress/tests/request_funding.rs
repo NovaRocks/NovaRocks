@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A source-free request can return its own real funding without a later cut.
+//! Unused source-pair swaps preserve original slot and role identities.
+//! These component observations do not authorize an R refund after rotation.
 //! These component roles use the fixture's actual observer-only source reports;
 //! consuming the summary does not manufacture a Context actor Core receipt.
 
@@ -65,9 +66,11 @@ fn retire_owned_unused_pair(f: &Fixture, pair: SourcePositionPair, funding: &Sou
         .prepare_owned_pair_reap(&pair)
         .unwrap()
         .map(|probe| probe.observe_reaped().unwrap());
-    f.ingress
+    let storage = f
+        .ingress
         .release_owned_pair(&pair, witnesses)
         .unwrap_or_else(|_| panic!("release the exact actually reaped funding pair"));
+    release_storage(storage);
     assert!(funding.custody.iter().all(SourceCustody::reusable));
 }
 
@@ -331,7 +334,7 @@ fn a_claimed_funding_source_waits_for_its_last_real_alias_and_cannot_match_a_rea
         .unwrap()
         .map(|probe| probe.observe_reaped().unwrap());
     f.ingress
-        .rearm_open_spare(reaped, f.roles())
+        .rearm_open_spare(reaped, f.reported_roles())
         .unwrap_or_else(|_| {
             panic!("the exact old headers reaped before fresh roles were admitted")
         });

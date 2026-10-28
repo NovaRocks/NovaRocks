@@ -262,9 +262,8 @@ fn foreign_ledger_whole_author_with_the_same_numeric_scope_and_work_returns_ever
     };
     let original_sources = sources.each_ref().map(|source| {
         (
-            source.work.id(),
-            source.capacity.id(),
-            source.report.clone(),
+            source.reported().work().id(),
+            source.reported().report().clone(),
         )
     });
     let actor_before = h.fixture.runtime.snapshot(actor()).unwrap();
@@ -292,18 +291,30 @@ fn foreign_ledger_whole_author_with_the_same_numeric_scope_and_work_returns_ever
     let CutSourceAdmission::Fresh(sources) = admission else {
         unreachable!()
     };
-    let source_unchanged = sources.each_ref().iter().zip(original_sources.iter()).all(
-        |(source, (work, capacity, report))| {
-            source.work.id() == *work
-                && source.capacity.id() == *capacity
-                && source.report.same_slot(report)
-        },
-    );
+    let source_unchanged =
+        sources
+            .each_ref()
+            .iter()
+            .zip(original_sources.iter())
+            .all(|(source, (work, report))| {
+                source.reported().work().id() == *work
+                    && source.reported().report().same_slot(report)
+            });
     dispose_unused_completion(admitted);
     dispose_unused_completion(local);
-    for source in sources {
-        dispose_unused_completion(source);
+    let mut partial =
+        crate::control_runtime::source_slot_issuer::SourceSlotIssuePartial::from_admissions(
+            &h.fixture.scope,
+            sources,
+        );
+    let mut partial_retired = false;
+    for _ in 0..256 {
+        if partial.try_retire(&h.fixture.ledger).unwrap() {
+            partial_retired = true;
+            break;
+        }
     }
+    assert!(partial_retired);
     h.fixture
         .ledger
         .reap_scope_ready(h.fixture.scope.id(), 256)
