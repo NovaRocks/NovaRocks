@@ -624,3 +624,224 @@ fn delayed_quiesce_reply_uses_its_original_token_after_the_initial_input_retires
     assert!(continue_seen && waiting && original_input_retired);
     assert!(continuation != request.token && late_original_reply && charged && retired);
 }
+
+fn task_funding_context(extra: StorageNeed) -> Harness {
+    // The fixture supplies the actual Task-causal profile to the process
+    // ledger. It does not borrow the Context bootstrap's paid inventory.
+    let mut f = Harness::new_with_request_profile(
+        CONTEXT_BOOTSTRAP_STORAGE.checked_add(extra).unwrap(),
+        1,
+        StorageNeed::role(true),
+    );
+    let materialize = f.materialize();
+    let binding = f.binding(context_actor(), &materialize);
+    f.service.adopt_context(&materialize, binding).unwrap();
+    f.complete_materialize_handoff(materialize);
+    f
+}
+
+#[test]
+fn task_request_source_siblings_and_outer_keep_shared_r_after_the_original_author_retires() {
+    use crate::control_runtime::admitted_role::{adopt_reported_work, dispose_unused_completion};
+    use novarocks_control_runtime::exit_role::{ExitRole, ExitRolePhase};
+
+    let mut f = task_funding_context(StorageNeed::default());
+    let dimensions = [
+        Dimension::Requests,
+        Dimension::Inputs,
+        Dimension::Batches,
+        Dimension::Effects,
+        Dimension::Cuts,
+        Dimension::Replies,
+        Dimension::Completions,
+        Dimension::Captures,
+        Dimension::Work,
+    ];
+    let baseline = dimensions.map(|dimension| f.ledger.used(dimension.id()));
+    let mut all_authors_retired = true;
+    let mut all_sources_still_live = true;
+    let mut original_outer_preserved = true;
+    let mut no_second_r = true;
+    for _ in 0..3 {
+        let funding = f
+            .service
+            .context(f.identity)
+            .unwrap()
+            .reserve_task_request_funding()
+            .unwrap();
+        let author = funding.author;
+        let sources = funding.sources;
+        let mut outer = funding.outer;
+        let main_retirement = author.work.retirement_observer();
+        let source_retirements = sources
+            .each_ref()
+            .map(|source| source.work.retirement_observer());
+        let (main, authority) = ExitRole::from_admitted(adopt_reported_work(
+            author.work,
+            author.capacity,
+            author.report,
+        ));
+        // These holders have never been exposed to a Task, producer or RPC.
+        // Only their own actual unused exit may be observed here.
+        authority.withdraw_unpublished_and_exit().unwrap();
+        let scope = f.service.context(f.identity).unwrap().scope().clone();
+        f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
+        all_authors_retired &= main_retirement.is_retired()
+            && main.try_retire().unwrap()
+            && main.phase() == ExitRolePhase::Retired;
+        all_sources_still_live &= source_retirements.iter().all(|source| !source.is_retired());
+        let original_outer = outer.resources().unwrap();
+        for (index, dimension) in dimensions.iter().enumerate() {
+            original_outer_preserved &= f.ledger.used(dimension.id())
+                == baseline[index] + original_outer.get(dimension.id());
+        }
+        let refusal = f
+            .service
+            .context(f.identity)
+            .unwrap()
+            .reserve_task_request_funding()
+            .err()
+            .expect("one actual process R remains occupied");
+        no_second_r &= refusal.partial.is_none();
+        if let Some(partial) = refusal.partial {
+            assert!(advance(&mut f, partial));
+        }
+        for source in sources {
+            dispose_unused_completion(source);
+        }
+        f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
+        assert!(source_retirements.iter().all(|source| source.is_retired()));
+        // Main Work has already gone; the same original outer is still the
+        // unique paid reservation. It grants no new Work/derivation authority.
+        outer.release(&original_outer).unwrap();
+        for (index, dimension) in dimensions.iter().enumerate() {
+            assert_eq!(f.ledger.used(dimension.id()), baseline[index]);
+        }
+    }
+    finish(f);
+    assert!(all_authors_retired && all_sources_still_live);
+    assert!(original_outer_preserved && no_second_r);
+}
+
+#[test]
+fn partial_task_source_report_admission_retains_original_outer_until_its_actual_headers_retire() {
+    let mut f = task_funding_context(StorageNeed {
+        completions: 128,
+        ..StorageNeed::default()
+    });
+    let mut probes = Vec::new();
+    {
+        let host = f.service.context(f.identity).unwrap();
+        while let Ok(report) = ReportSlot::reserve_next(
+            host.scope(),
+            generation(),
+            host.resources.roles[LIFETIME].work.id(),
+            1,
+            [(ConsumerId::new(1).unwrap(), ConsumerKind::Observer)],
+        ) {
+            probes.push(report);
+        }
+    }
+    // Leave exactly the original author's report and Source1's report free.
+    // The second Source admission must return a real partial, not a fabricated
+    // successful Source2 or an immediate refund of its occupied outer storage.
+    assert!(probes.len() > 2);
+    for report in probes.drain(probes.len() - 2..) {
+        report.revoke_unused().unwrap();
+        report.body_exited().unwrap();
+        report.captures_exited().unwrap();
+        assert!(report.try_retire().unwrap());
+    }
+    let before_admission = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .scope()
+        .snapshot()
+        .unwrap();
+    let refusal = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .reserve_task_request_funding()
+        .err()
+        .expect("actual report inventory is full");
+    let partial = refusal
+        .partial
+        .expect("actual author, Source1 and outer remain owned");
+    let held = f.ledger.used(Dimension::Requests.id()) == 1;
+    let before = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .scope()
+        .snapshot()
+        .unwrap();
+    // Actual resident reports distinguish the retained author plus Source1
+    // from a refusal that rolled every header back or merely copied counts.
+    let held_original_partial =
+        before.storage == before_admission.storage + 2 && before.work >= before_admission.work + 2;
+    for report in probes {
+        report.revoke_unused().unwrap();
+        report.body_exited().unwrap();
+        report.captures_exited().unwrap();
+        assert!(report.try_retire().unwrap());
+    }
+    let cleaned = advance(&mut f, partial);
+    let after = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .scope()
+        .snapshot()
+        .unwrap();
+    let actual_headers_retired = after.work < before.work && after.storage < before.storage;
+    finish(f);
+    assert!(held_original_partial && held && cleaned && actual_headers_retired);
+}
+
+#[test]
+fn task_funding_in_a_cleanup_epoch_keeps_the_original_core_consumer_generation() {
+    use crate::control_runtime::admitted_role::{adopt_reported_work, dispose_unused_completion};
+    use novarocks_control_runtime::exit_role::ExitRole;
+    let mut f = task_funding_context(StorageNeed::default());
+    let scope = f.service.context(f.identity).unwrap().scope().clone();
+    let original_generation = scope.gates().unwrap().generation;
+    let cleanup_generation = scope.fail().unwrap();
+    assert!(cleanup_generation > original_generation);
+    let funding = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .reserve_task_request_funding()
+        .unwrap();
+    let reports = [
+        funding.author.report.clone(),
+        funding.sources[0].report.clone(),
+        funding.sources[1].report.clone(),
+    ];
+    let mut original_core_legs = true;
+    for report in &reports {
+        original_core_legs &= report
+            .abandon_failed_owner(ConsumerId::new(1).unwrap(), &scope, original_generation)
+            .is_ok();
+    }
+    // No report/body was published to the external leg. These exact unexposed
+    // holders now take their real unused exit; abandoning Core did not sign it.
+    let (main, authority) = ExitRole::from_admitted(adopt_reported_work(
+        funding.author.work,
+        funding.author.capacity,
+        funding.author.report,
+    ));
+    let no_invented_physical_exit = !main.body_exited() && !main.captures_exited();
+    authority.withdraw_unpublished_and_exit().unwrap();
+    for source in funding.sources {
+        dispose_unused_completion(source);
+    }
+    f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
+    let retired = main.try_retire().unwrap();
+    let mut outer = funding.outer;
+    outer.release(&outer.resources().unwrap()).unwrap();
+    finish(f);
+    assert!(original_core_legs && no_invented_physical_exit && retired);
+}

@@ -882,9 +882,18 @@ mod tests {
             Self::new_with_request_capacity(context_storage, 0)
         }
         fn new_with_request_capacity(context_storage: StorageNeed, requests: usize) -> Self {
-            let request_storage = super::requests::CONTEXT_REQUEST_STORAGE
-                .checked_mul(requests)
-                .unwrap();
+            Self::new_with_request_profile(
+                context_storage,
+                requests,
+                super::requests::CONTEXT_REQUEST_STORAGE,
+            )
+        }
+        fn new_with_request_profile(
+            context_storage: StorageNeed,
+            requests: usize,
+            profile: StorageNeed,
+        ) -> Self {
+            let request_storage = profile.checked_mul(requests).unwrap();
             let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
                 ordinary_running: 1,
                 ordinary_waiting: 0,

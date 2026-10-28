@@ -18,14 +18,18 @@
 //! Original direct Context RPC custody. A command handoff, Core consumption,
 //! reply publication and the actual external delivery exit are separate facts.
 
+mod task_funding;
+
 use super::ContextHostRecord;
 use crate::control_runtime::{
     actors::{ContextMessage, RequestMetadata, WorkerAction, WorkerActor, WorkerMessage},
+    admitted_role::dispose_unused_completion,
     control_request::ControlRequestError,
     request_endpoint::{RequestEndpoint, RequestHandle},
     request_ready::{ControlRequestReady, RequestExternalLeg},
 };
 use crate::control_runtime_policy::{PolicyError, StorageNeed};
+use crate::task_completion_roles::AdmittedCompletionRole;
 use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::{
@@ -132,11 +136,42 @@ pub(crate) struct ContextRequestPartial {
     report_revoked: bool,
     exited: bool,
     unresolved: bool,
+    outer: Option<CapacityBundle>,
+    sources: Vec<UnusedRequestSource>,
 }
+
+struct UnusedRequestSource {
+    admitted: Option<AdmittedCompletionRole>,
+    retirement: WorkRetirementObserver,
+}
+
 impl ContextRequestPartial {
     fn try_retire(&mut self) -> Result<bool, ContextRequestError> {
         if self.unresolved {
             return Err(ContextRequestError::SubmissionUnresolved);
+        }
+        for source in &mut self.sources {
+            if let Some(admitted) = source.admitted.take() {
+                // These exact originals were never exposed to an ingress or
+                // source producer. This call observes their actual empty exit.
+                dispose_unused_completion(admitted);
+            }
+        }
+        if self
+            .sources
+            .iter()
+            .any(|source| !source.retirement.is_retired())
+        {
+            self.ledger
+                .reap_scope_ready(self.work.scope().id(), 1)
+                .map_err(ContextRequestError::Runtime)?;
+            if self
+                .sources
+                .iter()
+                .any(|source| !source.retirement.is_retired())
+            {
+                return Ok(false);
+            }
         }
         if let Some(permit) = self.permit.take()
             && let Err(error) = permit.revoke_unused()
@@ -182,13 +217,23 @@ impl ContextRequestPartial {
                 return Ok(false);
             }
         }
-        let remaining = self
-            .capacity
-            .resources()
-            .map_err(ContextRequestError::Runtime)?;
-        self.capacity
-            .release(&remaining)
-            .map_err(ContextRequestError::Runtime)?;
+        if !self.capacity.is_released() {
+            let remaining = self
+                .capacity
+                .resources()
+                .map_err(ContextRequestError::Runtime)?;
+            self.capacity
+                .release(&remaining)
+                .map_err(ContextRequestError::Runtime)?;
+        }
+        if let Some(outer) = &mut self.outer
+            && !outer.is_released()
+        {
+            let remaining = outer.resources().map_err(ContextRequestError::Runtime)?;
+            outer
+                .release(&remaining)
+                .map_err(ContextRequestError::Runtime)?;
+        }
         Ok(true)
     }
 }
@@ -273,6 +318,8 @@ impl ContextRequestCustody {
             report_revoked: false,
             exited: false,
             unresolved: false,
+            outer: None,
+            sources: Vec::new(),
         };
         let report = match ReportSlot::reserve_next(
             scope,
@@ -334,6 +381,8 @@ impl ContextRequestCustody {
                         report_revoked: false,
                         exited: false,
                         unresolved: false,
+                        outer: None,
+                        sources: Vec::new(),
                     }),
                 ));
             }
@@ -618,6 +667,26 @@ impl ContextRequestCustody {
 }
 
 impl ContextHostRecord {
+    fn retain_request_partial(
+        &mut self,
+        error: ContextRequestError,
+        partial: Option<ContextRequestPartial>,
+    ) -> ContextRequestAdmissionRefusal {
+        let partial = partial.map(|partial| {
+            let work = partial.work.id();
+            assert!(
+                self.resources
+                    .request_partials
+                    .insert(work, partial)
+                    .is_none()
+            );
+            if let Some(notice) = &self.resources.notice {
+                notice.notify();
+            }
+            work
+        });
+        ContextRequestAdmissionRefusal { error, partial }
+    }
     /// The actual Context owns each admitted R before its command can be
     /// filled. The process-wide ready index grants no substitute scope/payer.
     pub(crate) fn admit_request(
@@ -639,25 +708,7 @@ impl ContextHostRecord {
                 assert!(self.resources.requests.insert(work, custody).is_none());
                 Ok((work, handle))
             }
-            Err((error, partial)) => {
-                let work = partial.map(|partial| {
-                    let work = partial.work.id();
-                    assert!(
-                        self.resources
-                            .request_partials
-                            .insert(work, partial)
-                            .is_none()
-                    );
-                    if let Some(notice) = &self.resources.notice {
-                        notice.notify();
-                    }
-                    work
-                });
-                Err(ContextRequestAdmissionRefusal {
-                    error,
-                    partial: work,
-                })
-            }
+            Err((error, partial)) => Err(self.retain_request_partial(error, partial)),
         }
     }
     pub(crate) fn submit_request(
