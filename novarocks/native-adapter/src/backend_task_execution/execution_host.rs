@@ -82,8 +82,7 @@ use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, Do
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution_contract::task_execution::status::{
-    AbortCause, CancelReason, SafeDetail, TaskFailureCategory, TaskOutputFacts, TaskState,
-    TerminationDetail,
+    AbortCause, CancelReason, SafeDetail, TaskFailureCategory, TaskOutputFacts, TerminationDetail,
 };
 use novarocks_execution_contract::{FragmentNodeId, FragmentSinkKind};
 use novarocks_proto_codec::FieldPath;
@@ -1726,7 +1725,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     observation.handoff(observed).unwrap_or_else(|_retained| {
                         std::panic::panic_any(NativePreparationUnresolved)
                     });
-                    completion_worker.finish(None);
+                    completion_worker.finish();
                     split_queues.close_attempt(attempt);
                     queries.unregister_fragment_execution(execution, kernel_key);
                     queries.finish_fragment(execution);
@@ -2012,7 +2011,6 @@ struct RunnableState {
     handle: Option<Arc<dyn FragmentStandDown>>,
     stand_down: Option<StandDown>,
     finished: bool,
-    finished_root_reporter: Option<TaskStatusReporter>,
 }
 
 struct PreparedNativeStart {
@@ -2115,7 +2113,9 @@ impl NativeRunnableTask {
         };
         let stopped_before_start = latched_stop
             || self.status.as_ref().is_some_and(|status| {
-                let current = status.current();
+                let current = status.current().unwrap_or_else(|_missing_owner| {
+                    std::panic::panic_any(NativePreparationUnresolved)
+                });
                 current.termination().is_some() || current.is_terminal()
             });
         let PreparedNativeStart {
@@ -2227,28 +2227,16 @@ impl NativeRunnableTask {
     /// Releases this handle's reference to the running fragment once the
     /// completion owner has its terminal fact, so the kernel handle's last
     /// drop belongs to that owner rather than to a later canceller.
-    fn finish(&self, root_reporter: Option<&TaskStatusReporter>) {
-        let (late_stand_down, handle, replaced_reporter) = {
+    fn finish(&self) {
+        let handle = {
             let mut state = self.state.lock().expect(RUNNABLE_LOCK);
             state.finished = true;
-            let handle = state.handle.take();
-            let replaced_reporter =
-                std::mem::replace(&mut state.finished_root_reporter, root_reporter.cloned());
-            let late = state.stand_down.and_then(|stand_down| {
-                state
-                    .finished_root_reporter
-                    .take()
-                    .map(|reporter| (stand_down, reporter))
-            });
-            (late, handle, replaced_reporter)
+            state.handle.take()
         };
-        // A last kernel/reporter alias may run foreign teardown. The same
-        // completion Work supervises it after the runnable metadata unlocks.
+        // Last kernel destruction belongs to the actual completion owner,
+        // outside the runnable metadata lock. Root drain is its own original
+        // Worker role and is never inferred from a later control request.
         drop(handle);
-        drop(replaced_reporter);
-        if let Some((stand_down, reporter)) = late_stand_down {
-            settle_finished_root_result(&reporter, stand_down);
-        }
     }
 
     fn accept_control(&self, stand_down: StandDown) {
@@ -2273,7 +2261,7 @@ impl NativeRunnableTask {
     }
 
     fn request_physical(&self, stand_down: StandDown) {
-        let (handle, finished_root_reporter, resume_start) = {
+        let (handle, resume_start) = {
             let mut state = self.state.lock().expect(RUNNABLE_LOCK);
             if state.stand_down.is_some() {
                 return;
@@ -2281,11 +2269,10 @@ impl NativeRunnableTask {
             state.stand_down = Some(stand_down);
             self.stop.request_stop();
             if state.finished {
-                (None, state.finished_root_reporter.take(), false)
+                (None, false)
             } else {
                 (
                     state.handle.as_ref().map(Arc::clone),
-                    None,
                     state.start_deferred && state.prepared_start.is_some(),
                 )
             }
@@ -2293,35 +2280,10 @@ impl NativeRunnableTask {
         if resume_start {
             self.start_committed();
         }
-        // The kernel may have stopped while a root result is still FLUSHING.
-        // The finished runnable supplies the missing terminal/output facts.
-        if let Some(reporter) = finished_root_reporter {
-            settle_finished_root_result(&reporter, stand_down);
-        }
-        // An absent handle means the fragment has not been attached yet. The
-        // latch set above is what `attach` replays.
+        // An absent handle leaves the original stand-down latched for attach.
         if let Some(handle) = handle {
             handle.cancel(stand_down.reason());
         }
-    }
-}
-
-fn settle_finished_root_result(reporter: &TaskStatusReporter, stand_down: StandDown) {
-    let current = reporter.current();
-    if current.state() == TaskState::Finished {
-        return;
-    }
-    // Context termination and CancelTask normally discard this first. A
-    // creation that lost to context termination can install its result after
-    // that fan-out, so the execution owner must close its own late buffer too.
-    if !matches!(stand_down, StandDown::Quiesce) {
-        novarocks_worker::result_buffer::discard_task(reporter.identity());
-    }
-    if !current.is_terminal() {
-        reporter.conclude_termination(stand_down.proposal(), TaskOutputFacts::default());
-    }
-    if !matches!(stand_down, StandDown::Quiesce) {
-        reporter.release_output();
     }
 }
 
@@ -2374,7 +2336,11 @@ fn observe_compiled_terminal(
         if !root_channel.is_some_and(|channel| channel.is_closed()) {
             return None;
         }
-        match reporter.current().termination() {
+        match reporter
+            .current()
+            .unwrap_or_else(|_missing_owner| std::panic::panic_any(NativePreparationUnresolved))
+            .termination()
+        {
             Some(novarocks_execution_contract::TerminationDetail::Aborted(cause)) => {
                 Some(StandDown::Abort(*cause))
             }
@@ -2666,6 +2632,7 @@ pub(super) fn failure_category(
 /// The status owner moves through the terminating state the state machine
 /// requires, and keeps an abort that already won: a failure cannot rewrite a
 /// stand-down the Worker published before this runnable heard of it.
+#[cfg(test)]
 fn report_failure(reporter: &TaskStatusReporter, failure: ExecutionFailure) {
     reporter.conclude_failure(
         failure,
@@ -4369,7 +4336,7 @@ pub(crate) mod tests {
         };
         task.attach(make());
         task.attach(make());
-        task.finish(None);
+        task.finish();
         assert_eq!(unlocked.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(locked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -4445,7 +4412,7 @@ pub(crate) mod tests {
 
         // Once the worker has its terminal fact a stand-down has nothing left
         // to reach, and must not resurrect a reference to the kernel handle.
-        task.finish(None);
+        task.finish();
         task.abort(AbortCause::PeerTaskFailed);
         assert_eq!(handle.reasons.lock().expect("reasons").len(), 1);
     }

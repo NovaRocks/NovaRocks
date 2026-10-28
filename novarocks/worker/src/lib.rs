@@ -92,6 +92,7 @@ pub use task_preparation::{
 mod task_registry;
 mod task_registry_config;
 mod task_registry_entry;
+mod task_reporter;
 pub use host::{TaskPreparationContext, TaskPreparationRoles, TaskPreparationRolesTaken};
 pub use task_registry_entry::TaskPreparationView;
 #[cfg(test)]
@@ -131,6 +132,7 @@ pub use catalog_manager::{
 };
 pub use catalog_manager_config::{CatalogManagerConfig, DEFAULT_MAX_RETAINED_CATALOGS};
 pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
+pub use control_runtime::lifecycle_read::TaskReadError;
 pub use control_runtime::operator_statistics::{
     StatisticsSubmission, TaskStatisticsFinalizer, TaskStatisticsProducer,
 };
@@ -186,8 +188,7 @@ pub use reliable_transport::{
 };
 pub use runtime_filter_error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 pub use status::{
-    CompletionExitAlreadyTaken, METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute,
-    StatusAdvance, TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
+    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance, TaskStatusOwner,
 };
 pub use task_completion::{
     CompletionReservationError, TaskCompletionAction, TaskCompletionReservation,
@@ -208,9 +209,9 @@ pub use task_execution_ports::{
     TaskExecutionMetrics, TaskExecutionPorts, TaskProtocolObserver, TaskResultLifecycle,
 };
 pub use task_lifecycle::{
-    CompletionExitCapability, CompletionExitNotice, TaskLifecycleEvent, TaskLifecycleHandoffError,
-    TaskLifecyclePort, TaskRootDrainCapability, TaskRootDrainFuture, TaskRootDrainOutcome,
-    TaskRootDrainPermit, TaskStartPermit, TaskStartRefusal, TaskStopIntent, TaskTerminalPermit,
+    CompletionExitCapability, CompletionExitNotice, TaskLifecycleHandoffError,
+    TaskRootDrainCapability, TaskRootDrainFuture, TaskRootDrainOutcome, TaskRootDrainPermit,
+    TaskStartPermit, TaskStartRefusal, TaskStopIntent, TaskTerminalPermit,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{
@@ -218,6 +219,7 @@ pub use task_registry::{
     TaskExecutionRegistry, TaskPreparationSnapshot, TaskPreparationSnapshotError,
 };
 pub use task_registry_config::{TaskExecutionRegistryConfig, TaskPreparationLimits};
+pub use task_reporter::TaskStatusReporter;
 pub use typed_preparation_flow::ScanPreparationTimer;
 pub use typed_scan_runtime::{
     CatalogExecutionAccessError, CatalogReadExecutionResolver, CatalogWriteExecutionResolver,

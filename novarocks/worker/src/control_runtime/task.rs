@@ -1054,6 +1054,14 @@ impl TaskHostRecord {
     pub(crate) fn statistics(&mut self) -> Option<&mut TaskStatisticsInbox> {
         self.resources.statistics.as_mut()
     }
+    /// Detached views borrow this original owner and its one read authority;
+    /// they issue no Work, lifecycle input or physical-exit notice.
+    pub(crate) fn reporter(&self) -> crate::TaskStatusReporter {
+        crate::TaskStatusReporter::from_original(
+            self.resources.port.execution_view(),
+            self.resources.lifetime.observation(),
+        )
+    }
     /// Issue before the dormant runtime start captures this capability. Only
     /// this owner can consume the original Running role's paid inventory.
     pub(crate) fn issue_start_permit(&mut self) -> Result<crate::TaskStartPermit, TaskHostError> {

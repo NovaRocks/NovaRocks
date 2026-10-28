@@ -301,7 +301,7 @@ pub(crate) struct TaskRuntimePort {
 /// The actual Task host/scope retains the strong port. Executing work may
 /// retain this detached view in an error source without forming a cycle back
 /// from the published accepted source to its own owner.
-struct TaskExecutionView {
+pub(crate) struct TaskExecutionView {
     owner: Weak<TaskRuntimePort>,
     identity: TaskIdentity,
     health: Arc<ExecutionHealth>,
@@ -431,6 +431,9 @@ impl TaskRuntimePort {
     pub(crate) fn execution_port(
         self: &Arc<Self>,
     ) -> Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort> {
+        self.execution_view()
+    }
+    pub(crate) fn execution_view(self: &Arc<Self>) -> Arc<TaskExecutionView> {
         Arc::new(TaskExecutionView {
             owner: Arc::downgrade(self),
             identity: self.identity,

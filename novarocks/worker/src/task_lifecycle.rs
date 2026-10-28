@@ -19,12 +19,8 @@
 //! Task causal roles; they select no conclusion, invoke no observer and wait
 //! for neither the Core nor another queue's capacity.
 
-use crate::{PreparedCleanupDiagnostic, TaskConvergenceSnapshot, TaskSecondaryDiagnosticsSnapshot};
-use novarocks_execution::runtime::task_control::TaskExecutionPort;
 use novarocks_execution_contract::{
-    AbortCause, CancelReason, CodecOwnedContent, DomainVersion, OperationOutcome,
-    OperatorStatistics, TaskIdentity, TaskOutputFacts, TaskResourceFacts, TaskStatus,
-    TaskStatusVersion, TaskWriterFacts,
+    AbortCause, CancelReason, OperationOutcome, TaskIdentity, TaskStatusVersion,
 };
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -232,50 +228,6 @@ impl Drop for TaskTerminalPermit {
 pub enum TaskStopIntent {
     Canceled(CancelReason),
     Aborted(AbortCause),
-}
-
-/// Only neutral owned facts enter the lifecycle mailbox. A mutable payload or
-/// originating error is transferred through its separate host custody port.
-#[derive(Debug)]
-pub enum TaskLifecycleEvent {
-    Running,
-    Flushing,
-    CompletionIntent {
-        completed_output: Option<TaskOutputFacts>,
-    },
-    FinishWithOutput {
-        output: Option<TaskOutputFacts>,
-    },
-    OutputReleased,
-    ActualStopped,
-    ResourcesConverged,
-    Metrics {
-        resources: TaskResourceFacts,
-        writer: Option<TaskWriterFacts>,
-    },
-    OperatorStatistics {
-        statistics: Vec<OperatorStatistics>,
-        truncated: bool,
-    },
-}
-
-/// Implemented only by the actual admitted Task host. Clones address its same
-/// prepaid roles and coalesced positions; no call signs another input or Work.
-/// Each event seals the Task's proposal prefix before it can reach its FIFO.
-pub trait TaskLifecyclePort: TaskExecutionPort {
-    fn current(&self) -> TaskStatus;
-    fn convergence(&self) -> TaskConvergenceSnapshot;
-    fn secondary_diagnostics(&self) -> TaskSecondaryDiagnosticsSnapshot;
-    fn handoff(&self, event: TaskLifecycleEvent);
-    fn handoff_cleanup(&self, diagnostic: PreparedCleanupDiagnostic);
-    /// The actual host retains this original carrier in its paid payload
-    /// position. Only its PayloadId and exact neutral facts reach the Core.
-    fn handoff_dynamic_filters(
-        &self,
-        version: DomainVersion,
-        domain_count: u32,
-        payload: Arc<dyn CodecOwnedContent>,
-    );
 }
 
 /// The scope issuer supplies this once before attaching the original terminal

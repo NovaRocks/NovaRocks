@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) type TaskReadSnapshot = TaskNeutralObservation;
 #[derive(Debug)]
-pub(crate) enum TaskReadError {
+pub enum TaskReadError {
     OwnerMissing,
     WorkStillLive,
     ProtocolStillLive,
@@ -171,6 +171,7 @@ impl TaskLifetime {
 
 #[cfg(test)]
 mod tests {
+    mod reporter;
     use super::super::actors::{WorkerAction, WorkerActor};
     use super::super::task_publication::commit_task_projection;
     use super::*;
