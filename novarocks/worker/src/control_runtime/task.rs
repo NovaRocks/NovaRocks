@@ -45,8 +45,8 @@ use super::{
     },
     preparation_refusal::{HostPreparationRefusal, RefusalPosition},
     task_host_call::{
-        HOST_CALL_KINDS, TaskHostCall, TaskHostCallError, TaskHostCallKind, TaskHostCallOwner,
-        TaskHostCallPayment,
+        HOST_CALL_KINDS, TaskHostCall, TaskHostCallError, TaskHostCallJob, TaskHostCallKind,
+        TaskHostCallOwner, TaskHostCallPayment,
     },
 };
 use super::{
@@ -504,6 +504,18 @@ pub(crate) struct TaskHostRecord {
     source_storage_model: bool,
     lifecycle_issued: [bool; TaskLifecycleRole::COUNT],
 }
+/// A borrowed proof from the original failed Task inventory. Its producer
+/// facts are monotonic and its business issuers are already fenced by the
+/// actual failed scope. It grants neither admission nor a replacement role.
+pub(super) struct TaskExecutionBorrowersExited<'a> {
+    owner: &'a TaskHostRecord,
+}
+impl TaskExecutionBorrowersExited<'_> {
+    pub(super) fn matches(&self, task: TaskIdentity, scope: &ScopeHandle) -> bool {
+        self.owner.task == task && self.owner.scope.same_scope(scope)
+    }
+}
+
 impl TaskHostRecord {
     /// Electing the Task and paying its active/loading storage happened in
     /// the Core step. This takes the same guard once; it reserves no new quota.
@@ -740,6 +752,53 @@ impl TaskHostRecord {
             .iter()
             .find(|call| call.kind() == kind)
             .expect("the elected Task retains each fixed original host call")
+    }
+    /// Read only original execution-call holders. No Core/report/Source/R
+    /// consumer, delivery, retained data alias or this closing call is part of
+    /// the predicate. Readiness alone gives no execution permission.
+    pub(super) fn execution_borrowers_exited(&self) -> Result<bool, TaskHostCallError> {
+        if self.resources.pending_preparation_adoption.is_some()
+            || self
+                .resources
+                .preparation
+                .as_ref()
+                .is_some_and(|owner| !owner.host_borrowers_exited())
+            || self
+                .resources
+                .completion
+                .as_ref()
+                .is_some_and(|roles| !roles.execution_calls_exited())
+            || !self.host_call(TaskHostCallKind::Stop).actual_call_exited()
+        {
+            return Ok(false);
+        }
+        if let Some(action) = &self.resources.completion_action
+            && !action.actual_exit_ready()?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    /// Failure publication order and actual producer exit are distinct gates.
+    /// Native preparation records Some before exposing its unique job and
+    /// never clears that original custody. Here a missing producer is therefore
+    /// meaningful only after the same failed scope has closed fresh issuers:
+    /// old EnqueuePreparation guards fail their generation check, while any
+    /// previously handed-off job is covered by its existing preparation row.
+    /// Loading data and RPC deliveries cannot create a Native execution trait
+    /// projection and are not execution borrowers.
+    pub(crate) fn take_failed_retire_borrowing_job(
+        &self,
+        drained: &super::failure::ScopePublicationsDrained<'_>,
+    ) -> Result<Option<TaskHostCallJob>, TaskHostCallError> {
+        drained.validate(self.resources.causal.runtime(), self.actor)?;
+        if !self.execution_borrowers_exited()? {
+            return Ok(None);
+        }
+        let exited = TaskExecutionBorrowersExited { owner: self };
+        self.host_call(TaskHostCallKind::RetireBorrowing)
+            .take_retire_failure_job(drained, &exited)
+            .map(Some)
     }
     pub(crate) fn task_id(&self) -> TaskIdentity {
         self.task
@@ -1504,6 +1563,9 @@ impl TaskHostRecord {
     pub(crate) fn issue_completion_exit_notice(
         &mut self,
     ) -> Result<crate::CompletionExitNotice, TaskHostError> {
+        if self.scope.gates()?.failed {
+            return Err(TaskHostError::OwnerFailed);
+        }
         if self.resources.preparation.is_none() {
             return Err(TaskHostError::CompletionBeforeAccepted);
         }

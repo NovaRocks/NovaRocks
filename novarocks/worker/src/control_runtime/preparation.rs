@@ -482,6 +482,20 @@ impl PreparationCustody {
         drop(state);
         self.0.pending.pending();
     }
+    /// Only the actual preparation call, its captures and its registered
+    /// provider-host holders. This read cannot invoke a provider or publish an
+    /// exit report. Source aliases and report consumption retain their own
+    /// independent whole-preparation/capacity retirement obligations.
+    pub(crate) fn host_borrowers_exited(&self) -> bool {
+        let exited = {
+            let state = self.0.state.lock().expect("preparation borrower exit");
+            !state.unresolved && state.body_exited && state.captures_exited
+        };
+        exited
+            && self
+                .host_children()
+                .is_none_or(|child| child.host_captures_exited())
+    }
     /// The physical worker can already be reused. Children, input unwind and
     /// independent report consumers can still prevent whole exit/charge reuse.
     pub(crate) fn publish_whole_exit(&self) -> Result<bool, RuntimeError> {

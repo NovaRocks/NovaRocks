@@ -157,6 +157,7 @@ impl Fixture {
         )
     }
     fn release(&self, owner: &PreparationCustody) {
+        assert!(owner.host_borrowers_exited());
         assert!(owner.publish_whole_exit().unwrap());
         for report in [owner.body_report(), owner.exit_report()] {
             report.consume(core()).unwrap();
@@ -401,6 +402,7 @@ fn input_destructor_panic_retains_unknown_work_and_payload_while_other_context_p
         0,
         "the caught opaque panic is still in original custody"
     );
+    assert!(!bad.host_borrowers_exited());
     assert!(!bad.publish_whole_exit().unwrap());
     assert!(bad.take_after_exit().unwrap().is_none());
     assert_eq!(fixture.ledger.unresolved_work(), vec![bad.key()]);

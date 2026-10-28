@@ -201,6 +201,19 @@ impl ObserverGate {
     }
 }
 
+fn take_original_retire_job(
+    f: &mut Harness,
+    task: TaskIdentity,
+) -> Result<
+    Option<crate::control_runtime::task_host_call::TaskHostCallJob>,
+    crate::control_runtime::context_host::failure::FailurePublicationError,
+> {
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .take_failed_retire_borrowing_job(task)
+}
+
 #[test]
 fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_refund() {
     let (mut f, task, preparation) = accepted_task_fixture();
@@ -212,7 +225,17 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
     assert_eq!(usage(&f.ledger), paid);
     let port = original_port(&mut f, task);
     publish_failure(&mut f);
+    {
+        let context = f.service.context(f.identity).unwrap();
+        let stage = context.failure_publication_stage().unwrap();
+        assert!(matches!(
+            close.take_failure_job(&stage).err().unwrap(),
+            TaskHostCallError::BorrowerExitRequired
+        ));
+    }
+    assert!(take_original_retire_job(&mut f, task).unwrap().is_none());
     let metadata_thread = thread::current().id();
+    let mut prepared_close = None;
     for (index, call) in [&stop, &close].into_iter().enumerate() {
         assert!(!call.is_retired());
         if call.kind() == TaskHostCallKind::RetireBorrowing {
@@ -223,15 +246,25 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
         let subscription = port
             .stop_observable()
             .subscribe(Arc::new(move || observer.observe()));
-        let job = {
-            let host = f.service.context(f.identity).unwrap();
-            let stage = host.failure_publication_stage().unwrap();
+        let job = if call.kind() == TaskHostCallKind::Stop {
+            let context = f.service.context(f.identity).unwrap();
+            let stage = context.failure_publication_stage().unwrap();
             let job = call.take_failure_job(&stage).unwrap();
             assert!(matches!(
                 call.take_failure_job(&stage).err().unwrap(),
                 TaskHostCallError::AlreadyIssued
             ));
             job
+        } else {
+            assert!(matches!(
+                take_original_retire_job(&mut f, task).err().unwrap(),
+                crate::control_runtime::context_host::failure::FailurePublicationError::HostCall(
+                    TaskHostCallError::AlreadyIssued
+                )
+            ));
+            prepared_close
+                .take()
+                .expect("the original Retire job was admitted before Stop report consumption")
         };
         let runner = thread::spawn(move || job.run());
         let arrived = entered.recv_timeout(Duration::from_secs(10));
@@ -246,6 +279,12 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
             .unwrap()
             .advance_failure_publications(1);
         let borrowing_closed = port.prepare_source_retirement().is_ok();
+        let stopped = port.is_stopped();
+        let blocked_retire = if call.kind() == TaskHostCallKind::Stop {
+            Some(take_original_retire_job(&mut f, task))
+        } else {
+            None
+        };
         gate.release();
         let joined = runner.join();
         drop(subscription);
@@ -267,12 +306,34 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
             borrowing_closed,
             call.kind() == TaskHostCallKind::RetireBorrowing
         );
+        assert!(stopped);
+        if let Some(blocked) = blocked_retire {
+            assert!(blocked.unwrap().is_none());
+        }
         assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
         // Actual return and capture exit have happened, but neither report
         // observer nor the slot fee may retire merely because the thread joined.
         assert_eq!(call.phase(), ExitRolePhase::Exited);
         assert!(!call.is_retired());
         assert_eq!(usage(&f.ledger), held);
+        if call.kind() == TaskHostCallKind::Stop {
+            // Borrowers have truly exited: obtain the same original Retire job
+            // before consuming Stop's return or report, and before its fee refund.
+            prepared_close = Some(
+                take_original_retire_job(&mut f, task)
+                    .unwrap()
+                    .expect("actual Stop exit opens borrowing retirement"),
+            );
+            assert_eq!(usage(&f.ledger), held);
+            assert_eq!(stop.phase(), ExitRolePhase::Exited);
+            assert!(!stop.is_retired());
+            assert!(matches!(
+                take_original_retire_job(&mut f, task).err().unwrap(),
+                crate::control_runtime::context_host::failure::FailurePublicationError::HostCall(
+                    TaskHostCallError::AlreadyIssued
+                )
+            ));
+        }
         assert!(matches!(
             call.poll_return().unwrap(),
             Some(TaskHostCallOutcome::Completed)
@@ -280,13 +341,23 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
         assert_eq!(usage(&f.ledger), held);
         retire_call(call, &f.ledger);
         assert_eq!(usage(&f.ledger), [held[0] - 1, held[1] - 1, held[2] - 1]);
-        let host = f.service.context(f.identity).unwrap();
-        let stage = host.failure_publication_stage().unwrap();
-        assert!(matches!(
-            call.take_failure_job(&stage).err().unwrap(),
-            TaskHostCallError::AlreadyIssued
-        ));
+        if call.kind() == TaskHostCallKind::Stop {
+            let context = f.service.context(f.identity).unwrap();
+            let stage = context.failure_publication_stage().unwrap();
+            assert!(matches!(
+                call.take_failure_job(&stage).err().unwrap(),
+                TaskHostCallError::AlreadyIssued
+            ));
+        } else {
+            assert!(matches!(
+                take_original_retire_job(&mut f, task).err().unwrap(),
+                crate::control_runtime::context_host::failure::FailurePublicationError::HostCall(
+                    TaskHostCallError::AlreadyIssued
+                )
+            ));
+        }
     }
+    assert!(prepared_close.is_none());
     assert!(port.is_stopped());
     assert!(port.prepare_source_retirement().is_ok());
     assert_eq!(usage(&f.ledger), [paid[0] - 2, paid[1] - 2, paid[2] - 2]);

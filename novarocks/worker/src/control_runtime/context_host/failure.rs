@@ -45,6 +45,7 @@ pub(crate) enum FailurePublicationError {
     Settlement(SettlementDispatchError),
     Request(ContextRequestError),
     Open(OpenSummaryError),
+    HostCall(crate::control_runtime::task_host_call::TaskHostCallError),
 }
 /// Visits count actual mailbox classes, including empty ones. Taking a neutral
 /// message neither retires its input receipt nor claims any source/R exit.
@@ -460,6 +461,24 @@ impl ContextHostRecord {
             .failure
             .as_ref()
             .is_some_and(ScopeFailureOwner::is_drained)
+    }
+    /// Borrow both original owners together. Failure publication and execution
+    /// exit remain separate proofs; this method calls no host or destructor.
+    pub(crate) fn take_failed_retire_borrowing_job(
+        &self,
+        task: TaskIdentity,
+    ) -> Result<
+        Option<crate::control_runtime::task_host_call::TaskHostCallJob>,
+        FailurePublicationError,
+    > {
+        let stage = self.failure_publication_stage()?;
+        let Some(TaskHostOwner::Ready(host) | TaskHostOwner::Initializing(host)) =
+            self.tasks.get(&task)
+        else {
+            return Err(FailurePublicationError::UnknownTask);
+        };
+        host.take_failed_retire_borrowing_job(&stage)
+            .map_err(FailurePublicationError::HostCall)
     }
     /// Access the original Task's unfilled open segment only after this exact
     /// Context has finished its actual scope-wide failure publication stage.

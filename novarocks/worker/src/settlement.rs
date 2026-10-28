@@ -152,6 +152,16 @@ impl SettlementRole {
     }
     /// The original one-shot barrier remains committed after its reader takes
     /// the value; observing it grants neither another callback nor any exit.
+    /// The same admitted callback and its captures really returned. Report
+    /// consumers and the finisher's child-header retirement are independent;
+    /// waiting for them here would make execution-borrow closure cyclic.
+    pub(crate) fn actual_call_exited(&self) -> bool {
+        matches!(
+            self.slot.phase(),
+            SettlementPhase::Exited | SettlementPhase::Retired
+        ) && self.slot.body_exited()
+            && self.slot.captures_exited()
+    }
     pub(crate) fn barrier_committed(&self) -> bool {
         self.barrier.is_committed()
     }

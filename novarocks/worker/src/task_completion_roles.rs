@@ -257,6 +257,19 @@ impl TaskCompletionRoles {
             self.settlement.unused_role_exited();
         }
     }
+    /// Read the real fixed execution-call holders, without consuming reports
+    /// or waiting for causal inputs, sources or child-header reaping. In
+    /// particular the finisher's settlement child has its own actual-exit
+    /// evidence below; its still-live report must not delay this narrow gate.
+    pub(crate) fn execution_calls_exited(&self) -> bool {
+        self.originals.iter().all(|original| {
+            matches!(
+                original.role.phase(),
+                ExitRolePhase::Exited | ExitRolePhase::Retired
+            ) && original.role.body_exited()
+                && original.role.captures_exited()
+        }) && self.settlement.actual_call_exited()
+    }
     /// This covers these four roles only. Whole Task convergence also requires
     /// its other actual subsystem/source/cut/report facts. The context's bounded
     /// reaper separately advances child-to-parent work retirement.
@@ -561,4 +574,5 @@ mod tests {
         assert!(!f.roles.try_retire());
         assert_eq!(f.ledger.used(dimension()), 4);
     }
+    mod execution_calls_exit;
 }

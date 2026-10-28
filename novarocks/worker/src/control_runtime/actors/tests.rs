@@ -2766,6 +2766,7 @@ fn exercise_fragment_roles_with_preparation(
     if transfer_bundle {
         // The real install wrapper registered its original host-child scope.
         // Body return, even without a provider child, cannot settle that scope.
+        assert!(!prep.host_borrowers_exited());
         assert!(!prep.publish_whole_exit().unwrap());
         let descriptor = cleanup_descriptor.as_ref().unwrap();
         // This host created no kernel/root/provider. We intentionally decline
@@ -2775,6 +2776,10 @@ fn exercise_fragment_roles_with_preparation(
             || crate::TaskExecutionHost::remove_receiver(&capture, descriptor),
         ));
         assert!(prep.host_children().unwrap().host_captures_exited());
+        assert!(
+            prep.host_borrowers_exited(),
+            "the actual host call and rollback returned, before report consumption"
+        );
         assert_eq!(capture.inbound_cleanup.load(Ordering::SeqCst), 1);
         assert_eq!(capture.receiver_cleanup.load(Ordering::SeqCst), 1);
         // A real successful call also owned its refusal position. Reap only
@@ -2949,6 +2954,19 @@ fn exercise_fragment_roles_with_preparation(
             );
             f.runtime.poll_one(Tick(5)).unwrap();
             assert!(f.runtime.snapshot(actor()).unwrap().failed);
+            // A failed scope forbids a fresh terminal-action capture, even
+            // though the same Task's original Accepted preparation exists.
+            let before_action = f.scope.snapshot().unwrap();
+            let original_action = host.completion_action().map(|action| action.cut());
+            assert!(matches!(
+                host.issue_completion_exit_notice(),
+                Err(TaskHostError::OwnerFailed)
+            ));
+            assert_eq!(
+                host.completion_action().map(|action| action.cut()),
+                original_action
+            );
+            assert_eq!(f.scope.snapshot().unwrap(), before_action);
             assert_eq!(
                 completion.dispatch_settlement(&port).unwrap(),
                 SettlementRun::Deferred

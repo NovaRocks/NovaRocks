@@ -88,6 +88,7 @@ pub(crate) enum TaskHostCallError {
     AlreadyIssued,
     Withdrawn,
     AwaitingFailurePublication,
+    BorrowerExitRequired,
     AlreadyCaptured,
     PortAlreadyAttached,
     MissingPort,
@@ -439,6 +440,15 @@ impl TaskHostCall {
     pub(crate) fn phase(&self) -> ExitRolePhase {
         self.0.role.phase()
     }
+    /// Positive observation of this original synchronous host call and its
+    /// port capture, independent of its return reader/report consumers/reaper.
+    pub(crate) fn actual_call_exited(&self) -> bool {
+        matches!(
+            self.0.role.phase(),
+            ExitRolePhase::Exited | ExitRolePhase::Retired
+        ) && self.0.role.body_exited()
+            && self.0.role.captures_exited()
+    }
     pub(crate) fn is_retired(&self) -> bool {
         self.0.state.lock().expect("host-call retirement").retired
     }
@@ -454,6 +464,26 @@ impl TaskHostCall {
         &self,
         drained: &ScopePublicationsDrained<'_>,
     ) -> Result<TaskHostCallJob, TaskHostCallError> {
+        if self.0.kind != TaskHostCallKind::Stop {
+            return Err(TaskHostCallError::BorrowerExitRequired);
+        }
+        drained.validate(&self.0.runtime, self.0.actor)?;
+        self.take_job(StartPermission::FailurePublicationsDrained)
+    }
+    /// Only the actual Task owner can construct this borrowed proof after
+    /// examining its original fixed producer inventory. A drained publication
+    /// stage alone cannot authorize execution-borrow retirement.
+    pub(super) fn take_retire_failure_job(
+        &self,
+        drained: &ScopePublicationsDrained<'_>,
+        exited: &super::task::TaskExecutionBorrowersExited<'_>,
+    ) -> Result<TaskHostCallJob, TaskHostCallError> {
+        if self.0.kind != TaskHostCallKind::RetireBorrowing {
+            return Err(TaskHostCallError::WrongTask);
+        }
+        if !exited.matches(self.0.task, &self.0.scope) {
+            return Err(TaskHostCallError::WrongScope);
+        }
         drained.validate(&self.0.runtime, self.0.actor)?;
         self.take_job(StartPermission::FailurePublicationsDrained)
     }
