@@ -264,6 +264,8 @@ class CloudMachineTests(unittest.TestCase):
         self.assertEqual("NOT_RUN", report["status"])
         self.assertEqual("cloud-ttl", report["scope"])
         self.assertFalse(report["cleanup_performed"])
+        self.assertEqual([], report["errors"])
+        self.assertEqual([], report["removed"])
         self.assertEqual("retained-no-writer-exit-proof", report["disposition"])
 
     def test_mutable_desired_copy_cannot_retarget_original_activation(self):

@@ -44,6 +44,40 @@ def env_values(path):
     return result
 
 
+def cloud_configuration(values, record):
+    """Consume the exact non-secret machine definition without provider fallback."""
+    config = record.get("config", {})
+    if not isinstance(config, dict):
+        raise runtime.RuntimeFailure("InvalidScratchScope", "machine storage configuration is invalid")
+    if "object_store" not in config:
+        owner = record.get("storage_owner", {})
+        if values.get("NOVA_ENV_OBJECT_STORE_KIND") == "aliyun-oss" or (
+                isinstance(owner, dict) and owner.get("provider") == "aliyun-oss"):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "cloud machine storage configuration is missing")
+        return None
+    from oss_ops import OpsError, validate_config
+    try:
+        cloud = validate_config(config["object_store"])
+    except (OpsError, ValueError, TypeError) as error:
+        raise runtime.RuntimeFailure("InvalidScratchScope", "cloud machine storage configuration is invalid") from error
+    if cloud != config["object_store"]:
+        raise runtime.RuntimeFailure("InvalidScratchScope", "cloud machine storage configuration is not canonical")
+    return cloud
+
+
+def worktree_root(values, record, *, published_env_id):
+    cloud = cloud_configuration(values, record)
+    if cloud is None:
+        return "s3://novarocks/" + values["NOVA_ENV_ID"]
+    env_id = values.get("NOVA_ENV_ID")
+    if not isinstance(env_id, str):
+        raise runtime.RuntimeFailure("InvalidScratchScope", "cloud publication worktree identity is missing")
+    env_id = runtime.safe_component(env_id)
+    if env_id != published_env_id:
+        raise runtime.RuntimeFailure("InvalidScratchScope", "cloud publication worktree identity differs from its manifest")
+    return f"s3://{cloud['bucket']}/{cloud['root_prefix']}worktrees/{env_id}"
+
+
 def admit(env_file, seconds=None, *, inherited=None):
     values = env_values(env_file)
     manifest = json.loads(Path(values.get("NOVA_ENV_MANIFEST", str(Path(env_file).with_name("manifest.json")))).read_text())
@@ -56,8 +90,11 @@ def admit(env_file, seconds=None, *, inherited=None):
     if isinstance(inherited, str) and len(inherited) > 16384:
         raise runtime.RuntimeFailure("RunBudgetRejected", "inherited context exceeds its input bound")
     inherited = json.loads(inherited) if isinstance(inherited, str) else inherited
-    identity = ScratchIdentity.from_dict(inherited["identity"]) if inherited else ScratchIdentity.create(
-        "s3://novarocks/" + values["NOVA_ENV_ID"])
+    if inherited:
+        cloud_configuration(values, record)
+        identity = ScratchIdentity.from_dict(inherited["identity"])
+    else:
+        identity = ScratchIdentity.create(worktree_root(values, record, published_env_id=manifest.get("env_id")))
     budget = RunBudget.admit(record, identity, seconds=int(seconds if seconds is not None else os.environ.get("NOVA_FIXTURE_BUDGET_SECS", "3600")), inherited=inherited, cleanup=os.environ.get("NOVA_FIXTURE_CLEANUP_MODE") == "true")
     scope = RunStorageScope.from_record(identity, record)
     raw_scope = os.environ.get(RUN_STORAGE_ENV)

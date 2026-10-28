@@ -169,6 +169,110 @@ class RunTests(unittest.TestCase):
                 else:
                     self.assertEqual(facts['cleanup']['report']['errors'],['original'])
 
+    def cloud_publication(self):
+        cloud = dict(kind="aliyun-oss", region="cn-test", bucket="fixture-bucket",
+                     role_name="fixture-role", root_prefix="development/")
+        self.manifest["env_id"] = "worktree-id"
+        record = self.manifest["runtime"]["machine"]
+        record["config"] = {"object_store": cloud, "benchmark_root": "s3://fixture-bucket/development/benchmarks"}
+        record["storage_owner"] = dict(provider="aliyun-oss", endpoint="https://s3.oss-cn-test-internal.aliyuncs.com",
+            region="cn-test", bucket="fixture-bucket", root_prefix="development/")
+        record["server_warehouses"] = {service: "s3://fixture-bucket/development/machines/exact-machine/exact-generation/" + service
+                                       for service in ("rest", "rest-mv")}
+        self.write_manifest()
+        # This broad, foreign location must never become the new run's root.
+        self.env.write_text("export NOVA_ENV_ID='worktree-id'\nexport NOVA_ENV_OBJECT_STORE_KIND='aliyun-oss'\n"
+                            "export CATALOG_WAREHOUSE_URI='s3://foreign-bucket/ancestor'\n")
+        return record
+
+    def test_cloud_new_admission_uses_exact_machine_worktree_domain_without_static_credentials(self):
+        record = self.cloud_publication()
+        with patch.dict(os.environ, {}, clear=True), patch("machine_runtime.MachineOwner") as machine:
+            values, _, budget = fixture_run.admit(self.env)
+            storage = json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+            self.assertEqual("s3://fixture-bucket/development/worktrees/worktree-id/scratch/" + budget.identity.run_id,
+                             budget.identity.scope_root)
+            self.assertEqual(2, storage["schema"])
+            self.assertEqual(record["storage_owner"], storage["storage_owner"])
+            fixture_run.RunStorageScope.from_dict(storage).validate_against(budget.identity, record)
+            for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "MINIO_ROOT_USER"):
+                self.assertNotIn(key, values)
+                self.assertNotIn(key, os.environ)
+            machine.assert_not_called()
+
+    def test_cloud_inheritance_keeps_original_identity_scope_and_deadline(self):
+        self.cloud_publication()
+        with patch.dict(os.environ, {}, clear=True):
+            original = fixture_run.admit(self.env)[2]
+            storage = os.environ["NOVA_FIXTURE_RUN_STORAGE"]
+            with patch.object(fixture_run.ScratchIdentity, "create", side_effect=AssertionError("must keep original run")):
+                nested = fixture_run.admit(self.env, inherited=original.as_dict())[2]
+            self.assertEqual(original.as_dict(), nested.as_dict())
+            self.assertEqual(json.loads(storage), json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]))
+
+    def test_cloud_changed_owner_and_inherited_scope_are_rejected_before_publication(self):
+        record = self.cloud_publication()
+        with patch.dict(os.environ, {}, clear=True):
+            original = fixture_run.admit(self.env)[2]
+            context = os.environ["NOVA_FIXTURE_RUN_CONTEXT"]
+            raw = os.environ["NOVA_FIXTURE_RUN_STORAGE"]
+            record["storage_owner"]["bucket"] = "foreign-bucket"
+            self.write_manifest()
+            with self.assertRaises(fixture_runtime.RuntimeFailure):
+                fixture_run.admit(self.env, inherited=original.as_dict())
+            self.assertEqual(context, os.environ["NOVA_FIXTURE_RUN_CONTEXT"])
+            self.assertEqual(raw, os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+            record["storage_owner"]["bucket"] = "fixture-bucket"
+            self.write_manifest()
+            wrong = json.loads(raw)
+            wrong["storage_owner"]["root_prefix"] = "another-prefix/"
+            os.environ["NOVA_FIXTURE_RUN_STORAGE"] = json.dumps(wrong)
+            with self.assertRaises(fixture_runtime.RuntimeFailure):
+                fixture_run.admit(self.env, inherited=original.as_dict())
+            os.environ["NOVA_FIXTURE_RUN_STORAGE"] = raw
+            record["config"]["object_store"] = None
+            self.write_manifest()
+            with patch.object(fixture_run.ScratchIdentity, "create", side_effect=AssertionError("must not create a replacement")):
+                with self.assertRaises(fixture_runtime.RuntimeFailure):
+                    fixture_run.admit(self.env, inherited=original.as_dict())
+            self.assertEqual(context, os.environ["NOVA_FIXTURE_RUN_CONTEXT"])
+            self.assertEqual(raw, os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+
+    def test_cloud_configuration_is_closed_and_never_falls_back_to_minio(self):
+        import copy
+        record = self.cloud_publication()
+        valid = copy.deepcopy(record["config"]["object_store"])
+        for cloud in (None, {}, {**valid, "kind": "minio"}, {**valid, "bucket": ""},
+                      {**valid, "root_prefix": "development"}, {**valid, "access_key": "forbidden"}):
+            with self.subTest(cloud=cloud), patch.dict(os.environ, {}, clear=True):
+                record["config"]["object_store"] = cloud
+                record["config"]["minio_volume"] = "must-not-fallback"
+                self.write_manifest()
+                with self.assertRaises(fixture_runtime.RuntimeFailure):
+                    fixture_run.admit(self.env)
+                self.assertNotIn("NOVA_FIXTURE_RUN_CONTEXT", os.environ)
+                self.assertNotIn("NOVA_FIXTURE_RUN_STORAGE", os.environ)
+        record["config"] = {"minio_volume": "must-not-fallback"}
+        self.write_manifest()
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(fixture_runtime.RuntimeFailure):
+            fixture_run.admit(self.env)
+
+    def test_cloud_env_id_cannot_escape_its_exact_worktree_component(self):
+        self.cloud_publication()
+        for env_id in ("foreign-worktree", "../foreign", "worktree-id/other", ".", "..", "", "worktree-id\nforeign"):
+            import shlex
+            self.env.write_text("export NOVA_ENV_OBJECT_STORE_KIND='aliyun-oss'\nexport NOVA_ENV_ID=" + shlex.quote(env_id) + "\n")
+            with self.subTest(env_id=env_id), patch.dict(os.environ, {}, clear=True), self.assertRaises((fixture_runtime.RuntimeFailure, ValueError)):
+                fixture_run.admit(self.env)
+        self.env.write_text("export NOVA_ENV_OBJECT_STORE_KIND='aliyun-oss'\n")
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(fixture_runtime.RuntimeFailure):
+            fixture_run.admit(self.env)
+        self.env.write_text("export NOVA_ENV_ID='worktree-id'\nexport NOVA_ENV_OBJECT_STORE_KIND='aliyun-oss'\n")
+        del self.manifest["env_id"]
+        self.write_manifest()
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(fixture_runtime.RuntimeFailure):
+            fixture_run.admit(self.env)
+
     def test_storage_projection_is_fixed_and_revalidated_before_native_effects(self):
         with patch.dict(os.environ, {}, clear=True):
             _, manifest, original = fixture_run.admit(self.env)

@@ -14,7 +14,11 @@
   "download_timeout_seconds": 600,
   "locale": "zh_CN.UTF-8",
   "cargo_build_jobs": "available",
-  "fixture_image_sources": {},
+  "fixture_image_sources": {
+    "gradle-builder": "docker.m.daocloud.io/library/gradle",
+    "iceberg-rest": "docker.m.daocloud.io/apache/iceberg-rest-fixture",
+    "iceberg-spark-base": "docker.m.daocloud.io/apache/spark"
+  },
   "tool_download_urls": {
     "rustup": "https://rsproxy.cn/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init"
   },

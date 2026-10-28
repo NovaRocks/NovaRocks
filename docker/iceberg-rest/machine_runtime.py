@@ -1536,6 +1536,7 @@ class MachineOwner:
                     raise runtime.RuntimeFailure("MachineUnavailable", "machine services are not healthy")
                 if is_cloud(state):
                     return {"complete": True, "status": "NOT_RUN", "scope": "cloud-ttl", "cleanup_performed": False,
+                            "errors": [], "removed": [],
                             "disposition": "retained-no-writer-exit-proof",
                             "reason": "cloud TTL cleanup requires original writer exit evidence"}
                 observation_only = False
