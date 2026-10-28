@@ -101,5 +101,12 @@ fn closed_task_admission_keeps_the_original_request_routable_until_unused_retire
     assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
     assert_eq!(ready.registered(), 0);
     assert!(f.service.context(f.identity).unwrap().task(task).is_some());
+    assert!(
+        matches!(
+            f.service.context(f.identity).unwrap().take_task(task),
+            Err(ContextHostError::TaskStillOwned)
+        ),
+        "the original Source/lifetime publication inventory remains owned after R exits"
+    );
     finish_task_fixture(f, task);
 }

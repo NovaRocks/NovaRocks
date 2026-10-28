@@ -206,6 +206,9 @@ impl TaskCompletionRoles {
     ) -> Result<(), crate::settlement::SettlementDispatchError> {
         self.settlement.commit_barrier(runtime, ticket, port)
     }
+    pub(crate) fn settlement_barrier_committed(&self) -> bool {
+        self.settlement.barrier_committed()
+    }
     pub(crate) fn commit_failure_settlement_barrier(
         &self,
         session: &mut novarocks_control_runtime::driver::FailurePublicationSession<

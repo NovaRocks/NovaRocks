@@ -19,6 +19,7 @@
 //! only transfers the existing guard and establishes finite metadata roles;
 //! it does not run materialization, publish Active, or infer any host exit.
 
+pub(super) mod failure;
 mod progress;
 pub(crate) use progress::{ContextHostProgress, ContextHostProgressError};
 
@@ -138,6 +139,7 @@ pub(crate) struct ContextHostResources {
     io_attempted: bool,
     pub requests:
         BTreeMap<novarocks_control_runtime_core::identity::WorkId, requests::ContextRequestCustody>,
+    failure: Option<failure::ScopeFailureOwner>,
     pub request_partials: BTreeMap<
         novarocks_control_runtime_core::identity::WorkId,
         requests::ContextRequestAdmissionPartial,
@@ -306,6 +308,7 @@ impl ContextHostRecord {
             .bind(WorkKind::Business)
             .map_err(|error| no_owner(ContextHostError::AdmissionBindInvariant(error)))?;
         let mut resources = ContextHostResources {
+            failure: None,
             admission: ContextMetadataRole { work, capacity },
             scope: None,
             roles: Vec::with_capacity(LOCAL_ROLES.len()),
@@ -788,12 +791,42 @@ impl ContextHostRecord {
             TaskHostOwner::Initializing(_) | TaskHostOwner::Unpublished(_) => None,
         }
     }
-    /// Moves the same actual inventory to its original host cleanup lane.
-    /// Removal supplies no terminal/source/body/report or quota-release proof.
+    /// A Task remains in this Context's failure-publication inventory until
+    /// its real producers, captures and consumers have all closed. Moving an
+    /// active Task to an unindexed cleanup owner would lose Scope-wide duties.
     pub(crate) fn take_task(
         &mut self,
         task: TaskIdentity,
     ) -> Result<TaskHostOwner, ContextHostError> {
+        if self
+            .scope()
+            .gates()
+            .map_err(ContextHostError::Runtime)?
+            .failed
+            && !self.failure_publications_drained()
+        {
+            return Err(ContextHostError::TaskStillOwned);
+        }
+        self.ensure_task_unrouted(task)?;
+        match self.tasks.get(&task) {
+            Some(TaskHostOwner::Ready(host) | TaskHostOwner::Initializing(host)) => {
+                host.resources_for_retirement()
+                    .seal_read_observation()
+                    .map_err(|_| ContextHostError::TaskStillOwned)?;
+            }
+            _ => return Err(ContextHostError::TaskStillOwned),
+        }
+        Ok(self.tasks.remove(&task).expect("same closed original Task"))
+    }
+    fn ensure_task_unrouted(&mut self, task: TaskIdentity) -> Result<(), ContextHostError> {
+        if self
+            .resources
+            .failure
+            .as_ref()
+            .is_some_and(|failure| !failure.is_drained())
+        {
+            return Err(ContextHostError::TaskStillOwned);
+        }
         if self
             .task_request_cuts
             .range((task, novarocks_worker_protocol::proposal_summary::CutId(0))..)
@@ -811,10 +844,21 @@ impl ContextHostRecord {
             Some(TaskHostOwner::Unpublished(_)) => {}
             None => return Err(ContextHostError::TaskNotOwned),
         }
+        Ok(())
+    }
+    /// Component fixture teardown moves the actual still-paid originals only
+    /// after it has stopped driving this Context. This grants no production
+    /// removal, failed-owner stage, physical exit or resource refund.
+    #[cfg(test)]
+    pub(super) fn take_task_for_teardown(
+        &mut self,
+        task: TaskIdentity,
+    ) -> Result<TaskHostOwner, ContextHostError> {
+        self.ensure_task_unrouted(task)?;
         Ok(self
             .tasks
             .remove(&task)
-            .expect("same serial Context owns the original Task"))
+            .expect("same original component Task"))
     }
     pub(crate) fn into_resources(
         self,

@@ -150,6 +150,11 @@ impl SettlementRole {
     pub(crate) fn phase(&self) -> SettlementPhase {
         self.slot.phase()
     }
+    /// The original one-shot barrier remains committed after its reader takes
+    /// the value; observing it grants neither another callback nor any exit.
+    pub(crate) fn barrier_committed(&self) -> bool {
+        self.barrier.is_committed()
+    }
     pub(crate) fn work_id(&self) -> WorkId {
         self.work
     }

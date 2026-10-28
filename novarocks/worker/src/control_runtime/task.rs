@@ -95,6 +95,7 @@ pub(crate) enum TaskHostError {
     SourceSlots(SourceSlotIssueError),
     SourceStorage(PreparationStorageSplitError),
     SourceInventoryPending,
+    OwnerFailed,
     WrongEffect,
     WrongTaskOrPayload,
     InvalidGeometry,
@@ -125,6 +126,7 @@ impl std::fmt::Display for TaskHostError {
             Self::SourceStorage(error) => {
                 write!(f, "original source storage transfer failed: {error:?}")
             }
+            Self::OwnerFailed => f.write_str("the Task owner failed before new business capture"),
             Self::SourceInventoryPending => {
                 f.write_str("an original source admission still requires unused retirement")
             }
@@ -1145,6 +1147,9 @@ impl TaskHostRecord {
         ),
         TaskHostError,
     > {
+        if self.scope.gates()?.failed {
+            return Err(TaskHostError::OwnerFailed);
+        }
         let kind = TaskLifecycleRole::OperatorStatistics;
         if self.resources.preparation.is_none() {
             return Err(TaskHostError::CompletionBeforeAccepted);
@@ -1303,6 +1308,11 @@ impl TaskHostRecord {
         registration: Box<dyn RegistrationNotice>,
     ) -> Result<AdmittedFragmentRoles<ExecutionFailure>, (TaskHostError, Box<dyn RegistrationNotice>)>
     {
+        match self.scope.gates() {
+            Ok(gates) if gates.failed => return Err((TaskHostError::OwnerFailed, registration)),
+            Err(error) => return Err((TaskHostError::Runtime(error), registration)),
+            Ok(_) => {}
+        }
         if self.resources.preparation.is_none() {
             return Err((TaskHostError::CompletionBeforeAccepted, registration));
         }
@@ -1456,6 +1466,9 @@ impl TaskHostRecord {
     /// Host ownership transfer only. The receiving cleanup job must dispose
     /// opaque sources/captures and observe real body/children/report exits
     /// before releasing these bundles; Core terminal is no substitute.
+    pub(super) fn resources_for_retirement(&self) -> &TaskHostResources {
+        &self.resources
+    }
     pub(crate) fn into_resources(self) -> TaskHostResources {
         self.resources
     }

@@ -2025,6 +2025,21 @@ impl<A: Actor> ActorRuntime<A> {
         action: ActionId,
         work: WorkId,
     ) -> Result<(), DriverError> {
+        Self::validate_failure_record(
+            node,
+            inbox,
+            ledger,
+            (input, generation, action, work),
+            false,
+        )
+    }
+    fn validate_failure_record(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        (input, generation, action, work): (InputId, Generation, ActionId, WorkId),
+        allow_admitted: bool,
+    ) -> Result<(), DriverError> {
         let scope = ledger
             .scopes
             .get(&node.scope.id())
@@ -2051,8 +2066,56 @@ impl<A: Actor> ActorRuntime<A> {
             return Err(EffectError::InvalidTransition.into());
         }
         let work = scope.work(work).ok_or(DriverError::FailureWorkInactive)?;
-        if work.kind != WorkKind::Cleanup || work.phase != WorkPhase::Started || work.body_exited {
+        if work.kind != WorkKind::Cleanup
+            || !(work.phase == WorkPhase::Started
+                || allow_admitted && matches!(work.phase, WorkPhase::Admitted | WorkPhase::Queued))
+            || work.body_exited
+        {
             return Err(DriverError::FailureWorkInactive);
+        }
+        Ok(())
+    }
+    /// Validate an original failure action before its owner starts the prepaid
+    /// cleanup Work. This read-only check grants no publication or exit and
+    /// never accepts an ordinary publication ticket from a failed generation.
+    pub fn validate_failure_effect_ticket(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+    ) -> Result<(), DriverError> {
+        let node = self.node(ticket.actor)?;
+        Self::validate_ticket_origin(&node, ticket)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let ledger = node
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        Self::validate_failure_record(
+            &node,
+            &inbox,
+            &ledger,
+            (
+                ticket.input,
+                ticket.generation,
+                ticket.descriptor.id,
+                ticket.descriptor.work,
+            ),
+            true,
+        )?;
+        let record = inbox
+            .batches
+            .get(&ticket.input)
+            .expect("validated failure batch")
+            .state
+            .record(ticket.descriptor.id)
+            .expect("validated failure action");
+        if record.descriptor() != &ticket.descriptor {
+            return Err(EffectError::InvalidTransition.into());
+        }
+        if inbox.failure_publication.is_some() {
+            return Err(DriverError::FailurePublicationAlreadyClaimed);
         }
         Ok(())
     }

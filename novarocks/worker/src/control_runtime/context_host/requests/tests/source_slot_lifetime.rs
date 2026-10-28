@@ -65,7 +65,7 @@ fn source_fees(f: &Harness) -> [u64; 3] {
 // actual fee refund. Finish only the remaining original open pair, then the
 // same unstarted preparation, Task lifetime and Context inventories. This is
 // the existing fixture's genuine unused teardown, not a Native stop report.
-fn finish_after_consuming_pair_detached(
+pub(super) fn finish_after_consuming_pair_detached(
     mut f: Harness,
     task: TaskIdentity,
     mut preparation: ContextMetadataRole,
@@ -82,7 +82,7 @@ fn finish_after_consuming_pair_detached(
 
     let host = f.service.context(f.identity).unwrap();
     host.close_task_request_admission(task).unwrap();
-    let TaskHostOwner::Ready(task) = host.take_task(task).unwrap() else {
+    let TaskHostOwner::Ready(task) = host.take_task_for_teardown(task).unwrap() else {
         panic!("the original ready Task remains owned by this Context");
     };
     let mut resources = task.into_resources();

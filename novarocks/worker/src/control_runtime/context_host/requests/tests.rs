@@ -134,6 +134,10 @@ fn finish(mut f: Harness) {
             .request_partials
             .is_empty()
     );
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .complete_failure_publications_for_test();
     f.dispose_service_bootstrap(context_actor());
     f.finish_model_refusal();
 }
@@ -1108,7 +1112,7 @@ fn finish_task_fixture(mut f: Harness, task: TaskIdentity) {
     let host = f.service.context(f.identity).unwrap();
     host.close_task_request_admission(task).unwrap();
     let owner = host
-        .take_task(task)
+        .take_task_for_teardown(task)
         .expect("original requests and cuts have drained");
     let crate::control_runtime::task::TaskHostOwner::Ready(task) = owner else {
         panic!("same actual ready Task");
@@ -1530,3 +1534,6 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
 
 #[path = "tests/source_slot_lifetime.rs"]
 mod source_slot_lifetime;
+
+#[path = "tests/failure_publications.rs"]
+mod failure_publications;

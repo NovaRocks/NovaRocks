@@ -434,6 +434,9 @@ impl ContextHostRecord {
         if !matches!(class, InputClass::Ordinary | InputClass::Control) {
             return Err(no_partial(ContextRequestError::InvalidClass));
         }
+        if self.resources.failure.is_some() {
+            return Err(no_partial(ContextRequestError::OwnerFailed));
+        }
         match self.tasks.get(&task) {
             Some(super::super::TaskHostOwner::Ready(host)) if host.request_admission_open() => {}
             Some(super::super::TaskHostOwner::Ready(_)) => {

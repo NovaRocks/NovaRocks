@@ -18,31 +18,4 @@
 //! Evidence from the live failure owner's scope publication-drain stage.
 //! Actor failure alone supplies no authority to abandon Core consumption.
 
-use super::actors::WorkerActor;
-use novarocks_control_runtime::driver::{ActorRuntime, DriverError, FailurePublicationSession};
-use novarocks_control_runtime_core::identity::ActorId;
-
-/// Only the failure-owner loop in this module can construct this stage after
-/// walking its original Task/reply/batch inventories and committing all needed
-/// failure projections and reply outboxes. Physical source/callback/send exit
-/// and the other report consumers remain independent; waiting for those before
-/// this stage could create a cycle with the Core consumption legs.
-///
-/// There is deliberately no constructor from a failed flag or one Task's
-/// accepted snapshot. The loop must retain its original running cleanup work.
-pub(crate) struct ScopePublicationsDrained<'a> {
-    session: &'a FailurePublicationSession<WorkerActor>,
-}
-impl ScopePublicationsDrained<'_> {
-    pub(crate) fn validate(
-        &self,
-        runtime: &ActorRuntime<WorkerActor>,
-        actor: ActorId,
-    ) -> Result<(), DriverError> {
-        if self.session.matches_actor_runtime(runtime, actor)? {
-            Ok(())
-        } else {
-            Err(DriverError::PublicationTargetMismatch)
-        }
-    }
-}
+pub(crate) use super::context_host::failure::ScopePublicationsDrained;

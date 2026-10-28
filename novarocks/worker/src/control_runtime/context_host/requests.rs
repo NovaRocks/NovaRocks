@@ -98,6 +98,7 @@ pub(crate) enum ContextRequestError {
     UnknownRequest,
     WrongRequest,
     WrongPhase,
+    OwnerFailed,
     MissingCoreReceipt,
     SubmissionUnresolved,
     TaskPredecessorRequired,
@@ -753,6 +754,12 @@ impl ContextHostRecord {
         operation: TaskOperationId,
         deadline: MonotonicInstant,
     ) -> Result<(WorkId, ContextRequestHandle), ContextRequestAdmissionRefusal> {
+        if self.resources.failure.is_some() {
+            return Err(ContextRequestAdmissionRefusal {
+                error: ContextRequestError::OwnerFailed,
+                partial: None,
+            });
+        }
         match ContextRequestCustody::admit(self, ready, source, class, operation, deadline) {
             Ok((custody, handle)) => {
                 let work = custody.work();
@@ -772,6 +779,12 @@ impl ContextHostRecord {
         work: WorkId,
         command: ContextCommand,
     ) -> Result<(), ContextRequestSubmitRefusal> {
+        if self.resources.failure.is_some() {
+            return Err(ContextRequestSubmitRefusal {
+                error: ContextRequestError::OwnerFailed,
+                command: Some(command),
+            });
+        }
         match self.resources.requests.get_mut(&work) {
             Some(original) => {
                 if let Some(mut route) = original.task_route.take() {
