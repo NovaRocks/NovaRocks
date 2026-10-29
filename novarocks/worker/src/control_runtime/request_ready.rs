@@ -85,6 +85,15 @@ impl ControlRequestReady {
     pub(super) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
     }
+    pub(super) fn has_control_ready(&self) -> bool {
+        !self
+            .shared
+            .state
+            .lock()
+            .expect("request ready index")
+            .control_ready
+            .is_empty()
+    }
     pub(super) fn limit(&self) -> NonZeroUsize {
         self.shared.limit
     }

@@ -39,7 +39,6 @@ use super::{
     },
     context_lifecycle::{CONTEXT_LIFECYCLE_STORAGE, ContextLifecycle},
     context_ready::{ContextReadyError, ContextReadyNotice},
-    control_request::ValidatedEstablishRoute,
     effect_dispatch::{EffectDispatch, EffectRef},
     establish_ingress::ValidatedMaterializationSource,
     establish_route::{EstablishRouteCustody, EstablishRouteError},
@@ -684,41 +683,41 @@ impl ContextHostRecord {
         }
         Ok(())
     }
-    pub(super) fn validate_establish_route(
-        &self,
-        runtime: &ActorRuntime<WorkerActor>,
-        seed: &ValidatedEstablishRoute,
+    pub(crate) fn register_establish_route(
+        &mut self,
+        route: Arc<EstablishRouteCustody>,
     ) -> Result<(), EstablishRouteError> {
-        if !self.control_runtime.same_runtime(runtime)
-            || seed.root() != self.control
-            || seed.context() != self.identity
-        {
+        if !route.target_matches(
+            &self.control_runtime,
+            self.registration(),
+            self.identity,
+            self.control,
+        ) {
             return Err(EstablishRouteError::WrongOwner);
         }
-        if self.resources.routes.contains_key(&seed.request().token) {
+        // A captured address is not a lifecycle pin. A sealed/removed actor
+        // cannot admit a new Context leg after its metadata sources exit.
+        match self.control_runtime.snapshot(self.actor) {
+            Ok(snapshot) if snapshot.sealed => return Err(EstablishRouteError::TargetRemoved),
+            Ok(_) => {}
+            Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {
+                return Err(EstablishRouteError::TargetRemoved);
+            }
+            Err(error) => return Err(EstablishRouteError::Driver(error)),
+        }
+        if self.resources.routes.contains_key(&route.request().token) {
             return Err(EstablishRouteError::WrongPhase);
         }
         if self.resources.routes.len() >= self.max_routes {
             return Err(EstablishRouteError::Capacity);
         }
-        Ok(())
-    }
-    pub(crate) fn register_establish_route(
-        &mut self,
-        route: Arc<EstablishRouteCustody>,
-        root_author: &WorkLease,
-    ) -> Result<(), EstablishRouteError> {
-        assert_eq!(route.context(), self.identity);
-        assert_eq!(route.actor(), self.actor);
-        assert!(self.resources.routes.len() < self.max_routes);
         let request = route.request();
-        assert!(
-            self.resources
-                .routes
-                .insert(request.token, route.clone())
-                .is_none()
-        );
-        route.initialize(&self.resources.roles[LIFETIME].work, root_author)
+        // Store this alias before the Context's first Work/report/input.
+        self.resources.routes.insert(request.token, route.clone());
+        let initialized = route.initialize_context(&self.resources.roles[LIFETIME].work);
+        // Cancellation can precede insertion; retain an actual cleanup wake.
+        self.notify_host_progress();
+        initialized
     }
     pub(crate) fn handoff_establish_probe(
         &mut self,

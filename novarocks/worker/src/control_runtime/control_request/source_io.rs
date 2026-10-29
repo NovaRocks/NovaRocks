@@ -38,7 +38,6 @@ impl From<ControlRequestError> for RequestIoError {
 /// whole Source exit. A retired R still requires its original retirement gate.
 #[derive(Debug, Default)]
 pub(crate) struct RequestIoProgress {
-    pub routed: usize,
     pub visited: usize,
     pub dispatched: usize,
     pub submitted: usize,

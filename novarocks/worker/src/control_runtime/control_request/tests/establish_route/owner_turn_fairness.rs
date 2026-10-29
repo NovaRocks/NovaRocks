@@ -18,7 +18,10 @@
 //! Independent route and original-R service under the smallest owner budget.
 
 use super::*;
-use crate::control_runtime::establish_executors::EstablishExecutors;
+use crate::control_runtime::{
+    establish_executors::EstablishExecutors, process_control::RootHostCell,
+};
+use novarocks_control_runtime::driver::{ActorHostTurn, ActorRegistration};
 use std::num::NonZeroUsize;
 
 struct PoolJoin(Option<EstablishExecutors>);
@@ -36,6 +39,27 @@ impl Drop for PoolJoin {
     fn drop(&mut self) {
         self.join();
     }
+}
+
+fn root_turn(
+    runtime: &ActorRuntime<WorkerActor>,
+    registration: &ActorRegistration,
+) -> ActorHostTurn<WorkerActor> {
+    runtime.notify_host_actor(registration).unwrap();
+    let mut other_claims = Vec::new();
+    let turn = loop {
+        let turn = runtime
+            .claim_host_actor()
+            .expect("the original Root was notified");
+        if turn.matches_registration(registration) {
+            break turn;
+        }
+        other_claims.push(turn);
+    };
+    for other in other_claims {
+        other.release(true).unwrap();
+    }
+    turn
 }
 
 fn probe_in_handoff_order(f: &mut RouteFixture, input: InputId) -> EstablishReplayResult {
@@ -139,13 +163,22 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
     );
     f.adopt_pending_context();
     let replies_before = f.f.ledger.used(Dimension::Replies.id());
-    let first_turn = f.f.root.advance_ready_requests(&handles, 1).unwrap();
-    let second_turn = f.f.root.advance_ready_requests(&handles, 1).unwrap();
+    let registration = f.f.root.registration().clone();
+    let runtime = f.f.runtime.clone();
+    let cell = Arc::new(RootHostCell::new(f.f.root));
+    let turn = root_turn(&runtime, &registration);
+    let first_turn = cell.advance_ready(&turn, &handles, 1).unwrap();
+    let second_turn = cell.advance_ready(&turn, &handles, 1).unwrap();
+    turn.release(second_turn.runnable).unwrap();
+    f.f.root = Arc::try_unwrap(cell)
+        .ok()
+        .expect("the same Root owner returns")
+        .into_owner();
     let served_both_classes = first_turn.routed == 1
         && second_turn.routed == 1
-        && first_turn.visited == 1
-        && second_turn.visited == 1
-        && first_turn.retired + second_turn.retired == 1;
+        && first_turn.requests.visited == 1
+        && second_turn.requests.visited == 1
+        && first_turn.requests.retired + second_turn.requests.retired == 1;
     let retired_original = !f.f.root.resources().requests.contains_key(&withdrawn)
         && f.f.ledger.used(Dimension::Replies.id()) + 1 == replies_before;
     {
@@ -191,4 +224,108 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
     finish_conflict_return(&mut f, second, second_handle, second_getters, second_drops);
     f.finish_model_refusal();
     assert!(served_both_classes && retired_original);
+}
+
+#[test]
+fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_turn() {
+    use std::{sync::mpsc, time::Instant};
+    let mut f = RouteFixture::with_geometry(2, StorageNeed::default(), true);
+    let (input, handle, getters, drops) = f.begin_route(op(12), 100, None);
+    f.adopt_pending_context();
+    let runtime = f.f.runtime.clone();
+    let registration = f.f.root.registration().clone();
+    let address = f.f.root.service().context(f.f.context).unwrap();
+    let mut context_guard = address.lock().unwrap();
+    let context_scope = context_guard
+        .resources_for_test()
+        .scope
+        .as_ref()
+        .unwrap()
+        .clone();
+    let before = context_scope.snapshot().unwrap();
+    let owner = match f
+        .f
+        .root
+        .start_establish_executors(NonZeroUsize::new(1).unwrap(), NonZeroUsize::new(1).unwrap())
+    {
+        Ok(owner) => owner,
+        Err(refusal) => {
+            let mut partial = PoolJoin(refusal.owner.map(|owner| *owner));
+            partial.join();
+            panic!("actual source executor startup: {:?}", refusal.error);
+        }
+    };
+    let handles = owner.handles().unwrap();
+    let mut pools = PoolJoin(Some(owner));
+    let cell = Arc::new(RootHostCell::new(f.f.root));
+    let turn = root_turn(&runtime, &registration);
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let worker_cell = cell.clone();
+    let worker_handles = handles.clone();
+    let worker = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let progress = worker_cell.advance_ready(&turn, &worker_handles, 1);
+        // Root owns this same exclusive Common turn throughout preparation,
+        // the target-lock wait and the independent original-R progress phase.
+        let runnable = progress.as_ref().map_or(true, |progress| progress.runnable);
+        turn.release(runnable).unwrap();
+        done_tx.send(()).unwrap();
+        progress
+    });
+    let started = started_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut root_was_free_after_prepare = false;
+    while Instant::now() < deadline {
+        if let Some(root) = cell.try_lock() {
+            let original = root.resources().requests.get(&input).unwrap();
+            // The actual Root return role exists only after original-R
+            // preparation, before any target Context Work can be admitted.
+            if original.route_return_role().is_some() && original.pending_route().is_none() {
+                root_was_free_after_prepare = true;
+                break;
+            }
+        }
+        thread::yield_now();
+    }
+    let still_waiting_for_context = matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    let context_unchanged_while_blocked = context_scope.snapshot().unwrap() == before;
+    let mut other_turns = Vec::new();
+    let mut no_second_root_turn = true;
+    while let Some(other) = runtime.claim_host_actor() {
+        no_second_root_turn &= !other.matches_registration(&registration);
+        other_turns.push(other);
+    }
+    for other in other_turns {
+        other.release(true).unwrap();
+    }
+    // Always release the real mutex before asserting/receiving/joining. A
+    // regression holding Root across bind can thus unwind with full cleanup.
+    drop(context_guard);
+    let returned = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    let progress = worker.join().unwrap().unwrap();
+    f.f.root = Arc::try_unwrap(cell)
+        .ok()
+        .expect("worker returned its Root alias")
+        .into_owner();
+    drop(handles);
+    pools.join();
+    assert_eq!(
+        probe_in_handoff_order(&mut f, input),
+        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    );
+    assert!(
+        address
+            .lock()
+            .unwrap()
+            .advance_establish_route(input)
+            .unwrap()
+    );
+    finish_conflict_return(&mut f, input, handle, getters, drops);
+    f.finish_model_refusal();
+    assert!(started && returned);
+    assert!(root_was_free_after_prepare && still_waiting_for_context);
+    assert!(context_unchanged_while_blocked);
+    assert!(no_second_root_turn);
+    assert_eq!(progress.routed, 1);
 }

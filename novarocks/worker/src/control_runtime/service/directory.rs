@@ -65,6 +65,9 @@ impl ContextHostAddress {
     pub(crate) fn context(&self) -> QueryContextRef {
         self.0.context
     }
+    pub(in crate::control_runtime) fn registration(&self) -> &ActorRegistration {
+        &self.0.registration
+    }
     pub(crate) fn lock(&self) -> Option<ContextHostGuard<'_>> {
         let host = self.0.host.lock().expect("original Context owner lock");
         host.is_some().then_some(ContextHostGuard(host))

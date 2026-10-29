@@ -89,12 +89,12 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert!(handle.try_take().is_none());
     let pending_work = f.f.ledger.used(Dimension::Work.id());
-    assert_eq!(f.f.root.advance_route_bindings(32).unwrap(), 0);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 32).unwrap(), 0);
     assert_eq!(f.f.ledger.used(Dimension::Work.id()), pending_work);
     assert!(f.f.root.take_control_effect(64).unwrap().is_none());
 
     f.adopt_pending_context();
-    assert_eq!(f.f.root.advance_route_bindings(0).unwrap(), 0);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 0).unwrap(), 0);
     assert!(
         f.f.root
             .service()
@@ -106,7 +106,7 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
             .routes
             .is_empty()
     );
-    assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 1);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 1);
     {
         let original_address = f.f.root.service().context(f.f.context).unwrap();
         let mut original_context = original_address.lock().unwrap();
@@ -114,7 +114,7 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
         assert_eq!(routes.len(), 1);
         assert!(routes.contains_key(&input));
     }
-    assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 0);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 0);
     assert_eq!(
         f.probe(input),
         EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
@@ -182,7 +182,7 @@ fn cancelling_a_never_registered_target_clears_only_that_original_route_address(
     assert!(f.f.root.take_retired_route_disposal(input).is_none());
 
     f.adopt_pending_context();
-    assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 0);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 0);
     assert!(
         f.f.root
             .service()
@@ -293,7 +293,7 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
         WorkerAction::Control { effect: ControlEffect::RouteEstablish { request, .. }, .. }
             if request.request.token == earlier_token
     ));
-    assert!(f.f.root.handoff_establish_route(route).unwrap().is_none());
+    f.f.root.handoff_establish_route(route).unwrap();
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
     assert!(
         f.f.runtime
@@ -310,7 +310,7 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
     assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 3);
 
     f.adopt_pending_context();
-    assert_eq!(f.f.root.advance_route_bindings(0).unwrap(), 0);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 0).unwrap(), 0);
     assert!(
         f.f.root
             .service()
@@ -322,7 +322,7 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
             .routes
             .is_empty()
     );
-    assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 1);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 1);
     {
         let original_address = f.f.root.service().context(f.f.context).unwrap();
         let mut original_context = original_address.lock().unwrap();
@@ -331,7 +331,7 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
         assert!(routes.contains_key(&later_token));
         assert!(!routes.contains_key(&earlier_token));
     }
-    assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 1);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 1);
     {
         let original_address = f.f.root.service().context(f.f.context).unwrap();
         let mut original_context = original_address.lock().unwrap();
@@ -340,7 +340,7 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
         assert!(routes.contains_key(&later_token));
         assert!(routes.contains_key(&earlier_token));
     }
-    assert_eq!(f.f.root.advance_route_bindings(1).unwrap(), 0);
+    assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 0);
     assert_eq!(
         probe_in_handoff_order(&mut f, later_token),
         EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
@@ -385,4 +385,156 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
     );
     assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 1);
     f.finish_model_refusal();
+}
+
+#[test]
+fn an_original_timeout_retires_an_unbound_transfer_and_late_bind_cannot_admit_context_work() {
+    use crate::control_runtime::establish_route::EstablishRouteError;
+    let mut f = RouteFixture::with_geometry(2, StorageNeed::default(), true);
+    let (input, mut handle, getters, drops) = f.begin_route(op(12), 10, None);
+    f.adopt_pending_context();
+    let prepared = f.f.root.take_ready_route_binding().unwrap().unwrap();
+    let address = f.f.root.service().context(f.f.context).unwrap();
+    let scope = address
+        .lock()
+        .unwrap()
+        .resources_for_test()
+        .scope
+        .as_ref()
+        .unwrap()
+        .clone();
+    let before = scope.snapshot().unwrap();
+    assert_eq!(f.f.runtime.advance_time(Tick(10), 2).unwrap(), 1);
+    f.f.runtime.poll_one(Tick(10)).unwrap();
+    f.f.root.index_control_effects(64).unwrap();
+    let cancel = f.f.root.take_control_effect(64).unwrap().unwrap();
+    let timer_input = cancel.input;
+    assert!(matches!(&cancel.effect,
+        WorkerAction::Control { effect: ControlEffect::CancelEstablishRoute { request, .. }, .. }
+            if request.token == input));
+    f.f.root.handoff_establish_route_cancel(cancel).unwrap();
+    let disposal =
+        f.f.root
+            .take_retired_route_disposal(input)
+            .expect("the original never-bound Context leg has genuinely retired");
+    let reply = f.f.root.take_control_effect(64).unwrap().unwrap();
+    assert!(matches!(&reply.effect, WorkerAction::ControlReply(reply)
+        if reply.request.token == input && reply.result == RequestResult::TimeoutWhileAccepted));
+    f.f.root.publish_request_reply(reply).unwrap();
+    drop(handle.try_take().unwrap());
+    drop(handle);
+    f.f.runtime.retire_input(actor(), timer_input).unwrap();
+    let still_original = f.f.root.resources().requests.contains_key(&input);
+    let late = prepared.bind();
+    let no_context_work = scope.snapshot().unwrap() == before;
+    // register_establish_route stores the original alias before attempting
+    // its issuer. Even this refusal is owned and really removed by Context.
+    let removed_original_alias = address
+        .lock()
+        .unwrap()
+        .advance_establish_route(input)
+        .unwrap();
+    assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
+    let disposed = thread::spawn(move || disposal.run()).join().unwrap();
+    let retired = f.f.root.reap_ready_requests(32).unwrap();
+    f.finish_model_refusal();
+    assert!(matches!(
+        late,
+        Err(ControlRequestError::Route(EstablishRouteError::WrongPhase))
+    ));
+    assert!(still_original && no_context_work && removed_original_alias && disposed);
+    assert_eq!(retired, 1);
+    assert_eq!(getters.load(Ordering::SeqCst), 3);
+    assert_eq!(drops.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn a_prepared_transfer_to_an_actually_removed_context_parks_without_work_until_its_original_timeout()
+ {
+    use crate::control_runtime::establish_route::EstablishRouteError;
+    let mut f = RouteFixture::with_geometry(2, StorageNeed::default(), true);
+    let (input, mut handle, getters, drops) = f.begin_route(op(12), 10, None);
+    f.adopt_pending_context();
+    let prepared = f.f.root.take_ready_route_binding().unwrap().unwrap();
+    let original = f.f.root.resources().requests.get(&input).unwrap();
+    let return_role = original.route_return_role().unwrap();
+    let original_work = original.work;
+    let address = f.f.root.service().context(f.f.context).unwrap();
+    // This actually closes the sources/actor, exits the metadata Work and
+    // removes its Scope. The captured address is only a metadata alias.
+    f.dispose_context_metadata();
+    let actor_removed = matches!(
+        f.f.runtime.snapshot(context_actor()),
+        Err(DriverError::UnknownActor)
+    );
+    let dimensions = [
+        Dimension::Inputs,
+        Dimension::Batches,
+        Dimension::Effects,
+        Dimension::Work,
+        Dimension::Completions,
+        Dimension::Captures,
+        Dimension::Replies,
+    ];
+    let fees_after_removal = dimensions.map(|dimension| f.f.ledger.used(dimension.id()));
+    let late = prepared.bind();
+    let no_new_payment =
+        dimensions.map(|dimension| f.f.ledger.used(dimension.id())) == fees_after_removal;
+    let no_alias = address
+        .lock()
+        .unwrap()
+        .resources_for_test()
+        .routes
+        .is_empty();
+    let original = f.f.root.resources().requests.get(&input).unwrap();
+    let same_return_and_original_r =
+        original.work == original_work && original.route_return_role() == Some(return_role);
+    let early_disposal = f.f.root.take_retired_route_disposal(input);
+    let no_premature_disposal = early_disposal.is_none();
+    let still_pending = handle.try_take().is_none();
+    let no_premature_refund = f.f.root.reap_ready_requests(32).unwrap() == 0;
+
+    // Target loss is not a reply or an exit fact. Only this same request's
+    // real Core deadline can authorize its unbound-context cancellation.
+    assert_eq!(f.f.runtime.advance_time(Tick(10), 2).unwrap(), 1);
+    f.f.runtime.poll_one(Tick(10)).unwrap();
+    f.f.root.index_control_effects(64).unwrap();
+    let cancel = f.f.root.take_control_effect(64).unwrap().unwrap();
+    let timer_input = cancel.input;
+    assert!(matches!(&cancel.effect,
+        WorkerAction::Control { effect: ControlEffect::CancelEstablishRoute { request, .. }, .. }
+            if request.token == input));
+    f.f.root.handoff_establish_route_cancel(cancel).unwrap();
+    let disposal = early_disposal
+        .or_else(|| f.f.root.take_retired_route_disposal(input))
+        .expect("real cancellation positively retires only the original unbound Context leg");
+    let reply = f.f.root.take_control_effect(64).unwrap().unwrap();
+    assert!(matches!(&reply.effect, WorkerAction::ControlReply(reply)
+        if reply.request.token == input && reply.result == RequestResult::TimeoutWhileAccepted));
+    f.f.root.publish_request_reply(reply).unwrap();
+    drop(handle.try_take().unwrap());
+    drop(handle);
+    f.f.runtime.retire_input(actor(), timer_input).unwrap();
+    let raw_still_owned = f.f.root.reap_ready_requests(32).unwrap() == 0
+        && f.f.root.resources().requests.contains_key(&input)
+        && drops.load(Ordering::SeqCst) == 0;
+    let disposed = thread::spawn(move || disposal.run()).join().unwrap();
+    let retired = f.f.root.reap_ready_requests(32).unwrap();
+    let exact_r_removed = !f.f.root.resources().requests.contains_key(&input);
+    f.finish_model_refusal(); // Reuses the already-retired Context metadata.
+
+    assert!(matches!(
+        late,
+        Err(ControlRequestError::Route(
+            EstablishRouteError::TargetRemoved
+        ))
+    ));
+    assert!(actor_removed && no_alias && no_new_payment);
+    assert!(
+        same_return_and_original_r && no_premature_disposal && still_pending && no_premature_refund
+    );
+    assert!(raw_still_owned && disposed && exact_r_removed);
+    assert_eq!(retired, 1);
+    assert_eq!(getters.load(Ordering::SeqCst), 3);
+    assert_eq!(drops.load(Ordering::SeqCst), 4);
 }

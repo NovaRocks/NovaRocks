@@ -26,7 +26,6 @@ pub(crate) use super::request_ready::ControlRequestReady;
 use super::request_ready::RequestExternalLeg;
 use super::{
     actors::{ControlMessage, RequestMetadata, WorkerAction, WorkerActor, WorkerMessage},
-    context_host::ContextHostRecord,
     context_host_jobs::{ContextHostJobError, ContextHostJobs},
     establish_ingress::{
         EstablishDisposalJob, EstablishIngressJob, EstablishIngressOutcome, EstablishIngressOwner,
@@ -37,6 +36,7 @@ use super::{
         ROOT_ROUTE_RETURN_STORAGE,
     },
     process_control::ProcessControlOwner,
+    service::ContextHostAddress,
 };
 use crate::control_runtime_policy::{PolicyError, StorageNeed};
 use novarocks_control_runtime::{
@@ -246,17 +246,26 @@ pub(super) struct ValidatedEstablishRoute {
     request: EstablishReplayRequest,
     order: u64,
 }
-impl ValidatedEstablishRoute {
-    pub(super) fn root(&self) -> ActorId {
-        self.root
-    }
-    pub(super) fn context(&self) -> QueryContextRef {
-        self.context
-    }
-    pub(super) fn request(&self) -> RequestContext {
-        self.request.request
+/// Root already retains the same original route and return position. This
+/// transfer owns only the target address and neutral Context half; the driver
+/// releases its Root inventory guard before binding the target inventory.
+#[must_use = "Bind the same original transfer outside the Root inventory lock"]
+pub(crate) struct PreparedEstablishRoute {
+    address: ContextHostAddress,
+    route: Arc<EstablishRouteCustody>,
+    initialization: Result<(), EstablishRouteError>,
+}
+impl PreparedEstablishRoute {
+    pub(crate) fn bind(self) -> Result<(), ControlRequestError> {
+        self.initialization.map_err(ControlRequestError::Route)?;
+        let mut host = self.address.lock().ok_or(ControlRequestError::Route(
+            EstablishRouteError::TargetRemoved,
+        ))?;
+        host.register_establish_route(self.route)
+            .map_err(ControlRequestError::Route)
     }
 }
+
 #[must_use = "The actual Root must retain the request until its original retirement"]
 pub(crate) struct ControlRequestCustody {
     runtime: ActorRuntime<WorkerActor>,
@@ -804,42 +813,52 @@ impl ControlRequestCustody {
             .as_ref()
             .and_then(EstablishIngressOwner::take_disposal))
     }
-    pub(super) fn bind_pending_establish_route(
+    pub(super) fn prepare_pending_establish_route(
         &mut self,
-        host: &mut ContextHostRecord,
+        address: ContextHostAddress,
         root_author: &WorkLease,
-    ) -> Result<Result<(), EstablishRouteError>, ControlRequestError> {
+    ) -> Result<PreparedEstablishRoute, ControlRequestError> {
         let seed = self
             .pending_route
             .as_ref()
             .ok_or(ControlRequestError::WrongPhase)?;
-        host.validate_establish_route(&self.runtime, seed)
-            .map_err(ControlRequestError::Route)?;
+        if address.context() != seed.context || seed.root != self.actor {
+            return Err(ControlRequestError::WrongRequest);
+        }
         let escrow = self
             .route_escrow
             .take()
             .ok_or(ControlRequestError::WrongPhase)?;
-        let seed = self
-            .pending_route
-            .take()
-            .expect("validated original route seed");
-        let route = EstablishRouteCustody::new(
+        let route = match EstablishRouteCustody::new(
             self.runtime.clone(),
             self.ledger.clone(),
             self.actor,
             self.work,
             seed.context,
-            host.registration().clone(),
-            host.scope().clone(),
+            address.registration().clone(),
             seed.request,
             escrow,
             ControlRequestNotice(self.endpoint.external.slot().clone()),
-        );
-        // Register both aliases before the first Context Work, input or
-        // backchannel is constructed. Initialization refusal retains the same
-        // original partial in these actual failure inventories.
+        ) {
+            Ok(route) => route,
+            Err((error, original)) => {
+                self.route_escrow = Some(original);
+                return Err(ControlRequestError::Route(match error {
+                    EstablishRouteError::Driver(
+                        DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch,
+                    ) => EstablishRouteError::TargetRemoved,
+                    error => error,
+                }));
+            }
+        };
         self.route = Some(route.clone());
-        Ok(host.register_establish_route(route, root_author))
+        self.pending_route = None;
+        let initialization = route.initialize_root(root_author);
+        Ok(PreparedEstablishRoute {
+            address,
+            route,
+            initialization,
+        })
     }
     pub(super) fn cancel_establish_route(
         &mut self,
@@ -866,6 +885,11 @@ impl ControlRequestCustody {
         }
         if let Some(route) = &self.route {
             route.cancel();
+            // A never-bound leg admitted no Context Work or capture. An
+            // admitted Context leg still exits through its actual owner.
+            route
+                .try_retire_unbound_context()
+                .map_err(ControlRequestError::Route)?;
         }
         self.pending_route = None;
         self.route_cancelled = true;
@@ -897,6 +921,11 @@ impl ControlRequestCustody {
         }
         if self.pending_route.is_some() {
             return Ok(false);
+        }
+        if let Some(route) = &self.route {
+            route
+                .try_retire_unbound_context()
+                .map_err(ControlRequestError::Route)?;
         }
         if let Some(route) = &self.route
             && !route

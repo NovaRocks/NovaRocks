@@ -20,7 +20,11 @@
 //! Request, ticket, materialization and transport inventories are independent
 //! owners; this constructor does not expose a ready Native request facade.
 
+mod host_cell;
+mod ready_routes;
 mod source_io;
+pub(crate) use host_cell::{RootHostCell, RootHostProgress};
+use ready_routes::ReadyRoutes;
 pub(crate) use source_io::RootRequestAdvanceError;
 
 use super::{
@@ -34,7 +38,7 @@ use super::{
     control_request::{
         ControlRequestAdmissionRefusal, ControlRequestCustody, ControlRequestError,
         ControlRequestHandle, ControlRequestPublishRefusal, ControlRequestReady,
-        ControlRequestSubmitRefusal,
+        ControlRequestSubmitRefusal, PreparedEstablishRoute,
     },
     control_ticket::{ControlTicketError, ControlTicketInventory},
     effect_dispatch::{DispatchError, EffectDispatch, EffectRef, IndexedBatches},
@@ -64,10 +68,7 @@ use novarocks_worker_protocol::{
     control::{ControlCore, ControlInput},
     lease::MonotonicInstant,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::NonZeroUsize,
-};
+use std::{collections::BTreeMap, num::NonZeroUsize};
 
 const KINDS: [WorkKind; 3] = [WorkKind::Business, WorkKind::Step, WorkKind::Cleanup];
 const LIFETIME: usize = 0;
@@ -148,8 +149,7 @@ pub(crate) struct ProcessControlResources {
     // Addresses of the original R owners, never decisions or obligations.
     // Keys follow actual metadata handoff order, not request token order.
     route_waiters: BTreeMap<QueryContextRef, BTreeMap<u64, InputId>>,
-    ready_routes: BTreeSet<QueryContextRef>,
-    route_cursor: Option<QueryContextRef>,
+    ready_routes: ReadyRoutes,
     next_route_order: u64,
     // Original paid return-role addresses. Repeated occurrence InputIds are
     // not RPC tokens; even an empty callback batch must wake its same R.
@@ -278,8 +278,7 @@ impl ProcessControlOwner {
             internal: None,
             internal_partial: None,
             route_waiters: BTreeMap::new(),
-            ready_routes: BTreeSet::new(),
-            route_cursor: None,
+            ready_routes: ReadyRoutes::new(binding.request_positions),
             next_route_order: 0,
             return_routes: BTreeMap::new(),
         };
@@ -643,7 +642,7 @@ impl ProcessControlOwner {
     pub(crate) fn handoff_establish_route(
         &mut self,
         ticket: EffectTicket<super::actors::WorkerAction>,
-    ) -> Result<Option<ControlRequestError>, ControlRouteHandoffRefusal> {
+    ) -> Result<(), ControlRouteHandoffRefusal> {
         use super::actors::WorkerAction;
         use novarocks_worker_protocol::control::ControlEffect;
         let WorkerAction::Control {
@@ -680,7 +679,12 @@ impl ProcessControlOwner {
         );
         // Always bind this pair's head, including when a newer R encounters
         // an actor that appeared after an older R had already been deferred.
-        let refusal = self.advance_context_route(context).err();
+        if self.service.context(context).is_some() {
+            self.resources.ready_routes.mark(context);
+            self.runtime()
+                .notify_host_actor(&self.registration)
+                .unwrap_or_else(|_| std::process::abort());
+        }
         let effect = EffectRef {
             input: ticket.input,
             action: ticket.descriptor.id,
@@ -691,28 +695,25 @@ impl ProcessControlOwner {
         if self.control_completion_observed(effect).is_err() {
             std::process::abort();
         }
-        Ok(refusal)
+        Ok(())
     }
-    fn advance_context_route(
+    fn prepare_context_route(
         &mut self,
         context: QueryContextRef,
-    ) -> Result<bool, ControlRequestError> {
+    ) -> Result<Option<PreparedEstablishRoute>, ControlRequestError> {
         let Some((&order, &input)) = self
             .resources
             .route_waiters
             .get(&context)
             .and_then(|rows| rows.first_key_value())
         else {
-            self.resources.ready_routes.remove(&context);
-            return Ok(false);
+            self.resources.ready_routes.forget(context);
+            return Ok(None);
         };
         let Some(address) = self.service.context(context) else {
-            self.resources.ready_routes.remove(&context);
-            return Ok(false);
-        };
-        let Some(mut host) = address.lock() else {
-            self.resources.ready_routes.remove(&context);
-            return Ok(false);
+            // Await actual publication. No poller waits for a Context mutex.
+            self.resources.ready_routes.forget(context);
+            return Ok(None);
         };
         let custody = self
             .resources
@@ -720,8 +721,8 @@ impl ProcessControlOwner {
             .get_mut(&input)
             .expect("route address retains its original R owner");
         assert_eq!(custody.pending_route(), Some((context, order)));
-        let initialization =
-            custody.bind_pending_establish_route(&mut host, &self.resources.roles[FAILURE].work)?;
+        let transfer = custody
+            .prepare_pending_establish_route(address, &self.resources.roles[FAILURE].work)?;
         if let Some(role) = custody.route_return_role() {
             assert!(self.resources.return_routes.insert(role, input).is_none());
         }
@@ -733,41 +734,21 @@ impl ProcessControlOwner {
         rows.remove(&order);
         if rows.is_empty() {
             self.resources.route_waiters.remove(&context);
-            self.resources.ready_routes.remove(&context);
+            self.resources.ready_routes.forget(context);
         } else {
-            self.resources.ready_routes.insert(context);
+            self.resources.ready_routes.mark(context);
         }
-        initialization.map_err(ControlRequestError::Route)?;
-        Ok(true)
+        Ok(Some(transfer))
     }
-    /// Each unit binds one existing original R through a coalesced target
-    /// index. No request thread scans Contexts or recreates an obligation.
-    pub(crate) fn advance_route_bindings(
+    /// Take one original neutral transfer. Its Root return is registered
+    /// before the caller releases Root; binding never borrows this owner.
+    pub(crate) fn take_ready_route_binding(
         &mut self,
-        budget: usize,
-    ) -> Result<usize, ControlRequestError> {
-        use std::ops::Bound::{Excluded, Unbounded};
-        let mut units = 0;
-        while units < budget {
-            let context = self
-                .resources
-                .route_cursor
-                .and_then(|cursor| {
-                    self.resources
-                        .ready_routes
-                        .range((Excluded(cursor), Unbounded))
-                        .next()
-                        .copied()
-                })
-                .or_else(|| self.resources.ready_routes.first().copied());
-            let Some(context) = context else {
-                break;
-            };
-            self.resources.route_cursor = Some(context);
-            self.advance_context_route(context)?;
-            units += 1;
-        }
-        Ok(units)
+    ) -> Result<Option<PreparedEstablishRoute>, ControlRequestError> {
+        let Some(context) = self.resources.ready_routes.pop() else {
+            return Ok(None);
+        };
+        self.prepare_context_route(context)
     }
     pub(crate) fn adopt_context(
         &mut self,
@@ -777,7 +758,7 @@ impl ProcessControlOwner {
         let context = binding.core.identity();
         self.service.adopt_context(ticket, binding)?;
         if self.resources.route_waiters.contains_key(&context) {
-            self.resources.ready_routes.insert(context);
+            self.resources.ready_routes.mark(context);
             self.runtime()
                 .notify_host_actor(&self.registration)
                 .unwrap_or_else(|_| std::process::abort());
@@ -861,7 +842,7 @@ impl ProcessControlOwner {
             assert_eq!(rows.remove(&order), Some(request.token));
             if rows.is_empty() {
                 self.resources.route_waiters.remove(&context);
-                self.resources.ready_routes.remove(&context);
+                self.resources.ready_routes.forget(context);
             }
         }
         let effect = EffectRef {
@@ -893,8 +874,7 @@ impl ProcessControlOwner {
         budget: usize,
     ) -> Result<usize, ControlRequestError> {
         let mut retired = 0;
-        let route_units = self.advance_route_bindings(budget)?;
-        for _ in route_units..budget {
+        for _ in 0..budget {
             let Some(input) = self.resources.request_ready.next_ready() else {
                 break;
             };

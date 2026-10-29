@@ -88,6 +88,7 @@ pub(crate) enum EstablishRouteError {
     Runtime(RuntimeError),
     Exit(ExitRoleError),
     WrongOwner,
+    TargetRemoved,
     WrongEffect,
     WrongPhase,
     Capacity,
@@ -116,7 +117,7 @@ enum ProbePhase {
     Finished,
 }
 struct ContextLeg {
-    scope: ScopeHandle,
+    scope: Option<ScopeHandle>,
     escrow: Option<CapacityBundle>,
     work: Option<WorkLease>,
     work_id: Option<WorkId>,
@@ -172,20 +173,15 @@ impl EstablishRouteCustody {
         root_work: WorkId,
         context: QueryContextRef,
         registration: ActorRegistration,
-        scope: ScopeHandle,
         request: EstablishReplayRequest,
         escrow: CapacityBundle,
         notice: ControlRequestNotice,
-    ) -> Arc<Self> {
-        assert!(
-            registration.matches_scope(&scope),
-            "original route Context scope"
-        );
-        runtime
-            .validate_registration(&registration)
-            .expect("original route Context registration");
+    ) -> Result<Arc<Self>, (EstablishRouteError, CapacityBundle)> {
+        if let Err(error) = runtime.validate_registration(&registration) {
+            return Err((EstablishRouteError::Driver(error), escrow));
+        }
         let actor = registration.actor();
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             runtime,
             ledger,
             root,
@@ -196,7 +192,7 @@ impl EstablishRouteCustody {
             request,
             notice,
             context_leg: Mutex::new(ContextLeg {
-                scope,
+                scope: None,
                 escrow: Some(escrow),
                 work: None,
                 work_id: None,
@@ -220,13 +216,27 @@ impl EstablishRouteCustody {
             }),
             context_retired: AtomicBool::new(false),
             root_leg: Mutex::new(RootLeg::default()),
-        })
+        }))
     }
     pub(crate) fn context(&self) -> QueryContextRef {
         self.context
     }
     pub(crate) fn actor(&self) -> ActorId {
         self.actor
+    }
+    /// Qualify the immutable target without taking either original leg lock.
+    /// Equal public IDs cannot replace the admitted Context registration.
+    pub(crate) fn target_matches(
+        &self,
+        runtime: &ActorRuntime<WorkerActor>,
+        registration: &ActorRegistration,
+        context: QueryContextRef,
+        root: ActorId,
+    ) -> bool {
+        self.root == root
+            && self.runtime.same_runtime(runtime)
+            && self.registration.same_registration(registration)
+            && self.context == context
     }
     pub(crate) fn request(&self) -> RequestContext {
         self.request.request
@@ -242,23 +252,21 @@ impl EstablishRouteCustody {
             .expect("original Root route return")
             .role_id
     }
-    /// Called only after this same Arc is in the actual Context inventory.
-    /// Every fallible construction stores its original partial first. No
-    /// foreign payload or callback is taken by this neutral metadata role.
-    pub(crate) fn initialize(
+    /// Root stores this same Arc before initializing its original backchannel.
+    /// This touches only Root's leg and never borrows a Context owner or scope.
+    pub(crate) fn initialize_root(
         &self,
-        parent: &WorkLease,
         root_author: &WorkLease,
     ) -> Result<(), EstablishRouteError> {
-        let mut leg = self.context_leg.lock().expect("original Context route");
-        if !matches!(leg.phase, ProbePhase::Constructing)
-            || leg.work_id.is_some()
-            || leg.cancelled
-            || parent.scope().id() != leg.scope.id()
+        let mut root = self.root_leg.lock().expect("original Root route return");
+        if root.retired
+            || root.permit.is_some()
+            || root.input.is_some()
+            || root.role_id.is_some()
+            || self.context_retired.load(Ordering::Acquire)
         {
             return Err(EstablishRouteError::WrongPhase);
         }
-        let mut root = self.root_leg.lock().expect("original Root route return");
         root.permit = Some(self.runtime.reserve_admitted_input(
             self.root,
             self.actor,
@@ -274,9 +282,43 @@ impl EstablishRouteCustody {
             }
         });
         root.role_id = Some(root.input.as_ref().expect("original return role").id());
-        drop(root);
-        let generation = leg.scope.gates()?.generation;
-        let guard = leg.scope.reserve_next(
+        Ok(())
+    }
+    /// Context stores its alias before initializing any Context Work or input.
+    /// Every partial stays in this original leg; the Root return is already paid.
+    pub(crate) fn initialize_context(&self, parent: &WorkLease) -> Result<(), EstablishRouteError> {
+        let mut leg = self.context_leg.lock().expect("original Context route");
+        if !matches!(leg.phase, ProbePhase::Constructing)
+            || leg.scope.is_some()
+            || leg.work_id.is_some()
+            || leg.cancelled
+            || leg.retired
+            || self.context_retired.load(Ordering::Acquire)
+        {
+            return Err(EstablishRouteError::WrongPhase);
+        }
+        if !self.registration.matches_scope(parent.scope()) {
+            return Err(EstablishRouteError::WrongOwner);
+        }
+        self.runtime.validate_registration(&self.registration)?;
+        {
+            // Keep the existing ContextLeg -> RootLeg order whenever both
+            // original legs are needed. Root initialization takes Root only.
+            let root = self.root_leg.lock().expect("original Root route return");
+            if root.retired
+                || root.permit.is_some()
+                || root.input.is_none()
+                || root.role_id.is_none()
+            {
+                return Err(EstablishRouteError::WrongPhase);
+            }
+        }
+        let scope = parent.scope().clone();
+        // The Context now owns all further partial cleanup, even if its next
+        // admission refuses. Root may retire only a still-unbound cancelled leg.
+        leg.scope = Some(scope.clone());
+        let generation = scope.gates()?.generation;
+        let guard = scope.reserve_next(
             generation,
             ResourceVector::default(),
             WorkKind::Settlement,
@@ -296,7 +338,7 @@ impl EstablishRouteCustody {
         }
         Self::release(&mut leg.zero)?;
         leg.report = Some(ReportSlot::reserve_next(
-            &leg.scope,
+            &scope,
             generation,
             leg.work_id.expect("bound Context route Work"),
             1,
@@ -484,10 +526,32 @@ impl EstablishRouteCustody {
         *capacity = None;
         Ok(())
     }
+    /// Only cancelled metadata that never entered a Context scope can be
+    /// withdrawn by Root. No Context Work, report or body exit is fabricated.
+    pub(crate) fn try_retire_unbound_context(&self) -> Result<bool, EstablishRouteError> {
+        let mut leg = self.context_leg.lock().expect("original Context route");
+        if leg.scope.is_some() || !leg.cancelled {
+            return Ok(false);
+        }
+        if leg.retired {
+            return Ok(true);
+        }
+        Self::release(&mut leg.escrow)?;
+        leg.phase = ProbePhase::Finished;
+        leg.retired = true;
+        self.context_retired.store(true, Ordering::Release);
+        drop(leg);
+        self.notice.notify();
+        Ok(true)
+    }
     pub(crate) fn try_retire_context(&self) -> Result<bool, EstablishRouteError> {
         let mut leg = self.context_leg.lock().expect("original Context route");
         if leg.retired {
             return Ok(true);
+        }
+        if leg.scope.is_none() {
+            drop(leg);
+            return self.try_retire_unbound_context();
         }
         if !leg.cancelled && !matches!(leg.phase, ProbePhase::Finished) {
             return Ok(false);
@@ -553,7 +617,9 @@ impl EstablishRouteCustody {
             }
             leg.report = None;
         }
-        self.ledger.reap_scope_ready(leg.scope.id(), 1)?;
+        if let Some(scope) = &leg.scope {
+            self.ledger.reap_scope_ready(scope.id(), 1)?;
+        }
         if leg
             .retirement
             .as_ref()

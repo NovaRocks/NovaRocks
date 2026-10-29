@@ -48,6 +48,23 @@ use std::{
     thread,
 };
 
+// Serial component-test driver only. Production must release RootHostCell's
+// guard before bind, as the real owner-turn regression below verifies.
+fn advance_route_bindings(
+    root: &mut crate::control_runtime::process_control::ProcessControlOwner,
+    budget: usize,
+) -> Result<usize, ControlRequestError> {
+    let mut routed = 0;
+    for _ in 0..budget {
+        let Some(original) = root.take_ready_route_binding()? else {
+            break;
+        };
+        original.bind()?;
+        routed += 1;
+    }
+    Ok(routed)
+}
+
 fn op(value: u8) -> TaskOperationId {
     let mut bytes = [value; 16];
     bytes[6] = 0x70;
@@ -481,7 +498,8 @@ impl RouteFixture {
         assert!(
             matches!(&route.effect,WorkerAction::Control{effect:ControlEffect::RouteEstablish{request,..},..} if request.request.token==input)
         );
-        let refusal = self.f.root.handoff_establish_route(route).unwrap();
+        self.f.root.handoff_establish_route(route).unwrap();
+        let refusal = advance_route_bindings(&mut self.f.root, 1).err();
         RouteStarted {
             input,
             handle,

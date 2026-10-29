@@ -74,14 +74,9 @@ impl ProcessControlOwner {
             .map_err(|error| RootRequestAdvanceError::Control(ControlRequestError::Runtime(error)))?
             .generation;
         let failure_work = self.resources.roles[FAILURE].work.id();
-        // Each class has its own finite allowance. A continuously ready
-        // Context route must not consume the Source-return allowance.
-        let mut progress = RequestIoProgress {
-            routed: self
-                .advance_route_bindings(budget)
-                .map_err(RootRequestAdvanceError::Control)?,
-            ..Default::default()
-        };
+        // Context transfers are driven outside this Root inventory lock.
+        // Source returns retain their own independent finite allowance.
+        let mut progress = RequestIoProgress::default();
         for _ in 0..budget {
             let Some(input) = self.resources.request_ready.next_ready() else {
                 break;
