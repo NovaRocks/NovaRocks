@@ -715,10 +715,27 @@ impl TaskHostCall {
         }
         self.finish_retirement(ledger)
     }
-    pub(crate) fn retire_returned(
+    /// Advance the original call's actual disposition. An unexposed,
+    /// withdrawn call has revoked its return slot; it must never be polled
+    /// or acknowledged as an invoked call while its physical header retires.
+    pub(crate) fn advance_retirement(
         &self,
         ledger: &RuntimeLedger,
     ) -> Result<bool, TaskHostCallError> {
+        let handoff = {
+            let state = self.0.state.lock().expect("original host-call disposition");
+            if state.retired {
+                return Ok(true);
+            }
+            state.handoff
+        };
+        match handoff {
+            CallHandoff::Withdrawn => return self.finish_retirement(ledger),
+            CallHandoff::Available | CallHandoff::AwaitingFailurePublication => {
+                return Ok(false);
+            }
+            CallHandoff::Issued => {}
+        }
         self.complete_stop_effect()?;
         let returned = self.poll_return()?;
         if !matches!(returned, Some(TaskHostCallOutcome::Completed)) {

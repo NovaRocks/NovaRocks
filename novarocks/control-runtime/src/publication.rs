@@ -66,6 +66,14 @@ impl<T> PublishedSnapshot<T> {
     pub fn read(&self) -> Arc<T> {
         self.value.lock().expect("published snapshot lock").clone()
     }
+    /// A nonblocking read of the same cell without cloning its rich projection.
+    /// Busy or poisoned cells are unavailable; the ordinary read paths are unchanged.
+    pub fn try_borrow(&self) -> Option<SnapshotBorrow<'_, T>> {
+        self.value
+            .try_lock()
+            .ok()
+            .map(|value| SnapshotBorrow { value })
+    }
     pub fn borrow(&self) -> SnapshotBorrow<'_, T> {
         SnapshotBorrow {
             value: self.value.lock().expect("published snapshot lock"),

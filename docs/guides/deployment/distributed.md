@@ -149,10 +149,10 @@ handler 前拒绝错误域，不转发到另一条 listener：
 
 | BE endpoint | 接受的方法 |
 | --- | --- |
-| Data | `ApplyTaskOperations`、`SubscribeTaskStatus`、`FetchTaskResult`、`FetchTaskDynamicFilters`、`GetFinalTaskInfo`、`PruneCatalogs`、`ExchangeUnary`、`TransmitRuntimeFilterEnvelope` |
+| Data | `ApplyTaskOperations`、`SubscribeTaskStatus`、`FetchRootResult`、`FetchTaskDynamicFilters`、`GetFinalTaskInfo`、`PruneCatalogs`、`ExchangeUnary`、`TransmitRuntimeFilterEnvelope` |
 | Control | `ApplyTaskControlOperations`、`Heartbeat` |
 
-`AnnounceBackend` 发到 FE 原有 Native endpoint；已退役的 `FetchResult` 和 `Exchange`
+`AnnounceBackend` 发到 FE 原有 Native endpoint；已退役的 `FetchResult`、`FetchTaskResult` 和 `Exchange`
 不因换一个端口而恢复。FE 每个已准入 attempt 冻结完整 BE descriptor，再按具体 RPC method
 选择其中的 Data 或 Control endpoint，不重新查询 membership，也不在 Control 缺失时拨 Data。
 消息尺寸门位于 protobuf 对象构造之前，Worker 的 Context reservation 仍是另一道

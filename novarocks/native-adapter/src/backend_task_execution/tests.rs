@@ -3185,8 +3185,6 @@ fn a_shared_domain_advance_applies_once_and_replays_idempotently() {
 
 #[test]
 fn a_cancel_stands_a_task_down_and_a_late_cancel_is_settled() {
-    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
-
     let fixture = Fixture::new();
     fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
@@ -3206,12 +3204,6 @@ fn a_cancel_stands_a_task_down_and_a_late_cancel_is_settled() {
     assert_eq!(cancel.outcome(), OperationOutcome::Accepted);
     assert_eq!(HostLedger::get(&fixture.ledger.cancels), 1);
     assert_eq!(reporter.current().state(), TaskState::Canceled);
-    assert_eq!(
-        fetch_status(&poll_root_result(&fixture.registry, identity)),
-        FetchStatus::Error,
-        "accepted cancellation revokes output even after its producer finished"
-    );
-
     let late = fixture.registry.cancel_task(&request);
     assert_eq!(
         late.outcome(),
@@ -3269,95 +3261,8 @@ fn a_dynamic_filter_read_returns_what_the_task_advertised() {
 
 // -------------------------------------------------------------- root result
 
-/// Polls the root result plane the way the RPC boundary does.
-fn poll_root_result(
-    registry: &Arc<TaskExecutionRegistry>,
-    identity: TaskIdentity,
-) -> novarocks_proto_models::novarocks::FetchResultResponse {
-    poll_root_result_after(registry, identity, None)
-}
-
-fn poll_root_result_after(
-    registry: &Arc<TaskExecutionRegistry>,
-    identity: TaskIdentity,
-    acknowledged_packet_sequence: Option<u64>,
-) -> novarocks_proto_models::novarocks::FetchResultResponse {
-    poll_root_result_after_with_limit(
-        registry,
-        identity,
-        acknowledged_packet_sequence,
-        16 * 1024 * 1024,
-    )
-}
-
-fn poll_root_result_after_with_limit(
-    registry: &Arc<TaskExecutionRegistry>,
-    identity: TaskIdentity,
-    acknowledged_packet_sequence: Option<u64>,
-    max_result_bytes: u64,
-) -> novarocks_proto_models::novarocks::FetchResultResponse {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("root result test runtime")
-        .block_on(TaskExecutionIngress::fetch_task_result(
-            RegistryTaskExecutionIngress::new(
-                Arc::clone(registry),
-                NativeCompatibilityId::new([0x71; 32]),
-                crate::backend_application::test_static_package_admission(),
-            )
-            .as_ref(),
-            novarocks_proto_models::novarocks::FetchTaskResultRequest {
-                root_task: Some(novarocks_task_codec::identity::encode_task_identity(
-                    identity,
-                )),
-                max_wait_millis: 1,
-                acknowledged_packet_sequence,
-                max_result_bytes,
-            },
-        ))
-        .expect("a poll that reaches a decision is answered in band")
-}
-
 #[test]
-fn a_root_result_above_the_requested_cap_is_not_delivered_or_acknowledged() {
-    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
-
-    let fixture = Fixture::new();
-    fixture.establish(79);
-    let root = fixture.identity(79, 79, 1);
-    let reporter = fixture.create(root, 5);
-    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
-    novarocks_worker::result_buffer::create_task_typed_sender(root);
-    novarocks_worker::result_buffer::insert_task_typed(root, vec![1, 2, 3, 4])
-        .expect("one retained payload");
-
-    let refused = poll_root_result_after_with_limit(&fixture.registry, root, None, 3);
-    assert_eq!(fetch_status(&refused), FetchStatus::Error);
-    assert!(refused.message.contains("exceeding the requested limit 3"));
-    assert!(refused.result_arrow_ipc.is_empty());
-
-    let not_acknowledged = poll_root_result_after_with_limit(&fixture.registry, root, Some(0), 4);
-    assert_eq!(fetch_status(&not_acknowledged), FetchStatus::Error);
-
-    let delivered = poll_root_result_after_with_limit(&fixture.registry, root, None, 4);
-    assert_eq!(fetch_status(&delivered), FetchStatus::Ready);
-    assert_eq!(delivered.packet_seq, 0);
-    assert_eq!(delivered.result_arrow_ipc.as_ref(), &[1, 2, 3, 4]);
-    novarocks_worker::result_buffer::discard_task(root);
-}
-
-fn fetch_status(
-    response: &novarocks_proto_models::novarocks::FetchResultResponse,
-) -> novarocks_proto_models::novarocks::fetch_result_response::Status {
-    novarocks_proto_models::novarocks::fetch_result_response::Status::try_from(response.status)
-        .expect("a known fetch status")
-}
-
-#[test]
-fn only_the_task_that_owns_the_query_result_may_be_polled_for_it() {
-    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
-
+fn only_the_creation_winner_with_a_result_sink_owns_the_result_route() {
     let fixture = Fixture::new();
     let context = fixture.establish(71);
     let root = fixture.identity(71, 71, 1);
@@ -3401,20 +3306,10 @@ fn only_the_task_that_owns_the_query_result_may_be_polled_for_it() {
         fixture.registry.root_result_route(producer),
         RootResultRoute::NotResultOwner
     ));
-    let refused = poll_root_result(&fixture.registry, producer);
-    assert_eq!(fetch_status(&refused), FetchStatus::Error);
-    assert!(
-        refused.message.contains("does not own this query's result"),
-        "{}",
-        refused.message
-    );
-    assert!(refused.result_arrow_ipc.is_empty());
 }
 
 #[test]
-fn a_result_poll_is_fenced_against_a_foreign_process_and_an_unknown_task() {
-    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
-
+fn a_result_route_is_fenced_against_a_foreign_process_and_an_unknown_task() {
     let fixture = Fixture::new();
     fixture.establish(73);
     let root = fixture.identity(73, 73, 1);
@@ -3433,151 +3328,13 @@ fn a_result_poll_is_fenced_against_a_foreign_process_and_an_unknown_task() {
         fixture.registry.root_result_route(replaced),
         RootResultRoute::UnknownTask
     ));
-    let refused = poll_root_result(&fixture.registry, replaced);
-    assert_eq!(fetch_status(&refused), FetchStatus::Error);
-    assert!(
-        refused.message.contains("does not own"),
-        "{}",
-        refused.message
-    );
-
     // A task identity of this process that was never created.
     let absent = fixture.identity(73, 73, 2);
     assert!(matches!(
         fixture.registry.root_result_route(absent),
         RootResultRoute::UnknownTask
     ));
-    assert_eq!(
-        fetch_status(&poll_root_result(&fixture.registry, absent)),
-        FetchStatus::Error
-    );
-
     novarocks_worker::result_buffer::discard(UniqueId::new(73, 1));
-}
-
-#[test]
-fn the_root_stays_flushing_until_the_frontend_consumes_end_of_stream() {
-    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
-
-    let fixture = Fixture::new();
-    fixture.establish(74);
-    let root = fixture.identity(74, 74, 1);
-    let reporter = fixture.create(root, 5);
-    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
-
-    novarocks_worker::result_buffer::create_task_typed_sender(root);
-    novarocks_worker::result_buffer::insert_task_typed(root, vec![1, 2, 3]).expect("one payload");
-    // The pipeline is done producing, so the runtime moves the task to
-    // FLUSHING and closes the buffer. The output responsibility is still
-    // outstanding: the coordinator has not read a byte.
-    novarocks_worker::result_buffer::close_task_ok(root);
-    assert!(matches!(reporter.flushing(), StatusAdvance::Published(_)));
-    assert_eq!(reporter.current().state(), TaskState::Flushing);
-    assert!(!reporter.current().output().responsibility_complete());
-
-    let payload = poll_root_result(&fixture.registry, root);
-    assert_eq!(fetch_status(&payload), FetchStatus::Ready);
-    assert!(!payload.eos);
-    assert_eq!(payload.result_arrow_ipc.as_ref(), &[1, 2, 3]);
-    assert_eq!(
-        reporter.current().state(),
-        TaskState::Flushing,
-        "a delivered payload is not the end of the stream"
-    );
-
-    let end = poll_root_result_after(&fixture.registry, root, Some(0));
-    assert_eq!(fetch_status(&end), FetchStatus::Ready);
-    assert!(end.eos);
-    assert_eq!(reporter.current().state(), TaskState::Flushing);
-    assert!(!reporter.current().output().responsibility_complete());
-
-    let version_before = reporter.current().version();
-    let acknowledged = poll_root_result_after(&fixture.registry, root, Some(1));
-    assert_eq!(fetch_status(&acknowledged), FetchStatus::Eof);
-    let terminal = reporter.current();
-    assert_eq!(terminal.state(), TaskState::Finished);
-    assert!(terminal.output().responsibility_complete());
-    assert!(
-        terminal.version() > version_before,
-        "the drain publishes a new version immediately"
-    );
-    // A release may not linearize before the output is gone, so the drain is
-    // also what reports the output released.
-    assert!(
-        fixture
-            .registry
-            .root_result_route(root)
-            .refusal_detail()
-            .is_none()
-    );
-    let info = fixture
-        .registry
-        .get_final_task_info(&GetFinalTaskInfo::new(TaskOperationId::new_v7(), root));
-    assert_eq!(info.outcome(), OperationOutcome::Accepted);
-    assert_eq!(
-        info.acknowledgement()
-            .expect("a terminal task has final info")
-            .final_status(),
-        &terminal,
-        "final info is exactly the terminal that was published"
-    );
-
-    novarocks_worker::result_buffer::discard_task(root);
-}
-
-#[test]
-fn final_eos_ack_replays_after_task_retirement_until_context_release() {
-    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
-
-    let fixture = Fixture::new();
-    let context = fixture.establish(78);
-    let root = fixture.identity(78, 78, 1);
-    let reporter = fixture.create(root, 5);
-    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
-    novarocks_worker::result_buffer::create_task_typed_sender(root);
-    novarocks_worker::result_buffer::close_task_ok(root);
-    assert!(matches!(reporter.flushing(), StatusAdvance::Published(_)));
-    reporter.note_actual_stopped();
-    reporter.note_resources_converged();
-
-    let eos = poll_root_result(&fixture.registry, root);
-    assert_eq!(fetch_status(&eos), FetchStatus::Ready);
-    assert!(eos.eos);
-    let first_ack = poll_root_result_after(
-        &fixture.registry,
-        root,
-        Some(u64::try_from(eos.packet_seq).expect("nonnegative eos sequence")),
-    );
-    assert_eq!(fetch_status(&first_ack), FetchStatus::Eof);
-    assert_eq!(first_ack.packet_seq, eos.packet_seq);
-
-    fixture.registry.advance_deadlines();
-    assert!(matches!(
-        fixture.registry.root_result_route(root),
-        RootResultRoute::TerminalResultOwner(TaskState::Finished)
-    ));
-    let replayed = poll_root_result_after(
-        &fixture.registry,
-        root,
-        Some(u64::try_from(eos.packet_seq).expect("nonnegative eos sequence")),
-    );
-    assert_eq!(fetch_status(&replayed), FetchStatus::Eof);
-    assert_eq!(replayed.packet_seq, first_ack.packet_seq);
-
-    fixture.quiesce(context, &[root]);
-    let released = fixture
-        .registry
-        .release_query_context(&ReleaseQueryContext::new(
-            TaskOperationId::new_v7(),
-            context,
-        ));
-    assert_eq!(released.outcome(), OperationOutcome::Accepted);
-    let after_release = poll_root_result_after(
-        &fixture.registry,
-        root,
-        Some(u64::try_from(eos.packet_seq).expect("nonnegative eos sequence")),
-    );
-    assert_eq!(fetch_status(&after_release), FetchStatus::Error);
 }
 
 #[test]
@@ -3645,9 +3402,7 @@ fn an_end_of_stream_from_a_root_that_never_ran_is_refused_rather_than_finished()
 }
 
 #[test]
-fn a_result_poll_after_retirement_reports_the_terminal_rather_than_a_buffer() {
-    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
-
+fn a_retired_result_owner_keeps_its_terminal_without_releasing_its_context() {
     let fixture = Fixture::new();
     let context = fixture.establish(77);
     let root = fixture.identity(77, 77, 1);
@@ -3686,13 +3441,6 @@ fn a_result_poll_after_retirement_reports_the_terminal_rather_than_a_buffer() {
             RootResultRoute::TerminalResultOwner(TaskState::Finished)
         ),
         "{route:?}"
-    );
-    let refused = poll_root_result(&fixture.registry, root);
-    assert_eq!(fetch_status(&refused), FetchStatus::Error);
-    assert!(
-        refused.message.contains("already FINISHED"),
-        "{}",
-        refused.message
     );
     assert_eq!(
         fixture.registry.context_state(context),
@@ -4254,7 +4002,6 @@ fn two_concurrent_advances_never_roll_a_shared_token_backwards() {
 
 #[test]
 fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
-    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
     let fixture = Fixture::new();
     let context = fixture.establish(90_501);
     let root = fixture.identity(90_501, 1, 1);
@@ -4263,9 +4010,6 @@ fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
     let child_reporter = fixture.create(child, STREAM_SINK);
     root_reporter.running();
     child_reporter.running();
-    let active_missing = poll_root_result(&fixture.registry, root);
-    assert_eq!(fetch_status(&active_missing), FetchStatus::Error);
-    assert_eq!(active_missing.message, "no result for this query");
     novarocks_worker::result_buffer::create_task_typed_sender(root);
     let RootResultRoute::Serve(_held_route) = fixture.registry.root_result_route(root) else {
         panic!("the active root must own its registered result");
@@ -4330,15 +4074,6 @@ fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
         fixture.registry.root_result_route(root),
         RootResultRoute::AwaitTerminalControl
     ));
-    let response = poll_root_result(&fixture.registry, root);
-    assert_eq!(fetch_status(&response), FetchStatus::AwaitTerminalControl);
-    assert!(response.message.is_empty() && response.result_arrow_ipc.is_empty());
-    assert!(!response.eos);
-    assert_eq!(
-        fetch_status(&poll_root_result(&fixture.registry, child)),
-        FetchStatus::Error
-    );
-
     // The first Serve preceded revocation. Its real typed buffer read now
     // returns NotFound; one exact owner reread changes only the typed verdict.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4361,32 +4096,6 @@ fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
         error.kind,
         novarocks_worker::result_buffer::FetchErrorKind::NotFound
     ));
-    let ingress = RegistryTaskExecutionIngress::new(
-        Arc::clone(&fixture.registry),
-        NativeCompatibilityId::new([0x71; 32]),
-        crate::backend_application::test_static_package_admission(),
-    );
-    assert!(matches!(
-        runtime
-            .block_on(ingress.resolve_task_result_error(root, error, None))
-            .unwrap(),
-        novarocks_native_adapter::task_protocol::TaskResultRead::AwaitTerminalControl
-    ));
-    let wrong = TaskIdentity::new(
-        root.query_execution_id(),
-        root.stage_id(),
-        root.task_id(),
-        BackendProcessId::new_v7(),
-    );
-    assert_eq!(
-        fetch_status(&poll_root_result(&fixture.registry, wrong)),
-        FetchStatus::Error
-    );
-    assert_eq!(
-        fetch_status(&poll_root_result_after(&fixture.registry, root, Some(0))),
-        FetchStatus::AwaitTerminalControl,
-        "an unproven ACK must never be manufactured into EOF"
-    );
     // These are the original submitted workers, not synthetic cleanup reporters.
     assert!(!child_reporter.convergence().actual_stopped());
     child_reporter.release_output();

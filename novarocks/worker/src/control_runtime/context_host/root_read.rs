@@ -443,9 +443,13 @@ pub(super) struct RootReadData {
 struct DataBody {
     authority: Option<ExitAuthority>,
     failed: AtomicBool,
-    notice: RequestNotice,
+    shared: Arc<RootReadShared>,
 }
-impl crate::root_result_channel::RootDeliveryAttachment for DataBody {}
+impl crate::root_result_channel::RootDeliveryAttachment for DataBody {
+    fn end_acknowledged(&self, fact: RootEndAcknowledged) {
+        self.shared.observe_end_acknowledged(fact);
+    }
+}
 impl Drop for DataBody {
     fn drop(&mut self) {
         if let Some(authority) = self.authority.take() {
@@ -455,7 +459,7 @@ impl Drop for DataBody {
                 let _ = authority.exited();
             }
         }
-        self.notice.notify();
+        self.shared.notice.notify();
     }
 }
 #[derive(Clone)]
@@ -471,27 +475,46 @@ impl RootReadDataGuard {
     fn attachment(&self) -> Arc<dyn crate::root_result_channel::RootDeliveryAttachment> {
         self.0.clone()
     }
-    pub(super) fn new(authority: ExitAuthority, notice: RequestNotice) -> Self {
+    pub(super) fn new(authority: ExitAuthority, shared: Arc<RootReadShared>) -> Self {
         Self(Arc::new(DataBody {
             authority: Some(authority),
             failed: AtomicBool::new(false),
-            notice,
+            shared,
         }))
     }
 }
 pub(super) struct RootReadShared {
-    drain_requested: Mutex<bool>,
+    end_acknowledged: Mutex<bool>,
     pub(super) notice: RequestNotice,
 }
 impl RootReadShared {
     pub(super) fn new(notice: RequestNotice) -> Arc<Self> {
         Arc::new(Self {
-            drain_requested: Mutex::new(false),
+            end_acknowledged: Mutex::new(false),
             notice,
         })
     }
-    pub(super) fn drain_requested(&self) -> bool {
-        *self.drain_requested.lock().expect("original Root R phase")
+    // The private channel receipt is moved through this same R's admitted
+    // delivery attachment. Coalescing it retains no Root/guard/second source.
+    fn observe_end_acknowledged(&self, _fact: RootEndAcknowledged) {
+        let changed = {
+            let mut actual = self
+                .end_acknowledged
+                .lock()
+                .expect("original Root R ACK fact");
+            let changed = !*actual;
+            *actual = true;
+            changed
+        };
+        if changed {
+            self.notice.notify();
+        }
+    }
+    pub(super) fn end_acknowledged(&self) -> bool {
+        *self
+            .end_acknowledged
+            .lock()
+            .expect("original Root R ACK fact")
     }
 }
 
@@ -534,14 +557,13 @@ impl NodeRootRead {
         self.read.native_send_backing_refusal()
     }
     pub(crate) async fn read(self) -> Result<NodeRootDelivery, RootReadError> {
-        let mut delivery = self.read.read().await.map_err(RootReadError::Channel)?;
-        let acknowledged = delivery.take_acknowledged_end();
-        let drain = acknowledged.map(|proof| {
-            assert_eq!(proof.identity(), self.task);
+        let delivery = self.read.read().await.map_err(RootReadError::Channel)?;
+        // The fact was already accepted by this R before any data await.
+        // Returning or dropping this observer cannot withdraw that handoff.
+        let drain = self.shared.end_acknowledged().then(|| {
             TaskRootDrainPermit::from_admitted_role(
                 self.task,
                 Box::new(RootDrain {
-                    _proof: proof,
                     handle: Some(self.handle),
                     shared: self.shared,
                     holder: self.holder.clone(),
@@ -582,21 +604,15 @@ impl NodeRootDelivery {
     }
 }
 struct RootDrain {
-    _proof: RootEndAcknowledged,
     handle: Option<TaskContextRequestHandle>,
     shared: Arc<RootReadShared>,
     holder: RootReadDataGuard,
 }
 impl TaskRootDrainCapability for RootDrain {
     fn submit(mut self: Box<Self>) -> TaskRootDrainFuture {
-        // The channel already applied only the actual caller's ACK and minted
-        // this proof under its lock. Submission never advances that frontier.
-        *self
-            .shared
-            .drain_requested
-            .lock()
-            .expect("original EOF request") = true;
-        self.shared.notice.notify();
+        // Only observe the R's existing fact/reply. The channel already
+        // transferred responsibility even if this capability is never used.
+        assert!(self.shared.end_acknowledged(), "original Root ACK fact");
         let handle = self.handle.take().expect("unique original Root R");
         let holder = self.holder.clone();
         Box::pin(async move {
@@ -698,5 +714,25 @@ impl ContextHostRecord {
             shared,
             holder,
         })
+    }
+}
+
+impl RootReadState {
+    /// Sample only original installed tokens, including Context-retained Roots.
+    pub(super) fn try_ownership_snapshot(
+        &self,
+    ) -> Option<crate::root_result_channel::RootOwnershipSnapshot> {
+        let mut total = crate::root_result_channel::RootOwnershipSnapshot::default();
+        for row in self.roots.values() {
+            if let Some(root) = &row.retained {
+                total.try_add(root.try_ownership_snapshot()?)?;
+            }
+        }
+        Some(total)
+    }
+    pub(super) fn installed_root_tasks(&self) -> impl Iterator<Item = TaskIdentity> + '_ {
+        self.roots
+            .iter()
+            .filter_map(|(task, row)| row.retained.as_ref().map(|_| *task))
     }
 }

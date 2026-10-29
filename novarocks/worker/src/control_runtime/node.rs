@@ -1505,3 +1505,24 @@ impl WorkerNodeHost {
         super::node_metrics::WorkerNodeMetricsSnapshot::sample(&self.metrics_ledger)
     }
 }
+
+impl WorkerNodeHost {
+    /// Original registered inventory over a bounded observation interval.
+    /// Logical channel fields share their own lock; physical atomics and
+    /// different Contexts are independent samples, never an exit receipt.
+    pub(crate) fn try_root_ownership_snapshot(
+        &self,
+    ) -> Option<crate::root_result_channel::RootOwnershipSnapshot> {
+        let addresses = self
+            .directory
+            .try_census_addresses(self.config.max_contexts)?;
+        let mut total = crate::root_result_channel::RootOwnershipSnapshot::default();
+        for address in &addresses {
+            let host = address.try_lock()?;
+            total.try_add(host.try_root_ownership_snapshot()?)?;
+        }
+        self.directory
+            .census_addresses_unchanged(&addresses)
+            .then_some(total)
+    }
+}

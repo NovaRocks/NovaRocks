@@ -116,6 +116,13 @@ impl RootContextRetention {
     ) -> Result<RootChannelRead, TaskRootReadError> {
         self.custody.begin_original_root_read(read)
     }
+    /// Borrow the original channel without creating a rich alias or a credit pin.
+    pub(crate) fn try_ownership_snapshot(
+        &self,
+    ) -> Option<crate::root_result_channel::RootOwnershipSnapshot> {
+        let state = self.custody.state.try_lock().ok()?;
+        state.root.as_ref()?.try_ownership_snapshot().ok()?
+    }
     pub(crate) fn physical_idle(&self) -> bool {
         self.custody.physical_idle()
     }

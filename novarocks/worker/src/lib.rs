@@ -96,8 +96,9 @@ mod task_registry;
 mod task_registry_config;
 mod task_registry_entry;
 mod task_reporter;
-pub use host::{TaskPreparationContext, TaskPreparationRoles, TaskPreparationRolesTaken};
-pub use task_registry_entry::TaskPreparationView;
+pub use host::{
+    TaskPreparationContext, TaskPreparationRoles, TaskPreparationRolesTaken, TaskPreparationView,
+};
 #[cfg(test)]
 mod task_registry_tests;
 pub mod typed_connector_runtime;

@@ -398,7 +398,9 @@ impl NativeRootResultReader {
         let (mut reply, guard, drain) = delivery.into_parts();
         tracing::debug!(task = ?request.root_task(), consumed = request.consumed(), accepted = reply.accepted_consumed, drain = drain.is_some(), "Native Root read returned original delivery");
         if let Some(drain) = drain {
-            tracing::debug!(task = ?request.root_task(), consumed = request.consumed(), "Native Root submits acknowledged End");
+            // The original R already owns the channel's accepted End fact.
+            // This observer waits for its verdict; cancellation cannot revoke it.
+            tracing::debug!(task = ?request.root_task(), consumed = request.consumed(), "Native Root awaits acknowledged End verdict");
             let outcome = drain.submit().await;
             tracing::debug!(task = ?request.root_task(), outcome = ?outcome, "Native Root received original End verdict");
             match outcome {

@@ -1924,7 +1924,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     // Only the unified owner turn dispatches it to the same cleanup pool.
     let raw_progress = f
         .root
-        .advance_ready_requests(source_pools.handles(), 8)
+        .advance_ready_requests(source_pools.handles(), None, 8)
         .unwrap();
     let raw_dispatched = raw_progress.dispatched == 1;
     let raw_disposed = matches!(
@@ -1938,7 +1938,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     drop(external);
     for _ in 0..8 {
         f.root
-            .advance_ready_requests(source_pools.handles(), 8)
+            .advance_ready_requests(source_pools.handles(), None, 8)
             .unwrap();
     }
     let raw_drops_before_r = drops.load(Ordering::SeqCst);

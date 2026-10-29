@@ -9431,7 +9431,6 @@ pub(crate) mod tests {
     }
     #[test]
     fn real_owner_result_revocation_waits_for_terminal_control() {
-        use crate::task_protocol::TaskExecutionIngress;
         let fixture = OwnerFixture::new(90_503);
         let root = fixture.identity(1);
         let descriptor = consistent_descriptor(root, UniqueId::new(90_503, 1));
@@ -9476,25 +9475,6 @@ pub(crate) mod tests {
             fixture.registry.root_result_route(root),
             novarocks_worker::RootResultRoute::AwaitTerminalControl
         ));
-        let ingress = crate::task_protocol_ingress::RegistryTaskExecutionIngress::new(
-            Arc::clone(&fixture.registry),
-            NativeCompatibilityId::new([0x71; 32]),
-            crate::backend_application::test_static_package_admission(),
-        );
-        let response = runtime
-            .block_on(ingress.fetch_task_result(proto::FetchTaskResultRequest {
-                root_task: Some(novarocks_task_codec::identity::encode_task_identity(root)),
-                max_wait_millis: 1_000,
-                acknowledged_packet_sequence: None,
-                max_result_bytes: 1024,
-            }))
-            .unwrap();
-        assert_eq!(
-            response.status,
-            proto::fetch_result_response::Status::AwaitTerminalControl as i32
-        );
-        assert!(response.message.is_empty() && response.result_arrow_ipc.is_empty());
-        assert!(!response.eos);
     }
     /// Hosts composed with the compiled-package interpreter: the static
     /// carrier is a physical package, received, provider-validated and

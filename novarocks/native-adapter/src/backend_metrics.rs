@@ -43,6 +43,8 @@ pub struct BackendMetricsRegistry {
     worker_node_snapshot_available: IntGauge,
     preparation_gauges: IntGaugeVec,
     preparation_snapshot_available: IntGauge,
+    root_ownership_gauges: IntGaugeVec,
+    root_ownership_snapshot_available: IntGauge,
     process_memory: Option<(ProcessMemoryObservation, ProcessMemoryGauges)>,
     scrape_lock: std::sync::Mutex<()>,
 }
@@ -419,6 +421,23 @@ impl BackendMetricsRegistry {
         registry
             .register(Box::new(worker_node_snapshot_available.clone()))
             .map_err(|error| format!("register Worker Node snapshot availability: {error}"))?;
+        let root_ownership_gauges = IntGaugeVec::new(
+            Opts::new(
+                "novarocks_backend_root_ownership",
+                "Original registered Root owners over one nonblocking bounded interval. Channel logic shares its own lock; physical counters and Contexts are independent samples, not coherent totals or exit receipts.",
+            ),
+            &["resource"],
+        ).map_err(|error| format!("construct original Root ownership metrics: {error}"))?;
+        registry
+            .register(Box::new(root_ownership_gauges.clone()))
+            .map_err(|error| format!("register original Root ownership metrics: {error}"))?;
+        let root_ownership_snapshot_available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_root_ownership_snapshot_available",
+            "Whether the original Node supplied a complete current Root sample. Busy, moved or unavailable owners omit the whole family; no stale or default zero sample is substituted.",
+        )).map_err(|error| format!("construct original Root availability: {error}"))?;
+        registry
+            .register(Box::new(root_ownership_snapshot_available.clone()))
+            .map_err(|error| format!("register original Root availability: {error}"))?;
         let preparation_gauges = IntGaugeVec::new(
             Opts::new("novarocks_backend_task_preparation", "Actual preparation charges and independently sampled original physical fair-queue occupancy. Charges include retained/exiting holders; queue/worker counts do not prove whole exit."),
             &["resource", "dimension"],
@@ -489,6 +508,8 @@ impl BackendMetricsRegistry {
             worker_node_snapshot_available,
             preparation_gauges,
             preparation_snapshot_available,
+            root_ownership_gauges,
+            root_ownership_snapshot_available,
             process_memory: None,
             scrape_lock: std::sync::Mutex::new(()),
         })
@@ -604,6 +625,26 @@ impl BackendMetricsRegistry {
                     .set(gauge_value(used));
             }
         }
+        let roots = self
+            .worker_node
+            .as_ref()
+            .and_then(|owner| owner.try_root_ownership_snapshot())
+            .filter(|snapshot| {
+                root_ownership_values(*snapshot)
+                    .iter()
+                    .all(|(_, value)| i64::try_from(*value).is_ok())
+            });
+        self.root_ownership_snapshot_available
+            .set(i64::from(roots.is_some()));
+        if let Some(snapshot) = roots {
+            for (resource, used) in root_ownership_values(snapshot) {
+                // The complete sample's representability was checked before
+                // publishing any field, so no partial/saturated census escapes.
+                self.root_ownership_gauges
+                    .with_label_values(&[resource])
+                    .set(i64::try_from(used).expect("checked original Root metric"));
+            }
+        }
         let preparation = match &self.worker_node {
             Some(owner) => owner
                 .try_preparation_snapshot()
@@ -667,11 +708,36 @@ impl BackendMetricsRegistry {
             families
                 .retain(|family| family.get_name() != "novarocks_backend_worker_node_resources");
         }
+        if roots.is_none() {
+            families.retain(|family| family.get_name() != "novarocks_backend_root_ownership");
+        }
         if preparation.is_none() {
             families.retain(|family| family.get_name() != "novarocks_backend_task_preparation");
         }
         Ok(families)
     }
+}
+
+/// Fixed scalar projection only; no Root/Task source, alias or callback escapes.
+fn root_ownership_values(
+    snapshot: novarocks_worker::root_result_channel::RootOwnershipSnapshot,
+) -> [(&'static str, usize); 14] {
+    [
+        ("channels", snapshot.channels),
+        ("terminal_task_records", snapshot.terminal_task_records),
+        ("producers_running", snapshot.producers_running),
+        ("producers_exited", snapshot.producers_exited),
+        ("ends_published", snapshot.ends_published),
+        ("ends_acknowledged", snapshot.ends_acknowledged),
+        ("sealed", snapshot.sealed),
+        ("data_positions", snapshot.data_positions),
+        ("payload_bytes", snapshot.payload_bytes),
+        ("segments", snapshot.segments),
+        ("deliveries", snapshot.deliveries),
+        ("retained_reservations", snapshot.retained_reservations),
+        ("metadata_holders", snapshot.metadata_holders),
+        ("metadata_bytes", snapshot.metadata_bytes),
+    ]
 }
 
 static BACKEND_QUERY_EXECUTION_RESOURCES: Lazy<IntGaugeVec> = Lazy::new(|| {

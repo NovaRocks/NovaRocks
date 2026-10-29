@@ -137,6 +137,13 @@ impl ContextHostRecord {
             .descriptor
             .work;
         let key = (self.scope().id(), author);
+        let mut after = original.refused_request_input_after;
+        let request_inputs_runnable = {
+            let stage = original.drained().map_err(ContextDriverError::Failure)?;
+            self.advance_refused_root_ack_inputs(&stage, &mut after, budget)
+                .map_err(ContextDriverError::Request)?
+        };
+        original.refused_request_input_after = after;
         if let Some((task, candidate)) = self
             .failed_retirement_candidate()
             .map_err(ContextDriverError::Task)?
@@ -168,7 +175,7 @@ impl ContextHostRecord {
             )?;
             return Ok(false);
         }
-        let mut runnable = false;
+        let mut runnable = request_inputs_runnable;
         for _ in 0..budget {
             let next = if let Some(task) = original.pending_projection_task {
                 let next = original

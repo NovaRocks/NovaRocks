@@ -74,6 +74,7 @@ fn second_host_report_refusal_keeps_the_same_task_and_all_paid_originals_until_u
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
             ),
         },
+        &f.roles[0].0,
     )
     .err()
     .expect("the second host report exceeds the actual six-slot Scope limit");

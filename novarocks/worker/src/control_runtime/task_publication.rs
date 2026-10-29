@@ -497,6 +497,7 @@ mod tests {
                                 pending: Arc::new(Pending),
                                 health: Arc::new(ExecutionHealth::default()),
                             },
+                            &self.roles[0].0,
                         )
                         .unwrap();
                         assert!(self.port.replace(host.port()).is_none());
@@ -592,6 +593,7 @@ mod tests {
                 mut active,
                 port: host_port,
                 host_calls,
+                disposal,
                 loader,
                 loading_events,
                 loading_return,
@@ -605,6 +607,7 @@ mod tests {
                 completion_action,
                 lifecycle_inputs,
                 statistics,
+                dynamic_filters,
                 open_summary,
                 causal,
                 production,
@@ -623,6 +626,7 @@ mod tests {
             assert!(completion_action.is_none());
             assert!(lifecycle_inputs.is_empty());
             assert!(statistics.is_none());
+            assert!(dynamic_filters.is_none());
             assert!(
                 open_summary.is_none(),
                 "this component issued no open-summary role"
@@ -660,6 +664,14 @@ mod tests {
                 &host_calls,
                 &self.ledger,
             );
+            let mut disposal_retired = false;
+            for _ in 0..64 {
+                if disposal.retire_unused(&self.ledger).unwrap() {
+                    disposal_retired = true;
+                    break;
+                }
+            }
+            assert!(disposal_retired && disposal.is_retired());
             lifetime.body_exited().unwrap();
             lifetime.captures_exited().unwrap();
             assert!(

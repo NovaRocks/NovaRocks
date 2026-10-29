@@ -2442,7 +2442,13 @@ mod tests {
         // No Context scope was created. The actual failed host has no child
         // left to stop, so its retained/removal facts can retire only the real
         // ticket and metadata holders elected by their corresponding effects.
-        let retained = f.host_input(ControlInput::Retained { context: f.context }, host_storage);
+        let retained = f.host_input(
+            ControlInput::Retained {
+                context: f.context,
+                normal_close: false,
+            },
+            host_storage,
+        );
         f.runtime.poll_one(Tick(4)).unwrap();
         let retire_ticket = f.ordered_reply(&mut dispatch, retained.input);
         assert!(f.root.retire_ticket(&retire_ticket).unwrap());

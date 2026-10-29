@@ -3264,7 +3264,32 @@ impl TaskHostRecord {
     }
 }
 
+/// The original installation's exclusive Root handoff, not another Root owner.
+pub(crate) enum RootHandoffCensus {
+    NoRoot,
+    ContextOwned,
+    Pending(crate::root_result_channel::RootOwnershipSnapshot),
+}
 impl TaskHostRecord {
+    /// An in-flight or failed foreign installation is not an observed empty Root.
+    pub(crate) fn try_root_handoff_census(&self) -> Option<RootHandoffCensus> {
+        let Some(owner) = &self.resources.production else {
+            return Some(RootHandoffCensus::NoRoot);
+        };
+        let state = owner.state.try_lock().ok()?;
+        if let Some(root) = &state.root_handoff {
+            return root
+                .try_ownership_snapshot()
+                .map(RootHandoffCensus::Pending);
+        }
+        if state.root.is_some() {
+            return Some(RootHandoffCensus::ContextOwned);
+        }
+        if state.host_install_attempted && !state.installation_observed {
+            return None;
+        }
+        Some(RootHandoffCensus::NoRoot)
+    }
     /// Move only the installed Root token; executable Task ownership remains here.
     pub(crate) fn take_root_context_retention(
         &mut self,

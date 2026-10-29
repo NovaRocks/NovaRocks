@@ -304,6 +304,13 @@ enum CoreReceipt {
     Abandoned,
 }
 
+// The same rejected input and its actual error remain with the original R.
+// Only an exact neutral Root ACK may be consumed by the failed-owner stage.
+struct RefusedRequestInput {
+    error: DriverError,
+    message: WorkerMessage,
+}
+
 #[must_use = "The actual Context retains its request until every original leg retires"]
 pub(crate) struct ContextRequestCustody {
     runtime: ActorRuntime<WorkerActor>,
@@ -324,7 +331,7 @@ pub(crate) struct ContextRequestCustody {
     expected_task: Option<TaskIdentity>,
     submitted: bool,
     started: bool,
-    failed_message: Option<WorkerMessage>,
+    failed_message: Option<RefusedRequestInput>,
     #[cfg(novarocks_dev_controls)]
     owner_panic_on_renew: bool,
     published: Option<(InputId, ActionId)>,
@@ -594,7 +601,6 @@ impl ContextRequestCustody {
                 command,
                 ContextCommand::Cancel { .. }
                     | ContextCommand::UpdateTask { .. }
-                    | ContextCommand::RootDrained { .. }
                     | ContextCommand::GetFinalInfo { .. }
                     | ContextCommand::GetDynamicFilters { .. }
             )
@@ -663,7 +669,10 @@ impl ContextRequestCustody {
                 Ok(())
             }
             Err((error, original)) => {
-                self.failed_message = Some(original);
+                self.failed_message = Some(RefusedRequestInput {
+                    error,
+                    message: original,
+                });
                 Err(ContextRequestSubmitRefusal {
                     error: ContextRequestError::Driver(error),
                     command: None,
@@ -770,6 +779,111 @@ impl ContextRequestCustody {
         self.endpoint.external().notify();
         Ok(true)
     }
+    fn is_refused_root_ack(&self, error: DriverError, message: &WorkerMessage) -> bool {
+        if !matches!(
+            error,
+            DriverError::ActorFailed
+                | DriverError::Closed
+                | DriverError::FailurePublicationRequired
+        ) || self.submitted
+            || !self.started
+            || self.task_route.is_some()
+        {
+            return false;
+        }
+        let Some(root) = self.deferred_root.as_ref() else {
+            return false;
+        };
+        let Some(original) = self.request else {
+            return false;
+        };
+        let metadata = self.endpoint.metadata();
+        root.retained
+            && root.funding.is_none()
+            && root.shared.end_acknowledged()
+            && self.expected_task == Some(root.task)
+            && original.operation == metadata.operation
+            && original.deadline == metadata.deadline
+            && matches!(message, WorkerMessage::Context(ContextMessage::Command {
+                work,
+                request: Some(request),
+                command: ContextInput::RootEndAcknowledged { task },
+            }) if *work == self.work && *task == root.task
+                && request.operation == metadata.operation && request.deadline == metadata.deadline)
+    }
+
+    /// The stage authenticates this original failed Core and committed outbox.
+    /// Consume only the exact all-neutral ACK variant after saving the actual
+    /// abandoned header. Other variants retain their complete original owner.
+    fn consume_refused_root_ack(
+        &mut self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+    ) -> Result<bool, ContextRequestError> {
+        let Some(RefusedRequestInput { error, message }) = &self.failed_message else {
+            return Ok(false);
+        };
+        if !self.is_refused_root_ack(*error, message) {
+            return Ok(false);
+        }
+        stage
+            .validate_scope(&self.runtime, self.actor, &self.scope)
+            .map_err(ContextRequestError::Driver)?;
+        if !self.reply_completed || !self.endpoint.reply().is_committed() {
+            return Ok(false);
+        }
+        let input = self.request().token;
+        let actual = self
+            .runtime
+            .input_custody(self.actor, input)
+            .map_err(ContextRequestError::Driver)?
+            .ok_or(ContextRequestError::MissingCoreReceipt)?;
+        if actual.source != self.actor
+            || actual.class != InputClass::Control
+            || actual.role.is_some()
+            || !matches!(
+                actual.phase,
+                InputPhase::Bound | InputPhase::AbandonedByOwnerFailure
+            )
+        {
+            return Err(ContextRequestError::WrongRequest);
+        }
+        self.runtime
+            .abandon_failed_input(self.actor, input)
+            .map_err(ContextRequestError::Driver)?;
+        let abandoned = self
+            .runtime
+            .input_custody(self.actor, input)
+            .map_err(ContextRequestError::Driver)?
+            .ok_or(ContextRequestError::MissingCoreReceipt)?;
+        if abandoned.phase != InputPhase::AbandonedByOwnerFailure {
+            return Err(ContextRequestError::MissingCoreReceipt);
+        }
+        self.core_receipt = CoreReceipt::Abandoned;
+        // submitted stays false: no command ever entered the mailbox/Core.
+        let refused = self.failed_message.take().expect("same refused Root ACK");
+        match refused.message {
+            WorkerMessage::Context(ContextMessage::Command {
+                work,
+                request: Some(metadata),
+                command: ContextInput::RootEndAcknowledged { task },
+            }) => {
+                // Every field of this exact variant is Copy neutral metadata;
+                // none owns a callback, payload, guard, Work or Source. Owned
+                // destructuring also prevents silently accepting custom Drop.
+                let _original_fields = (work, metadata, task, refused.error);
+            }
+            message => {
+                self.failed_message = Some(RefusedRequestInput {
+                    error: refused.error,
+                    message,
+                });
+                return Err(ContextRequestError::WrongRequest);
+            }
+        }
+        self.endpoint.external().notify();
+        Ok(true)
+    }
+
     fn observe_core(&mut self) -> Result<bool, ContextRequestError> {
         if self.core_receipt != CoreReceipt::Pending {
             return Ok(true);
@@ -859,10 +973,23 @@ impl ContextRequestCustody {
         if self.protocol_observation.failed() || self.notification.snapshot().failure.is_some() {
             return Err(ContextRequestError::SubmissionUnresolved);
         }
-        if self.failed_message.is_some() || self.unresolved_revocation {
+        if self.unresolved_revocation {
             return Err(ContextRequestError::SubmissionUnresolved);
         }
-        if !self.submitted {
+        if let Some(refused) = &self.failed_message {
+            if self.is_refused_root_ack(refused.error, &refused.message)
+                && self
+                    .runtime
+                    .snapshot(self.actor)
+                    .map_err(ContextRequestError::Driver)?
+                    .failed
+            {
+                // The exact R waits for its stage-authenticated abandonment.
+                return Ok(false);
+            }
+            return Err(ContextRequestError::SubmissionUnresolved);
+        }
+        if !self.submitted && self.core_receipt != CoreReceipt::Abandoned {
             if !self.endpoint.external_ended() || !self.notification.is_idle() {
                 return Ok(false);
             }
@@ -1256,6 +1383,46 @@ impl ContextHostRecord {
         original.notification.published();
         original.endpoint.external().notify();
         Ok(())
+    }
+    /// Inspect only a bounded slice of original R rows. The exact neutral
+    /// Root ACK can end here; no rich/generic message is dropped by this pump.
+    pub(super) fn advance_refused_root_ack_inputs(
+        &mut self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+        after: &mut Option<WorkId>,
+        budget: usize,
+    ) -> Result<bool, ContextRequestError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if budget == 0 {
+            return Ok(false);
+        }
+        stage
+            .validate_scope(&self.control_runtime, self.actor, self.scope())
+            .map_err(ContextRequestError::Driver)?;
+        let mut progressed = false;
+        for _ in 0..budget {
+            let Some((&work, original)) = self
+                .resources
+                .requests
+                .range_mut((after.map_or(Unbounded, Excluded), Unbounded))
+                .next()
+            else {
+                *after = None;
+                return Ok(progressed);
+            };
+            *after = Some(work);
+            progressed |= original.consume_refused_root_ack(stage)?;
+        }
+        let more = self
+            .resources
+            .requests
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .next()
+            .is_some();
+        if !more {
+            *after = None;
+        }
+        Ok(progressed || more)
     }
     /// The same actual input's request wake, if this effect belongs to an R.
     /// No endpoint/body/Work authority is reconstructed from numeric identity.
@@ -1813,7 +1980,7 @@ impl ContextHostRecord {
             .deferred_root
             .as_mut()
             .expect("same deferred Root read");
-        let holder = RootReadDataGuard::new(authority, root.shared.notice.clone());
+        let holder = RootReadDataGuard::new(authority, root.shared.clone());
         root.data = Some(RootReadData {
             role,
             report,
@@ -2058,7 +2225,7 @@ impl ContextHostRecord {
 }
 
 impl ContextRequestCustody {
-    /// Some means this R has not handed a command to Core and is still wholly
+    /// Some means this R has not handed its fact to Core and is still wholly
     /// governed by its original deferred/unused owner, not generic input logic.
     fn prepare_deferred_root(
         &mut self,
@@ -2079,7 +2246,20 @@ impl ContextRequestCustody {
         if self.notification.snapshot().failure.is_some() || root.binding_refusal.is_some() {
             return Err(ContextRequestError::SubmissionUnresolved);
         }
-        if root.funding.is_some() && !root.shared.drain_requested() {
+        let acknowledged = root.shared.end_acknowledged();
+        let failed_before_binding = root.funding.is_some()
+            && acknowledged
+            && self
+                .runtime
+                .snapshot(self.actor)
+                .map_err(ContextRequestError::Driver)?
+                .failed;
+        if failed_before_binding && !self.reply_completed {
+            // Only the actual failure session may publish this original R's
+            // OwnerFailed result. Its ACK cannot be delivered to a dead Core.
+            return Ok(Some(false));
+        }
+        if root.funding.is_some() && (!acknowledged || failed_before_binding) {
             if !self.endpoint.external_ended() || !self.notification.is_idle() {
                 return Ok(Some(false));
             }
@@ -2129,6 +2309,24 @@ impl ContextRequestCustody {
                                     outer: funding.outer,
                                 });
                                 use crate::control_runtime::causal::RpcAuthorAdmissionError;
+                                if matches!(
+                                    error,
+                                    RpcAuthorAdmissionError::Causal(CausalError::Driver(
+                                        DriverError::ActorFailed
+                                            | DriverError::Closed
+                                            | DriverError::FailurePublicationRequired
+                                    ))
+                                ) && self
+                                    .runtime
+                                    .snapshot(self.actor)
+                                    .map_err(ContextRequestError::Driver)?
+                                    .failed
+                                {
+                                    // The exact BeforeCut refusal returned all unissued
+                                    // originals. Await their real failure publication;
+                                    // a bound cut/refused input never takes this path.
+                                    return Ok(Some(false));
+                                }
                                 let error = match error {
                                     RpcAuthorAdmissionError::Causal(
                                         CausalError::Cut(novarocks_worker_protocol::proposal_summary::CutError::Full)
@@ -2165,10 +2363,9 @@ impl ContextRequestCustody {
                 self.report = author_report;
                 let mut route =
                     TaskRequestRoute::new(root.task, admitted.cut, admitted.sender, funding.outer);
-                let result =
-                    route.submit(self, task, ContextCommand::RootDrained { task: root.task });
+                let result = route.submit_root_end_acknowledged(self, task, &root.shared);
                 self.task_route = Some(route);
-                result.map_err(|error| error.error)?;
+                result?;
             } else if root.retained {
                 // Only the installed token plus its actual Task-retired receipt
                 // proves that this same R no longer needs a live Task prefix.
@@ -2182,6 +2379,19 @@ impl ContextRequestCustody {
                     Ok(permit) => permit,
                     Err(error) => {
                         root.funding = Some(funding);
+                        if matches!(
+                            error,
+                            DriverError::ActorFailed
+                                | DriverError::Closed
+                                | DriverError::FailurePublicationRequired
+                        ) && self
+                            .runtime
+                            .snapshot(self.actor)
+                            .map_err(ContextRequestError::Driver)?
+                            .failed
+                        {
+                            return Ok(Some(false));
+                        }
                         return Err(ContextRequestError::Driver(error));
                     }
                 };
@@ -2210,7 +2420,7 @@ impl ContextRequestCustody {
                 let message = WorkerMessage::Context(ContextMessage::Command {
                     work: self.work,
                     request: Some(metadata),
-                    command: ContextInput::Request(ContextCommand::RootDrained { task: root.task }),
+                    command: ContextInput::RootEndAcknowledged { task: root.task },
                 });
                 match permit.fill(message) {
                     Ok(actual) => {
@@ -2218,7 +2428,7 @@ impl ContextRequestCustody {
                         self.submitted = true;
                     }
                     Err((error, message)) => {
-                        self.failed_message = Some(message);
+                        self.failed_message = Some(RefusedRequestInput { error, message });
                         return Err(ContextRequestError::Driver(error));
                     }
                 }

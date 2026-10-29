@@ -52,8 +52,7 @@ use novarocks_execution_contract::task_execution::operation::{
     GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind, OperationOutcome,
     QueryContextAdmissionTicketReceipt, QueryContextDomainReceipt, QueryContextReceipt,
     QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
-    RenewQueryExecutionLease, ResultByteLimit, ResultPacketSequence, TaskDomainReceipt,
-    UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    RenewQueryExecutionLease, TaskDomainReceipt, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
 use novarocks_execution_contract::task_execution::status::{TaskStatus, TaskStatusCursor};
 use novarocks_execution_contract::task_execution::task_convergence::{
@@ -92,7 +91,7 @@ pub const NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// The payload stays below it by a fixed envelope reserve so protobuf tags,
 /// lengths, sequence and status fields cannot turn a legal payload into an
 /// oversized decoded message.
-pub const MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES: u64 =
+pub const MAX_NATIVE_ROOT_RESULT_PAYLOAD_BYTES: u64 =
     (NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES - 1024) as u64;
 use crate::identity::{
     decode_admission_ticket_id, decode_query_context_ref, decode_task_identity,
@@ -1535,53 +1534,6 @@ pub fn decode_get_final_task_info(
     Ok(GetFinalTaskInfo::new(operation_id, identity))
 }
 
-/// Decodes a root result poll request.
-///
-/// The root task identity is the whole point of this shape: unlike the
-/// fragment-instance-addressed form it replaces, it is fenced against an exact
-/// task and backend process.
-pub fn decode_fetch_task_result(
-    src: &novarocks::FetchTaskResultRequest,
-    path: FieldPath,
-) -> Result<
-    (
-        TaskIdentity,
-        Duration,
-        Option<ResultPacketSequence>,
-        ResultByteLimit,
-    ),
-    ProtocolError,
-> {
-    let root = src.root_task.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("root_task"),
-            "a result poll requires a root task identity",
-        )
-    })?;
-    let root = crate::identity::decode_task_identity(root, path.clone().field("root_task"))?;
-    let max_wait = decode_duration_millis(
-        src.max_wait_millis,
-        path.clone().field("max_wait_millis"),
-        MaxWait::MAX_REPRESENTABLE,
-    )?;
-    let acknowledged = src
-        .acknowledged_packet_sequence
-        .map(ResultPacketSequence::new);
-    let max_result_bytes = ResultByteLimit::new(src.max_result_bytes)
-        .map_err(|error| invalid(path.clone().field("max_result_bytes"), error.to_string()))?;
-    if max_result_bytes.get() > MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES {
-        return Err(out_of_range(
-            path.field("max_result_bytes"),
-            format!(
-                "max_result_bytes {} exceeds the Native payload limit {}",
-                max_result_bytes.get(),
-                MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
-            ),
-        ));
-    }
-    Ok((root, max_wait, acknowledged, max_result_bytes))
-}
-
 /// Decodes one server-reported operation outcome.
 ///
 /// A read whose response reports why it has nothing to return needs this: the
@@ -1612,27 +1564,6 @@ pub fn encode_fetch_dynamic_filters(
 pub fn encode_get_final_task_info(identity: TaskIdentity) -> novarocks::GetFinalTaskInfoRequest {
     novarocks::GetFinalTaskInfoRequest {
         identity: Some(crate::identity::encode_task_identity(identity)),
-    }
-}
-
-/// Encodes a root result poll request.
-pub fn encode_fetch_task_result(
-    root_task: TaskIdentity,
-    max_wait: MaxWait,
-    acknowledged: Option<ResultPacketSequence>,
-    max_result_bytes: ResultByteLimit,
-) -> novarocks::FetchTaskResultRequest {
-    assert!(
-        max_result_bytes.get() <= MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES,
-        "root result byte limit must fit the Native gRPC response"
-    );
-    novarocks::FetchTaskResultRequest {
-        root_task: Some(crate::identity::encode_task_identity(root_task)),
-        // `MaxWait` is already bounded by `MAX_REPRESENTABLE`, so this cannot
-        // narrow a wait the caller asked for.
-        max_wait_millis: u64::try_from(max_wait.get().as_millis()).unwrap_or(u64::MAX),
-        acknowledged_packet_sequence: acknowledged.map(ResultPacketSequence::get),
-        max_result_bytes: max_result_bytes.get(),
     }
 }
 

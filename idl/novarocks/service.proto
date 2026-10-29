@@ -81,8 +81,10 @@ service NovaRocksGrpc {
       returns (FetchTaskDynamicFiltersResponse);
   rpc GetFinalTaskInfo(GetFinalTaskInfoRequest)
       returns (GetFinalTaskInfoResponse);
-  // Root result poll, fenced against an exact task and backend process.
-  rpc FetchTaskResult(FetchTaskResultRequest) returns (FetchResultResponse);
+  // Retired wire tombstone. Root reads use FetchRootResult.
+  rpc FetchTaskResult(FetchTaskResultRequest) returns (FetchResultResponse) {
+    option deprecated = true;
+  }
   // M07 context-owned bounded root read on the ResultData lane. One RPC per
   // root stream in flight; served by the Backend's root reader, never by a
   // decoded Arrow packet path.
@@ -1680,10 +1682,10 @@ message GetFinalTaskInfoResponse {
   }
 }
 
-// Coordinator long-poll request for the root task's result stream. Unlike the
-// fragment-instance-addressed form it replaces, this is fenced against an
-// exact task and backend process.
+// Retired FetchTaskResult request. Original field numbers remain tombstones;
+// bounded context-owned Root reads use FetchRootResultRequest.
 message FetchTaskResultRequest {
+  option deprecated = true;
   TaskIdentity root_task = 1;
   uint64 max_wait_millis = 2;  // nonzero, <= 300000
   // Highest packet durably accepted into the frontend's bounded delivery

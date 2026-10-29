@@ -131,6 +131,8 @@ pub(super) struct ScopeFailureOwner {
     empty_input_classes: usize,
     physical: Option<(FailurePhysicalPurpose, super::failure_tail::FailureTail)>,
     completed_tail_input: Option<InputId>,
+    // Cursor over the original R map, not a second input ownership index.
+    refused_request_input_after: Option<WorkId>,
     cleanup_bindings: CleanupBindingCursor,
 }
 enum CleanupBindingCursor {
@@ -396,6 +398,7 @@ impl ContextHostRecord {
             empty_input_classes: 0,
             physical: None,
             completed_tail_input: None,
+            refused_request_input_after: None,
             cleanup_bindings: CleanupBindingCursor::Batches(None),
         });
         self.notify_host_progress();

@@ -1442,43 +1442,66 @@ fn final_task_info_carries_no_result_credential_or_commit_payload() {
     }
 }
 
-/// The root result poll is fenced against an exact task and process, which is
-/// what the fragment-instance-addressed form it replaces could not do.
+/// The active root read binds exact task identity, purpose and independent cursors.
 #[test]
 fn the_root_result_poll_is_addressed_by_task_identity() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
     let request = pool
-        .get_message_by_name("novarocks.FetchTaskResultRequest")
-        .expect("FetchTaskResultRequest descriptor");
+        .get_message_by_name("novarocks.FetchRootResultRequest")
+        .expect("FetchRootResultRequest descriptor");
     assert_eq!(
         request
             .get_field_by_name("root_task")
-            .expect("root task identity")
+            .unwrap()
             .kind()
             .as_message()
-            .expect("TaskIdentity message")
+            .unwrap()
             .full_name(),
         "novarocks.TaskIdentity"
     );
-    assert!(
-        request.get_field_by_name("finst_id").is_none(),
-        "the root result is no longer addressed by a fragment instance id"
-    );
-    assert!(
-        request.get_field_by_name("max_wait_millis").is_some(),
-        "the poll budget is a duration the backend times itself"
-    );
-    assert!(
-        matches!(
+    assert!(request.get_field_by_name("finst_id").is_none());
+    for (name, number) in [
+        ("profile_id", 2),
+        ("output_kind", 3),
+        ("wanted_sequence", 4),
+        ("consumed_sequence", 5),
+        ("max_wait_millis", 6),
+    ] {
+        assert_eq!(
             request
-                .get_field_by_name("max_result_bytes")
-                .expect("result payload byte credit")
-                .kind(),
-            prost_reflect::Kind::Uint64
-        ),
-        "the root result poll carries a positive payload-byte credit"
+                .get_field_by_name(name)
+                .expect("active Root read field")
+                .number(),
+            number
+        );
+    }
+    // The retired request remains decodable with its original field tags.
+    let retired = pool
+        .get_message_by_name("novarocks.FetchTaskResultRequest")
+        .expect("retired request descriptor");
+    assert_eq!(
+        retired
+            .descriptor_proto()
+            .options
+            .as_ref()
+            .and_then(|options| options.deprecated),
+        Some(true)
     );
+    for (name, number) in [
+        ("root_task", 1),
+        ("max_wait_millis", 2),
+        ("acknowledged_packet_sequence", 3),
+        ("max_result_bytes", 4),
+    ] {
+        assert_eq!(
+            retired
+                .get_field_by_name(name)
+                .expect("retired field")
+                .number(),
+            number
+        );
+    }
 }
 
 /// A credential rotation announces scopes and carries no material at all.

@@ -30,7 +30,10 @@ use crate::control_runtime::{
     task::TaskHostError,
 };
 use novarocks_control_runtime::driver::{DriverError, EffectTicket};
-use novarocks_control_runtime_core::identity::{ActorId, Generation, InputId};
+use novarocks_control_runtime_core::{
+    fair_queue::{FairQueueError, FairWorkQueue},
+    identity::{ActorId, Generation, InputId},
+};
 use novarocks_execution_contract::{QueryContextRef, TaskIdentity};
 use novarocks_worker_protocol::context::ContextEffect;
 use std::{
@@ -104,7 +107,49 @@ pub(crate) struct TaskDriverProgress {
     pub delivered: usize,
     pub runnable: bool,
 }
-#[derive(Default)]
+/// The Context has one original ready address per live Task, bounded by T.
+/// TaskReady replaces the old identity-ordered set: its group/work/ready
+/// indexes each contain at most T positions. This is a position bound, not a
+/// claim that its physical byte layout equals a single BTreeSet.
+struct TaskReady {
+    queue: FairWorkQueue<TaskIdentity, ()>,
+}
+impl TaskReady {
+    fn new(max_live_tasks: usize) -> Self {
+        Self {
+            queue: FairWorkQueue::new(max_live_tasks, max_live_tasks, 1),
+        }
+    }
+    fn insert(&mut self, task: TaskIdentity) {
+        match self.queue.enqueue(task, ()) {
+            Ok(()) | Err(FairQueueError::DuplicateWork) => {}
+            Err(error) => panic!("original bounded Task readiness refused: {error:?}"),
+        }
+    }
+    fn pop(&mut self) -> Option<TaskIdentity> {
+        let (task, ()) = self.queue.pop()?;
+        // The caller retains the same ready mutex across both operations.
+        // No running metadata marker escapes into Task or foreign work.
+        self.queue
+            .finish(task, ())
+            .expect("same original Task readiness marker");
+        Some(task)
+    }
+    fn remove(&mut self, task: &TaskIdentity) {
+        if self.contains(task) {
+            self.queue
+                .remove_queued(*task, ())
+                .expect("same queued Task readiness marker");
+        }
+    }
+    fn contains(&self, task: &TaskIdentity) -> bool {
+        self.queue.contains(*task, ())
+    }
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
 pub(super) struct TaskDriverState {
     pub(super) sources: BTreeMap<ActorId, TaskIdentity>,
     pub(super) domain_feedback_cuts: BTreeMap<
@@ -132,8 +177,9 @@ pub(super) struct TaskDriverState {
     root_seal_cursor: Option<TaskIdentity>,
     root_seal_finished: bool,
     retained_seal_cursor: Option<TaskIdentity>,
-    ready: Arc<Mutex<BTreeSet<TaskIdentity>>>,
+    ready: Arc<Mutex<TaskReady>>,
     jobs: BTreeMap<TaskIdentity, TaskDriverHostJob>,
+    jobs_retry_after: Option<TaskIdentity>,
     physical_pending: VecDeque<TaskDriverHostJob>,
     retirements: BTreeMap<TaskIdentity, TaskRetirement>,
     // Original payload disambiguates a physically retired rejected creation
@@ -153,6 +199,31 @@ struct TaskRetirement {
     retained_payload: Option<novarocks_worker_protocol::creation::PayloadId>,
 }
 impl TaskDriverState {
+    pub(super) fn new(max_live_tasks: usize) -> Self {
+        Self {
+            sources: BTreeMap::new(),
+            domain_feedback_cuts: BTreeMap::new(),
+            domain_requests: BTreeMap::new(),
+            domain_wakes: BTreeMap::new(),
+            domain_wake_order: VecDeque::new(),
+            notices: BTreeMap::new(),
+            admission_closed: false,
+            roots_sealed: false,
+            root_close_reason: None,
+            root_seal_cursor: None,
+            root_seal_finished: false,
+            retained_seal_cursor: None,
+            ready: Arc::new(Mutex::new(TaskReady::new(max_live_tasks))),
+            jobs: BTreeMap::new(),
+            jobs_retry_after: None,
+            physical_pending: VecDeque::new(),
+            retirements: BTreeMap::new(),
+            retiring_tasks: BTreeMap::new(),
+            disposal_cursor: None,
+            failed_retirement_cursor: None,
+            publication_refusal: None,
+        }
+    }
     pub(super) fn is_idle(&self) -> bool {
         self.sources.is_empty()
             && self.domain_feedback_cuts.is_empty()
@@ -962,13 +1033,34 @@ impl ContextHostRecord {
         budget: usize,
     ) -> Result<TaskDriverProgress, TaskDriverError> {
         let mut progress = TaskDriverProgress::default();
-        for (task, job) in self.task_driver.jobs.iter().take(budget) {
-            if !job.awaiting_initial_plan() {
+        // Accepted jobs are cumulative-bounded by the Context's original T.
+        // Advance after every inspection, including an outstanding initial
+        // plan, so a low address cannot monopolize capacity retry hints.
+        let retry_budget = budget.min(self.task_driver.jobs.len());
+        for _ in 0..retry_budget {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let next = self
+                .task_driver
+                .jobs
+                .range((
+                    self.task_driver
+                        .jobs_retry_after
+                        .map_or(Unbounded, Excluded),
+                    Unbounded,
+                ))
+                .next()
+                .or_else(|| self.task_driver.jobs.first_key_value())
+                .map(|(&task, job)| (task, !job.awaiting_initial_plan()));
+            let Some((task, runnable)) = next else {
+                break;
+            };
+            self.task_driver.jobs_retry_after = Some(task);
+            if runnable {
                 self.task_driver
                     .ready
                     .lock()
                     .expect("original pending Task address")
-                    .insert(*task);
+                    .insert(task);
             }
         }
 
@@ -999,7 +1091,7 @@ impl ContextHostRecord {
                 .ready
                 .lock()
                 .expect("Task ready metadata")
-                .pop_first()
+                .pop()
             else {
                 break;
             };
@@ -1279,7 +1371,7 @@ impl ContextHostRecord {
 struct TaskDriverPending {
     active: Mutex<bool>,
     task: TaskIdentity,
-    ready: Arc<Mutex<BTreeSet<TaskIdentity>>>,
+    ready: Arc<Mutex<TaskReady>>,
     notice: crate::control_runtime::context_ready::ContextReadyNotice,
 }
 impl TaskDriverPending {
@@ -1618,7 +1710,7 @@ enum RootWakeRoute {
 /// wake, so transfer cannot leave a stale Task address after retirement.
 pub(crate) struct TaskRootWake {
     task: TaskIdentity,
-    ready: Arc<Mutex<BTreeSet<TaskIdentity>>>,
+    ready: Arc<Mutex<TaskReady>>,
     notice: crate::control_runtime::context_ready::ContextReadyNotice,
     route: Mutex<RootWakeRoute>,
 }
@@ -1719,7 +1811,7 @@ impl ContextHostRecord {
             .ready
             .lock()
             .expect("original failed Task readiness")
-            .pop_first()
+            .pop()
         else {
             return Ok(None);
         };

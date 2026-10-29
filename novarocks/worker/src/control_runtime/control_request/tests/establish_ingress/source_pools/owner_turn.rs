@@ -27,7 +27,7 @@ fn advance_until(
     let mut total = RequestIoProgress::default();
     loop {
         let version = f.runtime.change_version();
-        let progress = f.root.advance_ready_requests(handles, 8).unwrap();
+        let progress = f.root.advance_ready_requests(handles, None, 8).unwrap();
         total.visited += progress.visited;
         total.dispatched += progress.dispatched;
         total.submitted += progress.submitted;
@@ -63,7 +63,7 @@ fn original_ready_turn_submits_getter_return_and_disposes_rejected_source_before
     let fees = tests::original_fees(&f);
     let wrong_owner = matches!(
         f.root
-            .advance_ready_requests(foreign_pools.handles.as_ref().unwrap(), 8),
+            .advance_ready_requests(foreign_pools.handles.as_ref().unwrap(), None, 8),
         Err(RootRequestAdvanceError::WrongOwner)
     );
     let untouched = tests::original_fees(&f) == fees && getters.load(Ordering::SeqCst) == 0;
@@ -86,7 +86,12 @@ fn original_ready_turn_submits_getter_return_and_disposes_rejected_source_before
     let delivery = external.try_take().unwrap();
     let gone = delivery.body()
         == &ControlReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::Gone));
-    let held_for_delivery = f.root.advance_ready_requests(&handles, 8).unwrap().retired == 0
+    let held_for_delivery = f
+        .root
+        .advance_ready_requests(&handles, None, 8)
+        .unwrap()
+        .retired
+        == 0
         && f.ledger.used(Dimension::Replies.id()) == 1;
     drop(delivery);
     drop(external);
@@ -203,7 +208,7 @@ fn a_cancelled_original_return_keeps_authority_for_actual_withdrawal_and_cleanup
         .begin_establish_ingress(input, raw, PayloadId(1))
         .unwrap();
     job.cancel_before_start();
-    let observed = matches!(f.root.advance_ready_requests(&handles, 8),
+    let observed = matches!(f.root.advance_ready_requests(&handles, None, 8),
         Err(RootRequestAdvanceError::Request { input: actual, error: RequestIoError::Observed(EstablishIngressOutcome::CancelledBeforeStart) }) if actual == input);
     let cached = matches!(
         f.root.resources().requests[&input].ingress_outcome,

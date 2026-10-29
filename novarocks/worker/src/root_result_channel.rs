@@ -1717,7 +1717,6 @@ impl RootResultChannel {
                 Ok(RootResultDelivery {
                     reply: self.reply(consumed, RootReadOutcome::AwaitTerminalControl),
                     guard: RootDeliveryOwner { position: None },
-                    acknowledged_end: None,
                 })
             }
             Err(error) => Err(error),
@@ -1733,22 +1732,14 @@ impl RootResultChannel {
             let notified = self.physical.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let (reply, acknowledged_end) = self.read_once_with_ack(read, &guard)?;
+            let reply = self.read_once(read, &guard)?;
             if !matches!(reply.outcome, RootReadOutcome::NotReady)
                 || tokio::time::Instant::now() >= deadline
             {
-                return Ok(RootResultDelivery {
-                    reply,
-                    guard,
-                    acknowledged_end,
-                });
+                return Ok(RootResultDelivery { reply, guard });
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return Ok(RootResultDelivery {
-                    reply,
-                    guard,
-                    acknowledged_end,
-                });
+                return Ok(RootResultDelivery { reply, guard });
             }
         }
     }
@@ -1757,26 +1748,15 @@ impl RootResultChannel {
         read: &RootResultRead,
         guard: &RootDeliveryOwner,
     ) -> Result<RootResultReply, RootChannelError> {
-        self.read_once_with_ack(read, guard)
-            .map(|(reply, _proof)| reply)
-    }
-    fn read_once_with_ack(
-        &self,
-        read: &RootResultRead,
-        guard: &RootDeliveryOwner,
-    ) -> Result<(RootResultReply, Option<RootEndAcknowledged>), RootChannelError> {
-        let (reply, retired) = {
+        let (reply, acknowledged_end, retired) = {
             let mut state = self.state.lock().unwrap();
             if !state.context_owned {
                 return Err(RootChannelError::Identity);
             }
             if !state.lifetime.allows_read() {
-                return Ok((
-                    self.reply(
-                        state.stream.snapshot().consumed_through,
-                        RootReadOutcome::AwaitTerminalControl,
-                    ),
-                    None,
+                return Ok(self.reply(
+                    state.stream.snapshot().consumed_through,
+                    RootReadOutcome::AwaitTerminalControl,
                 ));
             }
             let (accepted, retired) = state.acknowledge_and_retire(read.consumed())?;
@@ -1786,10 +1766,7 @@ impl RootResultChannel {
                 .filter(|end| {
                     read.consumed() >= end.sequence.get() && accepted >= end.sequence.get()
                 })
-                .map(|_| RootEndAcknowledged {
-                    task: self.spec.task,
-                    _position: guard.clone(),
-                });
+                .map(|_| RootEndAcknowledged { _private: () });
             let outcome = (|| {
                 Ok(match read.wanted() {
                     None => RootReadOutcome::AckOnly,
@@ -1828,10 +1805,16 @@ impl RootResultChannel {
                 })
             })();
             (
-                outcome.map(|outcome| (self.reply(accepted, outcome), acknowledged_end)),
+                outcome.map(|outcome| self.reply(accepted, outcome)),
+                acknowledged_end,
                 retired,
             )
         };
+        // The exact admitted R accepts this fact before a foreign retired
+        // payload destructor or a NotReady await can interrupt the reader.
+        if let Some(fact) = acknowledged_end {
+            guard.note_end_acknowledged(fact);
+        }
         drop(retired);
         self.physical.writable.notify_observers();
         reply
@@ -1840,8 +1823,12 @@ impl RootResultChannel {
     /// Apply only the request's cumulative ACK. No payload alias or new read
     /// position is constructed here. Retired allocations exit outside the
     /// channel lock, before a native sender asks for independent copy space.
-    fn apply_consumed(&self, consumed: u64) -> Result<u64, RootChannelError> {
-        let (accepted, retired) = {
+    fn apply_consumed(
+        &self,
+        consumed: u64,
+        guard: &RootDeliveryOwner,
+    ) -> Result<u64, RootChannelError> {
+        let (accepted, acknowledged_end, retired) = {
             let mut state = self.state.lock().unwrap();
             if !state.context_owned {
                 return Err(RootChannelError::Identity);
@@ -1849,8 +1836,17 @@ impl RootResultChannel {
             if !state.lifetime.allows_read() {
                 return Err(RootChannelError::Closed);
             }
-            state.acknowledge_and_retire(consumed)?
+            let (accepted, retired) = state.acknowledge_and_retire(consumed)?;
+            let acknowledged_end = state
+                .lifetime
+                .end()
+                .filter(|end| consumed >= end.sequence.get() && accepted >= end.sequence.get())
+                .map(|_| RootEndAcknowledged { _private: () });
+            (accepted, acknowledged_end, retired)
         };
+        if let Some(fact) = acknowledged_end {
+            guard.note_end_acknowledged(fact);
+        }
         drop(retired);
         self.physical.writable.notify_observers();
         Ok(accepted)
@@ -1928,9 +1924,13 @@ impl RootProducerExit {
 pub struct RootDeliveryOwner {
     position: Option<Arc<RootDeliveryPosition>>,
 }
-/// A lifetime-only attachment to an already admitted read position. It has
-/// no operations, resource factories or publication/exit authority.
-pub(crate) trait RootDeliveryAttachment: Send + Sync {}
+/// The same admitted read's body lifetime and bounded metadata ACK sink.
+/// Only the Worker R body implements this crate-private attachment. The
+/// channel supplies its private receipt outside the channel lock; this grants
+/// no resource factory, new input or physical-exit authority.
+pub(crate) trait RootDeliveryAttachment: Send + Sync {
+    fn end_acknowledged(&self, fact: RootEndAcknowledged);
+}
 struct RootDeliveryPosition {
     physical: Arc<PhysicalOwners>,
     // The real read R follows the same position already carried by every
@@ -1938,6 +1938,17 @@ struct RootDeliveryPosition {
     request_body: std::sync::OnceLock<Arc<dyn RootDeliveryAttachment>>,
 }
 impl RootDeliveryOwner {
+    fn note_end_acknowledged(&self, fact: RootEndAcknowledged) {
+        if let Some(body) = self
+            .position
+            .as_ref()
+            .and_then(|position| position.request_body.get())
+        {
+            // Attachment and read were bound to the same Task/R before ACK.
+            // A direct channel reader without a Worker R has no such sink.
+            body.end_acknowledged(fact);
+        }
+    }
     fn backing_metadata_bytes() -> usize {
         std::alloc::Layout::new::<[AtomicUsize; 2]>()
             .extend(std::alloc::Layout::new::<RootDeliveryPosition>())
@@ -1973,16 +1984,11 @@ pub struct RootChannelRead {
     request: RootResultRead,
     guard: RootDeliveryOwner,
 }
-/// Private proof from this actual request's channel-lock ACK transaction.
-/// Offered End, another reader's frontier, and a naked sequence cannot mint it.
+/// Private, non-Clone receipt from this actual admitted read's channel-lock
+/// ACK transaction. Identity is retained by the original position/R binding.
+/// No Root Arc, delivery guard or payment is held by this neutral marker.
 pub(crate) struct RootEndAcknowledged {
-    task: TaskIdentity,
-    _position: RootDeliveryOwner,
-}
-impl RootEndAcknowledged {
-    pub(crate) fn identity(&self) -> TaskIdentity {
-        self.task
-    }
+    _private: (),
 }
 impl RootChannelRead {
     pub(crate) fn attach_delivery_lifetime(
@@ -2001,7 +2007,8 @@ impl RootChannelRead {
     /// This neither offers a payload nor creates another read holder. A repeat
     /// by `read()` is idempotent; seal winning this cut refuses the late ACK.
     pub fn apply_consumed(&self) -> Result<u64, RootChannelError> {
-        self.channel.apply_consumed(self.request.consumed())
+        self.channel
+            .apply_consumed(self.request.consumed(), &self.guard)
     }
     /// Snapshot the actual applied ACK frontier of this original admission.
     /// In particular, send pregrant losing to seal can return a closed marker
@@ -2053,12 +2060,8 @@ impl RootChannelRead {
 pub struct RootResultDelivery {
     reply: RootResultReply,
     guard: RootDeliveryOwner,
-    acknowledged_end: Option<RootEndAcknowledged>,
 }
 impl RootResultDelivery {
-    pub(crate) fn take_acknowledged_end(&mut self) -> Option<RootEndAcknowledged> {
-        self.acknowledged_end.take()
-    }
     pub fn reply(&self) -> &RootResultReply {
         &self.reply
     }

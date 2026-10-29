@@ -932,3 +932,13 @@ impl WorkerTaskControl {
         self.node.try_preparation_snapshot()
     }
 }
+
+impl WorkerTaskControl {
+    /// Nonblocking original registered Root census, not a settlement receipt.
+    /// Busy, incomplete, poisoned or overflowing observations are unavailable.
+    pub fn try_root_ownership_snapshot(
+        &self,
+    ) -> Option<crate::root_result_channel::RootOwnershipSnapshot> {
+        self.node.try_root_ownership_snapshot()
+    }
+}

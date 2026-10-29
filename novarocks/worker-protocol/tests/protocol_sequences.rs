@@ -4507,7 +4507,10 @@ fn physically_retained_context_returns_the_active_ticket_before_metadata_evictio
     let retained = control
         .handle(
             at(1),
-            ControlInput::Retained { context: context() },
+            ControlInput::Retained {
+                context: context(),
+                normal_close: false,
+            },
             &mut port,
         )
         .unwrap();
@@ -4524,7 +4527,10 @@ fn physically_retained_context_returns_the_active_ticket_before_metadata_evictio
     let replay = control
         .handle(
             at(1),
-            ControlInput::Retained { context: context() },
+            ControlInput::Retained {
+                context: context(),
+                normal_close: false,
+            },
             &mut port,
         )
         .unwrap();
@@ -4922,11 +4928,24 @@ fn successful_root_production_waits_for_output_and_drain_reply_follows_the_termi
     );
     assert_eq!(core.task(task(1)).unwrap().state, TaskState::Flushing);
     assert!(core.task(task(1)).unwrap().completion_success_pending);
-    let drained = completion_step(
-        &mut core,
-        &mut port,
-        rpc(operation(10), ContextCommand::RootDrained { task: task(1) }),
-    );
+    // The channel fact keeps the same original correlation even after the
+    // data wait deadline. It does not re-enter business RPC admission.
+    port.next_context_input += 1;
+    let token = InputId::new(1_000_000 + port.next_context_input).unwrap();
+    port.context_tokens.insert(operation(10), token);
+    let drained = core
+        .handle_root_end_acknowledged(
+            at(0),
+            RequestContext {
+                token,
+                operation: operation(10),
+                deadline: at(0),
+            },
+            task(1),
+            &mut port,
+        )
+        .unwrap();
+    assert!(drained.charged_work() <= ContextCore::MAX_BODY_WORK);
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Finished);
     let terminal_version = drained
@@ -5444,11 +5463,24 @@ fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abo
             ))),
         },
     );
-    let drained = completion_step(
-        &mut core,
-        &mut port,
-        rpc(operation(10), ContextCommand::RootDrained { task: task(1) }),
-    );
+    // The channel fact keeps the same original correlation even after the
+    // data wait deadline. It does not re-enter business RPC admission.
+    port.next_context_input += 1;
+    let token = InputId::new(1_000_000 + port.next_context_input).unwrap();
+    port.context_tokens.insert(operation(10), token);
+    let drained = core
+        .handle_root_end_acknowledged(
+            at(0),
+            RequestContext {
+                token,
+                operation: operation(10),
+                deadline: at(0),
+            },
+            task(1),
+            &mut port,
+        )
+        .unwrap();
+    assert!(drained.charged_work() <= ContextCore::MAX_BODY_WORK);
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Aborted);
     assert!(
@@ -6542,7 +6574,10 @@ fn late_materialization_error_reports_actual_releasing_or_terminal_state_without
             f.control
                 .handle(
                     at(0),
-                    ControlInput::Retained { context: context() },
+                    ControlInput::Retained {
+                        context: context(),
+                        normal_close: false,
+                    },
                     &mut f.port,
                 )
                 .unwrap();
@@ -6708,7 +6743,10 @@ fn terminal_establishment_and_retained_use_one_original_retirement_and_one_ttl_i
             context: context(),
             decision,
         };
-        let retained = ControlInput::Retained { context: context() };
+        let retained = ControlInput::Retained {
+            context: context(),
+            normal_close: false,
+        };
         let (first, second) = if retained_first {
             (retained, decided)
         } else {
@@ -6869,7 +6907,10 @@ fn retained_state_without_a_completion_does_not_backdate_the_typed_establishment
         .control
         .handle(
             at(0),
-            ControlInput::Retained { context: context() },
+            ControlInput::Retained {
+                context: context(),
+                normal_close: false,
+            },
             &mut f.port,
         )
         .unwrap();
@@ -7073,7 +7114,10 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
     f.control
         .handle(
             at(0),
-            ControlInput::Retained { context: context() },
+            ControlInput::Retained {
+                context: context(),
+                normal_close: false,
+            },
             &mut f.port,
         )
         .unwrap();
@@ -7280,7 +7324,10 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         .control
         .handle(
             at(0),
-            ControlInput::Retained { context: context() },
+            ControlInput::Retained {
+                context: context(),
+                normal_close: false,
+            },
             &mut f.port,
         )
         .unwrap();

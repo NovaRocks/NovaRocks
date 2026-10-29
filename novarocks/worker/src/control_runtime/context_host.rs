@@ -36,6 +36,7 @@ mod internal;
 mod owner_control;
 pub(crate) use internal::ContextInternalAdvance;
 mod progress;
+mod root_census;
 pub(crate) use owner_control::OwnerFenceDelivery;
 pub(crate) use progress::{ContextHostProgress, ContextHostProgressError};
 
@@ -487,7 +488,7 @@ impl ContextHostRecord {
             resources,
             tasks: BTreeMap::new(),
             retired_task_reads: BTreeMap::new(),
-            task_driver: task_driver::TaskDriverState::default(),
+            task_driver: task_driver::TaskDriverState::new(binding.max_live_tasks),
             root_issuance_sealed: false,
             max_live_tasks: binding.max_live_tasks,
             max_live_roots: binding.max_live_roots,
@@ -956,7 +957,7 @@ impl ContextHostRecord {
             return Err(ContextHostError::WrongContext);
         }
         // The installed Root was already moved into this Context's original
-        // slot. Only this real closed Task prefix permits direct RootDrained.
+        // slot. Only this real closed Task prefix permits direct RootEndAcknowledged.
         self.resources.root_reads.mark_task_retired(task);
         assert!(
             self.retired_task_reads.insert(task, sealed_read).is_none(),
@@ -1718,6 +1719,7 @@ mod tests {
                 self.command(
                     ControlInput::Retained {
                         context: self.identity,
+                        normal_close: false
                     },
                     None
                 )
@@ -1791,7 +1793,8 @@ mod tests {
             assert!(
                 self.command(
                     ControlInput::Retained {
-                        context: self.identity
+                        context: self.identity,
+                        normal_close: false
                     },
                     None
                 )

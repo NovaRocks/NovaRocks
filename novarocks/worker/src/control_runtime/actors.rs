@@ -177,19 +177,16 @@ impl Actor for ContextActor {
         };
         let result = match request {
             Some(request) => {
-                let ContextInput::Request(command) = command else {
-                    panic!("an admitted Context request carries its original command");
+                let original = RequestContext {
+                    token: envelope.input,
+                    operation: request.operation,
+                    deadline: request.deadline,
                 };
-                self.core.handle_request(
-                    now,
-                    RequestContext {
-                        token: envelope.input,
-                        operation: request.operation,
-                        deadline: request.deadline,
-                    },
-                    command,
-                    &mut admission,
-                )
+                match command {
+                    ContextInput::Request(command) => self.core.handle_request(now, original, command, &mut admission),
+                    ContextInput::RootEndAcknowledged { task } => self.core.handle_root_end_acknowledged(now, original, task, &mut admission),
+                    _ => panic!("an admitted Context R carries its original command or End ACK"),
+                }
             }
             None => self.core.handle(now, command, &mut admission),
         }

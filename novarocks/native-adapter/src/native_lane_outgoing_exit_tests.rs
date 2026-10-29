@@ -51,7 +51,7 @@ async fn bounded<F: Future>(future: F) -> FixtureResult<F::Output> {
 fn request() -> hyper::http::Request<BoxBody> {
     hyper::http::Request::builder()
         .method("POST")
-        .uri("/novarocks.NovaRocksGrpc/FetchTaskResult")
+        .uri("/novarocks.NovaRocksGrpc/FetchRootResult")
         .body(tonic::body::empty_body())
         .unwrap()
 }

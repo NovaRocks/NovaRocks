@@ -1166,7 +1166,10 @@ mod admitted_exit_tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut action = GatedAction {
-            inner: work.action.take(),
+            inner: work.action.take().map(|action| match action {
+                CompletionAction::Standalone(action) => action,
+                _ => panic!("this fixture owns its original standalone completion action"),
+            }),
             entered: entered_tx,
             release: release_rx,
         };

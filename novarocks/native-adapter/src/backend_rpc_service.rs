@@ -93,7 +93,7 @@ fn ingress_ownership<T>(request: &tonic::Request<T>) -> Option<Arc<NativeIngress
 }
 
 fn retired_fetch_result_status() -> tonic::Status {
-    tonic::Status::unimplemented("FetchResult is retired; use FetchTaskResult")
+    tonic::Status::unimplemented("FetchResult is retired; use FetchRootResult")
 }
 
 #[tonic::async_trait]
@@ -376,14 +376,11 @@ impl NovaRocksGrpc for BackendRpcService {
 
     async fn fetch_task_result(
         &self,
-        request: tonic::Request<proto::FetchTaskResultRequest>,
+        _request: tonic::Request<proto::FetchTaskResultRequest>,
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
-        let ownership = ingress_ownership(&request);
-        let response = self
-            .task_execution_ingress
-            .fetch_task_result_with_ownership(request.into_inner(), ownership)
-            .await?;
-        Ok(tonic::Response::new(response))
+        Err(tonic::Status::unimplemented(
+            "FetchTaskResult is retired; use FetchRootResult",
+        ))
     }
 
     async fn fetch_root_result(
@@ -409,7 +406,7 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::Unimplemented);
         assert_eq!(
             status.message(),
-            "FetchResult is retired; use FetchTaskResult"
+            "FetchResult is retired; use FetchRootResult"
         );
     }
 }

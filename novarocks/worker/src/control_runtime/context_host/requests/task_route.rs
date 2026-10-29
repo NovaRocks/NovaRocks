@@ -108,7 +108,6 @@ impl TaskRequestRoute {
                 command,
                 ContextCommand::Cancel { .. }
                     | ContextCommand::UpdateTask { .. }
-                    | ContextCommand::RootDrained { .. }
                     | ContextCommand::GetFinalInfo { .. }
                     | ContextCommand::GetDynamicFilters { .. }
             )
@@ -157,6 +156,52 @@ impl TaskRequestRoute {
                 error,
                 command: None,
             })
+    }
+    /// The same already paid R owns this channel fact even when its external
+    /// observer has ended. It must retain its original Task causal prefix.
+    pub(super) fn submit_root_end_acknowledged(
+        &mut self,
+        original: &mut ContextRequestCustody,
+        task: &mut TaskHostRecord,
+        shared: &RootReadShared,
+    ) -> Result<(), ContextRequestError> {
+        if !shared.end_acknowledged()
+            || task.task_id() != self.task
+            || original.expected_task != Some(self.task)
+        {
+            return Err(ContextRequestError::WrongRequest);
+        }
+        if original.submitted || self.sender.is_none() || self.failed_input.is_some() {
+            return Err(ContextRequestError::WrongPhase);
+        }
+        if !original.started {
+            original
+                .authority
+                .as_mut()
+                .expect("original Root R authority")
+                .start()
+                .map_err(ContextRequestError::Exit)?;
+            original.started = true;
+        }
+        let input = ContextInput::RootEndAcknowledged { task: self.task };
+        match self
+            .sender
+            .take()
+            .expect("same original Root R sender")
+            .send_input(input)
+        {
+            Ok(returned) => {
+                self.returned = Some(returned);
+                original.submitted = true;
+            }
+            Err(refusal) => {
+                self.returned = Some(refusal.returned);
+                self.failed_input = Some(refusal.input);
+                self.observe_return(task)?;
+                return Err(ContextRequestError::SubmissionUnresolved);
+            }
+        }
+        self.observe_return(task)
     }
     pub(super) fn capture_delivery(
         &mut self,
@@ -208,6 +253,10 @@ impl TaskRequestRoute {
             return Err(ContextRequestError::WrongRequest);
         }
         if !original.submitted
+            && !original
+                .deferred_root
+                .as_ref()
+                .is_some_and(|root| root.shared.end_acknowledged())
             && original.endpoint.external_ended()
             && let Some(sender) = self.sender.take()
         {

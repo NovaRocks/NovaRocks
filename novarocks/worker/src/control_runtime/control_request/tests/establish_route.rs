@@ -599,6 +599,7 @@ impl RouteFixture {
         let retained = self.f.host_input(
             ControlInput::Retained {
                 context: self.f.context,
+                normal_close: false,
             },
             self.host_storage,
         );

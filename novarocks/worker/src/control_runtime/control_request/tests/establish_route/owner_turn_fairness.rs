@@ -167,8 +167,8 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
     let runtime = f.f.runtime.clone();
     let cell = Arc::new(RootHostCell::new(f.f.root));
     let turn = root_turn(&runtime, &registration);
-    let first_turn = cell.advance_ready(&turn, &handles, 1).unwrap();
-    let second_turn = cell.advance_ready(&turn, &handles, 1).unwrap();
+    let first_turn = cell.advance_ready(&turn, &handles, None, 1).unwrap();
+    let second_turn = cell.advance_ready(&turn, &handles, None, 1).unwrap();
     turn.release(second_turn.runnable).unwrap();
     f.f.root = Arc::try_unwrap(cell)
         .ok()
@@ -263,7 +263,7 @@ fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_
     let worker_handles = handles.clone();
     let worker = thread::spawn(move || {
         started_tx.send(()).unwrap();
-        let progress = worker_cell.advance_ready(&turn, &worker_handles, 1);
+        let progress = worker_cell.advance_ready(&turn, &worker_handles, None, 1);
         // Root owns this same exclusive Common turn throughout preparation,
         // the target-lock wait and the independent original-R progress phase.
         let runnable = progress.as_ref().map_or(true, |progress| progress.runnable);

@@ -557,8 +557,10 @@ pub enum TaskRootDrainOutcome {
 }
 pub type TaskRootDrainFuture = Pin<Box<dyn Future<Output = TaskRootDrainOutcome> + Send + 'static>>;
 pub trait TaskRootDrainCapability: Send {
-    /// Dropping the returned observer cannot revoke a transferred ACK or
-    /// release its Work/capture/other-consumer obligations.
+    /// Observe the same R's committed ACK fact. The channel already handed
+    /// the fact to that R before returning this capability. Calling submit,
+    /// dropping it unused, or canceling the returned observer cannot revoke
+    /// the ACK or release its Work/capture/other-consumer obligations.
     fn submit(self: Box<Self>) -> TaskRootDrainFuture;
     fn revoke_unused(self: Box<Self>);
 }

@@ -35,6 +35,8 @@ uuid = { workspace = true, features = ["v4"] }
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-task-codec.workspace = true
+prost.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-functions.workspace = true
 novarocks-local-compiler.workspace = true

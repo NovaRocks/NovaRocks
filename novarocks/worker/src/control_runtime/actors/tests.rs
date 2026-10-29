@@ -700,6 +700,7 @@ impl Fixture {
                     novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
                 ),
             },
+            &self.roles[0].0,
         )
         .unwrap();
         self.runtime.effect_completed(ticket).unwrap();
@@ -899,6 +900,7 @@ fn source_bootstrap_slot_refusal_returns_the_original_paid_unpublished_task_unti
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
             ),
         },
+        &f.roles[0].0,
     )
     .err()
     .expect("the actual fourth Source report exceeds this Scope's slot capacity");
@@ -1029,17 +1031,17 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         }
     }
 
-    // Source4, the Actor attachment and two host reports use seven Scope
-    // slots. The loader/input reports use two, the first cut's Source2 use
-    // two, and only one second-cut Source fits in the twelfth final position.
-    let mut f = Fixture::with_policy_scope_slot_limit(4096, Some(12));
+    // Source4, Actor attachment, two host reports and the original disposal
+    // report use eight Scope slots. Two loader/input reports, first-cut
+    // Source2 and one second-cut Source fill the exact thirteenth position.
+    let mut f = Fixture::with_policy_scope_slot_limit(4096, Some(13));
     let policy = f.policy.unwrap();
     let task = task(f.identity, 1);
     let context_headers = f.scope.snapshot().unwrap().work;
     let mut host = f.adopt_task_host(task, 2);
     let elected = f.scope.snapshot().unwrap();
-    assert_eq!(elected.storage, 7);
-    assert_eq!(elected.work, context_headers + 7);
+    assert_eq!(elected.storage, 8);
+    assert_eq!(elected.work, context_headers + 8);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     f.assert_storage_paid(policy.loading);
 
@@ -1135,6 +1137,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         mut active,
         port: owned_port,
         host_calls,
+        disposal,
         loader,
         loading_events,
         loading_return,
@@ -1148,6 +1151,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         completion_action,
         lifecycle_inputs,
         statistics,
+        dynamic_filters,
         open_summary,
         mut causal,
         production,
@@ -1172,6 +1176,8 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
                     .unwrap()
             )
             .unwrap()
+            .checked_sub(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)
+            .unwrap()
             .resources()
             .unwrap()
             .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
@@ -1187,7 +1193,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert!(pending_preparation_adoption.is_none());
     retire_source_partials(&f, &mut source_partials);
     assert_eq!(f.scope.snapshot().unwrap().work, elected.work + 2);
-    assert_eq!(f.scope.snapshot().unwrap().storage, 9);
+    assert_eq!(f.scope.snapshot().unwrap().storage, 10);
     let live_after_partial = policy
         .loading
         .checked_sub(crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE)
@@ -1199,6 +1205,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     assert!(completion_action.is_none());
     assert!(lifecycle_inputs.is_empty());
     assert!(statistics.is_none());
+    assert!(dynamic_filters.is_none());
     assert!(open_summary.is_none());
     assert!(!lifetime.actual_exit_ready().unwrap());
 
@@ -1247,7 +1254,7 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
             "a retired report is not a reaped Work header"
         );
     }
-    assert_eq!(f.scope.snapshot().unwrap().storage, 7);
+    assert_eq!(f.scope.snapshot().unwrap().storage, 8);
     assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 2).unwrap(), 2);
     assert!(
         retired
@@ -1288,6 +1295,14 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
     // This unit destroys an empty bank after its real original Source4 exit;
     // it does not forge Loaded/LoaderExited or any protocol read-seal fact.
     crate::control_runtime::task::retire_unused_host_calls_for_test(&host_calls, &f.ledger);
+    let mut disposal_retired = false;
+    for _ in 0..64 {
+        if disposal.retire_unused(&f.ledger).unwrap() {
+            disposal_retired = true;
+            break;
+        }
+    }
+    assert!(disposal_retired && disposal.is_retired());
     finish_source_routes(&f, port.ingress());
     assert_eq!(f.scope.snapshot().unwrap().storage, 1);
     assert_eq!(f.scope.snapshot().unwrap().work, context_headers + 1);
@@ -1329,6 +1344,8 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
                     .checked_mul(2)
                     .unwrap(),
             )
+            .unwrap()
+            .checked_sub(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)
             .unwrap(),
     );
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
@@ -1862,7 +1879,14 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     assert!(f.runtime.snapshot(actor()).unwrap().failed);
     assert!(!f.runtime.snapshot(target).unwrap().failed);
     assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
-    let outputs = send(&mut f, ControlInput::Retained { context: next }, None);
+    let outputs = send(
+        &mut f,
+        ControlInput::Retained {
+            context: next,
+            normal_close: false,
+        },
+        None,
+    );
     assert!(outputs.iter().any(|action| matches!(
         action,
         WorkerAction::Control {
@@ -2186,6 +2210,15 @@ fn exercise_fragment_roles_with_preparation(
     impl TaskPendingNotice for Pending {
         fn pending(&self) {}
     }
+    struct PendingWake(Arc<dyn TaskPendingNotice>);
+    impl std::task::Wake for PendingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.pending();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.pending();
+        }
+    }
     struct Registered(Arc<AtomicUsize>);
     impl RegistrationNotice for Registered {
         fn bind_work(&mut self, _: novarocks_control_runtime_core::identity::WorkId) {}
@@ -2215,6 +2248,7 @@ fn exercise_fragment_roles_with_preparation(
         receiver_cleanup: AtomicUsize,
         inbound_cleanup: AtomicUsize,
         roles: std::sync::Mutex<Option<crate::TaskPreparationRoles>>,
+        inbound: Arc<crate::TaskInboundCapabilities>,
     }
     impl crate::TaskExecutionHost for CapturePreparationHost {
         fn close_context_admission(&self, _: QueryContextRef) {
@@ -2256,6 +2290,27 @@ fn exercise_fragment_roles_with_preparation(
             assert_eq!(descriptor.identity(), self.task);
             self.receiver_cleanup.fetch_add(1, Ordering::SeqCst);
         }
+        fn retire_receiver_checked(
+            &self,
+            descriptor: &novarocks_execution_contract::TaskDescriptor,
+            retirement: crate::TaskIngressRetirement,
+        ) -> Result<(), crate::HostRejection> {
+            if retirement == crate::TaskIngressRetirement::PreserveNormalClose {
+                // This host has no stream receiver author. The real bank must
+                // reject missing facts for the descriptor's nonempty input.
+                crate::TaskInboundCapabilities::validate_normal_close_facts(descriptor, &[])?;
+            }
+            self.remove_receiver(descriptor);
+            Ok(())
+        }
+        fn reserve_inbound_close_capacity_with_permit(
+            &self,
+            descriptor: &novarocks_execution_contract::TaskDescriptor,
+            permit: Option<crate::TaskInboundPermit>,
+        ) -> Result<(), crate::InboundCloseReservationRefusal> {
+            self.inbound
+                .reserve_normal_close_with_permit(descriptor, permit)
+        }
         fn install_inbound_capability(
             &self,
             _: &novarocks_execution_contract::TaskDescriptor,
@@ -2267,6 +2322,7 @@ fn exercise_fragment_roles_with_preparation(
             descriptor: &novarocks_execution_contract::TaskDescriptor,
         ) {
             assert_eq!(descriptor.identity(), self.task);
+            self.inbound.remove(descriptor);
             self.inbound_cleanup.fetch_add(1, Ordering::SeqCst);
         }
         fn submit_runnable(
@@ -2328,12 +2384,14 @@ fn exercise_fragment_roles_with_preparation(
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
             ),
         },
+        &f.roles[0].0,
     )
     .unwrap();
     let source4_headers = f.scope.snapshot().unwrap();
-    // The same loading admission now also retains its two host-only reports.
-    assert_eq!(source4_headers.work, loading_headers.work + 6);
-    assert_eq!(source4_headers.storage, loading_headers.storage + 6);
+    // Source4, two host calls and disposal retain their original seven roles
+    // and split fee rows from the same loading admission.
+    assert_eq!(source4_headers.work, loading_headers.work + 7);
+    assert_eq!(source4_headers.storage, loading_headers.storage + 7);
     f.assert_storage_paid(policy.loading);
     f.runtime.effect_completed(ticket).unwrap();
     f.drain(create);
@@ -2619,6 +2677,10 @@ fn exercise_fragment_roles_with_preparation(
         receiver_cleanup: AtomicUsize::new(0),
         inbound_cleanup: AtomicUsize::new(0),
         roles: std::sync::Mutex::new(None),
+        inbound: crate::TaskInboundCapabilities::with_limits(
+            1,
+            usize::try_from(inbound_bytes).unwrap(),
+        ),
     };
     let mut bundle_cuts = Vec::new();
     let mut bundle_inventory = None;
@@ -2657,6 +2719,7 @@ fn exercise_fragment_roles_with_preparation(
             &wrong_children,
             Duration::from_millis(10),
             roles,
+            std::task::Waker::from(Arc::new(PendingWake(host.pending_notice()))),
         ) {
             Err(refused) => refused,
             Ok(_) => panic!("mismatched preparation children must return the original bundle"),
@@ -3144,6 +3207,7 @@ fn exercise_fragment_roles_with_preparation(
         mut active,
         port,
         host_calls,
+        disposal,
         loader,
         loading_events,
         loading_return,
@@ -3231,6 +3295,8 @@ fn exercise_fragment_roles_with_preparation(
                 .unwrap(),
         )
         .unwrap()
+        .checked_sub(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)
+        .unwrap()
         .resources()
         .unwrap()
         .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
@@ -3238,7 +3304,7 @@ fn exercise_fragment_roles_with_preparation(
     assert_eq!(
         active.resources().unwrap(),
         expected_active,
-        "the Task remainder excludes the original Source4 and two host-call payments"
+        "the Task remainder excludes the original Source4, host-call and disposal payments"
     );
     let retained_profile = policy
         .accepted
@@ -3281,6 +3347,14 @@ fn exercise_fragment_roles_with_preparation(
             .unwrap(),
     );
     crate::control_runtime::task::retire_unused_host_calls_for_test(&host_calls, &f.ledger);
+    let mut disposal_retired = false;
+    for _ in 0..64 {
+        if disposal.retire_unused(&f.ledger).unwrap() {
+            disposal_retired = true;
+            break;
+        }
+    }
+    assert!(disposal_retired && disposal.is_retired());
     lifetime.body_exited().unwrap();
     lifetime.captures_exited().unwrap();
     assert!(
@@ -3313,6 +3387,8 @@ fn exercise_fragment_roles_with_preparation(
                     .checked_mul(detached_source_slots)
                     .unwrap(),
             )
+            .unwrap()
+            .checked_sub(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)
             .unwrap(),
     );
     active.release(&active.resources().unwrap()).unwrap();

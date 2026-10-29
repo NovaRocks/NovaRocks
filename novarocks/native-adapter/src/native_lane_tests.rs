@@ -252,7 +252,7 @@ async fn served_stream_position_outlives_the_handler_and_returns_at_body_eof() {
     .unwrap();
     for (method, lane) in [
         (NativeRpcMethod::ApplyTaskOperations, NativeLane::Submission),
-        (NativeRpcMethod::FetchTaskResult, NativeLane::ResultData),
+        (NativeRpcMethod::FetchRootResult, NativeLane::ResultData),
         (
             NativeRpcMethod::SubscribeTaskStatus,
             NativeLane::Observation,
@@ -289,7 +289,7 @@ async fn served_stream_position_outlives_the_handler_and_returns_at_body_eof() {
 async fn served_stream_position_returns_on_reset_or_error_and_on_early_body_drop() {
     let admission = NativeTransportAdmission::new().unwrap();
     for method in [
-        NativeRpcMethod::FetchTaskResult,
+        NativeRpcMethod::FetchRootResult,
         NativeRpcMethod::SubscribeTaskStatus,
     ] {
         let lane = NativeLane::of(method.contract().traffic).unwrap();
@@ -350,7 +350,7 @@ async fn exhausted_lane_refuses_before_execution_gates_without_borrowing_another
     let response = bounded(
         service
             .clone()
-            .oneshot(request(NativeRpcMethod::FetchTaskResult)),
+            .oneshot(request(NativeRpcMethod::FetchRootResult)),
     )
     .await
     .unwrap();
@@ -424,7 +424,7 @@ impl Drop for BodyServer {
 fn client_request() -> Request<BoxBody> {
     Request::builder()
         .method("POST")
-        .uri("/novarocks.NovaRocksGrpc/FetchTaskResult")
+        .uri("/novarocks.NovaRocksGrpc/FetchRootResult")
         .body(tonic::body::empty_body())
         .unwrap()
 }
@@ -589,7 +589,9 @@ impl NovaRocksGrpc for LaneProbe {
         &self,
         _request: tonic::Request<proto::FetchTaskResultRequest>,
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("probe"))
+        Err(tonic::Status::unimplemented(
+            "FetchTaskResult is retired; use FetchRootResult",
+        ))
     }
     async fn fetch_root_result(
         &self,

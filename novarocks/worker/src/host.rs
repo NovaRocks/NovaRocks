@@ -69,6 +69,44 @@ impl fmt::Debug for TaskPreparationRoles {
     }
 }
 
+/// Immutable metadata observes one exact accepted Task without retaining its
+/// owner, reporter, runtime, input, or publication capability. A short loan
+/// upgrades the owner only while an operation is actually using it.
+#[derive(Clone)]
+pub struct TaskPreparationView {
+    owner: std::sync::Weak<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
+    identity: novarocks_execution_contract::TaskIdentity,
+    cadence: std::time::Duration,
+}
+
+impl TaskPreparationView {
+    pub(crate) fn from_execution_port(
+        owner: &Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
+        cadence: std::time::Duration,
+    ) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            identity: owner.identity(),
+            cadence,
+        }
+    }
+    pub const fn identity(&self) -> novarocks_execution_contract::TaskIdentity {
+        self.identity
+    }
+    pub fn borrow_control(&self) -> crate::PreparationControlLoan<'_> {
+        crate::PreparationControlLoan::from_view(self)
+    }
+
+    pub(crate) fn control(
+        &self,
+    ) -> (
+        Option<Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>>,
+        std::time::Duration,
+    ) {
+        (self.owner.upgrade(), self.cadence)
+    }
+}
+
 /// One actual preparation body owns one original, finite fragment role set.
 /// Metadata gets only a weak stop view. Moving this context into the Native
 /// host cannot copy the finisher or sign another settlement registration.

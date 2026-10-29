@@ -159,7 +159,7 @@ fn usage(ledger: &RuntimeLedger) -> [u64; 3] {
 fn retire_call(call: &TaskHostCall, ledger: &RuntimeLedger) {
     let mut retired = false;
     for _ in 0..64 {
-        if call.retire_returned(ledger).unwrap() {
+        if call.advance_retirement(ledger).unwrap() {
             retired = true;
             break;
         }
@@ -447,8 +447,8 @@ fn observer_panic_keeps_the_original_payload_port_and_fee_in_unknown_custody() {
         call.poll_return().unwrap(),
         Some(TaskHostCallOutcome::Panicked)
     ));
-    assert!(!call.retire_returned(&ledger).unwrap());
-    assert!(!call.retire_returned(&ledger).unwrap());
+    assert!(!call.advance_retirement(&ledger).unwrap());
+    assert!(!call.advance_retirement(&ledger).unwrap());
     assert!(matches!(
         call.retire_unused(&ledger).err().unwrap(),
         TaskHostCallError::AlreadyIssued

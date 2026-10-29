@@ -637,11 +637,15 @@ impl TaskProposalIngress {
                 ContextInput::Request(
                     ContextCommand::Cancel { task, .. }
                     | ContextCommand::UpdateTask { task, .. }
-                    | ContextCommand::RootDrained { task }
                     | ContextCommand::GetFinalInfo { task }
                     | ContextCommand::GetDynamicFilters { task, .. },
                 ),
             ) => Some(*task),
+            // This exact paid R carries a channel fact, not another request
+            // admission. Keep its original Task prefix and reply identity.
+            (CausalEventKind::Request(_), ContextInput::RootEndAcknowledged { task }) => {
+                Some(*task)
+            }
             (
                 CausalEventKind::Input,
                 ContextInput::Loaded { task, .. }

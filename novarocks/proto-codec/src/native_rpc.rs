@@ -56,7 +56,7 @@ pub enum NativeBodyKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum NativeRpcMethod {
-    FetchTaskResult,
+    RetiredFetchTaskResult,
     FetchRootResult,
     ApplyTaskOperations,
     ApplyTaskControlOperations,
@@ -96,9 +96,9 @@ use FrontendNativeLane::{LifecycleControl, Observation, ResultData, Submission};
 use NativeTrafficClass::Frontend;
 pub const NATIVE_METHODS: [NativeMethodContract; 14] = [
     contract!(
-        FetchTaskResult,
+        RetiredFetchTaskResult,
         "FetchTaskResult",
-        Frontend(ResultData),
+        NativeTrafficClass::Retired,
         BackendData,
         FrontendToBackend,
         Unary
@@ -283,7 +283,8 @@ mod tests {
         assert!(NativeRpcMethod::Heartbeat.is_allowed_at(NativeEndpointDomain::BackendControl));
         assert!(!NativeRpcMethod::Heartbeat.is_allowed_at(NativeEndpointDomain::BackendData));
         assert!(
-            !NativeRpcMethod::FetchTaskResult.is_allowed_at(NativeEndpointDomain::BackendControl)
+            !NativeRpcMethod::RetiredFetchTaskResult
+                .is_allowed_at(NativeEndpointDomain::BackendControl)
         );
         assert!(NativeRpcMethod::FetchRootResult.is_allowed_at(NativeEndpointDomain::BackendData));
         assert!(
@@ -294,6 +295,14 @@ mod tests {
             NativeTrafficClass::Frontend(FrontendNativeLane::ResultData)
         );
         assert!(!NativeRpcMethod::RetiredExchange.is_allowed_at(NativeEndpointDomain::BackendData));
+        assert!(
+            !NativeRpcMethod::RetiredFetchTaskResult
+                .is_allowed_at(NativeEndpointDomain::BackendData)
+        );
+        assert_eq!(
+            NativeRpcMethod::RetiredFetchTaskResult.contract().traffic,
+            NativeTrafficClass::Retired
+        );
     }
     #[test]
     fn new_work_and_mixed_updates_never_use_urgent_control() {

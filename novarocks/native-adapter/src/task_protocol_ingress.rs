@@ -62,18 +62,14 @@ use novarocks_types::NativeCompatibilityId;
 use crate::static_package_admission::StaticPackageAdmission;
 use crate::task_protocol::{
     TaskExecutionIngress, TaskIngressTiming, TaskObservationReader, TaskOperationBatchApplier,
-    TaskOperationReceiptAck as ReceiptAck, TaskResultRead, TaskResultReadError,
-    TaskResultReadRequest, TaskResultReader, TaskStatusEventStream, TaskStatusSubscriptionReader,
+    TaskOperationReceiptAck as ReceiptAck, TaskStatusEventStream, TaskStatusSubscriptionReader,
     apply_task_control_operations, apply_task_control_operations_at, apply_task_operations,
     apply_task_operations_at, encode_operation_receipt, fetch_task_dynamic_filters,
-    fetch_task_result, fetch_task_result_with_ownership, get_final_task_info,
-    host_rejection_status, subscribe_task_status,
+    get_final_task_info, host_rejection_status, subscribe_task_status,
 };
 #[cfg(novarocks_dev_controls)]
 use crate::task_protocol_fault as fault;
-use novarocks_worker::{
-    AdmissionTicketObservation, RootResultRoute, StatusAdvance, TaskExecutionRegistry,
-};
+use novarocks_worker::{AdmissionTicketObservation, RootResultRoute, TaskExecutionRegistry};
 
 /// The wire adapter of one backend's task protocol owner.
 pub struct RegistryTaskExecutionIngress {
@@ -431,225 +427,6 @@ impl RegistryTaskExecutionIngress {
     }
 }
 
-#[tonic::async_trait]
-impl TaskResultReader for RegistryTaskExecutionIngress {
-    async fn read_task_result(
-        &self,
-        request: TaskResultReadRequest,
-        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
-    ) -> Result<TaskResultRead, TaskResultReadError> {
-        #[cfg(novarocks_dev_controls)]
-        use crate::task_result_diagnostics::emit_task_fetch_marker;
-        use novarocks_worker::result_buffer::{
-            TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed,
-        };
-        use proto::fetch_result_response::Status as FetchStatus;
-
-        let identity = request.identity();
-        let acknowledged = request.acknowledged_packet_sequence();
-        // The registry uses a synchronous mutex. Route only this narrow
-        // lookup through the blocking pool; the result-buffer wait below
-        // remains asynchronous on the listener runtime.
-        let registry = Arc::clone(&self.registry);
-        let queued_at = std::time::Instant::now();
-        let first_lookup_ownership = ownership.clone();
-        let route = tokio::task::spawn_blocking(move || {
-            crate::backend_metrics::native_blocking_queue_wait(
-                "fetch_task_result_route",
-                queued_at.elapsed(),
-            );
-            let _ownership = first_lookup_ownership;
-            registry.root_result_route(identity)
-        })
-        .await
-        .map_err(|error| TaskResultReadError::new(format!("root result route failed: {error}")))?;
-        let binding = match route {
-            RootResultRoute::Serve(binding) => binding,
-            RootResultRoute::TerminalResultOwner(_) | RootResultRoute::AwaitTerminalControl
-                if replays_task_terminal_ack(identity, acknowledged) =>
-            {
-                let packet_sequence =
-                    acknowledged.expect("an exact terminal replay carries its sequence");
-                #[cfg(novarocks_dev_controls)]
-                emit_task_fetch_marker(
-                    self.observation_controls.get().map(AsRef::as_ref),
-                    identity,
-                    FetchStatus::Eof,
-                    packet_sequence,
-                    true,
-                    0,
-                )
-                .map_err(TaskResultReadError::new)?;
-                return Ok(TaskResultRead::EndOfStream { packet_sequence });
-            }
-            RootResultRoute::AwaitTerminalControl => {
-                #[cfg(novarocks_dev_controls)]
-                emit_task_fetch_marker(
-                    self.observation_controls.get().map(AsRef::as_ref),
-                    identity,
-                    FetchStatus::AwaitTerminalControl,
-                    0,
-                    false,
-                    0,
-                )
-                .map_err(TaskResultReadError::new)?;
-                return Ok(TaskResultRead::AwaitTerminalControl);
-            }
-            route => {
-                let detail = route
-                    .refusal_detail()
-                    .expect("only a served route has no refusal detail");
-                // A refusal fails the frontend's read, and the frontend sees only this
-                // text. Recording it here is what attributes it to a backend process
-                // and to the route that produced it: a coordinator log alone cannot
-                // say which of this backend's task states the poll landed in.
-                tracing::warn!(
-                    task = %identity,
-                    route = ?route,
-                    "root result poll refused"
-                );
-                #[cfg(novarocks_dev_controls)]
-                emit_task_fetch_marker(
-                    self.observation_controls.get().map(AsRef::as_ref),
-                    identity,
-                    FetchStatus::Error,
-                    0,
-                    false,
-                    0,
-                )
-                .map_err(TaskResultReadError::new)?;
-                return Ok(TaskResultRead::Error { detail });
-            }
-        };
-        Ok(
-            match wait_fetch_task_typed(
-                identity,
-                acknowledged,
-                request.max_wait(),
-                request.max_result_bytes(),
-            )
-            .await
-            {
-                TryFetchTypedResult::Ready(result) => {
-                    #[cfg(novarocks_dev_controls)]
-                    emit_task_fetch_marker(
-                        self.observation_controls.get().map(AsRef::as_ref),
-                        identity,
-                        FetchStatus::Ready,
-                        result.packet_seq,
-                        result.eos,
-                        result.payload.len(),
-                    )
-                    .map_err(TaskResultReadError::new)?;
-                    TaskResultRead::Ready {
-                        packet_sequence: result.packet_seq,
-                        end_of_stream: result.eos,
-                        payload: result.payload,
-                    }
-                }
-                TryFetchTypedResult::EndAcknowledged => {
-                    let advance = binding.note_result_stream_drained();
-                    if matches!(
-                        advance,
-                        StatusAdvance::Illegal { .. }
-                            | StatusAdvance::Rejected(_)
-                            | StatusAdvance::VersionExhausted
-                    ) {
-                        return Err(TaskResultReadError::new(format!(
-                            "root task {identity} could not record its acknowledged result drain: {advance:?}"
-                        )));
-                    }
-                    let packet_sequence =
-                        acknowledged.expect("an acknowledged end carries its packet sequence");
-                    #[cfg(novarocks_dev_controls)]
-                    emit_task_fetch_marker(
-                        self.observation_controls.get().map(AsRef::as_ref),
-                        identity,
-                        FetchStatus::Eof,
-                        packet_sequence,
-                        true,
-                        0,
-                    )
-                    .map_err(TaskResultReadError::new)?;
-                    TaskResultRead::EndOfStream { packet_sequence }
-                }
-                TryFetchTypedResult::NotReady => TaskResultRead::NotReady,
-                TryFetchTypedResult::Error(error) => {
-                    let resolved = self
-                        .resolve_task_result_error(identity, error, ownership)
-                        .await?;
-                    match &resolved {
-                        TaskResultRead::AwaitTerminalControl => {
-                            #[cfg(novarocks_dev_controls)]
-                            emit_task_fetch_marker(
-                                self.observation_controls.get().map(AsRef::as_ref),
-                                identity,
-                                FetchStatus::AwaitTerminalControl,
-                                0,
-                                false,
-                                0,
-                            )
-                            .map_err(TaskResultReadError::new)?;
-                        }
-                        TaskResultRead::Error { .. } => {
-                            #[cfg(novarocks_dev_controls)]
-                            emit_task_fetch_marker(
-                                self.observation_controls.get().map(AsRef::as_ref),
-                                identity,
-                                FetchStatus::Error,
-                                0,
-                                false,
-                                0,
-                            )
-                            .map_err(TaskResultReadError::new)?;
-                        }
-                        _ => {
-                            return Err(TaskResultReadError::new(
-                                "terminal result recheck returned an invalid state",
-                            ));
-                        }
-                    }
-                    resolved
-                }
-            },
-        )
-    }
-}
-
-impl RegistryTaskExecutionIngress {
-    /// Rechecks one exact owner when its served buffer disappeared. No error
-    /// detail is inspected, and an active missing buffer remains a refusal.
-    pub(crate) async fn resolve_task_result_error(
-        &self,
-        identity: novarocks_execution_contract::task_execution::identity::TaskIdentity,
-        error: novarocks_worker::result_buffer::FetchError,
-        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
-    ) -> Result<TaskResultRead, TaskResultReadError> {
-        if matches!(
-            error.kind,
-            novarocks_worker::result_buffer::FetchErrorKind::NotFound
-        ) {
-            let registry = Arc::clone(&self.registry);
-            let route = tokio::task::spawn_blocking(move || {
-                // The closure can remain queued after its RPC future is canceled.
-                // Keep the original ingress slot until this exact work exits.
-                let _ownership = ownership;
-                registry.root_result_route(identity)
-            })
-            .await
-            .map_err(|error| {
-                TaskResultReadError::new(format!("root result terminal recheck failed: {error}"))
-            })?;
-            if matches!(route, RootResultRoute::AwaitTerminalControl) {
-                return Ok(TaskResultRead::AwaitTerminalControl);
-            }
-        }
-        Ok(TaskResultRead::Error {
-            detail: error.message,
-        })
-    }
-}
-
 impl TaskObservationReader for RegistryTaskExecutionIngress {
     fn read_task_dynamic_filters(
         &self,
@@ -787,21 +564,6 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         request: proto::GetFinalTaskInfoRequest,
     ) -> Result<proto::GetFinalTaskInfoResponse, tonic::Status> {
         get_final_task_info(self, request)
-    }
-
-    async fn fetch_task_result(
-        &self,
-        request: proto::FetchTaskResultRequest,
-    ) -> Result<proto::FetchResultResponse, tonic::Status> {
-        fetch_task_result(self, request).await
-    }
-
-    async fn fetch_task_result_with_ownership(
-        &self,
-        request: proto::FetchTaskResultRequest,
-        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
-    ) -> Result<proto::FetchResultResponse, tonic::Status> {
-        fetch_task_result_with_ownership(self, request, ownership).await
     }
 }
 
@@ -2592,33 +2354,6 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
-    #[tokio::test]
-    async fn a_result_poll_for_a_foreign_task_is_refused_before_a_buffer() {
-        let fixture = Fixture::new();
-        let foreign = fixture.identity_on(1, 1, BackendProcessId::new_v7());
-        let response = fixture
-            .ingress
-            .fetch_task_result(proto::FetchTaskResultRequest {
-                root_task: Some(encode_task_identity(foreign)),
-                max_wait_millis: 60_000,
-                acknowledged_packet_sequence: None,
-                max_result_bytes: 16 * 1024 * 1024,
-            })
-            .await
-            .expect("a fenced poll is answered, not errored");
-        assert_eq!(
-            response.status,
-            proto::fetch_result_response::Status::Error as i32
-        );
-        assert_eq!(
-            response.message, "result poll names a task this backend process does not own",
-            "the refusal must come from the process fence, not from a buffer"
-        );
-        assert_eq!(response.packet_seq, 0);
-        assert!(!response.eos);
-        assert!(response.result_arrow_ipc.is_empty());
-    }
-
     #[test]
     fn final_info_that_is_not_available_comes_back_as_an_outcome() {
         let fixture = Fixture::new();
@@ -2700,42 +2435,6 @@ mod tests {
         // is the one honest way to say "nothing to fetch".
         assert_eq!(response.version, 0);
         assert!(response.domains.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_result_poll_aimed_at_an_exchange_producer_is_refused() {
-        // Every task owns a result buffer keyed by its kernel key, so routing
-        // a poll by that key alone would hand back an exchange producer's
-        // output as if it were the query's answer. Owning a buffer and owing
-        // the coordinator a result are different facts.
-        let fixture = Fixture::new();
-        let context = fixture.context();
-        let producer = fixture.identity(3, 3);
-        fixture.apply(vec![
-            fixture.establish(context, TaskOperationId::new_v7()),
-            create_producer_task(context, producer, TaskOperationId::new_v7()),
-        ]);
-        fixture.wait_installed(producer);
-
-        let response = fixture
-            .ingress
-            .fetch_task_result(proto::FetchTaskResultRequest {
-                root_task: Some(encode_task_identity(producer)),
-                max_wait_millis: 60_000,
-                acknowledged_packet_sequence: None,
-                max_result_bytes: 16 * 1024 * 1024,
-            })
-            .await
-            .expect("a fenced poll is answered, not errored");
-        assert_eq!(
-            response.status,
-            proto::fetch_result_response::Status::Error as i32
-        );
-        assert_eq!(
-            response.message, "result poll names a task that does not own this query's result",
-            "the refusal must come from the ownership check, not from a buffer"
-        );
-        assert!(response.result_arrow_ipc.is_empty());
     }
 
     #[test]

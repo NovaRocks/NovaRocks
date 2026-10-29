@@ -84,7 +84,10 @@ impl ContextHostRecord {
             | ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Driver(error)))
             | ContextDriverError::Host(ContextHostJobError::Driver(error))
             | ContextDriverError::HostProgress(ContextHostProgressError::Host(ContextHostJobError::Driver(error)))
-            | ContextDriverError::Request(super::requests::ContextRequestError::Driver(error)) => fence(error),
+            | ContextDriverError::Request(super::requests::ContextRequestError::Driver(error))
+            | ContextDriverError::Request(super::requests::ContextRequestError::Causal(crate::control_runtime::causal::CausalError::Driver(error)))
+            | ContextDriverError::Task(TaskDriverError::Request(super::requests::ContextRequestError::Causal(crate::control_runtime::causal::CausalError::Driver(error))))
+            | ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Causal(crate::control_runtime::causal::CausalError::Driver(error)))) => fence(error),
             ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::OwnerFailed)) => true,
             ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Statistics(
                 crate::control_runtime::operator_statistics::StatisticsError::FailurePublicationRequired,

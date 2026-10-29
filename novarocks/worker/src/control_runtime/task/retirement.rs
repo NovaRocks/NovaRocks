@@ -199,7 +199,7 @@ impl TaskHostRecord {
         for call in &self.resources.host_calls {
             if !call.is_retired() && call.actual_call_exited() {
                 progress |= call
-                    .retire_returned(ledger)
+                    .advance_retirement(ledger)
                     .map_err(TaskHostError::HostCall)?;
             }
         }

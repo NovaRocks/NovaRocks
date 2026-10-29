@@ -890,11 +890,15 @@ mod tests {
         ] {
             assert!(matches!(control.classify(method), MethodClass::Control));
         }
-        for method in [
-            NativeRpcMethod::ApplyTaskOperations,
-            NativeRpcMethod::FetchTaskResult,
+        assert!(matches!(
+            data.classify(NativeRpcMethod::ApplyTaskOperations),
+            MethodClass::Ordinary
+        ));
+        for endpoint in [
+            NativeEndpointDomain::BackendData,
+            NativeEndpointDomain::BackendControl,
         ] {
-            assert!(matches!(data.classify(method), MethodClass::Ordinary));
+            assert!(!NativeRpcMethod::RetiredFetchTaskResult.is_allowed_at(endpoint));
         }
         assert!(matches!(
             data.classify(NativeRpcMethod::FetchRootResult),

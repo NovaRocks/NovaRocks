@@ -116,6 +116,10 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
     pub fn is_empty(&self) -> bool {
         self.work.is_empty()
     }
+    /// Read existing queue membership without creating a scheduling position.
+    pub fn contains(&self, group: G, work: W) -> bool {
+        self.work.contains_key(&(group, work))
+    }
     pub fn enqueue(&mut self, group: G, work: W) -> Result<(), FairQueueError> {
         if self.work.contains_key(&(group, work)) {
             return Err(FairQueueError::DuplicateWork);

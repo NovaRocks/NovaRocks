@@ -434,7 +434,7 @@ fn independent_raw_field_panics_never_unwind_through_another_field_or_return_rpc
     let cleanup = f.root.begin_unsubmitted_withdrawal(input).unwrap().unwrap();
     pools.disposal(cleanup);
     let disposition = source_pools::wait_disposal(&f, input);
-    let retired = f.root.advance_ready_requests(pools.handles(), 8);
+    let retired = f.root.advance_ready_requests(pools.handles(), None, 8);
     let held = f.ledger.used(Dimension::Replies.id());
     pools.finish();
     // This exact bounded Unknown is intentionally retained; it is not a green

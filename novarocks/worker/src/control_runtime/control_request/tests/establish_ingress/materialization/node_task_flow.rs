@@ -79,6 +79,22 @@ use novarocks_types::{StageId, TaskId, UniqueId};
 use std::{any::Any, collections::BTreeMap, num::NonZeroU64, sync::Weak};
 
 type Failure = Box<dyn Any + Send>;
+#[derive(Debug)]
+struct UnexpectedInbound;
+impl std::fmt::Display for UnexpectedInbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the compiled CountOnly fixture has no inbound stream or payment")
+    }
+}
+impl std::error::Error for UnexpectedInbound {}
+impl novarocks_execution_contract::failure::FailureProjection for UnexpectedInbound {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        novarocks_execution_contract::failure::FailureFact::new(
+            novarocks_execution_contract::failure::FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::InboundReservationConflict.reason(),
+        )
+    }
+}
 struct CompileControl;
 impl PureCompileControl for CompileControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -485,6 +501,7 @@ struct RunnableState {
     start: Option<crate::TaskStartPermit>,
     terminal: Option<crate::TaskTerminalPermit>,
     statistics: Option<crate::TaskStatisticsProducer>,
+    dynamic_filters: Option<crate::TaskDynamicFilterProducer>,
     final_statistics: Option<crate::TaskStatisticsFinalizer>,
     completion_exit: Option<crate::CompletionExitNotice>,
     root: Option<Arc<RootResultChannel>>,
@@ -504,6 +521,26 @@ struct Observations {
     producer_exit_observed: AtomicUsize,
     kernel_published: AtomicUsize,
     completion_entered: AtomicUsize,
+    created: AtomicUsize,
+    protocol_events: Mutex<Vec<crate::TaskProtocolEvent>>,
+}
+impl crate::TaskProtocolObserver for Observations {
+    fn observe(&self, event: crate::TaskProtocolEvent) {
+        self.protocol_events.lock().unwrap().push(event);
+    }
+}
+impl crate::TaskExecutionMetrics for Observations {
+    fn record_task_created(&self) {
+        self.created.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl crate::TaskResultLifecycle for Observations {
+    fn discard_task(&self, identity: TaskIdentity) {
+        crate::result_buffer::discard_task(identity);
+    }
+    fn retire_task_result(&self, identity: TaskIdentity) {
+        crate::result_buffer::retire_task_result(identity);
+    }
 }
 struct Runnable {
     identity: TaskIdentity,
@@ -519,11 +556,14 @@ impl std::fmt::Debug for Runnable {
 }
 struct PreparedChild {
     dormant: Mutex<Option<DormantFragmentHandle>>,
-    target: Weak<Runnable>,
+    target: Mutex<Weak<Runnable>>,
+    root_exit: Mutex<Option<crate::root_result_channel::RootPhysicalExitObservation>>,
+    rollback_requested: std::sync::atomic::AtomicBool,
     rolling_back: std::sync::atomic::AtomicBool,
 }
 impl crate::TaskPreparationChild for PreparedChild {
     fn request_rollback(&self) {
+        self.rollback_requested.store(true, Ordering::Release);
         if self.rolling_back.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -537,11 +577,20 @@ impl crate::TaskPreparationChild for PreparedChild {
         if self.rolling_back.load(Ordering::Acquire) {
             return crate::TaskPreparationChildExit::Pending;
         }
-        let original_moved = self.dormant.lock().unwrap().is_none();
-        if original_moved && !self.rolling_back.load(Ordering::Acquire) {
-            crate::TaskPreparationChildExit::Exited
-        } else {
-            crate::TaskPreparationChildExit::Pending
+        if !self.rollback_requested.load(Ordering::Acquire)
+            || self.dormant.lock().unwrap().is_some()
+        {
+            return crate::TaskPreparationChildExit::Pending;
+        }
+        let original = self.root_exit.lock().unwrap();
+        match original.as_ref() {
+            Some(original) if original.output_exited() => crate::TaskPreparationChildExit::Exited {
+                output: crate::TaskPreparationOutputExit::ActualOutputExited,
+            },
+            Some(_) => crate::TaskPreparationChildExit::Pending,
+            // Construction did not register an actual Root observation. A
+            // failed constructor is Unknown, never proof that no output existed.
+            None => crate::TaskPreparationChildExit::Unresolved,
         }
     }
     fn adopt_runtime(&self) {
@@ -553,6 +602,8 @@ impl crate::TaskPreparationChild for PreparedChild {
             .expect("one original dormant adoption");
         let target = self
             .target
+            .lock()
+            .unwrap()
             .upgrade()
             .expect("the actual host retains its dormant runnable");
         let mut state = target.state.lock().unwrap();
@@ -625,9 +676,20 @@ impl TaskExecutionHost for CompiledTaskHost {
             start,
             terminal,
             statistics,
+            dynamic_filters,
             final_statistics,
             completion_exit,
         } = preparation.take_roles().unwrap();
+        let child = Arc::new(PreparedChild {
+            dormant: Mutex::new(None),
+            target: Mutex::new(Weak::new()),
+            root_exit: Mutex::new(None),
+            rollback_requested: std::sync::atomic::AtomicBool::new(false),
+            rolling_back: std::sync::atomic::AtomicBool::new(false),
+        });
+        // Register the same physical child before opening output. Construction
+        // unwind cannot turn a lost, already-born Root into NoOutputCreated.
+        preparation.register_child(child.clone()).unwrap();
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             descriptor.identity().query_execution_id().query_id(),
@@ -656,6 +718,9 @@ impl TaskExecutionHost for CompiledTaskHost {
             health.clone(),
         )
         .unwrap();
+        *child.root_exit.lock().unwrap() = Some(root.physical_exit_observation());
+        root.bind_preparation_exit_waker(preparation.readiness_waker())
+            .unwrap_or_else(|_| panic!("the original preparation wake binds this Root once"));
         let session = CountSession::open(root.clone(), health, self.observed.clone());
         let context = FragmentPrepareContext::new(
             None,
@@ -678,6 +743,7 @@ impl TaskExecutionHost for CompiledTaskHost {
                 start: Some(start),
                 terminal: Some(terminal),
                 statistics: Some(statistics),
+                dynamic_filters: Some(dynamic_filters),
                 final_statistics: Some(final_statistics),
                 completion_exit: Some(completion_exit),
                 root: Some(root.clone()),
@@ -685,13 +751,8 @@ impl TaskExecutionHost for CompiledTaskHost {
             }),
             observed: self.observed.clone(),
         });
-        preparation
-            .register_child(Arc::new(PreparedChild {
-                dormant: Mutex::new(Some(dormant)),
-                target: Arc::downgrade(&runnable),
-                rolling_back: std::sync::atomic::AtomicBool::new(false),
-            }))
-            .unwrap();
+        *child.dormant.lock().unwrap() = Some(dormant);
+        *child.target.lock().unwrap() = Arc::downgrade(&runnable);
         assert!(
             self.tasks
                 .lock()
@@ -705,10 +766,52 @@ impl TaskExecutionHost for CompiledTaskHost {
         let original = self.tasks.lock().unwrap().remove(&descriptor.identity());
         drop(original);
     }
-    fn install_inbound_capability(&self, _: &TaskDescriptor) -> Result<(), HostRejection> {
+    fn retire_receiver_checked(
+        &self,
+        descriptor: &TaskDescriptor,
+        retirement: crate::TaskIngressRetirement,
+    ) -> Result<(), HostRejection> {
+        if retirement == crate::TaskIngressRetirement::PreserveNormalClose {
+            // Zero frozen inbound streams have zero close facts. The actual
+            // common validator rejects any nonempty descriptor here.
+            crate::TaskInboundCapabilities::validate_normal_close_facts(descriptor, &[])?;
+        }
+        self.remove_receiver(descriptor);
         Ok(())
     }
-    fn remove_inbound_capability(&self, _: &TaskDescriptor) {}
+    fn install_inbound_capability(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+        if crate::task_creation_cost::inbound_record_bytes(descriptor) != Some(0) {
+            return Err(HostRejection::from_domain(
+                novarocks_execution_contract::TaskFailureCategory::Protocol,
+                UnexpectedInbound,
+            ));
+        }
+        Ok(())
+    }
+    fn reserve_inbound_close_capacity_with_permit(
+        &self,
+        descriptor: &TaskDescriptor,
+        permit: Option<crate::TaskInboundPermit>,
+    ) -> Result<(), crate::InboundCloseReservationRefusal> {
+        if crate::task_creation_cost::inbound_record_bytes(descriptor) == Some(0)
+            && permit.is_none()
+        {
+            return Ok(());
+        }
+        Err(crate::InboundCloseReservationRefusal {
+            rejection: HostRejection::from_domain(
+                novarocks_execution_contract::TaskFailureCategory::Protocol,
+                UnexpectedInbound,
+            ),
+            permit,
+        })
+    }
+    fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
+        assert_eq!(
+            crate::task_creation_cost::inbound_record_bytes(descriptor),
+            Some(0)
+        );
+    }
     fn submit_runnable(
         &self,
         descriptor: &TaskDescriptor,
@@ -748,11 +851,16 @@ impl TaskExecutionHost for CompiledTaskHost {
                         .fetch_add(1, Ordering::SeqCst);
                     assert!(matches!(fact.outcome(), FragmentOutcome::Succeeded));
                     let final_statistics = final_statistics.take().unwrap().seal_for_terminal(None);
-                    let (statistics, running) = {
+                    let (statistics, dynamic_filters, running) = {
                         let mut state = runnable.state.lock().unwrap();
-                        (state.statistics.take(), state.running.take())
+                        (
+                            state.statistics.take(),
+                            state.dynamic_filters.take(),
+                            state.running.take(),
+                        )
                     };
                     drop(statistics);
+                    drop(dynamic_filters);
                     drop(running);
                     observation
                         .handoff(crate::TaskTerminalObservation {
@@ -797,6 +905,44 @@ struct TaskResources {
     preparation: HostExecutor<TaskDriverHostJob, fn(TaskDriverHostJob)>,
     lifecycle: HostExecutor<TaskDriverHostJob, fn(TaskDriverHostJob)>,
     _async_runtime: tokio::runtime::Runtime,
+}
+fn observation_projection() -> crate::ObservationProjection {
+    use novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
+    crate::ObservationProjection {
+        fact_bytes: observation_fact_bytes,
+        max_frame_bytes: NonZeroUsize::new(NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES).unwrap(),
+        // The component uses the same explicit catch-up profile as Native.
+        max_initial_bytes: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+    }
+}
+fn observation_fact_bytes(
+    fact: &novarocks_worker_protocol::observation::CoveredObservationFact,
+) -> Result<usize, crate::ObservationProjectionError> {
+    use novarocks_task_codec::operation::{
+        CoveredStatusStreamEvent, CoveredStatusStreamFact as WireFact,
+        covered_quiesce_fact_size_bound, encode_covered_status_event,
+    };
+    use novarocks_worker_protocol::observation::CoveredObservationFact as Fact;
+    use prost::Message;
+    let value = match fact {
+        Fact::Status(value) => WireFact::Status(value.clone()),
+        Fact::StatusUnchanged(value) => WireFact::StatusUnchanged(*value),
+        Fact::Unknown(value) => WireFact::Unknown(*value),
+        Fact::Gone(value) => WireFact::Gone(*value),
+        Fact::TaskConvergence(value) => WireFact::TaskConvergence(*value),
+        Fact::TaskConvergenceUnchanged(value) => WireFact::TaskConvergenceUnchanged(*value),
+        Fact::ContextConvergence(value) => WireFact::ContextConvergence(*value),
+        Fact::Quiesce(receipt) => {
+            return covered_quiesce_fact_size_bound(receipt)
+                .ok_or(crate::ObservationProjectionError::InvalidFact);
+        }
+    };
+    encode_covered_status_event(&CoveredStatusStreamEvent {
+        fact: value,
+        source_revision: Some(u64::MAX),
+    })
+    .map(|wire| wire.encoded_len())
+    .map_err(|_| crate::ObservationProjectionError::InvalidFact)
 }
 fn start_tasks(
     root: &mut ProcessControlOwner,
@@ -858,6 +1004,13 @@ fn start_tasks(
         result_limits,
     });
     let ports = TaskDriverPorts {
+        protocol_events: Some(crate::TaskExecutionPorts::new(
+            host.observed.clone(),
+            host.observed.clone(),
+            host.observed.clone(),
+            host.execution.execution_health(),
+        )),
+        observation: Some(observation_projection()),
         execution: Some(host.clone()),
         loading: Some(loading.handle()),
         preparation: Some(preparation.handle()),
@@ -922,7 +1075,7 @@ fn exercise_root(
         ),
         ingress_retained_bytes: 0,
     };
-    let mut handle = scene
+    let handle = scene
         .node
         .submit_task_create(
             ActorId::new(3).unwrap(),
@@ -930,6 +1083,15 @@ fn exercise_root(
             payload,
         )
         .map_err(|original| Box::new(original) as Failure)?;
+    let mut handle = match handle {
+        crate::control_runtime::node::NodeCreateHandle::Context(handle) => handle,
+        original => {
+            return Err(Box::new((
+                "Create unexpectedly routed before Context adoption",
+                original,
+            )));
+        }
+    };
     let Some(delivery) = wait_delivery(&mut handle) else {
         return Err(Box::new(("Create delivery timeout", handle)));
     };

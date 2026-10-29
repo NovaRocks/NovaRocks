@@ -45,7 +45,7 @@ use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{StageId, TaskId};
 
 use crate::ReleasedContextEvidence;
-use crate::{RunnableTask, TaskDomains, TaskStatusOwner, TaskStatusSource};
+use crate::{RunnableTask, TaskDomains, TaskPreparationView, TaskStatusOwner, TaskStatusSource};
 
 /// The comparable, secret-free identity of one establish request.
 ///
@@ -138,49 +138,15 @@ struct CreationProgress {
     rollback_complete: bool,
 }
 
-/// Immutable metadata observes one exact accepted Task without retaining its
-/// owner, reporter, runtime, input, or publication capability. A short loan
-/// upgrades the owner only while an operation is actually using it.
-#[derive(Clone)]
-pub struct TaskPreparationView {
-    owner: Weak<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
-    identity: TaskIdentity,
-    cadence: std::time::Duration,
-}
-
-impl TaskPreparationView {
-    pub(crate) fn from_execution_port(
-        owner: &Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
-        cadence: std::time::Duration,
-    ) -> Self {
-        Self {
-            owner: Arc::downgrade(owner),
-            identity: owner.identity(),
-            cadence,
-        }
-    }
+// The legacy creation fixture is the only owner of this compatibility
+// conversion. Production preparation views are issued from the actual port.
+impl crate::TaskPreparationView {
     // Existing direct-host fixtures keep their actual acceptance owner alive;
     // this view carries only a weak execution port and no role issuer.
     pub(crate) fn from_owner(owner: &Arc<TaskStatusOwner>, cadence: std::time::Duration) -> Self {
         let port: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort> =
             owner.clone();
         Self::from_execution_port(&port, cadence)
-    }
-
-    pub const fn identity(&self) -> TaskIdentity {
-        self.identity
-    }
-    pub fn borrow_control(&self) -> crate::PreparationControlLoan<'_> {
-        crate::PreparationControlLoan::from_view(self)
-    }
-
-    pub(crate) fn control(
-        &self,
-    ) -> (
-        Option<Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>>,
-        std::time::Duration,
-    ) {
-        (self.owner.upgrade(), self.cadence)
     }
 }
 

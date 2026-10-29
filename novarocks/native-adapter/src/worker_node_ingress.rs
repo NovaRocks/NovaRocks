@@ -784,24 +784,6 @@ impl crate::task_protocol::TaskExecutionIngress for WorkerNodeTaskIngress {
             result: Some(result),
         })
     }
-    async fn fetch_task_result(
-        &self,
-        _request: proto::FetchTaskResultRequest,
-    ) -> Result<proto::FetchResultResponse, Status> {
-        // The old registry still implements this Arrow-buffer route. No
-        // equivalent owning Node send adapter has been connected here.
-        Err(Status::unimplemented(
-            "FetchTaskResult is not connected to the Node owner; bounded Root reads use FetchRootResult",
-        ))
-    }
-    async fn fetch_task_result_with_ownership(
-        &self,
-        request: proto::FetchTaskResultRequest,
-        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
-    ) -> Result<proto::FetchResultResponse, Status> {
-        let _ownership = ownership;
-        crate::task_protocol::TaskExecutionIngress::fetch_task_result(self, request).await
-    }
 }
 
 fn encode_task_domain(

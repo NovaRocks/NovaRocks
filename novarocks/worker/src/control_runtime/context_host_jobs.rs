@@ -790,6 +790,15 @@ impl ContextHostJobs {
         self.0.pending.version()
     }
 
+    /// H owns the moved Root inventory until its actual disposal/report tail ends.
+    /// The empty Context map during that interval is not a zero Root census.
+    pub(super) fn try_root_census_ready(&self) -> bool {
+        let Ok(state) = self.0.state.try_lock() else {
+            return false;
+        };
+        !state.h_issued
+            || (state.h.retired && matches!(state.h.returned, Some(ContextHostReturned::Disposed)))
+    }
     pub(super) fn holder_disposed(
         &self,
         runtime: &ActorRuntime<WorkerActor>,

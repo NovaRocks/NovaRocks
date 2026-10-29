@@ -77,6 +77,11 @@ impl ContextHostAddress {
         let host = self.0.host.lock().expect("original Context owner lock");
         host.is_some().then_some(ContextHostGuard(host))
     }
+    /// A management observation never waits for an actor/host turn.
+    pub(in crate::control_runtime) fn try_lock(&self) -> Option<ContextHostGuard<'_>> {
+        let host = self.0.host.try_lock().ok()?;
+        host.is_some().then_some(ContextHostGuard(host))
+    }
     pub(super) fn take(&self) -> Option<ContextHostRecord> {
         // Returning the value moves its actual custody out of the cell. No
         // resource or foreign destructor executes under the directory lock.
@@ -176,5 +181,37 @@ impl ContextDirectory {
             state.actors.remove(&address.0.registration.actor()),
             Some(context)
         );
+    }
+}
+
+impl ContextDirectory {
+    /// Copy bounded metadata addresses under the short directory lock only.
+    /// A published cell's original owner is taken before its address is removed.
+    pub(in crate::control_runtime) fn try_census_addresses(
+        &self,
+        limit: usize,
+    ) -> Option<Vec<ContextHostAddress>> {
+        let state = self.0.try_lock().ok()?;
+        if state.contexts.len() > limit {
+            return None;
+        }
+        Some(state.contexts.values().cloned().collect())
+    }
+    /// No Context lock is held here. Same-ID replacement cannot reuse a cell
+    /// while the original metadata address remains in the observed list.
+    pub(in crate::control_runtime) fn census_addresses_unchanged(
+        &self,
+        original: &[ContextHostAddress],
+    ) -> bool {
+        let Ok(state) = self.0.try_lock() else {
+            return false;
+        };
+        state.contexts.len() == original.len()
+            && original.iter().all(|address| {
+                state
+                    .contexts
+                    .get(&address.context())
+                    .is_some_and(|current| current.same_origin(address))
+            })
     }
 }

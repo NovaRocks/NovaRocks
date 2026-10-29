@@ -687,8 +687,37 @@ fn fetch_rows(
             other => bail!("B RootV1 did not return its actual data or End: {other:?}"),
         }
     };
-    // Only this actually observed, fully consumed End authorizes advancing the
-    // FE frontier. A separate ACK-only R must return its real receipt.
+    // Only this actually observed End authorizes advancing the FE frontier.
+    // The same original R applies its ACK before waiting for a later packet.
+    // Exhausting the data wait must not discard the already accepted End fact.
+    let after_end = end
+        .sequence
+        .get()
+        .checked_add(1)
+        .context("B RootV1 sequence after End overflow")?;
+    let (waited, mut observation) = super::result_delivery_root_protocol::probe(
+        context,
+        session.index,
+        &request(Some(after_end), end.sequence.get()),
+        end.sequence.get(),
+        deadline,
+    )?;
+    observation["operation"] = json!("ack-end-and-wait-after-end");
+    observation["matches"] = json!(
+        matches!(waited.outcome, RootReadOutcome::NotReady)
+            && waited.accepted_consumed == end.sequence.get()
+    );
+    std::fs::write(
+        context.scenario_root().join("root-end-ack-data-wait.json"),
+        serde_json::to_vec_pretty(&observation)?,
+    )?;
+    ensure!(
+        matches!(waited.outcome, RootReadOutcome::NotReady)
+            && waited.accepted_consumed == end.sequence.get(),
+        "B RootV1 lost its accepted End after the data wait: {waited:?}"
+    );
+    drop(waited);
+    // Repeating the proven frontier remains an ordinary ACK-only replay.
     let (ack, _) = super::result_delivery_root_protocol::probe(
         context,
         session.index,
@@ -701,6 +730,54 @@ fn fetch_rows(
             && ack.accepted_consumed == end.sequence.get(),
         "B RootV1 did not settle the exact acknowledged End: {ack:?}"
     );
+    // Observe the same still-open Context Root through its original owner.
+    // Busy is an unavailable sample; neither absence nor stale zero is idle.
+    // This is an interval observation, not a physical-exit receipt.
+    let client = reqwest::blocking::Client::builder().build()?;
+    let port = context.handle().runtime().be[session.index].http;
+    let mut observations = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(context.scenario_root().join("root-end-ack-census.jsonl"))?;
+    loop {
+        use std::io::Write as _;
+        let remaining = context.remaining("observe the original acknowledged Context Root")?;
+        let metrics: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/metrics?type=json"))
+            .timeout(remaining.min(Duration::from_secs(1)))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let census = super::result_delivery::root_census(
+            metrics
+                .as_array()
+                .context("invalid original Root metrics")?,
+        )?;
+        serde_json::to_writer(
+            &mut observations,
+            &json!({"census": census, "original_metrics": metrics}),
+        )?;
+        writeln!(observations)?;
+        if let Some(census) = census {
+            ensure!(
+                census["channels"] == 1
+                    && census["terminal_task_records"] == 1
+                    && census["ends_published"] == 1
+                    && census["ends_acknowledged"] == 1
+                    && census["sealed"] == 0
+                    && census["data_positions"] == 0
+                    && census["payload_bytes"] == 0
+                    && census["metadata_bytes"] > 0,
+                "the original Context Root census changed its acknowledged ownership: {census:?}"
+            );
+            break;
+        }
+        thread::sleep(
+            context
+                .remaining("await an available Root observation")?
+                .min(POLL),
+        );
+    }
     Ok(rows)
 }
 

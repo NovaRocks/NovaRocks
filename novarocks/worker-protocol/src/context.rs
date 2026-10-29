@@ -233,9 +233,6 @@ pub enum ContextCommand {
         payload: PayloadId,
         update: ContextDomainInput,
     },
-    RootDrained {
-        task: TaskIdentity,
-    },
     GetFinalInfo {
         task: TaskIdentity,
     },
@@ -273,7 +270,6 @@ impl ContextCommand {
             | Self::InspectCreation { task }
             | Self::Cancel { task, .. }
             | Self::UpdateTask { task, .. }
-            | Self::RootDrained { task }
             | Self::GetFinalInfo { task }
             | Self::GetDynamicFilters { task, .. } => Some(*task),
             _ => None,
@@ -297,6 +293,11 @@ pub enum ContextInput {
     /// Transport-only neutral body. `handle_request` binds its original token;
     /// the lifecycle-only `handle` entry rejects this wrapper.
     Request(ContextCommand),
+    /// A channel-locked End ACK already belongs to this original R. Its
+    /// reply correlation is supplied by the actor, not by another RPC.
+    RootEndAcknowledged {
+        task: TaskIdentity,
+    },
     /// The owning frontend process was fenced. The original lifecycle role
     /// binds the target Context; no RPC token or directory epoch is supplied.
     OwnerFenced,
@@ -1110,6 +1111,7 @@ impl ContextCore {
             now,
             ContextInput::Request(command),
             Some(request.token),
+            None,
             capacity,
         )
     }
@@ -1119,16 +1121,42 @@ impl ContextCore {
         input: ContextInput,
         capacity: &mut impl AdmissionPort,
     ) -> Result<ContextStep, CoreError> {
-        if matches!(input, ContextInput::Request(_)) {
+        if matches!(
+            input,
+            ContextInput::Request(_) | ContextInput::RootEndAcknowledged { .. }
+        ) {
             return Err(CoreError::WrongIdentity);
         }
-        self.handle_bound(now, input, None, capacity)
+        self.handle_bound(now, input, None, None, capacity)
+    }
+    /// Commit an already accepted channel fact through its original input.
+    /// The data wait deadline cannot revoke an ACK; it is not business
+    /// request admission. Common consumes this exact input once, and this
+    /// step returns its one correlated reply after the actual publications.
+    pub fn handle_root_end_acknowledged(
+        &mut self,
+        now: MonotonicInstant,
+        original: RequestContext,
+        task: TaskIdentity,
+        capacity: &mut impl AdmissionPort,
+    ) -> Result<ContextStep, CoreError> {
+        if self.requests.contains_key(&original.token) {
+            return Err(CoreError::WrongIdentity);
+        }
+        self.handle_bound(
+            now,
+            ContextInput::RootEndAcknowledged { task },
+            None,
+            Some(original),
+            capacity,
+        )
     }
     fn handle_bound(
         &mut self,
         now: MonotonicInstant,
         input: ContextInput,
         request_token: Option<InputId>,
+        root_ack_request: Option<RequestContext>,
         capacity: &mut impl AdmissionPort,
     ) -> Result<ContextStep, CoreError> {
         if now < self.now {
@@ -1178,6 +1206,18 @@ impl ContextCore {
                 capacity,
                 &mut step,
             )?,
+            ContextInput::RootEndAcknowledged { task } => {
+                let original = root_ack_request.ok_or(CoreError::WrongIdentity)?;
+                let body = self.root_end_acknowledged(task, &mut step)?;
+                // No request_deadlines entry: the owner fact already happened.
+                // This is the same bounded reply correlation, not another R.
+                step.requests.push(ContextRequestSettlement::new(
+                    original,
+                    Some(task),
+                    Arc::new(body),
+                ));
+                step.records_visited += 1;
+            }
             ContextInput::RejectedCreationRetired { task, payload } => {
                 self.begin_rejected_creation_retirement(task, payload, &mut step)?;
             }
@@ -1893,7 +1933,6 @@ impl ContextCore {
             ContextCommand::UpdateContext { payload, update } => {
                 self.update_context(request, payload, update, step)?
             }
-            ContextCommand::RootDrained { task } => self.root_drained(request, task, step)?,
             ContextCommand::GetFinalInfo { task } => {
                 if self.task_request_cut(request, task, step)? {
                     self.try_finish_completion_intent(task, step)?;
@@ -3356,14 +3395,26 @@ impl ContextCore {
         });
         Ok(())
     }
-    fn root_drained(
+    fn root_end_acknowledged(
         &mut self,
-        request: InputId,
         task: TaskIdentity,
         step: &mut ContextStep,
-    ) -> Result<(), CoreError> {
-        if !self.task_request_cut(request, task, step)? {
-            return Ok(());
+    ) -> Result<ContextReplyBody, CoreError> {
+        if task.verify_query_context(self.identity).is_err() {
+            return Ok(ContextReplyBody::Verdict(RequestResult::Outcome(
+                OperationOutcome::IdentityMismatch,
+            )));
+        }
+        if !self.tasks.contains_key(&task) {
+            return Ok(ContextReplyBody::Verdict(RequestResult::Outcome(
+                OperationOutcome::InvalidStateOrRequest,
+            )));
+        }
+        self.flush(task, step)?;
+        if !self.tasks[&task].accepted() {
+            return Ok(ContextReplyBody::Verdict(RequestResult::Outcome(
+                OperationOutcome::InvalidStateOrRequest,
+            )));
         }
         let record = self.tasks.get_mut(&task).expect("located root");
         let result = match crate::lifecycle::classify_root_drain(record.state) {
@@ -3392,9 +3443,8 @@ impl ContextCore {
                 }
             }
         };
-        step.reply(request, ContextReplyBody::RootDrain(result));
         self.retire_if_ready(task, step)?;
-        Ok(())
+        Ok(ContextReplyBody::RootDrain(result))
     }
     fn apply_runtime_exit_receipts(
         task: &mut TaskRecord,
