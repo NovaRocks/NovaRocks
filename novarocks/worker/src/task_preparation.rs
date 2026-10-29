@@ -33,8 +33,17 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskPreparationChildExit {
     Pending,
-    Exited,
+    Exited { output: TaskPreparationOutputExit },
     Unresolved,
+}
+
+/// Neutral output evidence from the same original physical child owner.
+/// Child exit alone does not establish that no output exists or has exited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskPreparationOutputExit {
+    NoOutputCreated,
+    ActualOutputExited,
+    Unknown,
 }
 
 /// A provider's one whole child observation. Methods only manipulate its
@@ -124,6 +133,7 @@ struct State {
     body_secondary: [Option<ManuallyDrop<Payload>>; BODY_ROLES],
     body_publication: [Option<ManuallyDrop<Payload>>; BODY_ROLES],
     child: Option<Arc<dyn TaskPreparationChild>>,
+    output_exit: Option<TaskPreparationOutputExit>,
     phases: [Phase; STEPS],
     // Cold, bounded process custody. Never place opaque panic payloads in a
     // Task's originating failure graph or invoke their destructor on exit.
@@ -153,16 +163,15 @@ impl NeverAdoptedPreparationExit<'_> {
     pub(crate) fn same_scope(&self, scope: &TaskPreparationScope) -> bool {
         std::ptr::eq(self.scope, scope)
     }
-    /// The original host never registered its whole child owner. Registration
-    /// is permanently closed by the already-proved rollback and physical exit;
-    /// this is stronger than observing an empty child after its destruction.
-    pub(crate) fn never_registered_child(&self) -> bool {
-        !self
-            .scope
+    /// Expose only the fact cached from this scope's original physical Poll.
+    /// Construction already proved ChildDrop and all never-adopted exits.
+    pub(crate) fn output_exit(&self) -> TaskPreparationOutputExit {
+        self.scope
             .state
             .lock()
-            .expect("original child registration fact")
-            .registered
+            .expect("original preparation output exit")
+            .output_exit
+            .expect("the original physical Poll supplied output evidence")
     }
 }
 
@@ -190,6 +199,7 @@ impl TaskPreparationScope {
                 body_secondary: std::array::from_fn(|_| None),
                 body_publication: std::array::from_fn(|_| None),
                 child: None,
+                output_exit: None,
                 phases: [Phase::NotStarted; STEPS],
                 panics: None,
             }),
@@ -526,7 +536,7 @@ impl TaskPreparationScope {
         }
     }
     pub(crate) fn rollback_exited(&self) -> bool {
-        let child = {
+        let (child, registered) = {
             let mut state = self.state.lock().expect("preparation child scope lock");
             if !state.body_exited
                 || state.mode != Mode::Rollback
@@ -547,12 +557,20 @@ impl TaskPreparationScope {
                 }
                 Phase::NotStarted => state.phases[Step::Poll as usize] = Phase::Started,
             }
-            state.child.clone()
+            (state.child.clone(), state.registered)
         };
         let result = catch_unwind(AssertUnwindSafe(|| {
-            child
-                .as_ref()
-                .map_or(TaskPreparationChildExit::Exited, |child| child.poll_exit())
+            match child.as_ref() {
+                Some(child) => child.poll_exit(),
+                // The original registration gate is permanently sealed by
+                // physical rollback; no registered child ever created output.
+                None if !registered => TaskPreparationChildExit::Exited {
+                    output: TaskPreparationOutputExit::NoOutputCreated,
+                },
+                None => TaskPreparationChildExit::Exited {
+                    output: TaskPreparationOutputExit::Unknown,
+                },
+            }
         }));
         drop(child); // The scope still owns the original Arc; this is metadata only.
         match result {
@@ -563,11 +581,12 @@ impl TaskPreparationScope {
                     .phases[Step::Poll as usize] = Phase::NotStarted;
                 false
             }
-            Ok(TaskPreparationChildExit::Exited) => {
-                self.state
-                    .lock()
-                    .expect("preparation child scope lock")
-                    .phases[Step::Poll as usize] = Phase::Exited;
+            Ok(TaskPreparationChildExit::Exited { output }) => {
+                {
+                    let mut state = self.state.lock().expect("preparation child scope lock");
+                    state.output_exit = Some(output);
+                    state.phases[Step::Poll as usize] = Phase::Exited;
+                }
                 let child_exited = self.clear_child();
                 let state = self.state.lock().expect("preparation child scope lock");
                 child_exited && Self::body_obligations_exited(&state)
@@ -595,6 +614,7 @@ impl TaskPreparationScope {
             || !Self::body_obligations_exited(&state)
             || !Self::started_actions_exited(&state)
             || state.child.is_some()
+            || state.output_exit.is_none()
             || [
                 Step::Cancel,
                 Step::Inbound,
@@ -608,6 +628,11 @@ impl TaskPreparationScope {
             return None;
         }
         Some(NeverAdoptedPreparationExit { scope: self })
+    }
+    pub(crate) fn output_exit_unresolved(&self) {
+        if !self.is_unresolved(Step::Poll) {
+            self.fault(R::PreparationChildUnresolved, Step::Poll, None);
+        }
     }
     pub(crate) fn adopt_runtime(&self) -> bool {
         let child = {
@@ -789,7 +814,9 @@ mod host_handoff_tests {
     impl TaskPreparationChild for Child {
         fn request_rollback(&self) {}
         fn poll_exit(&self) -> TaskPreparationChildExit {
-            TaskPreparationChildExit::Exited
+            TaskPreparationChildExit::Exited {
+                output: TaskPreparationOutputExit::NoOutputCreated,
+            }
         }
         fn adopt_runtime(&self) {
             if let Some((entered, gate)) = &self.adoption {

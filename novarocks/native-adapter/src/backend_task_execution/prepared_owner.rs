@@ -31,7 +31,11 @@ use novarocks_execution_contract::{
     TaskFailurePhase, TaskIdentity,
     failure::{FailureClass, FailureFact, FailureProjection, FailureReason, domain},
 };
-use novarocks_worker::{TaskPreparationChild, TaskPreparationChildExit, TaskPreparationContext};
+use novarocks_worker::root_result_channel::{RootPhysicalExitObservation, RootResultChannel};
+use novarocks_worker::{
+    TaskPreparationChild, TaskPreparationChildExit, TaskPreparationContext,
+    TaskPreparationOutputExit,
+};
 use std::{
     any::Any,
     mem::ManuallyDrop,
@@ -53,8 +57,9 @@ pub(crate) enum Phase {
     Registration,
     Control,
     KernelObserve,
+    RootOutput,
 }
-const PHASES: usize = 10;
+const PHASES: usize = 11;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     NotStarted,
@@ -131,10 +136,18 @@ impl FailureProjection for NativePreparedOwnerFailure {
     }
 }
 
+enum RootBirth {
+    NeverStarted,
+    Building,
+    NoOutputCreated,
+    Born(RootPhysicalExitObservation),
+}
+
 struct State {
     retained: Option<Arc<Mutex<State>>>,
     rollback: bool,
     root_transferred: bool,
+    root_birth: RootBirth,
     kernel: Kernel,
     root: Option<ManuallyDrop<Arc<dyn TaskPreparationChild>>>,
     dormant: Option<ManuallyDrop<DormantFragmentHandle>>,
@@ -171,6 +184,7 @@ impl NativePreparationChild {
                 retained: None,
                 rollback: false,
                 root_transferred: false,
+                root_birth: RootBirth::NeverStarted,
                 kernel: Kernel::Vacant,
                 root: None,
                 dormant: None,
@@ -224,12 +238,81 @@ impl NativePreparationChild {
         let state = self.state.lock().unwrap();
         !state.rollback && state.kernel == Kernel::Prepared
     }
+    /// The original physical constructor reserves this once before opening a
+    /// channel. Rollback and Root birth use this same original state lock.
+    pub(crate) fn begin_root_birth(&self) -> ExecutionResult<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.rollback {
+            return Err(NativePreparedOwnerFailure::LateInstall.into());
+        }
+        if !matches!(state.root_birth, RootBirth::NeverStarted) {
+            return Err(NativePreparedOwnerFailure::DuplicateRoot.into());
+        }
+        state.root_birth = RootBirth::Building;
+        Ok(())
+    }
+    pub(crate) fn root_birth_metadata_bytes() -> usize {
+        std::mem::size_of::<RootBirth>()
+    }
+    /// A typed failed try_open returned no channel. Panic or lost construction
+    /// remains Building and cannot manufacture NoOutputCreated.
+    pub(crate) fn root_birth_refused(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert!(matches!(state.root_birth, RootBirth::Building));
+        state.root_birth = RootBirth::NoOutputCreated;
+    }
+    /// Record the exact original physical metadata before any later fallible
+    /// session construction. Even rollback winning now cannot lose this birth.
+    pub(crate) fn record_root_birth(&self, channel: &RootResultChannel) {
+        assert_eq!(channel.spec().task, self.identity);
+        let observation = channel.physical_exit_observation();
+        let mut state = self.state.lock().unwrap();
+        assert!(matches!(state.root_birth, RootBirth::Building));
+        state.root_birth = RootBirth::Born(observation);
+    }
+    pub(crate) fn root_birth_matches(&self, channel: &RootResultChannel) -> bool {
+        let state = self.state.lock().unwrap();
+        matches!(&state.root_birth, RootBirth::Born(original) if original.belongs_to(channel))
+    }
+    fn output_exit_after_root_drop(&self) -> TaskPreparationChildExit {
+        let state = self.state.lock().unwrap();
+        if state.root_transferred {
+            return TaskPreparationChildExit::Exited {
+                output: TaskPreparationOutputExit::Unknown,
+            };
+        }
+        if !state.rollback {
+            // A still-open birth gate is not a stable no-output observation.
+            return TaskPreparationChildExit::Pending;
+        }
+        match &state.root_birth {
+            RootBirth::NeverStarted | RootBirth::NoOutputCreated => {
+                TaskPreparationChildExit::Exited {
+                    output: TaskPreparationOutputExit::NoOutputCreated,
+                }
+            }
+            RootBirth::Born(original) if original.output_exited() => {
+                TaskPreparationChildExit::Exited {
+                    output: TaskPreparationOutputExit::ActualOutputExited,
+                }
+            }
+            RootBirth::Born(_) => TaskPreparationChildExit::Pending,
+            RootBirth::Building => {
+                drop(state);
+                self.fault(Phase::RootOutput, None, None);
+                TaskPreparationChildExit::Unresolved
+            }
+        }
+    }
     pub(crate) fn install_root(
         &self,
         slot: &mut Option<Arc<dyn TaskPreparationChild>>,
     ) -> ExecutionResult<()> {
         let mut state = self.state.lock().unwrap();
         if state.rollback {
+            return Err(NativePreparedOwnerFailure::LateInstall.into());
+        }
+        if !matches!(state.root_birth, RootBirth::Born(_)) {
             return Err(NativePreparedOwnerFailure::LateInstall.into());
         }
         if state.root.is_some() {
@@ -366,7 +449,9 @@ impl NativePreparationChild {
                 .kernel_stopped
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                TaskPreparationChildExit::Exited
+                TaskPreparationChildExit::Exited {
+                    output: TaskPreparationOutputExit::Unknown,
+                }
             } else {
                 TaskPreparationChildExit::Pending
             };
@@ -378,22 +463,30 @@ impl NativePreparationChild {
             let mut state = self.state.lock().unwrap();
             match state.phases[Phase::RootPoll as usize] {
                 Action::Started => return TaskPreparationChildExit::Pending,
-                Action::Exited => return TaskPreparationChildExit::Exited,
+                Action::Exited => {
+                    return TaskPreparationChildExit::Exited {
+                        output: TaskPreparationOutputExit::Unknown,
+                    };
+                }
                 Action::Unresolved => return TaskPreparationChildExit::Unresolved,
                 Action::NotStarted => state.phases[Phase::RootPoll as usize] = Action::Started,
             }
         }
         let root = self.state.lock().unwrap().root.as_deref().cloned();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            root.as_ref()
-                .map_or(TaskPreparationChildExit::Exited, |root| root.poll_exit())
+            root.as_ref().map_or(
+                TaskPreparationChildExit::Exited {
+                    output: TaskPreparationOutputExit::Unknown,
+                },
+                |root| root.poll_exit(),
+            )
         }));
         drop(root);
         match result {
             Ok(result) => {
                 self.state.lock().unwrap().phases[Phase::RootPoll as usize] = match result {
                     TaskPreparationChildExit::Pending => Action::NotStarted,
-                    TaskPreparationChildExit::Exited => Action::Exited,
+                    TaskPreparationChildExit::Exited { .. } => Action::Exited,
                     TaskPreparationChildExit::Unresolved => Action::Unresolved,
                 };
                 result
@@ -540,7 +633,9 @@ impl NativePreparationChild {
             .all(|phase| state.phases[*phase as usize] == Action::Exited);
         if exited {
             state.kernel = Kernel::Exited;
-            return TaskPreparationChildExit::Exited;
+            return TaskPreparationChildExit::Exited {
+                output: TaskPreparationOutputExit::Unknown,
+            };
         }
         if [Phase::KernelHolder, Phase::Registration, Phase::Control]
             .iter()
@@ -639,16 +734,24 @@ impl NativePreparationChild {
             match state.kernel {
                 Kernel::Vacant if state.rollback => {
                     state.kernel = Kernel::Exited;
-                    return TaskPreparationChildExit::Exited;
+                    return TaskPreparationChildExit::Exited {
+                        output: TaskPreparationOutputExit::Unknown,
+                    };
                 }
-                Kernel::Exited => return TaskPreparationChildExit::Exited,
+                Kernel::Exited => {
+                    return TaskPreparationChildExit::Exited {
+                        output: TaskPreparationOutputExit::Unknown,
+                    };
+                }
                 Kernel::Unresolved => return TaskPreparationChildExit::Unresolved,
                 Kernel::Transferred => {
                     return if self
                         .kernel_stopped
                         .load(std::sync::atomic::Ordering::Acquire)
                     {
-                        TaskPreparationChildExit::Exited
+                        TaskPreparationChildExit::Exited {
+                            output: TaskPreparationOutputExit::Unknown,
+                        }
                     } else {
                         TaskPreparationChildExit::Pending
                     };
@@ -852,7 +955,9 @@ impl TaskPreparationChild for NativePreparationChild {
             return TaskPreparationChildExit::Pending;
         }
         if self.drop_root() {
-            TaskPreparationChildExit::Exited
+            // This Root child held metadata itself. Only its actual Drop can
+            // precede the original full-output observation, avoiding self-wait.
+            self.output_exit_after_root_drop()
         } else {
             TaskPreparationChildExit::Unresolved
         }

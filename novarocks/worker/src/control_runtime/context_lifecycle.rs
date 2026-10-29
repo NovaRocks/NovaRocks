@@ -23,6 +23,7 @@ use super::{
     actors::{ControlMessage, WorkerAction, WorkerActor, WorkerMessage},
     context_host_jobs::{ContextHostJobError, ContextHostJobs},
     context_ready::ContextReadyNotice,
+    failure::ScopePublicationsDrained,
 };
 use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
@@ -71,7 +72,12 @@ pub(crate) struct ContextLifecycle {
     child: ScopeHandle,
     work: WorkId,
     ports: [Port; CONTEXT_LIFECYCLE_INPUTS],
-    retained: Option<(InputId, ActionId)>,
+    retained: Option<RetentionOrigin>,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RetentionOrigin {
+    Effect(InputId, ActionId),
+    FailedOwner,
 }
 impl ContextLifecycle {
     pub(super) fn new(
@@ -136,7 +142,7 @@ impl ContextLifecycle {
         {
             return Err(ContextHostJobError::WrongOwner);
         }
-        let key = (ticket.input, ticket.descriptor.id);
+        let key = RetentionOrigin::Effect(ticket.input, ticket.descriptor.id);
         if self.retained == Some(key) {
             return Ok(());
         }
@@ -161,6 +167,44 @@ impl ContextLifecycle {
         port.sent = true;
         self.retained = Some(key);
         Ok(())
+    }
+    /// The failed Core cannot issue RetainContext. Its actual drained failure
+    /// owner forwards the same preadmitted lifecycle position after physical R
+    /// supplies its real retention observation; Root keeps removal authority.
+    pub(crate) fn forward_failed_retained(
+        &mut self,
+        stage: &ScopePublicationsDrained<'_>,
+        jobs: &ContextHostJobs,
+    ) -> Result<bool, ContextHostJobError> {
+        stage.validate(&self.runtime, self.actor)?;
+        if !jobs.belongs_to_context(&self.runtime, self.actor, self.context, &self.child) {
+            return Err(ContextHostJobError::WrongOwner);
+        }
+        if self.retained.is_some() {
+            return Ok(false);
+        }
+        let Some(normal_close) = jobs.normal_close_observation() else {
+            return Ok(false);
+        };
+        let port = &mut self.ports[0];
+        if port.sent {
+            return Err(ContextHostJobError::WrongPhase);
+        }
+        port.input
+            .as_ref()
+            .ok_or(ContextHostJobError::WrongPhase)?
+            .fill(WorkerMessage::Control(ControlMessage::Command {
+                work: self.work,
+                request: None,
+                command: ControlInput::Retained {
+                    context: self.context,
+                    normal_close,
+                },
+            }))
+            .map_err(|(error, _neutral)| ContextHostJobError::Driver(error))?;
+        port.sent = true;
+        self.retained = Some(RetentionOrigin::FailedOwner);
+        Ok(true)
     }
     /// The exact child Scope disappearing proves its actual actor attachment,
     /// Work, reports and captures were removed. H's original return supplies

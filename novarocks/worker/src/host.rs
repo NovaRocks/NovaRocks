@@ -76,6 +76,7 @@ pub struct TaskPreparationContext<'a> {
     owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
     children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
     cadence: std::time::Duration,
+    readiness_waker: std::task::Waker,
     roles: Option<TaskPreparationRoles>,
 }
 impl<'a> TaskPreparationContext<'a> {
@@ -84,6 +85,7 @@ impl<'a> TaskPreparationContext<'a> {
         children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
         cadence: std::time::Duration,
         roles: TaskPreparationRoles,
+        readiness_waker: std::task::Waker,
     ) -> Result<
         Self,
         (
@@ -101,8 +103,14 @@ impl<'a> TaskPreparationContext<'a> {
             owner,
             children,
             cadence,
+            readiness_waker,
             roles: Some(roles),
         })
+    }
+    /// The same original preparation readiness source, installed before Root
+    /// birth. Cloning its standard Waker grants no Task/output authority.
+    pub fn readiness_waker(&self) -> std::task::Waker {
+        self.readiness_waker.clone()
     }
     /// Registers before the provider child attaches kernel/root captures. The
     /// original preparation owner continues to supervise rollback/adoption.

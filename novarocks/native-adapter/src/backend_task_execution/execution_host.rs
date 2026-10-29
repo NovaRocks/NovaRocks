@@ -728,7 +728,8 @@ impl NativeTaskExecutionHost {
                     self.result_retained_limits.per_process().get(),
                 )
                 .map_err(host_failure)?;
-                let channel = novarocks_worker::root_result_channel::RootResultChannel::try_open(
+                preparation_child.begin_root_birth().map_err(host_failure)?;
+                let channel = match novarocks_worker::root_result_channel::RootResultChannel::try_open_with_owner_metadata(
                     novarocks_execution::runtime::fragment::io::RootResultWriteSpec {
                         task: identity,
                         contract: Arc::clone(contract),
@@ -736,17 +737,41 @@ impl NativeTaskExecutionHost {
                     Arc::clone(&self.result_retained_budget),
                     bounded_limits,
                     self.execution_runtime.execution_health(),
-                )
-                .map_err(host_failure)?;
-                Some(
-                    NativeRootResultSession::try_open_prepared(
-                        channel,
-                        &self.root_producer_pool,
-                        preparation,
-                        preparation_child,
-                    )
-                    .map_err(host_failure)?,
-                )
+                    NativePreparationChild::root_birth_metadata_bytes(),
+                ) {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        preparation_child.root_birth_refused();
+                        return Err(host_failure(error));
+                    }
+                };
+                preparation_child.record_root_birth(&channel);
+                let waker = preparation.readiness_waker();
+                if let Err(original) = channel.bind_preparation_exit_waker(waker) {
+                    // The original birth is already retained. Its real close
+                    // precedes returning this invariant refusal to rollback.
+                    channel.close(novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted);
+                    drop(original);
+                    return Err(internal_failure(NativePreparationContractFailure::new(
+                        NativePreparationReason::RootExitWakeMismatch,
+                        "Root output exit has a different original readiness source",
+                    )));
+                }
+                match NativeRootResultSession::try_open_prepared(
+                    channel.clone(),
+                    &self.root_producer_pool,
+                    preparation,
+                    preparation_child,
+                ) {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        // A session refusal after channel birth still owes an
+                        // actual sealed output. This is physical host cleanup,
+                        // never an inference from a missing child or Weak.
+                        channel.close(novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted);
+                        return Err(host_failure(error));
+                    }
+                }
             }
             _ => None,
         };
@@ -2948,6 +2973,7 @@ enum NativePreparationReason {
     ReceiverTaskInventoryPoisoned = 9623,
     ReceiverRetirementInventoryPoisoned = 9624,
     ReceiverCloseFactsMissing = 9625,
+    RootExitWakeMismatch = 9626,
 }
 #[derive(Debug)]
 struct NativePreparationContractFailure {

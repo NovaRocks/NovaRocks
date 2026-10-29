@@ -101,14 +101,12 @@ pub(crate) enum RootProducerExitStatus {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootExitRole {
-    #[cfg(test)]
     Preparation,
     Runtime,
 }
 impl RootExitRole {
     fn index(self) -> usize {
         match self {
-            #[cfg(test)]
             Self::Preparation => 0,
             Self::Runtime => 1,
         }

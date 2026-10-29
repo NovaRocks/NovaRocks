@@ -617,6 +617,7 @@ struct NativeRootPreparationChild {
     observation: RootProducerExitObservation,
     preparation_cleared: AtomicBool,
     wake: RootProducerWake,
+    readiness: std::task::Waker,
 }
 impl novarocks_worker::TaskPreparationChild for NativeRootPreparationChild {
     fn request_rollback(&self) {
@@ -624,7 +625,13 @@ impl novarocks_worker::TaskPreparationChild for NativeRootPreparationChild {
     }
     fn poll_exit(&self) -> novarocks_worker::TaskPreparationChildExit {
         use novarocks_worker::TaskPreparationChildExit as Exit;
-        let pool = self.observation.status();
+        let pool = match self
+            .observation
+            .poll(RootExitRole::Preparation, &self.readiness)
+        {
+            Ok(status) => status,
+            Err(_) => return Exit::Unresolved,
+        };
         let pool = match pool {
             RootProducerExitStatus::Pending => RootWorkExitProgress::Pending,
             RootProducerExitStatus::NoJobInstalled | RootProducerExitStatus::Exited => {
@@ -632,9 +639,14 @@ impl novarocks_worker::TaskPreparationChild for NativeRootPreparationChild {
             }
             RootProducerExitStatus::Unresolved => RootWorkExitProgress::Unresolved,
         };
-        match join_root_exit_progress(pool, self.authority.input_exit_progress()) {
+        match join_root_exit_progress(pool, self.authority.poll_input_exit(&self.readiness)) {
             RootWorkExitProgress::Pending => Exit::Pending,
-            RootWorkExitProgress::Exited => Exit::Exited,
+            // This original producer/input observation does not include this
+            // child's own metadata or retained Root data. The outer owner
+            // observes full output only after actually dropping this child.
+            RootWorkExitProgress::Exited => Exit::Exited {
+                output: novarocks_worker::TaskPreparationOutputExit::Unknown,
+            },
             RootWorkExitProgress::Unresolved => Exit::Unresolved,
         }
     }
@@ -657,12 +669,19 @@ impl NativeRootResultSession {
         let control = preparation.runtime_control();
         if control.identity() != channel.spec().task
             || preparation_child.identity() != channel.spec().task
+            || !preparation_child.root_birth_matches(&channel)
         {
             return Err(io_error(
                 novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
             ));
         }
-        Self::open_in_scope(channel, pool, control, preparation_child)
+        Self::open_in_scope(
+            channel,
+            pool,
+            control,
+            preparation_child,
+            preparation.readiness_waker(),
+        )
     }
 
     fn open_in_scope(
@@ -670,6 +689,7 @@ impl NativeRootResultSession {
         pool: &Arc<RootProducerPool>,
         failure_reporter: RootFailureReporter,
         preparation: &Arc<crate::backend_task_execution::prepared_owner::NativePreparationChild>,
+        readiness: std::task::Waker,
     ) -> Result<Arc<Self>, FragmentIoError> {
         let contract = &channel.spec().contract;
         // Every closed internal domain has its producer codec; only a scalar
@@ -736,6 +756,7 @@ impl NativeRootResultSession {
                     observation: exit.clone(),
                     preparation_cleared: AtomicBool::new(false),
                     wake: wake.clone(),
+                    readiness,
                 }));
             preparation.install_root(&mut child).map_err(io_error)?;
         }

@@ -612,6 +612,11 @@ struct PhysicalOwners {
     notification_exited: RuntimeNotify,
     // One fixed driver I/O wake; it owns no Root read or physical-exit proof.
     exit_waker: OnceLock<std::task::Waker>,
+    // Canonical producer facts live with the original physical exit record,
+    // so an output observer never infers exit from a dead channel Weak.
+    producer_started: AtomicBool,
+    producer_exited: AtomicBool,
+    closed: AtomicBool,
     segments: AtomicUsize,
     deliveries: AtomicUsize,
     retained_reservations: RootReservationPositions,
@@ -829,8 +834,6 @@ struct ChannelState {
     retiring_payloads: Option<VecDeque<RootResultData>>,
     lifetime: RootResultLifetime,
     context_owned: bool,
-    producer_started: bool,
-    producer_exited: bool,
     finishing: bool,
     failed: Option<RootFailureObservation>,
     output_rows: u64,
@@ -871,6 +874,36 @@ struct RootCoreMetadataLayout {
     bytes: usize,
     stream_backing_bytes: usize,
     payload_backing_bytes: usize,
+}
+
+/// Read-only metadata of this exact Root's original physical owners. Holding
+/// it preserves the original fixed credit, but no data, read or producer grant.
+/// It does not count itself as a fixed metadata sub-allocation.
+pub struct RootPhysicalExitObservation {
+    original: Arc<PhysicalOwners>,
+}
+impl RootPhysicalExitObservation {
+    pub fn identity(&self) -> novarocks_execution_contract::TaskIdentity {
+        self.original.task
+    }
+    pub fn belongs_to(&self, channel: &RootResultChannel) -> bool {
+        Arc::ptr_eq(&self.original, &channel.physical)
+    }
+    /// A sealed source cannot admit a later producer/read. Every condition is
+    /// an actual original owner observation, including after the channel exits.
+    pub fn output_exited(&self) -> bool {
+        self.original.closed.load(Ordering::Acquire)
+            && (!self.original.producer_started.load(Ordering::Acquire)
+                || self.original.producer_exited.load(Ordering::Acquire))
+            && self.original.segments.load(Ordering::Acquire) == 0
+            && self.original.deliveries.load(Ordering::Acquire) == 0
+            && self.original.retained_reservations.count() == 0
+            && self.original.fixed_metadata_holders.load(Ordering::Acquire) == 0
+            && !self
+                .original
+                .metadata_notification_held
+                .load(Ordering::Acquire)
+    }
 }
 
 pub struct RootResultChannel {
@@ -1006,6 +1039,17 @@ impl RootResultChannel {
         limits: WorkerResultRetainedLimits,
         health: Arc<ExecutionHealth>,
     ) -> Result<Arc<Self>, RootChannelError> {
+        Self::try_open_with_owner_metadata(spec, budget, limits, health, 0)
+    }
+    /// Account for the original host's fixed observer slot in the same Root
+    /// envelope before creating either the channel or its metadata observer.
+    pub fn try_open_with_owner_metadata(
+        spec: RootResultWriteSpec,
+        budget: Arc<ResultRetainedBudget>,
+        limits: WorkerResultRetainedLimits,
+        health: Arc<ExecutionHealth>,
+        owner_metadata_bytes: usize,
+    ) -> Result<Arc<Self>, RootChannelError> {
         spec.contract
             .validate_purpose()
             .map_err(RootChannelError::Contract)?;
@@ -1025,10 +1069,13 @@ impl RootResultChannel {
         };
         let metadata_bytes = schema_bytes
             .checked_add(layout.bytes)
+            .and_then(|bytes| bytes.checked_add(owner_metadata_bytes))
             .filter(|bytes| *bytes <= fixed)
             .ok_or_else(|| {
                 RootChannelError::Capacity(RootCapacityRefusal::bytes(
-                    schema_bytes.checked_add(layout.bytes),
+                    schema_bytes
+                        .checked_add(layout.bytes)
+                        .and_then(|bytes| bytes.checked_add(owner_metadata_bytes)),
                     Some(fixed),
                     None,
                 ))
@@ -1090,6 +1137,9 @@ impl RootResultChannel {
             metadata_notification_held: AtomicBool::new(false),
             notification_exited: RuntimeNotify::default(),
             exit_waker: OnceLock::new(),
+            producer_started: AtomicBool::new(false),
+            producer_exited: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             segments: AtomicUsize::new(0),
             deliveries: AtomicUsize::new(0),
             retained_reservations: RootReservationPositions::new(),
@@ -1123,8 +1173,6 @@ impl RootResultChannel {
                 payloads,
                 retiring_payloads: None,
                 context_owned: false,
-                producer_started: false,
-                producer_exited: false,
                 finishing: false,
                 failed: None,
                 output_rows: 0,
@@ -1268,18 +1316,20 @@ impl RootResultChannel {
             return Err(RootChannelError::Closed);
         }
         state.context_owned = true;
-        Self::try_handoff(&mut state);
+        self.try_handoff(&mut state);
         Ok(())
     }
     pub fn start_producer(self: &Arc<Self>) -> Result<RootProducerExit, RootChannelError> {
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         if !state.lifetime.allows_read() {
             return Err(RootChannelError::Closed);
         }
-        if state.producer_started {
+        if self.physical.producer_started.load(Ordering::Acquire) {
             return Err(RootChannelError::Producer);
         }
-        state.producer_started = true;
+        self.physical
+            .producer_started
+            .store(true, Ordering::Release);
         Ok(RootProducerExit {
             channel: Arc::clone(self),
         })
@@ -1503,8 +1553,11 @@ impl RootResultChannel {
         Ok(Some(RootOwnershipSnapshot {
             channels: 1,
             terminal_task_records: 0, // The registry owns this independent fact.
-            producers_running: usize::from(state.producer_started && !state.producer_exited),
-            producers_exited: usize::from(state.producer_exited),
+            producers_running: usize::from(
+                self.physical.producer_started.load(Ordering::Acquire)
+                    && !self.physical.producer_exited.load(Ordering::Acquire),
+            ),
+            producers_exited: usize::from(self.physical.producer_exited.load(Ordering::Acquire)),
             ends_published: usize::from(stream.end_sequence.is_some()),
             ends_acknowledged: usize::from(
                 stream
@@ -1533,12 +1586,24 @@ impl RootResultChannel {
             .state
             .lock()
             .expect("original Root producer retirement");
-        (!state.producer_started || state.producer_exited)
+        (!self.physical.producer_started.load(Ordering::Acquire)
+            || self.physical.producer_exited.load(Ordering::Acquire))
             && state.lifetime.validate_task_retirement().is_ok()
     }
+    pub fn physical_exit_observation(&self) -> RootPhysicalExitObservation {
+        RootPhysicalExitObservation {
+            original: self.physical.clone(),
+        }
+    }
+    pub fn bind_preparation_exit_waker(
+        &self,
+        waker: std::task::Waker,
+    ) -> Result<(), std::task::Waker> {
+        self.bind_exit_waker(waker)
+    }
     pub fn physical_idle(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        (!state.producer_started || state.producer_exited)
+        (!self.physical.producer_started.load(Ordering::Acquire)
+            || self.physical.producer_exited.load(Ordering::Acquire))
             && self.physical.segments.load(Ordering::Acquire) == 0
             && self.physical.deliveries.load(Ordering::Acquire) == 0
             && self.physical.retained_reservations.count() == 0
@@ -1583,6 +1648,7 @@ impl RootResultChannel {
     pub fn seal_reads(&self, reason: RootRetentionClose) {
         let mut state = self.state.lock().unwrap();
         state.lifetime.close(reason);
+        self.physical.closed.store(true, Ordering::Release);
         self.physical.retained_reservations.close();
         state.stream.seal();
         if state.retiring_payloads.is_none() {
@@ -1798,9 +1864,9 @@ impl RootResultChannel {
             outcome,
         }
     }
-    fn try_handoff(state: &mut ChannelState) {
+    fn try_handoff(&self, state: &mut ChannelState) {
         if state.context_owned
-            && state.producer_exited
+            && self.physical.producer_exited.load(Ordering::Acquire)
             && state.lifetime.end().is_some()
             && state.lifetime.allows_read()
         {
@@ -1828,7 +1894,10 @@ impl RootProducerExit {
         self,
     ) -> Option<novarocks_execution::runtime::fragment::ExecutionFailure> {
         let mut state = self.channel.state.lock().unwrap();
-        state.producer_exited = true;
+        self.channel
+            .physical
+            .producer_exited
+            .store(true, Ordering::Release);
         state.lifetime.encoder_exited();
         let failure = if state.lifetime.end().is_none()
             && state.lifetime.allows_read()
@@ -1846,7 +1915,7 @@ impl RootProducerExit {
         } else {
             None
         };
-        RootResultChannel::try_handoff(&mut state);
+        self.channel.try_handoff(&mut state);
         drop(state);
         let failure =
             failure.map(novarocks_execution::runtime::fragment::ExecutionFailure::from_domain);
@@ -2630,7 +2699,7 @@ mod tests {
                 .code(),
             163
         );
-        assert!(channel.state.lock().unwrap().producer_exited);
+        assert!(channel.physical.producer_exited.load(Ordering::Acquire));
         assert!(!channel.physical_idle());
     }
 
@@ -3400,9 +3469,9 @@ mod tests {
         assert_eq!(extent.boundary, RepresentationBoundary::MinimumUnit);
         assert_eq!(extent.representable_prefix, None);
         assert!(fact.resource().is_none());
-        assert!(!root.state.lock().unwrap().producer_exited);
+        assert!(!root.physical.producer_exited.load(Ordering::Acquire));
         assert!(producer.finish_encoder().is_none());
-        assert!(root.state.lock().unwrap().producer_exited);
+        assert!(root.physical.producer_exited.load(Ordering::Acquire));
         assert_eq!(root.producer_state(), RootProducerState::Failed(original));
         let (root, _) = channel(FrozenRootOutput::CountOnly);
         let source = root
@@ -3475,7 +3544,7 @@ mod tests {
             // no encoder-exit fact, even with an already published End.
             assert_eq!(Arc::strong_count(&root), references);
             let state = root.state.lock().unwrap();
-            assert!(!state.producer_exited);
+            assert!(!root.physical.producer_exited.load(Ordering::Acquire));
             assert!(!state.lifetime.root_finished());
             assert!(state.failed.is_none(), "token loss is not a producer exit");
             assert_eq!(
@@ -3506,7 +3575,7 @@ mod tests {
             let with_builder = budget.retained_bytes_for_test();
             root.request_finish().unwrap();
             assert_eq!(root.producer_state(), RootProducerState::Finishing);
-            assert!(!root.state.lock().unwrap().producer_exited);
+            assert!(!root.physical.producer_exited.load(Ordering::Acquire));
             // This is a real original builder/backing exit, not an intent,
             // status flag, ACK or deadline standing in for destruction.
             drop(builder);
@@ -3515,9 +3584,9 @@ mod tests {
             // The channel author requires all builders to retire before an
             // empty End; that fact alone still cannot hand off the encoder.
             root.publish_end().unwrap();
-            assert!(!root.state.lock().unwrap().producer_exited);
+            assert!(!root.physical.producer_exited.load(Ordering::Acquire));
             assert!(producer.finish_encoder().is_none());
-            assert!(root.state.lock().unwrap().producer_exited);
+            assert!(root.physical.producer_exited.load(Ordering::Acquire));
             if !context_first {
                 assert_eq!(root.producer_state(), RootProducerState::Finishing);
                 root.mark_context_owned().unwrap();
@@ -3553,7 +3622,7 @@ mod tests {
         root.publish_end().unwrap();
         root.close(RootRetentionClose::ContextAborted);
         assert!(root.is_closed());
-        assert!(!root.state.lock().unwrap().producer_exited);
+        assert!(!root.physical.producer_exited.load(Ordering::Acquire));
         assert!(!root.state.lock().unwrap().lifetime.root_finished());
         assert_ne!(root.producer_state(), RootProducerState::ContextHeld);
         assert!(!root.physical_idle());
@@ -3565,7 +3634,7 @@ mod tests {
         // A cancelled encoder still must actually relinquish its inputs and
         // then explicitly finish. Closed retention never grants ContextHeld.
         assert!(producer.finish_encoder().is_none());
-        assert!(root.state.lock().unwrap().producer_exited);
+        assert!(root.physical.producer_exited.load(Ordering::Acquire));
         assert!(!root.state.lock().unwrap().lifetime.root_finished());
         assert_ne!(root.producer_state(), RootProducerState::ContextHeld);
         let snapshot = root.try_ownership_snapshot().unwrap().unwrap();

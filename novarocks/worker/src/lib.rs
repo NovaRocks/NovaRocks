@@ -89,6 +89,7 @@ mod task_proposal_ingress;
 mod task_protocol_event;
 pub use task_preparation::{
     TaskPreparationChild, TaskPreparationChildExit, TaskPreparationChildRegistrationFailure,
+    TaskPreparationOutputExit,
 };
 #[cfg(test)]
 mod task_registry;

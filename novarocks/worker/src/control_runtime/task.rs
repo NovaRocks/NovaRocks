@@ -395,6 +395,15 @@ pub(crate) enum HostInstallationOutcome {
     Refused(HostPreparationRefusal),
     WorkRefused(RuntimeError),
 }
+struct PreparationPendingWake(Arc<dyn TaskPendingNotice>);
+impl std::task::Wake for PreparationPendingWake {
+    fn wake(self: Arc<Self>) {
+        self.0.pending();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.pending();
+    }
+}
 impl TaskPreparationJob {
     /// The real Native preparation entry consumes the same queued input and
     /// original role set. It cannot construct a Task authority or reissue a
@@ -425,6 +434,7 @@ impl TaskPreparationJob {
                 &binding.children,
                 binding.cadence,
                 binding.roles,
+                std::task::Waker::from(Arc::new(PreparationPendingWake(binding.pending.clone()))),
             )
             .expect("original admitted role and child identities match the Task");
             let installed = host
@@ -2006,6 +2016,7 @@ impl ProductionPreparation {
 impl TaskHostRecord {
     pub(crate) fn trace_draining_originals(&self) {
         let status = self.resources.port.current();
+        let convergence = self.resources.port.publication().borrow().convergence();
         let production = self.resources.production.as_ref().map(|owner| {
             let state = owner.state.lock().expect("original Task drain observation");
             (
@@ -2040,6 +2051,7 @@ impl TaskHostRecord {
             .collect::<Vec<_>>();
         tracing::debug!(pid = std::process::id(), task = ?self.task,
             state = ?status.state(), installed = status.installed(), terminating = status.termination().is_some(),
+            ?convergence, output = ?status.output(),
             loader = ?self.resources.loader.as_ref().map(|loader| loader.phase()),
             preparation_body = self.resources.preparation.as_ref().map(|p| p.body_and_captures_exited()),
             preparation_report = self.resources.preparation.as_ref().map(|p| p.exit_report_retired()),
@@ -2102,13 +2114,9 @@ impl ProductionPreparation {
         host: &dyn crate::TaskExecutionHost,
         pending: &dyn TaskPendingNotice,
     ) {
-        let (descriptor, returned, no_host_call) = {
+        let (descriptor, returned) = {
             let state = self.state.lock().expect("original rollback captures");
-            (
-                state.descriptor.clone(),
-                state.terminal_return.clone(),
-                !state.host_install_attempted,
-            )
+            (state.descriptor.clone(), state.terminal_return.clone())
         };
         let mut finished = preparation.rollback_host_runtime(
             || {
@@ -2129,37 +2137,48 @@ impl ProductionPreparation {
                     // authorities are independent. A later real return wakes
                     // this same owner; do not seal it while one is still held.
                     finished = false;
-                    match returned.take_after_rollback(&proof) {
-                        Ok(Some((mut terminal, mut exit))) => {
-                            terminal.bind();
-                            exit.bind();
-                            // Failure/control proposals precede this original
-                            // role in the same causal FIFO. No replacement
-                            // terminal or physical-exit authority is minted.
-                            let _ = terminal.handoff(crate::TaskTerminalObservation {
-                                intent: crate::TaskTerminalIntent::FinishExistingTermination {
-                                    output: None,
-                                },
-                                normal_close_validated: false,
-                                // Root work requires the original whole child
-                                // registration before creation. A sealed, fully
-                                // exited scope that never registered a child
-                                // proves no output was created, including an
-                                // early stop inside the host entry checkpoint.
-                                output_released: no_host_call || proof.never_registered_child(),
-                                final_statistics: None,
-                            });
-                            exit.completed();
-                            finished = true;
-                        }
-                        Ok(None) => {}
-                        Err(
-                            crate::task_lifecycle::PreparationTerminalReturnError::AlreadyTaken,
-                        ) => {
-                            finished = true;
-                        }
-                        Err(error) => {
-                            tracing::error!(?error, "Original preparation terminal return failed");
+                    if proof.output_exit() == crate::TaskPreparationOutputExit::Unknown {
+                        // Actual child/capture exit does not prove output exit.
+                        // Retain both original terminal authorities and the
+                        // original P/payment under the same unresolved owner.
+                        children.output_exit_unresolved();
+                    } else {
+                        match returned.take_after_rollback(&proof) {
+                            Ok(Some((mut terminal, mut exit))) => {
+                                terminal.bind();
+                                exit.bind();
+                                // Failure/control proposals precede this original
+                                // role in the same causal FIFO. No replacement
+                                // terminal or physical-exit authority is minted.
+                                let _ = terminal.handoff(crate::TaskTerminalObservation {
+                                    intent: crate::TaskTerminalIntent::FinishExistingTermination {
+                                        output: None,
+                                    },
+                                    normal_close_validated: false,
+                                    // Only the same original physical Poll's
+                                    // positive output fact authorizes this field.
+                                    output_released: matches!(
+                                        proof.output_exit(),
+                                        crate::TaskPreparationOutputExit::NoOutputCreated
+                                            | crate::TaskPreparationOutputExit::ActualOutputExited
+                                    ),
+                                    final_statistics: None,
+                                });
+                                exit.completed();
+                                finished = true;
+                            }
+                            Ok(None) => {}
+                            Err(
+                                crate::task_lifecycle::PreparationTerminalReturnError::AlreadyTaken,
+                            ) => {
+                                finished = true;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    ?error,
+                                    "Original preparation terminal return failed"
+                                );
+                            }
                         }
                     }
                 }
@@ -2325,6 +2344,13 @@ impl TaskPreparationJob {
                 &binding.children,
                 binding.cadence,
                 binding.roles,
+                std::task::Waker::from(
+                    owner
+                        .root_wake
+                        .as_ref()
+                        .expect("original preparation Root readiness source")
+                        .clone(),
+                ),
             )
             .expect("same original preparation roles");
             let prepared = (|| {

@@ -26,6 +26,7 @@ use super::{
     context_ready::{ContextReadyError, ContextReadyNotice},
     control_request::ControlRequestNotice,
     establish_ingress::ValidatedMaterializationSource,
+    failure::ScopePublicationsDrained,
     preparation::{HostFairnessGroup, QueuedPreparation},
 };
 use crate::{
@@ -34,7 +35,9 @@ use crate::{
 };
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError, EffectTicket, InputPermit, InputRole, InputRoleId},
+    driver::{
+        ActorRuntime, DriverError, EffectTicket, InputPermit, InputPhase, InputRole, InputRoleId,
+    },
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
     lease::{WorkLease, WorkRetirementObserver},
     notify::Notify,
@@ -186,6 +189,16 @@ struct State {
     fault: Option<ContextHostReturned>,
     creator: Option<Creator>,
     removal: Option<OriginalRemoval>,
+    failed_return_cursor: usize,
+    failed_retirement_cursor: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FailedHostReturnProgress {
+    pub units: usize,
+    pub observed: usize,
+    pub settled: usize,
+    pub waiting: bool,
 }
 /// This receipt is created only by validating the actual Root effect against
 /// this same custodian. The pre-admitted H role owns the resulting cleanup
@@ -272,6 +285,18 @@ impl ContextHostJobs {
     pub(super) fn belongs_to(&self, runtime: &ActorRuntime<WorkerActor>, control: ActorId) -> bool {
         self.0.runtime.same_runtime(runtime) && self.0.control == control
     }
+    pub(super) fn belongs_to_context(
+        &self,
+        runtime: &ActorRuntime<WorkerActor>,
+        actor: ActorId,
+        context: QueryContextRef,
+        scope: &ScopeHandle,
+    ) -> bool {
+        self.0.runtime.same_runtime(runtime)
+            && self.0.actor == actor
+            && self.0.context == context
+            && self.0.scope.same_scope(scope)
+    }
     pub(super) fn materialization_key(&self) -> (ScopeId, WorkId) {
         (
             self.0.scope.id(),
@@ -332,6 +357,8 @@ impl ContextHostJobs {
                 fault: None,
                 creator: None,
                 removal: None,
+                failed_return_cursor: 0,
+                failed_retirement_cursor: 0,
             }),
             retained: Mutex::new(None),
         });
@@ -641,6 +668,25 @@ impl ContextHostJobs {
         self.wake();
         Ok(())
     }
+    /// The original failed-owner stage replaces only the lost Core's release
+    /// instruction. The caller still closes actual Task/Root borrowers before
+    /// taking R; its original authority and physical return remain mandatory.
+    pub(crate) fn request_failed_release(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+    ) -> Result<(), ContextHostJobError> {
+        stage.validate(&self.0.runtime, self.0.actor)?;
+        let changed = {
+            let mut state = self.0.state.lock().expect("failed Context release request");
+            let changed = !state.release_requested;
+            state.release_requested = true;
+            changed
+        };
+        if changed {
+            self.wake();
+        }
+        Ok(())
+    }
     pub(crate) fn take_release_job(&self) -> Result<Option<ContextHostJob>, ContextHostJobError> {
         let mut state = self.0.state.lock().expect("Context release inventory");
         if !state.release_requested || state.r_issued || state.domain_borrowers != 0 {
@@ -819,6 +865,170 @@ impl ContextHostJobs {
             c.notice.notify();
         }
         Ok(delivered)
+    }
+    /// Recover the original M/R returns without filling a dead Core. A return
+    /// settles only its Core consumer: the real role, capture, observer and
+    /// header must independently exit before callback retirement can finish.
+    pub(crate) fn poll_failed_returns(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        budget: usize,
+    ) -> Result<FailedHostReturnProgress, ContextHostJobError> {
+        stage.validate(&self.0.runtime, self.0.actor)?;
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .expect("failed Context original returns");
+        let mut progress = FailedHostReturnProgress::default();
+        for _ in 0..budget.min(3) {
+            let index = state.failed_return_cursor;
+            state.failed_return_cursor = (index + 1) % 3;
+            progress.units += 1;
+            let call = match index {
+                0 => &mut state.m,
+                1 => &mut state.r,
+                _ => &mut state.h,
+            };
+            if call.returned.is_none() {
+                call.returned = call.reader.try_take()?;
+                progress.observed += usize::from(call.returned.is_some());
+            }
+            let Some(outcome) = &call.returned else {
+                progress.waiting |= !call.retired;
+                continue;
+            };
+            if matches!(
+                outcome,
+                ContextHostReturned::Panicked | ContextHostReturned::StartRefused(_)
+            ) {
+                state.fault = Some(outcome.clone());
+                progress.waiting = true;
+                continue;
+            }
+            if call.delivered && (index == 2 || call.core_consumed) {
+                continue;
+            }
+            if index != 2 && !call.core_consumed {
+                let consumer = ConsumerId::new(1).expect("original Context Core consumer");
+                if call.report.consumption(consumer)?
+                    == novarocks_control_runtime_core::completion::Consumption::Pending
+                {
+                    let input = call.input.as_ref().ok_or(ContextHostJobError::WrongPhase)?;
+                    match input.in_flight()? {
+                        Some(input) => {
+                            let receipt = self
+                                .0
+                                .runtime
+                                .input_custody(self.0.actor, input)?
+                                .ok_or(ContextHostJobError::WrongPhase)?;
+                            match receipt.phase {
+                                InputPhase::Committed => call.report.consume(consumer)?,
+                                InputPhase::AbandonedByOwnerFailure => {
+                                    call.report.abandon_failed_owner(
+                                        consumer,
+                                        &self.0.scope,
+                                        self.0.generation,
+                                    )?
+                                }
+                                _ => {
+                                    progress.waiting = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        None if !call.delivered => call.report.abandon_failed_owner(
+                            consumer,
+                            &self.0.scope,
+                            self.0.generation,
+                        )?,
+                        None => return Err(ContextHostJobError::WrongPhase),
+                    }
+                }
+                call.core_consumed = true;
+            }
+            // This records the original return's disposition, not body or
+            // capture exit and not successful execution by the failed Core.
+            call.delivered = true;
+            progress.settled += 1;
+        }
+        drop(state);
+        if progress.observed != 0 || progress.settled != 0 {
+            self.wake();
+        }
+        Ok(progress)
+    }
+    /// Visit at most two original callbacks in round-robin order. Each visit
+    /// reaps at most one real ready header; waiting holders never self-wake.
+    pub(crate) fn retire_failed_callbacks(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        budget: usize,
+    ) -> Result<bool, ContextHostJobError> {
+        stage.validate(&self.0.runtime, self.0.actor)?;
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .expect("failed Context callback retirement");
+        let mut progressed = false;
+        for _ in 0..budget.min(2) {
+            let index = state.failed_retirement_cursor;
+            state.failed_retirement_cursor = (index + 1) % 2;
+            let call = if index == 0 {
+                &mut state.m
+            } else {
+                &mut state.r
+            };
+            if call.retired
+                || !call.delivered
+                || !call.core_consumed
+                || !matches!(
+                    call.role.phase(),
+                    ExitRolePhase::Exited | ExitRolePhase::Retired
+                )
+            {
+                continue;
+            }
+            if !call.closed {
+                let input = call.input.as_mut().ok_or(ContextHostJobError::WrongPhase)?;
+                if let Some(id) = input.in_flight()? {
+                    match self.0.runtime.retire_input(self.0.actor, id) {
+                        Ok(()) => {}
+                        Err(
+                            DriverError::InputStillQueued
+                            | DriverError::EffectsRemain
+                            | DriverError::ReservationsRemain,
+                        ) => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                input.close_after_exit()?;
+                call.closed = true;
+                progressed = true;
+            }
+            if !call.observer_consumed {
+                call.report
+                    .consume(ConsumerId::new(2).expect("original Context host consumer"))?;
+                call.observer_consumed = true;
+                progressed = true;
+            }
+            let phase = call.role.phase();
+            if phase != ExitRolePhase::Retired && !call.role.try_retire()? {
+                continue;
+            }
+            progressed |= phase != call.role.phase();
+            if !call.retirement.is_retired() {
+                progressed |= self.0.ledger.reap_scope_ready(self.0.scope.id(), 1)? != 0;
+            }
+            call.retired = call.retirement.is_retired();
+        }
+        let retired = state.m.retired && state.r.retired;
+        drop(state);
+        if progressed {
+            self.wake();
+        }
+        Ok(retired)
     }
     fn retire_call(&self, call: &mut Call, core: bool) -> Result<bool, ContextHostJobError> {
         if call.retired {
