@@ -22,6 +22,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(test)]
 use arrow_array::{Array, Int64Array};
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_cluster_harness::test_sessions::{
@@ -33,7 +34,7 @@ use novarocks_types::{BackendProcessId, FrontendProcessId};
 use prost::Message;
 use serde_json::json;
 
-use super::native_compatibility::{raw_operation_envelope, raw_unary};
+use super::native_compatibility::raw_operation_envelope;
 use super::native_creation::{
     RawBackendSession, RawCreate, RawSink, compiled_fragment, observe_task_terminal_and_stopped,
     outcome, receipt_verdict, session_control,
@@ -487,7 +488,7 @@ fn receiver(
         1,
         Some((edge, multicast)),
         if result {
-            RawSink::Result
+            RawSink::ClientRows
         } else {
             RawSink::CountOnly
         },
@@ -577,91 +578,130 @@ fn fetch_rows(
     session: &RawBackendSession,
     identity: &proto::TaskIdentity,
 ) -> Result<Vec<i64>> {
+    use novarocks_execution_contract::root_result::RootReadOutcome;
+    use novarocks_proto_models::result as result_proto;
+    use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor, RootProfileV1};
+
+    let request = |wanted_sequence, consumed_sequence| proto::FetchRootResultRequest {
+        root_task: Some(identity.clone()),
+        profile_id: 1,
+        output_kind: Some(result_proto::RootOutputKind {
+            kind: Some(result_proto::root_output_kind::Kind::ClientRows(true)),
+        }),
+        wanted_sequence,
+        consumed_sequence,
+        max_wait_millis: 100,
+    };
+    let profile = ClientRowProfile::try_new(
+        RootProfileV1::SEGMENT_BYTES,
+        RootProfileV1::ROW_PAYLOAD_BYTES,
+    )?;
     let mut rows = Vec::new();
-    let mut sequence = 0;
-    let mut acknowledged_packet_sequence = None;
-    let mut accepted_eos = false;
-    loop {
-        context.remaining("fetch exact B data and EOS")?;
-        let response: proto::FetchResultResponse = raw_unary(
-            session.connector.clone(),
-            "/novarocks.NovaRocksGrpc/FetchTaskResult",
-            &session.authorization,
-            proto::FetchTaskResultRequest {
-                root_task: Some(identity.clone()),
-                max_wait_millis: 100,
-                acknowledged_packet_sequence,
-                max_result_bytes: 1024 * 1024,
-            },
-            context.deadline(),
+    let mut cursor = ClientRowStreamCursor::new();
+    let mut row = Vec::new();
+    let mut wanted = 1;
+    let mut consumed = 0;
+    let deadline = context.deadline();
+    let end = loop {
+        context.remaining("fetch exact B RootV1 data and End")?;
+        let (reply, _) = super::result_delivery_root_protocol::probe(
+            context,
+            session.index,
+            &request(Some(wanted), consumed),
+            consumed,
+            deadline,
         )?;
         ensure!(
-            response.status != proto::fetch_result_response::Status::Error as i32,
-            "B result failed: {}",
-            response.message
+            reply.accepted_consumed == consumed,
+            "B RootV1 did not acknowledge the exact consumed prefix: {reply:?}"
         );
-        if response.status == proto::fetch_result_response::Status::NotReady as i32 {
-            continue;
-        }
-        if response.status == proto::fetch_result_response::Status::Eof as i32 {
-            ensure!(
-                accepted_eos
-                    && response.eos
-                    && response.result_arrow_ipc.is_empty()
-                    && acknowledged_packet_sequence == Some(u64::try_from(response.packet_seq)?),
-                "B EOF did not settle the exact acknowledged EOS packet: {response:?}"
-            );
-            return Ok(rows);
-        }
-        ensure!(
-            !accepted_eos && response.status == proto::fetch_result_response::Status::Ready as i32,
-            "B returned an invalid result status: {response:?}"
-        );
-        ensure!(
-            response.packet_seq == sequence,
-            "B packet sequence changed: expected {sequence}, got {}",
-            response.packet_seq
-        );
-        sequence += 1;
-        if !response.result_arrow_ipc.is_empty() {
-            // Decode the public NRX1 result envelope independently of the
-            // execution implementation, then use the standard Arrow client.
-            let wire = response.result_arrow_ipc.as_ref();
-            ensure!(
-                wire.len() >= 14 && &wire[..4] == b"NRX1",
-                "B result envelope is missing"
-            );
-            ensure!(
-                wire[4] == 1 && wire[5] == 1,
-                "B result envelope version or flags differ"
-            );
-            ensure!(
-                u32::from_le_bytes(wire[6..10].try_into()?) == 1,
-                "B returned another schema"
-            );
-            ensure!(
-                // LocalCompiler allocates the sole receiver channel from slot zero.
-                u32::from_le_bytes(wire[10..14].try_into()?) == 0,
-                "B result slot differs"
-            );
-            let chunks =
-                arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(&wire[14..]), None)?;
-            for chunk in chunks {
-                let chunk = chunk?;
-                ensure!(chunk.columns().len() == 1, "B returned another schema");
-                let values = chunk.columns()[0]
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .context("B column is not BIGINT")?;
-                ensure!(values.null_count() == 0, "B introduced NULLs");
-                rows.extend(values.values().iter().copied());
+        match reply.outcome {
+            RootReadOutcome::NotReady => {
+                thread::sleep(context.remaining("await exact B RootV1 packet")?.min(POLL));
             }
+            RootReadOutcome::Data(data) => {
+                ensure!(
+                    data.sequence().get() == wanted,
+                    "B RootV1 data sequence changed"
+                );
+                let body = cursor.validate_body(profile, data.body())?;
+                for span in body.payload_spans() {
+                    if let Some(length) = span.starts_row {
+                        // I64 ScalarText has at most 20 text bytes plus its
+                        // single MySQL length byte. This is the frozen fixture
+                        // type, not an inferred Arrow slot or new product cap.
+                        ensure!(
+                            row.is_empty() && length.get() <= 21,
+                            "B RootV1 row does not match its frozen single I64 occurrence"
+                        );
+                    }
+                    row.extend_from_slice(span.bytes);
+                    ensure!(
+                        row.len() <= 21,
+                        "B RootV1 exceeded its signed I64 row width"
+                    );
+                    if span.completes_row {
+                        let length = usize::from(*row.first().context("empty B RootV1 row")?);
+                        ensure!(
+                            (1..=20).contains(&length) && row.len() == length + 1,
+                            "B RootV1 row is NULL or not exactly one signed I64 cell"
+                        );
+                        let value = std::str::from_utf8(&row[1..])?
+                            .parse::<i64>()
+                            .context("B RootV1 cell is not signed BIGINT text")?;
+                        rows.push(value);
+                        row.clear();
+                    }
+                }
+                cursor = body.after();
+                // Offering an inline End is not a client consumption ACK.
+                // Still fetch its actual sequence before the separate ACK R.
+                if let Some(end) = data.end_after_data() {
+                    ensure!(
+                        end.sequence.get()
+                            == wanted
+                                .checked_add(1)
+                                .context("B RootV1 sequence overflow")?,
+                        "B inline End is not after its actual data packet"
+                    );
+                }
+                consumed = data.sequence().get();
+                wanted = consumed
+                    .checked_add(1)
+                    .context("B RootV1 sequence overflow")?;
+            }
+            RootReadOutcome::End(end) => {
+                ensure!(
+                    end.sequence.get() == wanted,
+                    "B RootV1 End sequence changed"
+                );
+                cursor.validate_end()?;
+                ensure!(
+                    row.is_empty()
+                        && end.output_rows == u64::try_from(rows.len())?
+                        && rows.as_slice() == ROWS,
+                    "B RootV1 End changed its exact five rows or ended a partial row: {rows:?}"
+                );
+                break end;
+            }
+            other => bail!("B RootV1 did not return its actual data or End: {other:?}"),
         }
-        // Acknowledge only after exact sequence and typed payload validation.
-        // The final EOS is also acknowledged before waiting on real stop.
-        acknowledged_packet_sequence = Some(u64::try_from(response.packet_seq)?);
-        accepted_eos = response.eos;
-    }
+    };
+    // Only this actually observed, fully consumed End authorizes advancing the
+    // FE frontier. A separate ACK-only R must return its real receipt.
+    let (ack, _) = super::result_delivery_root_protocol::probe(
+        context,
+        session.index,
+        &request(None, end.sequence.get()),
+        end.sequence.get(),
+        deadline,
+    )?;
+    ensure!(
+        matches!(ack.outcome, RootReadOutcome::AckOnly)
+            && ack.accepted_consumed == end.sequence.get(),
+        "B RootV1 did not settle the exact acknowledged End: {ack:?}"
+    );
+    Ok(rows)
 }
 
 fn await_normal_close_marker(

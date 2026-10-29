@@ -800,6 +800,8 @@ impl WorkerTaskControl {
 /// the real external reply exits. Both variants carry the Core's original body.
 #[must_use = "Retain the actual read delivery through response projection and send"]
 pub struct WorkerTaskReadDelivery {
+    // The original loan returns before its external endpoint is ended.
+    payload: Option<super::task_read_payload::DynamicFilterReadDelivery>,
     original: TaskReadDelivery,
 }
 enum TaskReadDelivery {
@@ -807,6 +809,16 @@ enum TaskReadDelivery {
     Sealed(RequestDelivery<WorkerContextReplyBody>),
 }
 impl WorkerTaskReadDelivery {
+    pub fn dynamic_filter_payload(
+        &self,
+    ) -> Option<(
+        novarocks_execution_contract::DomainVersion,
+        &dyn novarocks_execution_contract::task_execution::domain::CodecOwnedContent,
+    )> {
+        self.payload
+            .as_ref()
+            .map(|loan| (loan.version(), loan.payload()))
+    }
     pub fn operation(&self) -> TaskOperationId {
         match &self.original {
             TaskReadDelivery::Live(original) => original.request().operation,
@@ -829,18 +841,42 @@ impl WorkerTaskControl {
         command: ContextCommand,
     ) -> Result<WorkerTaskReadDelivery, WorkerRequestError> {
         use super::node::NodeTaskReadHandle;
-        let original = match self
+        let (original, payload) = match self
             .node
             .submit_task_read(context, operation, deadline, command)?
         {
-            NodeTaskReadHandle::Live(handle) => {
-                TaskReadDelivery::Live(handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?)
+            NodeTaskReadHandle::Live(handle, shared) => {
+                let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
+                let payload = match &shared {
+                    Some(shared) => shared
+                        .take_ready()
+                        .map_err(|_| WorkerRequestError::OwnerFailed)?,
+                    None => None,
+                };
+                match (original.body(), &payload) {
+                    (
+                        WorkerContextReplyBody::ReadPayload {
+                            version,
+                            payload: id,
+                            ..
+                        },
+                        Some(loan),
+                    ) if *version == loan.version() && *id == loan.payload_id() => {}
+                    (WorkerContextReplyBody::ReadPayload { .. }, _) | (_, Some(_)) => {
+                        return Err(WorkerRequestError::OwnerFailed);
+                    }
+                    _ => {}
+                }
+                (TaskReadDelivery::Live(original), payload)
             }
-            NodeTaskReadHandle::Sealed(handle) => {
-                TaskReadDelivery::Sealed(handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?)
-            }
+            NodeTaskReadHandle::Sealed(handle) => (
+                TaskReadDelivery::Sealed(
+                    handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?,
+                ),
+                None,
+            ),
         };
-        Ok(WorkerTaskReadDelivery { original })
+        Ok(WorkerTaskReadDelivery { payload, original })
     }
     pub async fn get_final_task_info(
         &self,

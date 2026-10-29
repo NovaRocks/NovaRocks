@@ -78,6 +78,9 @@ impl ContextHostRecord {
             ContextDriverError::Dispatch(DispatchError::OwnerFailed) => true,
             ContextDriverError::Driver(error)
             | ContextDriverError::Task(TaskDriverError::Driver(error))
+            | ContextDriverError::Task(TaskDriverError::Request(super::requests::ContextRequestError::Driver(error)))
+            | ContextDriverError::Task(TaskDriverError::DynamicFilter(crate::control_runtime::dynamic_filters::DynamicFilterError::Driver(error)))
+            | ContextDriverError::Task(TaskDriverError::Request(super::requests::ContextRequestError::DynamicFilter(crate::control_runtime::dynamic_filters::DynamicFilterError::Driver(error))))
             | ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Driver(error)))
             | ContextDriverError::Host(ContextHostJobError::Driver(error))
             | ContextDriverError::HostProgress(ContextHostProgressError::Host(ContextHostJobError::Driver(error)))
@@ -88,7 +91,10 @@ impl ContextHostRecord {
             ))) => true,
             ContextDriverError::Task(TaskDriverError::DynamicFilter(
                 crate::control_runtime::dynamic_filters::DynamicFilterError::FailurePublicationRequired,
-            )) => true,
+            ))
+            | ContextDriverError::Task(TaskDriverError::Request(super::requests::ContextRequestError::DynamicFilter(
+                crate::control_runtime::dynamic_filters::DynamicFilterError::FailurePublicationRequired,
+            ))) => true,
             _ => false,
         }
     }

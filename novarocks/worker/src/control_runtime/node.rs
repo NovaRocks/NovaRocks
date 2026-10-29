@@ -103,7 +103,10 @@ struct ContextRows {
     removed_ready: VecDeque<QueryContextRef>,
 }
 pub(crate) enum NodeTaskReadHandle {
-    Live(super::context_host::TaskContextRequestHandle),
+    Live(
+        super::context_host::TaskContextRequestHandle,
+        Option<Arc<super::task_read_payload::TaskReadPayloadShared>>,
+    ),
     Sealed(super::context_host::ContextRequestHandle),
 }
 pub(crate) enum NodeCreateHandle {
@@ -290,8 +293,18 @@ impl WorkerNodeHost {
                 .map_err(|original| {
                     NodeHostRefusal::new("Task causal read R admission", original)
                 })?;
+            let read_payload = if matches!(&command, ContextCommand::GetDynamicFilters { .. }) {
+                Some(
+                    host.attach_dynamic_filter_read(work, task)
+                        .map_err(|original| {
+                            NodeHostRefusal::new("Task RF original R read cell", original)
+                        })?,
+                )
+            } else {
+                None
+            };
             match host.submit_request(work, command) {
-                Ok(()) => Ok(NodeTaskReadHandle::Live(handle)),
+                Ok(()) => Ok(NodeTaskReadHandle::Live(handle, read_payload)),
                 Err(original) => Err(NodeHostRefusal::new(
                     "Task causal read original handoff",
                     (original, handle),

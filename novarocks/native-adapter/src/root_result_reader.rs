@@ -319,7 +319,7 @@ impl NativeRootResultReader {
             request,
         ) {
             Ok(read) => read,
-            Err(error) => return worker_refusal(request, error),
+            Err(error) => return worker_refusal(request, error, "begin"),
         };
         tracing::debug!(task = ?request.root_task(), wanted = ?request.wanted(), consumed = request.consumed(), data_wait = ?request.max_wait(), deadline = ?deadline, "Native Root admitted original read");
         // ACK retires queue ownership before data-copy admission. It cannot
@@ -393,7 +393,7 @@ impl NativeRootResultReader {
         };
         let delivery = match admitted.read().await {
             Ok(delivery) => delivery,
-            Err(error) => return worker_refusal(request, error),
+            Err(error) => return worker_refusal(request, error, "read"),
         };
         let (mut reply, guard, drain) = delivery.into_parts();
         tracing::debug!(task = ?request.root_task(), consumed = request.consumed(), accepted = reply.accepted_consumed, drain = drain.is_some(), "Native Root read returned original delivery");
@@ -464,13 +464,31 @@ fn refusal(request: &RootResultRead, cause: RootChannelError) -> NativeRootReadR
         request, fact, detail,
     )))
 }
-fn worker_refusal(request: &RootResultRead, cause: WorkerRootReadError) -> NativeRootReadResponse {
+fn worker_refusal(
+    request: &RootResultRead,
+    cause: WorkerRootReadError,
+    phase: &'static str,
+) -> NativeRootReadResponse {
     if let Some(reason) = cause.deferral() {
         return deferred(request, reason);
     }
+    let fact = cause.failure_fact();
+    // Worker Display contains its neutral error kind, never retained payloads.
+    tracing::info!(
+        pid = std::process::id(),
+        phase,
+        task = ?request.root_task(),
+        wanted = ?request.wanted(),
+        consumed = request.consumed(),
+        data_wait = ?request.max_wait(),
+        kind = ?cause.kind(),
+        error = %cause,
+        failure = ?fact,
+        "Native Root read refused by original Worker owner"
+    );
     NativeRootReadResponse::Refused(Box::new(RootReadRefusal::for_request(
         request,
-        cause.failure_fact(),
+        fact,
         SafeDetail::truncating("root read was refused by its original Worker owner"),
     )))
 }

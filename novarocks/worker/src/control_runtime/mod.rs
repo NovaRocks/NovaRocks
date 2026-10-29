@@ -70,3 +70,4 @@ pub(crate) mod source_slot_issuer;
 
 pub(crate) mod task_disposal;
 pub(crate) mod task_host_call;
+pub(crate) mod task_read_payload;

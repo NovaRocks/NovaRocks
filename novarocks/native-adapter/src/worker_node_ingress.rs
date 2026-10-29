@@ -690,9 +690,29 @@ impl crate::task_protocol::TaskExecutionIngress for WorkerNodeTaskIngress {
                 OperationOutcome::Idempotent,
             )) => crate::task_protocol::encode_dynamic_filter_read(request.identity(), None)
                 .map_err(host_rejection_status),
-            WorkerContextReplyBody::ReadPayload { .. } => Err(Status::unimplemented(
-                "original dynamic-filter payload loan and physical projection are not connected",
-            )),
+            WorkerContextReplyBody::ReadPayload { version, .. } => {
+                let (selected, payload) = original.dynamic_filter_payload().ok_or_else(|| {
+                    Status::internal("the original selected dynamic-filter loan is missing")
+                })?;
+                if selected != *version {
+                    return Err(Status::internal(
+                        "the original dynamic-filter loan version differs from its Core reply",
+                    ));
+                }
+                // Codec getters run on this original RPC thread, outside the
+                // Context/Task/store locks. `original` retains the same R pin.
+                let domain = novarocks_task_codec::domain::encode_task_dynamic_filter_domain(
+                    selected, payload,
+                )
+                .map_err(|error| Status::internal(error.to_string()))?;
+                Ok(proto::FetchTaskDynamicFiltersResponse {
+                    identity: Some(novarocks_task_codec::identity::encode_task_identity(
+                        request.identity(),
+                    )),
+                    version: selected.get(),
+                    domains: vec![domain],
+                })
+            }
             WorkerContextReplyBody::Verdict(WorkerRequestResult::Outcome(_))
             | WorkerContextReplyBody::Domain(_) => Err(Status::failed_precondition(
                 "the original Worker refused the dynamic-filter read",

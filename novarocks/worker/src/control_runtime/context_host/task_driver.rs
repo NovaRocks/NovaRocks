@@ -291,6 +291,30 @@ impl ContextHostRecord {
         if ticket.actor != self.actor {
             return Err(reject(TaskDriverError::WrongOwner, ticket));
         }
+        if let WorkerAction::Context(ContextEffect::PrepareReadPayload { task, .. }) =
+            &ticket.effect
+        {
+            let task = *task;
+            let effect = crate::control_runtime::effect_dispatch::EffectRef {
+                input: ticket.input,
+                action: ticket.descriptor.id,
+            };
+            if let Err(error) = self.prepare_dynamic_filter_read(&ticket) {
+                return Err(reject(TaskDriverError::Request(error), ticket));
+            }
+            self.complete_host_effect(ticket).map_err(|refusal| {
+                reject(TaskDriverError::Driver(refusal.error), refusal.ticket)
+            })?;
+            // Actual completion releases this original Task position AND
+            // acknowledges the original reply's declared predecessor.
+            return self
+                .dispatch
+                .task_preparation_completed(task, effect)
+                .map_err(|error| TaskDriverRefusal {
+                    error: TaskDriverError::Dispatch(error),
+                    ticket: None,
+                });
+        }
         if let WorkerAction::Context(ContextEffect::LoadInput { task, payload, .. }) =
             &ticket.effect
         {
@@ -595,6 +619,13 @@ impl ContextHostRecord {
                     ticket,
                 ));
             };
+            if !finalize_execution_only {
+                if let Some(filters) = owner.dynamic_filters() {
+                    if let Err(error) = filters.close_read_admission(&ticket) {
+                        return Err(reject(TaskDriverError::DynamicFilter(error), ticket));
+                    }
+                }
+            }
             let disposal_authorization = if !finalize_execution_only {
                 match owner.authorize_normal_disposal(&ticket) {
                     Ok(original) => Some(original),
@@ -2100,13 +2131,19 @@ impl ContextHostRecord {
         {
             return Ok(());
         }
+        let owner = match self.take_task(task) {
+            Ok(owner) => owner,
+            // A completed Task read seal does not remove the original R's
+            // final routing address. Its actual deletion wakes this Task.
+            Err(ContextHostError::TaskStillOwned) => return Ok(()),
+            Err(error) => return Err(TaskDriverError::Task(error)),
+        };
         // The same original pending object routes late physical tails only
         // to the Context after its real Task inventory closes. This is a
         // positive ownership transition, never a missing-Task fallback.
         if let Some(notice) = self.task_driver.notices.get(&task) {
             notice.retire_to_context();
         }
-        let owner = self.take_task(task).map_err(TaskDriverError::Task)?;
         self.task_driver.notices.remove(&task);
         let resources = match owner {
             super::TaskHostOwner::Ready(owner) | super::TaskHostOwner::Initializing(owner) => {

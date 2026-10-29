@@ -992,14 +992,15 @@ struct AttemptReacquiredTableKey {
     metadata_identity: String,
 }
 
-/// Provider-private capability cache for one admitted attempt.
+/// Provider-private, resource-free access facts for one admitted attempt.
 ///
-/// Attempt initialization opens sources serially. Keeping the cache in the
-/// shared request scope makes repeated frozen scans reuse one current
-/// capability without allowing that capability to cross an attempt boundary.
+/// Attempt initialization opens sources serially. The original reacquisition
+/// registers its lease once; repeated frozen scans reuse those exact facts.
+/// Request-bound FileIO must stay outside this scope-owned cache, otherwise
+/// its request context would retain the cache that owns it.
 #[derive(Default)]
 struct AttemptReacquiredTableCache {
-    tables: Mutex<BTreeMap<AttemptReacquiredTableKey, IcebergPhysicalTable>>,
+    tables: Mutex<BTreeMap<AttemptReacquiredTableKey, IcebergAttemptTableAccess>>,
 }
 
 impl AttemptReacquiredTableCache {
@@ -1007,7 +1008,7 @@ impl AttemptReacquiredTableCache {
         &self,
         key: AttemptReacquiredTableKey,
         reacquire: impl std::future::Future<Output = Result<IcebergPhysicalTable, ConnectorError>>,
-    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+    ) -> Result<IcebergAttemptTableAccess, ConnectorError> {
         if let Some(table) = self
             .tables
             .lock()
@@ -1017,7 +1018,9 @@ impl AttemptReacquiredTableCache {
         {
             return Ok(table);
         }
-        let table = reacquire.await?;
+        // Freeze and destroy the actual request-bound FileIO before taking
+        // the cache lock. Only the original immutable access facts may enter it.
+        let table = IcebergAttemptTableAccess::freeze(reacquire.await?);
         let mut unused = Some(table);
         let table = {
             let mut original = self
@@ -1063,7 +1066,7 @@ impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
                 table: self.name.clone(),
                 metadata_identity: self.access.access().request_cache_identity(),
             };
-            let physical = cache
+            let access = cache
                 .get_or_reacquire(key, async {
                     self.template
                         .runtime
@@ -1077,6 +1080,14 @@ impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
                         .map_err(|(kind, message)| ConnectorError::new(kind, message))
                 })
                 .await?;
+            // The miss already registered the same attempt's vended lease.
+            // This rebuild is metadata-only: it neither renews that lease nor
+            // reloads the table, and the resulting FileIO is never cached here.
+            let resources = self.template.runtime.resources();
+            let physical = access.reacquired_request_scoped(
+                resources.planning_binding().for_request(request.clone()),
+                resources.catalog_runtime().iceberg_runtime().clone(),
+            )?;
             let boundary = Arc::new(self.template.for_request_with_pinned_table(
                 request.clone(),
                 self.name.clone(),
@@ -4837,6 +4848,13 @@ mod attempt_access_tests {
             1,
             "one attempt must reacquire an identical frozen table once"
         );
+        let resources = metadata_context.resources();
+        let second_cached = second_cached
+            .reacquired_request_scoped(
+                resources.planning_binding().for_request(attempt.clone()),
+                resources.catalog_runtime().iceberg_runtime().clone(),
+            )
+            .expect("cached access rebuilds FileIO under the same admitted request");
         assert_eq!(
             second_cached.table.metadata_location(),
             Some("s3://warehouse/data/table/metadata/v1.json"),

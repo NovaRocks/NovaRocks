@@ -19,6 +19,9 @@
 //! only real publisher/host threads dispose them. Reporter clones issue no RF
 //! capability, and a Context-held feedback sink keeps only a weak writer.
 
+mod read;
+pub(crate) use read::TaskDynamicFilterLoan;
+
 use super::{
     actors::{ContextMessage, WorkerActor, WorkerMessage},
     admitted_role::adopt_reported_work,
@@ -45,8 +48,10 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-// Pending, in-flight/current, and one supervised physical disposal. Read loans
-// are added only by the original R issuer; no unbounded per-Task history exists.
+// Coalesced candidate, published flight, and previous current row. A pinned
+// previous current delays promotion; it never creates a history row. Taking
+// a row transfers its original value to the one supervised physical job.
+// Readers share these exact rows using their original admitted R authority.
 pub(crate) const RF_FIXED_PAYLOAD_POSITIONS: usize = 3;
 pub(crate) const RF_INPUT_POSITIONS: usize = 1;
 
@@ -114,6 +119,7 @@ struct State {
     next_payload: u64,
     last_version: u64,
     producer_exited: bool,
+    read_admission_closed: bool,
     sealed: bool,
     job_active: bool,
     rejected: Option<WorkerMessage>,
@@ -304,6 +310,8 @@ pub(crate) enum DynamicFilterError {
     Unresolved,
     MissingInput,
     WrongPublication,
+    WrongReadSelection,
+    ReadAdmissionClosed,
     FailurePublicationRequired,
 }
 impl From<RuntimeError> for DynamicFilterError {
@@ -373,6 +381,7 @@ impl TaskDynamicFilterInbox {
                 next_payload: 0,
                 last_version: 0,
                 producer_exited: false,
+                read_admission_closed: false,
                 sealed: false,
                 job_active: false,
                 rejected: None,
@@ -531,7 +540,10 @@ impl TaskDynamicFilterInbox {
                 }
             }
         }
-        if state.producer_exited {
+        // Producer exit closes writes, not the committed selector. Only the
+        // original Task retirement lane (or actual failed-publication stage)
+        // closes reads after previously accepted mechanical pins completed.
+        if state.read_admission_closed {
             state.sealed = true;
             let pending = state.pending_value.is_some();
             if let Some(original) = if pending {
@@ -555,6 +567,9 @@ impl TaskDynamicFilterInbox {
                         }
                     }
                 }
+                return Ok(result);
+            }
+            if !state.producer_exited {
                 return Ok(result);
             }
             drop(state);
@@ -657,8 +672,9 @@ impl TaskDynamicFilterInbox {
             .state
             .lock()
             .expect("original failed RF source");
-        result.progressed |= !state.sealed;
+        result.progressed |= !state.sealed || !state.read_admission_closed;
         state.sealed = true;
+        state.read_admission_closed = true;
         if state.unresolved {
             return Err(DynamicFilterError::Unresolved);
         }

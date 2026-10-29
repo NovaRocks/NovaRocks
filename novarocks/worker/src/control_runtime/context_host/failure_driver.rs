@@ -469,6 +469,20 @@ impl ContextHostRecord {
             WorkerAction::Context(
                 novarocks_worker_protocol::context::ContextEffect::Subscribe { .. },
             ) => self.settle_failed_subscribe(&stage, ticket),
+            // A refused mechanical read preparation never ran a getter.
+            // Its reply was superseded by this real failure session; any
+            // already-installed Ready pin remains with the original R cell.
+            // The Started ticket could not have released its dependent reply.
+            WorkerAction::Context(
+                novarocks_worker_protocol::context::ContextEffect::PrepareReadPayload { .. },
+            ) => self.complete_host_effect(ticket).map_err(|refusal| {
+                (
+                    crate::control_runtime::context_host::requests::ContextRequestError::Driver(
+                        refusal.error,
+                    ),
+                    refusal.ticket,
+                )
+            }),
             // Every Task publication was positively superseded by the same
             // failure session before this stage. These never-dispatched
             // metadata handlers own no foreign body; original Source custody

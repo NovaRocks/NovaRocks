@@ -103,8 +103,8 @@ fn has_ready_notifications(state: &State) -> bool {
 fn drain_notifications(inner: &Inner, frontier: WorkId) {
     let mut after = WorkId(0);
     loop {
-        let mut delivery = None;
-        inner.update_facts(|state| {
+        let delivery = {
+            let mut state = inner.state.lock().unwrap();
             let next = state
                 .nodes
                 .range((Excluded(after), Included(frontier)))
@@ -113,6 +113,7 @@ fn drain_notifications(inner: &Inner, frontier: WorkId) {
                     _ => None,
                 });
             let Some((id, reason)) = next else {
+                // No original Pending notification changed ownership.
                 return;
             };
             after = id;
@@ -121,8 +122,8 @@ fn drain_notifications(inner: &Inner, frontier: WorkId) {
             let slot = state.nodes[&id].cancellation;
             let cell = Arc::clone(state.cancellations.cell(slot));
             state.nodes.get_mut(&id).unwrap().cancellation_notification = Notification::Delivering;
-            // The real receiving guard exists before update's callbacks.
-            delivery = Some(Delivery {
+            // The real receiving guard exists before the post-State notify.
+            let delivery = Delivery {
                 cell,
                 pin: DeliveryPin {
                     inner,
@@ -130,11 +131,11 @@ fn drain_notifications(inner: &Inner, frontier: WorkId) {
                     reason: Some(reason),
                     completed: false,
                 },
-            });
-        });
-        let Some(delivery) = delivery else {
-            return;
+            };
+            state.advance_progress_revision();
+            delivery
         };
+        inner.changed.notify_waiters();
         delivery.run();
     }
 }
@@ -191,28 +192,49 @@ impl DeadlineExpiryHandle {
     pub fn expire_deadlines(&self) {
         // Discover the complete original frontier before any post-State wake.
         // Admission policy runs once for the batch, not once per notification.
-        let frontier = self.inner.update(|state| {
-            let frontier = state.nodes.last_key_value().map(|(&id, _)| id)?;
+        let (frontier, policy_updated) = {
+            let mut state = self.inner.state.lock().unwrap();
+            let frontier = state.nodes.last_key_value().map(|(&id, _)| id);
             let mut after = WorkId(0);
-            loop {
-                let next = state
-                    .nodes
-                    .range((Excluded(after), Included(frontier)))
-                    .find_map(|(&id, node)| match candidate(state, node) {
-                        Some((reason, true)) => Some((id, reason)),
-                        _ => None,
-                    });
-                let Some((id, reason)) = next else {
-                    break;
-                };
-                after = id;
-                crate::observation::queue_control(state, id, crate::ControlIntent::Cancel)
-                    .expect("selected notification retains its original Node");
-                state.nodes.get_mut(&id).unwrap().cancellation_notification =
-                    Notification::Pending(reason);
+            let mut discovered = false;
+            if let Some(frontier) = frontier {
+                loop {
+                    let next = state
+                        .nodes
+                        .range((Excluded(after), Included(frontier)))
+                        .find_map(|(&id, node)| match candidate(&state, node) {
+                            Some((reason, true)) => Some((id, reason)),
+                            _ => None,
+                        });
+                    let Some((id, reason)) = next else {
+                        break;
+                    };
+                    after = id;
+                    crate::observation::queue_control(&mut state, id, crate::ControlIntent::Cancel)
+                        .expect("selected notification retains its original Node");
+                    state.nodes.get_mut(&id).unwrap().cancellation_notification =
+                        Notification::Pending(reason);
+                    discovered = true;
+                }
             }
-            Some(frontier)
-        });
+            // Existing policy queues still need the original dispatch, including
+            // admission wait-deadline expiry without a new cancellation. An empty
+            // timer probe alone must not manufacture a revision or wake itself.
+            let policy_updated = discovered
+                || !state.requests.is_empty()
+                || !state.resource_waiters.is_empty()
+                || !state.control_waiting.is_empty();
+            if policy_updated {
+                crate::admission::dispatch(&mut state, &self.inner.config);
+                crate::observation::fill_control(&mut state, &self.inner.config);
+                state.advance_progress_revision();
+            }
+            (frontier, policy_updated)
+        };
+        if policy_updated {
+            crate::admission::drain_wakes(&self.inner);
+            self.inner.changed.notify_waiters();
+        }
         if let Some(frontier) = frontier {
             drain_notifications(&self.inner, frontier);
         }

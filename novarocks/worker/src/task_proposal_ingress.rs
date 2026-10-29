@@ -882,6 +882,12 @@ impl TaskProposalIngress {
         if state.segments.open_is_empty() {
             return Ok(None);
         }
+        // A reserved or consuming predecessor is still an actual cut holder.
+        // Keep this same queued open segment until that inventory really retires;
+        // failure fences new reservations under this lock, not existing exits.
+        if !state.cuts.is_empty() {
+            return Ok(None);
+        }
         let summary = state.segments.begin_abandon_open()?;
         let State { open, spare, .. } = &mut *state;
         open.as_mut()

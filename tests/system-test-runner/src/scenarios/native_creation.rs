@@ -573,6 +573,7 @@ impl RawBackendSession {
 #[derive(Clone, Copy)]
 pub(super) enum RawSink {
     CountOnly,
+    ClientRows,
     Result,
     Stream { multicast: bool },
 }
@@ -719,6 +720,32 @@ pub(super) fn compiled_fragment(
                 novarocks_result_contract::FrozenRootOutput::CountOnly,
             ),
         )),
+        RawSink::ClientRows => {
+            use novarocks_result_contract::{
+                ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
+                RenderPresentation, RootOutputContract, RootProfileId,
+            };
+            // This fixture authors one actual non-null I64 root occurrence.
+            // LocalCompiler binds its slot from the original native layout.
+            let schema = ClientRenderSchema::try_new(
+                vec![RenderColumn {
+                    source_ordinal: 0,
+                    source_slot: None,
+                    name: "v".into(),
+                    field: RenderField {
+                        presentation: RenderPresentation::ScalarText,
+                        nullable: false,
+                        native_type: NativeRenderType::SignedInteger(64),
+                    },
+                }],
+                1,
+            )
+            .expect("checked original one-column ClientRows root declaration");
+            FragmentSink::RootResult(Box::new(RootOutputContract::new(
+                RootProfileId::V1,
+                FrozenRootOutput::ClientRows(schema),
+            )))
+        }
         RawSink::Result => FragmentSink::Result,
         RawSink::Stream { multicast } => {
             cuts.outbound = (1..=if multicast { 2 } else { 1 })

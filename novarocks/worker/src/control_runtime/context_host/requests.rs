@@ -121,6 +121,8 @@ pub(crate) enum ContextRequestError {
     Observation(super::observation::ContextObservationError),
     NotificationSubmit(crate::control_runtime::host_executor::HostSubmitError),
     Domain(domain::DomainHostError),
+    DynamicFilter(crate::control_runtime::dynamic_filters::DynamicFilterError),
+    ReadPayload(crate::control_runtime::task_read_payload::TaskReadPayloadError),
 }
 
 #[derive(Debug)]
@@ -335,6 +337,7 @@ pub(crate) struct ContextRequestCustody {
     unresolved_revocation: bool,
     create: Option<TaskCreateCapture>,
     retired_task_read: Option<Arc<super::super::lifecycle_read::TaskReadSnapshot>>,
+    read_payload: Option<Arc<crate::control_runtime::task_read_payload::TaskReadPayloadShared>>,
     deferred_root: Option<DeferredRootRequest>,
     observation: Option<observation::ObservationRequest>,
     notification: novarocks_control_runtime::reply_notification::ReplyNotification<WorkerActor>,
@@ -545,6 +548,7 @@ impl ContextRequestCustody {
                 unresolved_revocation: false,
                 create: None,
                 retired_task_read: None,
+                read_payload: None,
                 deferred_root: None,
                 observation: None,
                 notification,
@@ -812,6 +816,29 @@ impl ContextRequestCustody {
         let abandoned_before_fill = route
             .as_ref()
             .is_some_and(|route| route.abandoned_before_fill());
+        if let Some(shared) = &self.read_payload {
+            if shared.is_unresolved() {
+                return Err(ContextRequestError::SubmissionUnresolved);
+            }
+            if self.endpoint.external_ended() {
+                if let Some(authority) = shared.take_unlent_after_external_end() {
+                    assert!(self.authority.is_none(), "one original read authority");
+                    self.authority = Some(authority);
+                }
+            }
+            if let Some(authority) = shared.take_returned() {
+                assert!(
+                    self.authority.is_none(),
+                    "same original read authority returns once"
+                );
+                self.authority = Some(authority);
+            }
+            // A lent payload remains part of this actual R's body/captures.
+            // External wait cancellation is not its actual physical return.
+            if !self.exit_observed && self.authority.is_none() && self.started {
+                return Ok(false);
+            }
+        }
         if self.domain.as_ref().is_some_and(|domain| !domain.retired) {
             return Ok(false);
         }
@@ -1533,13 +1560,58 @@ impl ContextHostRecord {
         if snapshot.failed || self.resources.failure.is_some() {
             return Err(reject(ContextRequestError::OwnerFailed));
         }
+        let (task_owner, task_request_admission_open) = match self.tasks.get(&task) {
+            Some(super::TaskHostOwner::Ready(host)) => {
+                ("Ready", Some(host.request_admission_open()))
+            }
+            Some(super::TaskHostOwner::Initializing(host)) => {
+                ("Initializing", Some(host.request_admission_open()))
+            }
+            Some(super::TaskHostOwner::Unpublished(_)) => ("Unpublished", None),
+            None => ("Absent", None),
+        };
         if snapshot.sealed || self.root_issuance_sealed || self.resources.control_admission_closed {
+            tracing::info!(
+                pid = std::process::id(),
+                context = ?self.identity,
+                task = ?task,
+                operation = ?operation,
+                actor_sealed = snapshot.sealed,
+                actor_external_open = snapshot.external_open,
+                root_issuance_sealed = self.root_issuance_sealed,
+                control_admission_closed = self.resources.control_admission_closed,
+                root_present = self.resources.root_reads.has_root(task),
+                root_task_retired = self.resources.root_reads.has_retained(task),
+                task_owner,
+                task_request_admission_open,
+                reason = "AdmissionClosed",
+                "Worker original Root R admission gate refused"
+            );
             return Err(reject(ContextRequestError::AdmissionClosed));
         }
         let retained = self.resources.root_reads.has_retained(task);
-        if !retained
+        // The installed Context Root owns reads independently of the closing
+        // Task RPC issuer. Only actual Task retirement below permits the EOF
+        // continuation to bypass that Task's original causal prefix.
+        if !self.resources.root_reads.has_root(task)
             && !matches!(self.tasks.get(&task), Some(super::TaskHostOwner::Ready(host)) if host.request_admission_open())
         {
+            tracing::info!(
+                pid = std::process::id(),
+                context = ?self.identity,
+                task = ?task,
+                operation = ?operation,
+                actor_sealed = snapshot.sealed,
+                actor_external_open = snapshot.external_open,
+                root_issuance_sealed = self.root_issuance_sealed,
+                control_admission_closed = self.resources.control_admission_closed,
+                root_present = self.resources.root_reads.has_root(task),
+                root_task_retired = self.resources.root_reads.has_retained(task),
+                task_owner,
+                task_request_admission_open,
+                reason = "TaskNotReady",
+                "Worker original Root R admission gate refused"
+            );
             return Err(reject(ContextRequestError::TaskNotReady));
         }
         let funding = self.reserve_task_request_funding()?;
@@ -1626,6 +1698,7 @@ impl ContextHostRecord {
             release_observation: None,
             observation: None,
             retired_task_read: None,
+            read_payload: None,
             deferred_root: Some(DeferredRootRequest {
                 task,
                 funding: Some(funding),
@@ -2253,5 +2326,110 @@ impl ContextHostRecord {
         }
         original.retired_task_read = Some(proof);
         original.submit(command)
+    }
+}
+
+impl ContextHostRecord {
+    /// Attach one return cell to this already-admitted Task read. The generic
+    /// reply endpoint stays neutral; this is the same R's optional read body.
+    pub(crate) fn attach_dynamic_filter_read(
+        &mut self,
+        work: WorkId,
+        task: TaskIdentity,
+    ) -> Result<
+        Arc<crate::control_runtime::task_read_payload::TaskReadPayloadShared>,
+        ContextRequestError,
+    > {
+        let original = self
+            .resources
+            .requests
+            .get_mut(&work)
+            .ok_or(ContextRequestError::UnknownRequest)?;
+        if original.expected_task != Some(task)
+            || original.read_payload.is_some()
+            || original.submitted
+        {
+            return Err(ContextRequestError::WrongRequest);
+        }
+        let shared = Arc::new(
+            crate::control_runtime::task_read_payload::TaskReadPayloadShared::new(
+                crate::control_runtime::request_endpoint::RequestNotice(
+                    original.endpoint.external().slot().clone(),
+                ),
+            ),
+        );
+        original.read_payload = Some(shared.clone());
+        Ok(shared)
+    }
+
+    /// The Core has selected the exact original payload. Pin it with the
+    /// already-started R authority before completing the mechanical effect.
+    /// No getter, codec or foreign destructor runs in this metadata turn.
+    pub(super) fn prepare_dynamic_filter_read(
+        &mut self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<(), ContextRequestError> {
+        self.control_runtime
+            .validate_effect_ticket(ticket)
+            .map_err(ContextRequestError::Driver)?;
+        let WorkerAction::Context(
+            novarocks_worker_protocol::context::ContextEffect::PrepareReadPayload {
+                request,
+                task,
+                version,
+                payload,
+            },
+        ) = &ticket.effect
+        else {
+            return Err(ContextRequestError::WrongRequest);
+        };
+        let work = *self
+            .request_inputs
+            .get(request)
+            .ok_or(ContextRequestError::UnknownRequest)?;
+        let original = self
+            .resources
+            .requests
+            .get_mut(&work)
+            .ok_or(ContextRequestError::UnknownRequest)?;
+        if original.expected_task != Some(*task)
+            || original.request().token != *request
+            || !original.started
+            || !original
+                .scope
+                .same_scope(self.resources.roles[super::LIFETIME].work.scope())
+        {
+            return Err(ContextRequestError::WrongRequest);
+        }
+        let shared = original
+            .read_payload
+            .as_ref()
+            .ok_or(ContextRequestError::WrongRequest)?
+            .clone();
+        let owner = match self.tasks.get_mut(task) {
+            Some(
+                super::TaskHostOwner::Ready(owner) | super::TaskHostOwner::Initializing(owner),
+            ) => owner,
+            _ => return Err(ContextRequestError::UnknownTask),
+        };
+        let inbox = owner
+            .dynamic_filters()
+            .ok_or(ContextRequestError::WrongRequest)?;
+        let authority = original
+            .authority
+            .take()
+            .ok_or(ContextRequestError::WrongPhase)?;
+        let loan = match inbox.loan_selected(*task, *version, *payload, authority) {
+            Ok(loan) => loan,
+            Err((error, authority)) => {
+                original.authority = Some(authority);
+                return Err(ContextRequestError::DynamicFilter(error));
+            }
+        };
+        if let Err((error, loan)) = shared.install_ready(loan) {
+            original.authority = Some(loan.reclaim());
+            return Err(ContextRequestError::ReadPayload(error));
+        }
+        Ok(())
     }
 }
