@@ -202,6 +202,8 @@ pub enum EffectEmissionError {
 #[derive(Clone, Copy, Debug)]
 pub struct ActorConfig {
     pub mailbox: [usize; 4],
+    /// Normal resident batches. IsolateScope also owns one separately funded
+    /// builtin supervisor batch, unavailable to ordinary mailbox dispatch.
     pub max_batches: usize,
     pub max_effects_per_step: usize,
     pub max_dependencies_per_effect: usize,

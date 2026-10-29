@@ -29,6 +29,7 @@ use novarocks_control_runtime::driver::{ActorHostTurn, TimerSourceState};
 pub(super) struct ContextTeardownState {
     local_exit_observed: [bool; 3],
     pub(super) parent_retire_authorized: bool,
+    pub(super) failed_owner_completed: bool,
     parent_exit_observed: bool,
 }
 
@@ -196,6 +197,14 @@ impl ContextHostRecord {
             });
         }
         self.resources.scope = None;
+        let execution = self.identity.query_execution_id();
+        tracing::debug!(
+            pid = std::process::id(),
+            query_high = execution.query_id().high(),
+            query_low = execution.query_id().low(),
+            attempt = execution.attempt_id().get(),
+            "Original Worker Context Scope removed"
+        );
         match self.publish_host_removed() {
             Ok(true) => Ok(actor),
             Ok(false) => Err(ContextTeardownRefusal::AfterActor {

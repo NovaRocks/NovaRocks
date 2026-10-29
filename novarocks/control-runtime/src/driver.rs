@@ -157,6 +157,17 @@ pub enum TimerSourceState {
     ClosedDrained,
 }
 
+/// One independently funded supervisor position per isolated actor. It never
+/// borrows a triggering request/source receipt or enters the normal mailbox.
+pub const ISOLATED_FAILURE_INPUT_POSITIONS: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureSourceState {
+    Open,
+    ClosedPending(InputId),
+    ClosedDrained,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputPhase {
     Reserved,
@@ -223,6 +234,10 @@ struct Inbox<A: Actor> {
     timer_input: Option<InputId>,
     // Monotonic source closure; an already filled Tick retains its input.
     timer_closed: bool,
+    // This identity is reserved at registration. Normal inputs/batches cannot
+    // spend the separate supervisor position. No message payload is invented.
+    failure_position: Option<InputId>,
+    failure_input: Option<InputId>,
     failure: Option<ManuallyDrop<Box<dyn Any + Send>>>,
     last_progress: Tick,
     failure_publication: Option<FailurePublicationRecord>,
@@ -301,6 +316,10 @@ impl<A: Actor> Inbox<A> {
 }
 impl<A: Actor> Drop for Inbox<A> {
     fn drop(&mut self) {
+        assert!(
+            self.failure_position.is_none() && self.failure_input.is_none(),
+            "the builtin failure source must close before driver removal"
+        );
         assert!(
             self.failure.is_none(),
             "actor panic payload must be transferred to its host failure owner"
@@ -1223,7 +1242,7 @@ impl<A: Actor> ActorRuntime<A> {
                     inputs: BTreeMap::new(),
                     roles: BTreeMap::new(),
                     counts: [0; 4],
-                    next_input: 0,
+                    next_input: u64::from(failure_policy == ActorFailurePolicy::IsolateScope),
                     batches: BTreeMap::new(),
                     batch_order: BTreeMap::new(),
                     next_batch: 0,
@@ -1231,6 +1250,9 @@ impl<A: Actor> ActorRuntime<A> {
                     failed: false,
                     timer_input: None,
                     timer_closed: false,
+                    failure_position: (failure_policy == ActorFailurePolicy::IsolateScope)
+                        .then(|| InputId::new(1).expect("fixed initial supervisor identity")),
+                    failure_input: None,
                     failure: None,
                     last_progress: Tick(0),
                     failure_publication: None,
@@ -1417,6 +1439,18 @@ impl<A: Actor> ActorRuntime<A> {
         let inbox = node.inbox.lock().expect("actor inbox lock");
         Ok(inbox.timer_input)
     }
+
+    pub fn failure_source_state(&self, actor: ActorId) -> Result<FailureSourceState, DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        Ok(if let Some(input) = inbox.failure_input {
+            FailureSourceState::ClosedPending(input)
+        } else if inbox.failure_position.is_some() {
+            FailureSourceState::Open
+        } else {
+            FailureSourceState::ClosedDrained
+        })
+    }
     fn timer_state(inbox: &Inbox<A>) -> TimerSourceState {
         if !inbox.timer_closed {
             TimerSourceState::Open
@@ -1446,6 +1480,9 @@ impl<A: Actor> ActorRuntime<A> {
         }
         inbox.sealed = true;
         inbox.timer_closed = true;
+        // All actual inputs and scheduler claims are empty under these same
+        // locks. Withdrawing the unused builtin cannot race a later Core turn.
+        inbox.failure_position = None;
         state.timers.cancel(actor);
         state.timers.acknowledge_tick(actor);
         drop(state);
@@ -1728,6 +1765,21 @@ impl<A: Actor> ActorRuntime<A> {
                     inbox.generation = generation;
                     inbox.failed = true;
                     inbox.failure = Some(ManuallyDrop::new(payload));
+                    let supervisor_input = inbox
+                        .failure_position
+                        .take()
+                        .expect("isolated actor owns its prepaid supervisor position");
+                    assert!(inbox.failure_input.is_none());
+                    inbox.failure_input = Some(supervisor_input);
+                    inbox.inputs.insert(
+                        supervisor_input,
+                        InputRecord {
+                            source: node.id,
+                            class: InputClass::Lifecycle,
+                            phase: InputPhase::Committed,
+                            role: None,
+                        },
+                    );
                     drop(inbox);
                     drop(step);
                     let mut failure_budget = TurnBudget::new(node.config.turn_budget)?;
@@ -1740,7 +1792,7 @@ impl<A: Actor> ActorRuntime<A> {
                         &mut failure_budget,
                         &node.scope,
                         generation,
-                        input.input,
+                        supervisor_input,
                         node.config.max_effects_per_step,
                         node.config.max_dependencies_per_effect,
                         node.config.max_step_work,
@@ -1752,7 +1804,7 @@ impl<A: Actor> ActorRuntime<A> {
                     let batch = failure_step.finish();
                     inbox.failure_action_watermark =
                         batch.state.last_action_id().map_or(0, ActionId::get);
-                    inbox.commit_batch(input.input, batch)?;
+                    inbox.commit_batch(supervisor_input, batch)?;
                     inbox
                         .inputs
                         .get_mut(&input.input)
@@ -1765,7 +1817,7 @@ impl<A: Actor> ActorRuntime<A> {
                     inbox.last_progress = now;
                     self.shared.record(HistoryFact::BatchCommitted {
                         scope: node.scope.id(),
-                        input: input.input,
+                        input: supervisor_input,
                     });
                     None
                 }
@@ -2158,6 +2210,7 @@ impl<A: Actor> ActorRuntime<A> {
             .ok_or(RuntimeError::UnknownScope)?;
         if !inbox.failed
             || !scope.failed()
+            || inbox.failure_input != Some(input)
             || inbox.generation != generation
             || scope.generation() != generation
         {
@@ -2681,8 +2734,11 @@ impl<A: Actor> ActorRuntime<A> {
                 .get_mut(&role)
                 .expect("in-flight role retains its position")
                 .in_flight = None;
-        } else {
+        } else if inbox.failure_input != Some(input) {
             inbox.counts[class.index()] -= 1;
+        }
+        if inbox.failure_input == Some(input) {
+            inbox.failure_input = None;
         }
         if inbox.timer_input == Some(input) {
             inbox.timer_input = None;
@@ -2948,6 +3004,7 @@ impl<A: Actor> ActorRuntime<A> {
         inbox.external_open = false;
         inbox.sealed = true;
         inbox.timer_closed = true;
+        inbox.failure_position = None;
         state.ready.unregister(actor)?;
         if claimed {
             state.effect_ready.unregister_claimed(actor)?;

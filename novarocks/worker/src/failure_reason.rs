@@ -124,6 +124,7 @@ pub(crate) enum WorkerFailureReason {
     CausalInputUnresolved = 169,
     RootControlReadCapacity = 170,
     RootControlReadAdmission = 171,
+    TaskDisposalCallback = 172,
 }
 impl WorkerFailureReason {
     pub(crate) const fn reason(self) -> FailureReason {

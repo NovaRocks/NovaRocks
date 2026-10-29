@@ -21,6 +21,7 @@
 
 mod driver;
 pub(super) mod failure;
+pub(super) mod failure_tail;
 pub(crate) mod observation;
 pub(crate) use driver::{ContextDriverError, ContextDriverProgress};
 pub(crate) mod root_read;
@@ -87,16 +88,19 @@ const FAILURE: usize = 2;
 pub(crate) const CONTEXT_BOOTSTRAP_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
     inputs: 1
+        + novarocks_control_runtime::driver::ISOLATED_FAILURE_INPUT_POSITIONS
         + CONTEXT_IO_STORAGE.inputs
         + CONTEXT_LIFECYCLE_STORAGE.inputs
         + owner_control::OWNER_CONTROL_STORAGE.inputs
         + internal::CONTEXT_INTERNAL_STORAGE.inputs,
     batches: 1
+        + novarocks_control_runtime::driver::ISOLATED_FAILURE_INPUT_POSITIONS
         + CONTEXT_IO_STORAGE.batches
         + CONTEXT_LIFECYCLE_STORAGE.batches
         + owner_control::OWNER_CONTROL_STORAGE.batches
         + internal::CONTEXT_INTERNAL_STORAGE.batches,
-    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
+    effects: (1 + novarocks_control_runtime::driver::ISOLATED_FAILURE_INPUT_POSITIONS)
+        * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
         + CONTEXT_IO_STORAGE.effects
         + CONTEXT_LIFECYCLE_STORAGE.effects
         + owner_control::OWNER_CONTROL_STORAGE.effects
@@ -104,7 +108,9 @@ pub(crate) const CONTEXT_BOOTSTRAP_STORAGE: StorageNeed = StorageNeed {
     cuts: 0,
     replies: 0,
     completions: CONTEXT_IO_STORAGE.completions,
-    captures: CONTEXT_IO_STORAGE.captures,
+    // The same failure Work serially retains one original projection,
+    // abandoned neutral body or final panic and its physical return cell.
+    captures: CONTEXT_IO_STORAGE.captures + failure_tail::FAILURE_TAIL_CAPTURES,
     work: LOCAL_ROLES.len() + 2 + CONTEXT_IO_STORAGE.work,
 };
 
@@ -860,7 +866,12 @@ impl ContextHostRecord {
             return Err(ContextHostError::TaskTableFull);
         }
         let source = binding.task_source;
-        let mut host = match TaskHostRecord::adopt_loading(runtime, ticket, binding) {
+        let mut host = match TaskHostRecord::adopt_loading(
+            runtime,
+            ticket,
+            binding,
+            &self.resources.roles[LIFETIME].work,
+        ) {
             Ok(host) => host,
             Err(refusal) => {
                 if let Some(unpublished) = refusal.unpublished {
@@ -899,11 +910,31 @@ impl ContextHostRecord {
         &mut self,
         task: TaskIdentity,
     ) -> Result<TaskHostOwner, ContextHostError> {
+        self.take_task_with_failure_stage(task, false)
+    }
+
+    pub(super) fn take_failed_task(
+        &mut self,
+        task: TaskIdentity,
+        stage: &failure::ScopePublicationsDrained<'_>,
+    ) -> Result<TaskHostOwner, ContextHostError> {
+        stage
+            .validate(&self.control_runtime, self.actor)
+            .map_err(ContextHostError::Driver)?;
+        self.take_task_with_failure_stage(task, true)
+    }
+
+    fn take_task_with_failure_stage(
+        &mut self,
+        task: TaskIdentity,
+        failed_stage: bool,
+    ) -> Result<TaskHostOwner, ContextHostError> {
         if self
             .scope()
             .gates()
             .map_err(ContextHostError::Runtime)?
             .failed
+            && !failed_stage
             && !self.failure_publications_drained()
         {
             return Err(ContextHostError::TaskStillOwned);

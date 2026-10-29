@@ -49,6 +49,14 @@ pub(crate) enum ContextMessage {
         request: Option<RequestMetadata>,
         command: ContextInput,
     },
+    /// A declared experimental action selects this same admitted R occurrence.
+    /// It changes no pure protocol input and allocates no additional position.
+    #[cfg(novarocks_dev_controls)]
+    TestOwnerPanicOnRenew {
+        work: WorkId,
+        request: RequestMetadata,
+        command: ContextInput,
+    },
     Timer,
 }
 
@@ -122,12 +130,31 @@ impl Actor for ContextActor {
         step: &mut StepContext<'_, WorkerAction>,
     ) {
         let now = MonotonicInstant::from_origin(Duration::from_nanos(now.0));
+        #[cfg(novarocks_dev_controls)]
+        let panic_on_renew = matches!(&message, ContextMessage::TestOwnerPanicOnRenew { .. });
         let (work, request, command) = match message {
             ContextMessage::Command {
                 work,
                 request,
                 command,
             } => (work, request, command),
+            #[cfg(novarocks_dev_controls)]
+            ContextMessage::TestOwnerPanicOnRenew {
+                work,
+                request,
+                command,
+            } => {
+                assert!(
+                    matches!(
+                        &command,
+                        ContextInput::Request(
+                            novarocks_worker_protocol::context::ContextCommand::Renew { .. }
+                        )
+                    ),
+                    "the selected experimental turn retains its original Renew"
+                );
+                (work, Some(request), command)
+            }
             ContextMessage::Timer => (self.timer_work, None, ContextInput::Tick),
         };
         let mut admission = ScopeAdmissionPort::new(
@@ -171,6 +198,16 @@ impl Actor for ContextActor {
                 "context protocol input preserves its frozen invariants: input={input_kind}, task={input_task:?}, error={error:?}"
             )
         });
+        #[cfg(novarocks_dev_controls)]
+        if panic_on_renew && request.is_some_and(|request| !now.has_reached(request.deadline)) {
+            // The pure decision exists but no effect/reply has left this turn.
+            // Common catches this panic and owns the actual scope-failure path.
+            panic!(
+                "declared Context owner panic context={:?} operation={}",
+                self.core.identity(),
+                request.expect("original Renew metadata").operation
+            );
+        }
         let internal_ready = self.core.has_internal_work();
         if matches!(
             self.core.state(),

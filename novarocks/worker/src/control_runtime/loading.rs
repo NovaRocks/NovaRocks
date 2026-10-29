@@ -75,12 +75,13 @@ impl LoadingSources {
 struct Custody {
     task: TaskIdentity,
     work: WorkId,
-    scope: ScopeId,
+    scope: novarocks_control_runtime::transaction::ScopeHandle,
     ingress_retained_bytes: usize,
     sources: Mutex<Option<LoadingSources>>,
     role: ExitRole,
     report: ReportSlot,
     input_role: ExitRole,
+    input_key: (ScopeId, WorkId),
     input_report: ReportSlot,
     input_authority: Mutex<Option<ExitAuthority>>,
     canceled: AtomicBool,
@@ -123,13 +124,14 @@ impl LoaderCustody {
         health: Arc<ExecutionHealth>,
     ) -> (Self, LoaderJob) {
         let work = admitted.work.id();
-        let scope = admitted.work.scope().id();
+        let scope = admitted.work.scope().clone();
         let report = admitted.report.clone();
         let (role, authority) = ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
             admitted.work,
             admitted.capacity,
             admitted.report,
         ));
+        let input_key = (input_admitted.work.scope().id(), input_admitted.work.id());
         let input_report = input_admitted.report.clone();
         let (input_role, input_authority) =
             ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
@@ -146,6 +148,7 @@ impl LoaderCustody {
             role,
             report,
             input_role,
+            input_key,
             input_report,
             input_authority: Mutex::new(Some(input_authority)),
             canceled: AtomicBool::new(false),
@@ -176,7 +179,10 @@ impl LoaderCustody {
         self.0.work
     }
     pub(crate) fn scope_id(&self) -> ScopeId {
-        self.0.scope
+        self.0.scope.id()
+    }
+    pub(crate) fn scope(&self) -> &novarocks_control_runtime::transaction::ScopeHandle {
+        &self.0.scope
     }
     pub(crate) fn owns_job(&self, job: &LoaderJob) -> bool {
         Arc::ptr_eq(&self.0, &job.custody.0)
@@ -442,6 +448,10 @@ impl LoaderJob {
     }
 }
 impl InputDisposalJob {
+    /// The exact original input-cleanup role, not its loader parent.
+    pub(crate) fn queue_key(&self) -> (ScopeId, WorkId) {
+        self.custody.0.input_key
+    }
     pub(crate) fn run(mut self) -> bool {
         self.custody
             .0

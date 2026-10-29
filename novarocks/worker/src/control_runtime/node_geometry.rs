@@ -119,6 +119,7 @@ pub(crate) struct NodeReservationGeometry {
     pub task_source_work: usize,
     pub task_source_payments: usize,
     pub task_host_payments: usize,
+    pub task_disposal_payments: usize,
     /// Retained normal-close payments outlive ActiveTask permits.
     pub inbound_payments: usize,
     pub shared_requests: usize,
@@ -340,6 +341,7 @@ impl NodeGeometry {
             1,
             crate::control_runtime::preparation_refusal::HOST_REFUSAL_WORK_POSITIONS,
             HOST_CALL_KINDS.len(),
+            crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE.work,
         ])?;
         // Source *locations*, not their old funders: open/spare Source4 plus
         // one pair per finite original lifecycle cut (including pending/partial
@@ -377,6 +379,10 @@ impl NodeGeometry {
             task_source_work: task_source_positions,
             task_source_payments: source_payment_rows,
             task_host_payments: task_host_payment_rows,
+            // One zero-resource role row is counted in non-source Work above;
+            // its original split fee is simultaneously resident through real
+            // disposal/report/header retirement. A is returned only afterward.
+            task_disposal_payments: a,
             // Each nonempty original permit owns exactly InboundRecords1.
             // ActiveTasks can return earlier, so this bound is global I, not A.
             inbound_payments: inputs.inbound.max_records(),
@@ -392,6 +398,7 @@ impl NodeGeometry {
             reservations.task_source_work,
             reservations.task_source_payments,
             reservations.task_host_payments,
+            reservations.task_disposal_payments,
             reservations.inbound_payments,
             reservations.shared_requests,
             reservations.root_data_work,

@@ -423,6 +423,30 @@ impl WorkerTaskControl {
         )
         .await
     }
+    /// A declared Native experimental action selects the same real Renew R.
+    /// There is no extra fault request, input, Work or protocol command.
+    #[cfg(novarocks_dev_controls)]
+    pub async fn renew_with_context_owner_panic(
+        &self,
+        request: RenewQueryExecutionLease,
+        deadline: WorkerMonotonicInstant,
+    ) -> Result<WorkerContextDelivery, WorkerRequestError> {
+        let handle = self.node.submit_context_owner_panic(
+            request.context(),
+            self.node.next_source(),
+            request.envelope().operation_id(),
+            deadline,
+            ContextCommand::Renew {
+                sequence: request.sequence(),
+                valid_for: request.valid_for(),
+            },
+        )?;
+        let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
+        Ok(WorkerContextDelivery {
+            evidence: None,
+            original,
+        })
+    }
     /// This admission intentionally precedes metadata/ACK/payload pregrant.
     /// Only the returned admitted owner can perform the subsequent async read.
     pub fn begin_root_read(

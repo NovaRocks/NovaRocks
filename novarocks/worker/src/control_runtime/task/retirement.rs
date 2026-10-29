@@ -460,23 +460,16 @@ impl ProductionPreparation {
 /// The actual removed Task owner remains in the Context's finite Task slot
 /// until its physical payload destruction and original payment release finish.
 /// Unexpected foreign Drop retains the same payment and panic inventory.
-pub(crate) struct RetiredTaskDisposal {
+pub(crate) struct TaskDisposal {
+    role: super::super::task_disposal::TaskDisposalRole,
     retirement: novarocks_control_runtime::lease::WorkRetirementObserver,
-    rejected_payload: Option<PayloadId>,
-    state: std::sync::Mutex<RetiredTaskDisposalState>,
+    state: std::sync::Mutex<TaskDisposalState>,
 }
-struct RetiredTaskDisposalState {
-    observation: Option<
-        Box<
-            ManuallyDrop<(
-                crate::TaskExecutionPorts,
-                TaskIdentity,
-                novarocks_execution_contract::TaskState,
-            )>,
-        >,
-    >,
+struct TaskDisposalState {
+    observation: Option<Box<ManuallyDrop<(crate::TaskExecutionPorts, TaskIdentity)>>>,
+    origin: super::super::task_disposal::TaskDisposalOrigin,
     started: bool,
-    payload: Option<ManuallyDrop<Box<dyn std::any::Any + Send>>>,
+    payload: Option<Box<ManuallyDrop<Box<dyn std::any::Any + Send>>>>,
     payment: Option<(
         TaskLifetime,
         CapacityBundle,
@@ -484,21 +477,28 @@ struct RetiredTaskDisposalState {
         Option<CapacityBundle>,
     )>,
     panic: Option<ManuallyDrop<Box<dyn std::any::Any + Send>>>,
-    complete: bool,
     retirement_input: Option<novarocks_control_runtime_core::identity::InputId>,
 }
-impl RetiredTaskDisposal {
+impl TaskDisposal {
     pub(crate) fn from_original(
         resources: TaskHostResources,
         ports: Option<crate::TaskExecutionPorts>,
-        task: TaskIdentity,
-        retained_state: novarocks_execution_contract::TaskState,
-        rejected_payload: Option<PayloadId>,
-    ) -> Self {
+        authorization: super::super::task_disposal::TaskDisposalAuthorization,
+    ) -> (Self, super::super::task_disposal::TaskDisposalJob) {
         assert!(
             resources.seal_read_observation().is_ok(),
             "original Task inventory is still live"
         );
+        let origin = authorization.origin();
+        let job = match resources.disposal.take_job(authorization) {
+            Ok(job) => job,
+            Err(original) => {
+                // Trusted transfer from one just-validated original Role. Do
+                // not unwind opaque resources on a metadata thread.
+                std::mem::forget((original, resources, ports));
+                std::process::abort();
+            }
+        };
         let retirement = resources.lifetime.retirement_observer();
         let TaskHostResources {
             active,
@@ -507,6 +507,7 @@ impl RetiredTaskDisposal {
             lifetime,
             port,
             host_calls,
+            disposal,
             loader,
             loading_events,
             loading_return,
@@ -523,43 +524,46 @@ impl RetiredTaskDisposal {
             causal,
             production,
         } = resources;
-        Self {
-            retirement,
-            rejected_payload,
-            state: std::sync::Mutex::new(RetiredTaskDisposalState {
-                observation: ports
-                    .map(|ports| Box::new(ManuallyDrop::new((ports, task, retained_state)))),
-                started: false,
-                payload: Some(ManuallyDrop::new(Box::new((
-                    port,
-                    host_calls,
-                    loader,
-                    loading_events,
-                    loading_return,
-                    pending_loading,
-                    preparation,
-                    pending_preparation_adoption,
-                    source_partials,
-                    completion,
-                    completion_action,
-                    lifecycle_inputs,
-                    statistics,
-                    dynamic_filters,
-                    open_summary,
-                    causal,
-                    production,
-                )))),
-                payment: Some((
-                    lifetime,
-                    active,
-                    preparation_remainder,
-                    accepted_source_storage,
-                )),
-                panic: None,
-                complete: false,
-                retirement_input: None,
-            }),
-        }
+        let task = lifetime.observation().identity();
+        (
+            Self {
+                role: disposal,
+                retirement,
+                state: std::sync::Mutex::new(TaskDisposalState {
+                    observation: ports.map(|ports| Box::new(ManuallyDrop::new((ports, task)))),
+                    origin,
+                    started: false,
+                    payload: Some(Box::new(ManuallyDrop::new(Box::new((
+                        port,
+                        host_calls,
+                        loader,
+                        loading_events,
+                        loading_return,
+                        pending_loading,
+                        preparation,
+                        pending_preparation_adoption,
+                        source_partials,
+                        completion,
+                        completion_action,
+                        lifecycle_inputs,
+                        statistics,
+                        dynamic_filters,
+                        open_summary,
+                        causal,
+                        production,
+                    ))))),
+                    payment: Some((
+                        lifetime,
+                        active,
+                        preparation_remainder,
+                        accepted_source_storage,
+                    )),
+                    panic: None,
+                    retirement_input: None,
+                }),
+            },
+            job,
+        )
     }
     pub(crate) fn key(
         &self,
@@ -567,18 +571,30 @@ impl RetiredTaskDisposal {
         novarocks_control_runtime_core::identity::ScopeId,
         novarocks_control_runtime_core::identity::WorkId,
     ) {
-        let state = self.state.lock().expect("original Task disposal key");
-        let (lifetime, ..) = state
-            .payment
-            .as_ref()
-            .expect("original Task payment before physical handoff");
-        (lifetime.scope().id(), lifetime.id())
+        self.role.key()
     }
     pub(crate) fn complete(&self) -> bool {
-        self.state.lock().expect("actual Task disposal").complete && self.retirement.is_retired()
+        self.role.is_retired()
+            && self.retirement.is_retired()
+            && self
+                .state
+                .lock()
+                .expect("original Task disposal payment")
+                .payment
+                .is_none()
     }
     pub(crate) fn rejected_payload(&self) -> Option<PayloadId> {
-        self.rejected_payload
+        match self
+            .state
+            .lock()
+            .expect("actual Task disposal origin")
+            .origin
+        {
+            super::super::task_disposal::TaskDisposalOrigin::RejectedCreation {
+                payload, ..
+            } => Some(payload),
+            _ => None,
+        }
     }
     pub(crate) fn retirement_input(
         &self,
@@ -592,72 +608,111 @@ impl RetiredTaskDisposal {
         &self,
         input: novarocks_control_runtime_core::identity::InputId,
     ) {
-        let mut state = self.state.lock().expect("original disposal receipt");
         assert!(
-            state.retirement_input.replace(input).is_none(),
+            self.state
+                .lock()
+                .expect("original disposal receipt")
+                .retirement_input
+                .replace(input)
+                .is_none(),
             "one original disposal receipt"
         );
     }
-    pub(crate) fn run_on_host(&self) -> Result<(), RuntimeError> {
+    pub(crate) fn take_failed_job(
+        &self,
+        stage: &super::super::failure::ScopePublicationsDrained<'_>,
+    ) -> Result<
+        super::super::task_disposal::TaskDisposalJob,
+        super::super::task_disposal::TaskDisposalError,
+    > {
+        let authorization = self.role.authorize_failure(stage)?;
+        self.role
+            .take_job(authorization)
+            .map_err(|(error, _authorization)| error)
+    }
+    /// Only TaskDisposalJob calls this on a physical worker after its original
+    /// Cleanup authority really started. A panic never retries partial Drop.
+    pub(crate) fn dispose_on_host(
+        &self,
+        origin: super::super::task_disposal::TaskDisposalOrigin,
+    ) -> bool {
         let (payload, observation) = {
             let mut state = self.state.lock().expect("actual Task physical payload");
-            if state.complete || state.panic.is_some() || state.started {
-                return Ok(());
+            if state.started || state.panic.is_some() {
+                return false;
             }
             state.started = true;
+            state.origin = origin;
             (state.payload.take(), state.observation.take())
         };
-        if let Some(payload) = payload {
-            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                drop(ManuallyDrop::into_inner(payload))
-            })) {
+        if let Some(mut payload) = payload {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: this stable original frame is destroyed once. A
+                // partial unwind is retained in place and never moved/retried.
+                unsafe { ManuallyDrop::drop(payload.as_mut()) };
+            }));
+            if let Err(panic) = result {
                 let mut state = self.state.lock().expect("original Task destruction panic");
+                state.payload = Some(payload);
                 state.observation = observation;
                 state.panic = Some(ManuallyDrop::new(panic));
-                return Ok(());
+                return false;
             }
+            drop(payload);
         }
         if let Some(mut observation) = observation {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let (ports, task, retained_state) = &**observation;
-                ports.observe(crate::TaskProtocolEvent::task_terminal_retained(
-                    *task,
-                    *retained_state,
-                ));
-                // SAFETY: this stable, original observer capture is destroyed
-                // once on the physical worker. An unwind retains its allocation
-                // without moving or retrying partially destroyed contents.
+                let (ports, task) = &**observation;
+                if let super::super::task_disposal::TaskDisposalOrigin::AcceptedTerminal { state } =
+                    origin
+                {
+                    ports.observe(crate::TaskProtocolEvent::task_terminal_retained(
+                        *task, state,
+                    ));
+                }
+                // SAFETY: original stable observer captures, once and only on
+                // this physical body. Failure retains its partially dropped frame.
                 unsafe { ManuallyDrop::drop(observation.as_mut()) };
             }));
             if let Err(panic) = result {
                 let mut state = self.state.lock().expect("original Task observer panic");
                 state.observation = Some(observation);
                 state.panic = Some(ManuallyDrop::new(panic));
-                return Ok(());
+                return false;
             }
             drop(observation);
         }
+        true
+    }
+    /// The original A position stays occupied through physical exit AND the
+    /// disposal role's actual report/header/payment tail. This is the finite
+    /// header bound, rather than an unbounded collection of completed jobs.
+    pub(crate) fn advance_retirement(&self, ledger: &RuntimeLedger) -> Result<bool, TaskHostError> {
+        let progress = self
+            .role
+            .advance_retirement(ledger)
+            .map_err(TaskHostError::Disposal)?;
+        if !self.role.is_retired() || !self.retirement.is_retired() {
+            return Ok(progress);
+        }
         let payment = {
-            let mut state = self.state.lock().expect("actual Task payment exit");
-            let (_, active, preparation, source) =
-                state.payment.as_mut().expect("original Task payment");
-            if let Some(capacity) = preparation {
-                capacity.release(&capacity.resources()?)?;
+            let mut state = self.state.lock().expect("actual Task final payment exit");
+            let Some((_, active, preparation, source)) = state.payment.as_mut() else {
+                return Ok(progress);
+            };
+            for capacity in [preparation, source].into_iter().flatten() {
+                if !capacity.is_released() {
+                    capacity.release(&capacity.resources()?)?;
+                }
             }
-            if let Some(capacity) = source {
-                capacity.release(&capacity.resources()?)?;
-            }
+            // Releasing the whole last Task bundle removes its original row
+            // atomically with making ActiveTasks reusable. All sibling role
+            // and fee rows are already truly retired/reaped/released above.
             active.release(&active.resources()?)?;
             state.payment.take()
         };
         drop(payment);
-        // No observer may release an identity before the original payment and
-        // all of this physical invocation's payload captures actually dropped.
-        self.state
-            .lock()
-            .expect("actual Task disposal completion")
-            .complete = true;
-        Ok(())
+        Ok(true)
     }
 }
 

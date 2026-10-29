@@ -55,6 +55,7 @@ enum AuthorPhase {
     Sending,
     Sent,
     Rejected,
+    Withdrawn,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReturnPhase {
@@ -94,6 +95,7 @@ struct State {
     // their owner cannot drop or reinterpret those exact returned payloads.
     rejected: [Option<ManuallyDrop<ContextInput>>; 2],
     fault: Option<Fault>,
+    failed: bool,
 }
 struct Custody {
     task: TaskIdentity,
@@ -102,6 +104,12 @@ struct Custody {
     issued: AtomicBool,
     state: Mutex<State>,
     retained: Mutex<Option<Arc<Self>>>,
+}
+pub(crate) struct LoadingFailureProgress {
+    pub progressed: bool,
+    pub retired: bool,
+    pub author_return: Option<LoadingAuthorReturn>,
+    pub rejected: [Option<ContextInput>; 2],
 }
 #[derive(Clone)]
 pub(crate) struct LoadingEvents(Arc<Custody>);
@@ -258,6 +266,7 @@ impl LoadingEvents {
                 returns: [ReturnPhase::Waiting; 2],
                 rejected: [None, None],
                 fault: None,
+                failed: false,
             }),
             retained: Mutex::new(None),
         });
@@ -537,6 +546,141 @@ impl LoadingEvents {
         let mut state = self.0.state.lock().expect("original loading event custody");
         std::array::from_fn(|index| state.rejected[index].take().map(ManuallyDrop::into_inner))
     }
+    /// Resolves the failed Core's original report, without publishing an exit
+    /// event to that dead Core. An unissued exit publisher relinquishes its
+    /// own sender only after the loader's complete physical tree truly exits.
+    pub(crate) fn advance_failed(
+        &self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+        inbox: &mut TaskCausalInbox,
+        original_generation: novarocks_control_runtime_core::identity::Generation,
+    ) -> Result<LoadingFailureProgress, LoadingEventError> {
+        inbox
+            .validate_failed_scope(stage, self.0.loader.scope())
+            .map_err(LoadingEventError::Causal)?;
+        let mut progress = LoadingFailureProgress {
+            progressed: false,
+            retired: false,
+            author_return: None,
+            rejected: [None, None],
+        };
+        {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .expect("original failed loading authors");
+            progress.progressed |= !state.failed;
+            state.failed = true;
+            if let Some(fault) = state.fault {
+                return Err(match fault {
+                    Fault::StartRefused(error) => LoadingEventError::StartRefused(error),
+                    Fault::Unresolved => LoadingEventError::Unresolved,
+                });
+            }
+        }
+        if self.0.loader.phase() != ExitRolePhase::Retired {
+            let core = ConsumerId::new(1).unwrap();
+            if self
+                .0
+                .loader
+                .report()
+                .consumption(core)
+                .map_err(LoadingEventError::Report)?
+                == Consumption::Pending
+            {
+                self.0
+                    .loader
+                    .report()
+                    .abandon_failed_owner(core, self.0.loader.scope(), original_generation)
+                    .map_err(LoadingEventError::Report)?;
+                progress.progressed = true;
+            }
+        }
+        if !self
+            .0
+            .loader
+            .ready_for_exit()
+            .map_err(LoadingEventError::Role)?
+        {
+            return Ok(progress);
+        }
+        for index in [LOADED, EXITED] {
+            let (phase, returned) = {
+                let state = self
+                    .0
+                    .state
+                    .lock()
+                    .expect("original failed loading authors");
+                (state.phases[index], state.returns[index])
+            };
+            if phase == AuthorPhase::Rejected && returned == ReturnPhase::Observed {
+                // The exact refused input remains in this same original cell
+                // until the actual failed owner takes it below. Not Sent.
+                inbox
+                    .withdraw_failed_unpublished_author(
+                        stage,
+                        &self.0.bindings[index],
+                        &self.0.loader,
+                    )
+                    .map_err(LoadingEventError::Causal)?;
+            }
+        }
+        let can_withdraw = {
+            let state = self
+                .0
+                .state
+                .lock()
+                .expect("original failed loading authors");
+            matches!(
+                state.phases[LOADED],
+                AuthorPhase::Sent | AuthorPhase::Rejected
+            ) && state.returns[LOADED] == ReturnPhase::Observed
+                && state.phases[EXITED] == AuthorPhase::Waiting
+        };
+        if can_withdraw {
+            let sender = self
+                .take_sender(EXITED)
+                .expect("original unissued loading exit sender");
+            sender.unused();
+            self.0
+                .state
+                .lock()
+                .expect("original failed loading authors")
+                .phases[EXITED] = AuthorPhase::Withdrawn;
+            progress.author_return = Some(self.author_return(EXITED));
+            progress.progressed = true;
+        }
+        progress.rejected = self.take_rejected();
+        progress.progressed |= progress.rejected.iter().any(Option::is_some);
+        if self.0.loader.phase() != ExitRolePhase::Retired {
+            let observer = ConsumerId::new(2).unwrap();
+            if self
+                .0
+                .loader
+                .report()
+                .consumption(observer)
+                .map_err(LoadingEventError::Report)?
+                == Consumption::Pending
+            {
+                self.0
+                    .loader
+                    .report()
+                    .consume(observer)
+                    .map_err(LoadingEventError::Report)?;
+                progress.progressed = true;
+            }
+            let before = self.0.loader.phase();
+            self.0
+                .loader
+                .try_retire()
+                .map_err(LoadingEventError::Role)?;
+            progress.progressed |= before != self.0.loader.phase();
+        }
+        self.release_retention();
+        progress.retired = self.is_retired();
+        Ok(progress)
+    }
     pub(crate) fn is_retired(&self) -> bool {
         if self.0.loader.phase() != ExitRolePhase::Retired {
             return false;
@@ -547,7 +691,11 @@ impl LoadingEvents {
                 .returns
                 .iter()
                 .all(|phase| *phase == ReturnPhase::Observed)
-            && state.phases.iter().all(|phase| *phase == AuthorPhase::Sent)
+            && state.phases.iter().all(|phase| {
+                *phase == AuthorPhase::Sent
+                    || (state.failed
+                        && matches!(phase, AuthorPhase::Rejected | AuthorPhase::Withdrawn))
+            })
             && state.senders.iter().all(Option::is_none)
             && state.rejected.iter().all(Option::is_none)
     }

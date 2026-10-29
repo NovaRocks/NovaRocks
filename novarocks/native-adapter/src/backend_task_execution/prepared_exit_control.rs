@@ -21,9 +21,12 @@ use crate::test_controls::{NativeHoldClaim, NativeTestControls};
 use novarocks_execution::runtime::fragment::ExecutionFailure;
 use novarocks_execution_contract::TaskIdentity;
 use std::{
+    future::Future,
     io::{Read, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
+    pin::Pin,
+    task::{Context, Poll, Waker},
     time::Instant,
 };
 
@@ -31,7 +34,10 @@ pub(super) struct PreparedExitGate {
     claim: NativeHoldClaim,
     identity: TaskIdentity,
     cause: ExecutionFailure,
-    stream: UnixStream,
+    stream: tokio::io::unix::AsyncFd<UnixStream>,
+    runtime: tokio::runtime::Handle,
+    readiness: Waker,
+    cancellation: Pin<Box<dyn Future<Output = ()> + Send>>,
     marker: Vec<u8>,
     written: usize,
     announced: bool,
@@ -41,6 +47,8 @@ impl PreparedExitGate {
     pub(super) fn connect(
         controls: &NativeTestControls,
         identity: TaskIdentity,
+        runtime: &tokio::runtime::Handle,
+        readiness: Waker,
     ) -> Result<Option<Self>, String> {
         let Some(claim) = controls.claim_prepared_failure_exit_hold(identity)? else {
             return Ok(None);
@@ -52,12 +60,14 @@ impl PreparedExitGate {
                 !cancellation.is_active()
             })
             .map_err(|error| format!("connect original prepared exit owner: {error}"))?;
-        Self::from_stream(claim, identity, stream).map(Some)
+        Self::from_stream(claim, identity, stream, runtime, readiness).map(Some)
     }
     fn from_stream(
         claim: NativeHoldClaim,
         identity: TaskIdentity,
         stream: UnixStream,
+        runtime: &tokio::runtime::Handle,
+        readiness: Waker,
     ) -> Result<Self, String> {
         stream
             .set_nonblocking(true)
@@ -77,11 +87,21 @@ impl PreparedExitGate {
         if marker.len() > 512 {
             return Err("prepared exit marker exceeds its finite identity bound".into());
         }
+        // Register the same original descriptor before the first readiness
+        // check. The existing Native I/O reactor wakes the original Task;
+        // no extra async task, polling timer or Work is created.
+        let _entered = runtime.enter();
+        let stream = tokio::io::unix::AsyncFd::new(stream).map_err(|error| error.to_string())?;
+        let cancellation = claim.cancellation();
+        let cancellation = Box::pin(async move { cancellation.cancelled().await });
         Ok(Self {
             claim,
             identity,
             cause: crate::task_protocol_fault::injected_prepared_task_failure(),
             stream,
+            runtime: runtime.clone(),
+            readiness,
+            cancellation,
             marker,
             written: 0,
             announced: false,
@@ -108,11 +128,19 @@ impl PreparedExitGate {
         }
         true
     }
-    /// At most one bounded write and one single-byte read per original recheck.
-    /// Existing Worker maintenance drives the next poll; no new timer or wake.
+    /// At most one bounded write and one single-byte read per original turn.
+    /// Pending I/O parks the same original Task on its real reactor readiness;
+    /// the fixed cancellation future also retains the original claim deadline.
     pub(super) fn poll_open(&mut self) -> bool {
         if self.open {
             return true;
+        }
+        let runtime = self.runtime.clone();
+        let _entered = runtime.enter();
+        let readiness = self.readiness.clone();
+        let mut context = Context::from_waker(&readiness);
+        if self.cancellation.as_mut().poll(&mut context).is_ready() {
+            return self.release("owner-ended");
         }
         let cancellation = self.claim.cancellation();
         if !cancellation.is_active() {
@@ -122,20 +150,23 @@ impl PreparedExitGate {
             return self.release("deadline");
         }
         if self.written < self.marker.len() {
-            match self.stream.write(&self.marker[self.written..]) {
-                Ok(0) => return self.release("eof"),
-                Ok(count) => self.written += count,
-                Err(error)
+            match poll_write_once(&self.stream, &mut context, &self.marker[self.written..]) {
+                Poll::Pending => return false,
+                Poll::Ready(Ok(0)) => return self.release("eof"),
+                Poll::Ready(Ok(count)) => self.written += count,
+                Poll::Ready(Err(error))
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                     ) =>
                 {
+                    self.readiness.wake_by_ref();
                     return false;
                 }
-                Err(_) => return self.release("invalid"),
+                Poll::Ready(Err(_)) => return self.release("invalid"),
             }
             if self.written < self.marker.len() {
+                self.readiness.wake_by_ref();
                 return false;
             }
         }
@@ -144,25 +175,72 @@ impl PreparedExitGate {
                 tracing::error!(%error,"prepared exit hold could not record its actual accepted hit");
                 return self.release("invalid");
             }
-            if self.stream.shutdown(Shutdown::Write).is_err() {
+            if self.stream.get_ref().shutdown(Shutdown::Write).is_err() {
                 return self.release("invalid");
             }
             self.announced = true;
         }
         let mut byte = [0u8; 1];
-        match self.stream.read(&mut byte) {
-            Ok(1) if byte[0] == b'R' => self.release("release"),
-            Ok(0) => self.release("eof"),
-            Ok(_) => self.release("invalid"),
-            Err(error)
+        match poll_read_once(&self.stream, &mut context, &mut byte) {
+            Poll::Pending => false,
+            Poll::Ready(Ok(1)) if byte[0] == b'R' => self.release("release"),
+            Poll::Ready(Ok(0)) => self.release("eof"),
+            Poll::Ready(Ok(_)) => self.release("invalid"),
+            Poll::Ready(Err(error))
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                 ) =>
             {
+                self.readiness.wake_by_ref();
                 false
             }
-            Err(_) => self.release("invalid"),
+            Poll::Ready(Err(_)) => self.release("invalid"),
+        }
+    }
+}
+
+fn poll_read_once(
+    stream: &tokio::io::unix::AsyncFd<UnixStream>,
+    context: &mut Context<'_>,
+    bytes: &mut [u8],
+) -> Poll<std::io::Result<usize>> {
+    let mut ready = match stream.poll_read_ready(context) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+        Poll::Ready(Ok(ready)) => ready,
+    };
+    match ready.try_io(|inner| inner.get_ref().read(bytes)) {
+        Ok(result) => Poll::Ready(result),
+        Err(_) => {
+            // try_io clears stale readiness on WouldBlock. Register again
+            // before parking; an already-arrived new event gets one real turn.
+            drop(ready);
+            if stream.poll_read_ready(context).is_ready() {
+                context.waker().wake_by_ref();
+            }
+            Poll::Pending
+        }
+    }
+}
+fn poll_write_once(
+    stream: &tokio::io::unix::AsyncFd<UnixStream>,
+    context: &mut Context<'_>,
+    bytes: &[u8],
+) -> Poll<std::io::Result<usize>> {
+    let mut ready = match stream.poll_write_ready(context) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+        Poll::Ready(Ok(ready)) => ready,
+    };
+    match ready.try_io(|inner| inner.get_ref().write(bytes)) {
+        Ok(result) => Poll::Ready(result),
+        Err(_) => {
+            drop(ready);
+            if stream.poll_write_ready(context).is_ready() {
+                context.waker().wake_by_ref();
+            }
+            Poll::Pending
         }
     }
 }
@@ -173,6 +251,10 @@ mod tests {
     use crate::test_controls::tests::{controlled, task};
     #[test]
     fn original_nonblocking_gate_waits_for_release_and_eof_without_restarting_its_claim() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         for eof in [false, true] {
             let fixture = controlled("prepared-failure-exit-hold");
             let identity = task(&fixture, 2);
@@ -182,7 +264,17 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let (stream, mut peer) = UnixStream::pair().unwrap();
-            let mut gate = PreparedExitGate::from_stream(claim, identity, stream).unwrap();
+            let mut gate = PreparedExitGate::from_stream(
+                claim,
+                identity,
+                stream,
+                runtime.handle(),
+                Waker::noop().clone(),
+            )
+            .unwrap();
+            runtime.block_on(async {
+                drop(gate.stream.writable().await.unwrap());
+            });
             assert!(!gate.poll_open());
             let mut marker = String::new();
             peer.read_to_string(&mut marker).unwrap();
@@ -196,6 +288,9 @@ mod tests {
             } else {
                 peer.write_all(b"R").unwrap();
             }
+            runtime.block_on(async {
+                drop(gate.stream.readable().await.unwrap());
+            });
             assert!(gate.poll_open());
             assert!(gate.poll_open());
             let hits = fixture

@@ -211,9 +211,15 @@ impl NativePreparationChild {
     pub(crate) fn inject_prepared_exit_failure(
         &self,
         controls: &crate::test_controls::NativeTestControls,
+        runtime: &tokio::runtime::Handle,
+        readiness: std::task::Waker,
     ) -> Result<Option<ExecutionFailure>, String> {
-        let Some(gate) =
-            super::prepared_exit_control::PreparedExitGate::connect(controls, self.identity)?
+        let Some(gate) = super::prepared_exit_control::PreparedExitGate::connect(
+            controls,
+            self.identity,
+            runtime,
+            readiness,
+        )?
         else {
             return Ok(None);
         };

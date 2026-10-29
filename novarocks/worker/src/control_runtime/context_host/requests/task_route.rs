@@ -36,6 +36,9 @@ pub(super) struct TaskRequestRoute {
     failed_input: Option<ContextInput>,
     outer: CapacityBundle,
     delivery: Option<CausalDelivery>,
+    // Positive saved receipt from the original queued RPC's failure takeover;
+    // no runtime event input was ever filled for this specific cut.
+    queued_abandoned: bool,
     prefix_retired: bool,
     cut_consumed: bool,
     retired: Option<RetiredCut>,
@@ -59,6 +62,7 @@ impl TaskRequestRoute {
             failed_input: None,
             outer,
             delivery: None,
+            queued_abandoned: false,
             prefix_retired: false,
             cut_consumed: false,
             retired: None,
@@ -73,6 +77,9 @@ impl TaskRequestRoute {
     }
     pub(super) fn cut(&self) -> CutId {
         self.cut
+    }
+    pub(super) fn abandoned_before_fill(&self) -> bool {
+        self.queued_abandoned
     }
     fn observe_return(&mut self, task: &mut TaskHostRecord) -> Result<(), ContextRequestError> {
         if let Some(returned) = self.returned.take()
@@ -181,6 +188,13 @@ impl TaskRequestRoute {
                         .map_err(ContextRequestError::Domain)?;
                 }
                 self.delivery = Some(delivery);
+            } else if task
+                .causal()
+                .rpc_abandoned_before_fill(self.cut)
+                .map_err(ContextRequestError::Causal)?
+            {
+                self.queued_abandoned = true;
+                original.core_receipt = CoreReceipt::Abandoned;
             }
         }
         Ok(())
@@ -592,6 +606,8 @@ impl ContextHostRecord {
             submitted: false,
             started: false,
             failed_message: None,
+            #[cfg(novarocks_dev_controls)]
+            owner_panic_on_renew: false,
             published: None,
             reply_completed: false,
             input_retired: false,

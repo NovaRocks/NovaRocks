@@ -107,6 +107,12 @@ pub(crate) enum CausalSourceRetirement {
     Unclaimed,
     Reaped([ReapedPosition; 2]),
 }
+pub(crate) struct CausalFailedProgress {
+    pub units: usize,
+    pub progressed: bool,
+    pub inputs_retired: bool,
+    pub rejected: Option<(Option<WorkerMessage>, WorkerMessage)>,
+}
 pub(crate) struct CausalSourceProgress {
     pub progressed: bool,
     pub reaped: Option<[ReapedPosition; 2]>,
@@ -1102,42 +1108,49 @@ impl TaskCausalInbox {
         cut: CutId,
     ) -> Result<Consumption, CausalError> {
         drained.validate(&self.runtime, self.actor)?;
-        let observed = self.observe_core(cut)?;
-        if observed != Consumption::Pending {
-            return Ok(observed);
-        }
+        self.observe_core(cut)?;
         let delivered = self
             .roles
-            .get(&cut)
+            .get_mut(&cut)
             .ok_or(CausalError::UnknownRole)?
             .delivered
-            .as_ref()
+            .as_mut()
             .ok_or(CausalError::NotDelivered)?;
-        let abandoned = match delivered.proof {
-            Some(input) => {
-                self.runtime
+        // Save each exact input independently before its header can retire.
+        // A committed predecessor never proves that the event was consumed.
+        for (input, receipt) in [
+            (delivered.prefix, &mut delivered.source_consumption),
+            (delivered.event, &mut delivered.event_consumption),
+        ] {
+            if *receipt != Consumption::Pending {
+                continue;
+            }
+            *receipt = match input {
+                Some(input) => match self
+                    .runtime
                     .input_custody(self.actor, input)?
                     .ok_or(CausalError::InputObservationMissing)?
                     .phase
-                    == InputPhase::AbandonedByOwnerFailure
-            }
-            None => true, // Exact partial-fill receipt proves no input transferred.
-        };
-        if !abandoned {
+                {
+                    InputPhase::Committed => Consumption::Consumed,
+                    InputPhase::AbandonedByOwnerFailure => Consumption::AbandonedByOwnerFailure,
+                    _ => Consumption::Pending,
+                },
+                // The saved partial-fill/queued receipt proves no transfer.
+                None => Consumption::AbandonedByOwnerFailure,
+            };
+        }
+        let ready = delivered.source_consumption != Consumption::Pending
+            && delivered.event_consumption != Consumption::Pending;
+        let observed = self.ingress.cut_consumption(cut).ok_or(CutError::Unknown)?;
+        if observed != Consumption::Pending {
+            return Ok(observed);
+        }
+        if !ready {
             return Ok(Consumption::Pending);
         }
         self.ingress.fail();
         self.ingress.abandon_consuming_event(cut)?;
-        let delivered = self
-            .roles
-            .get_mut(&cut)
-            .unwrap()
-            .delivered
-            .as_mut()
-            .unwrap();
-        if delivered.source_consumption == Consumption::Pending {
-            delivered.source_consumption = Consumption::AbandonedByOwnerFailure;
-        }
         Ok(Consumption::AbandonedByOwnerFailure)
     }
     /// The failure owner uses the actual fixed runtime state, never a damaged
@@ -1158,9 +1171,9 @@ impl TaskCausalInbox {
                     proof: None,
                     prefix: None,
                     sources: Delivered::sources(&input.prefix.summary),
-                    source_consumption: Consumption::Pending,
+                    source_consumption: Consumption::AbandonedByOwnerFailure,
                     event: None,
-                    event_consumption: Consumption::Pending,
+                    event_consumption: Consumption::AbandonedByOwnerFailure,
                     rejected: None,
                 });
                 Ok(Some(input))
@@ -1168,6 +1181,213 @@ impl TaskCausalInbox {
             Err(IngressError::Cut(CutError::NotReady | CutError::Consuming)) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+    pub(crate) fn validate_failed_scope(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        scope: &novarocks_control_runtime::transaction::ScopeHandle,
+    ) -> Result<(), CausalError> {
+        stage.validate_scope(&self.runtime, self.actor, scope)?;
+        Ok(())
+    }
+    /// The same loader has actually finished its complete physical tree. Its
+    /// original publisher can now relinquish only a never-registered event;
+    /// neither stage nor a missing input proves that the event was consumed.
+    pub(crate) fn withdraw_failed_unpublished_author(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        binding: &CausalAuthorBinding,
+        loader: &LoaderCustody,
+    ) -> Result<bool, CausalError> {
+        self.validate_failed_scope(stage, loader.scope())?;
+        self.validate_author_binding(binding)?;
+        if loader.identity() != self.task || loader.work_id() != binding.work {
+            return Err(CausalError::WrongAuthor);
+        }
+        if !loader.ready_for_exit().map_err(CausalError::Role)? {
+            return Ok(false);
+        }
+        if self.roles[&binding.cut].delivered.is_some() {
+            return Err(CausalError::AlreadyAdmitted);
+        }
+        if !self.ingress.event_unused(binding.cut)? {
+            self.ingress.revoke_event(binding.cut)?;
+        }
+        Ok(true)
+    }
+    pub(crate) fn failed_author_consumption(
+        &mut self,
+        stage: &ScopePublicationsDrained<'_>,
+        binding: &CausalAuthorBinding,
+    ) -> Result<Consumption, CausalError> {
+        stage.validate(&self.runtime, self.actor)?;
+        self.validate_author_binding(binding)?;
+        if self.roles[&binding.cut]
+            .input_author
+            .as_ref()
+            .is_some_and(|author| author.actual_exit_ready() == Ok(true))
+        {
+            self.ingress.observe_cut_exit(binding.cut, true, false)?;
+        }
+        if self.ingress.event_unused(binding.cut)? {
+            return Ok(Consumption::AbandonedByOwnerFailure);
+        }
+        if self.roles[&binding.cut].delivered.is_none() {
+            return Ok(Consumption::Pending);
+        }
+        self.abandon_core(stage, binding.cut)?;
+        Ok(self.roles[&binding.cut]
+            .delivered
+            .as_ref()
+            .unwrap()
+            .event_consumption)
+    }
+    /// One exact original cut, at most one real header retirement per budget
+    /// unit. Returned neutral bodies remain the caller's original inventory;
+    /// this method neither drops rich sources nor signs their physical exit.
+    pub(crate) fn advance_failed_original_cut(
+        &mut self,
+        stage: &ScopePublicationsDrained<'_>,
+        cut: CutId,
+        budget: usize,
+    ) -> Result<CausalFailedProgress, CausalError> {
+        stage.validate(&self.runtime, self.actor)?;
+        let mut progress = CausalFailedProgress {
+            units: 0,
+            progressed: false,
+            inputs_retired: false,
+            rejected: None,
+        };
+        if budget == 0 {
+            return Ok(progress);
+        }
+        if !self.roles.contains_key(&cut) {
+            return Err(CausalError::UnknownRole);
+        }
+        if !self.ingress.event_unused(cut)? {
+            if self.roles[&cut].delivered.is_none() {
+                return Ok(progress);
+            }
+            self.abandon_core(stage, cut)?;
+            let delivered = self.roles[&cut].delivered.as_ref().unwrap();
+            if delivered.event_consumption == Consumption::Pending
+                || delivered.source_consumption == Consumption::Pending
+            {
+                return Ok(progress);
+            }
+        }
+        progress.rejected = self.take_rejected(cut);
+        progress.progressed = progress.rejected.is_some();
+        for input in self.roles[&cut]
+            .inputs
+            .in_flight()?
+            .into_iter()
+            .flatten()
+            .take(budget)
+        {
+            progress.units += 1;
+            match self.runtime.retire_input(self.actor, input) {
+                Ok(()) => progress.progressed = true,
+                Err(
+                    DriverError::InputStillQueued
+                    | DriverError::EffectsRemain
+                    | DriverError::ReservationsRemain,
+                ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if self.roles[&cut]
+            .inputs
+            .in_flight()?
+            .iter()
+            .all(Option::is_none)
+            && self.observe_effects_exited(cut)?
+        {
+            progress.inputs_retired = true;
+            if !self.ingress.event_unused(cut)? && !self.roles[&cut].host_consumer_consumed {
+                self.ingress.consume_cut(cut, 0)?;
+                self.roles.get_mut(&cut).unwrap().host_consumer_consumed = true;
+                progress.progressed = true;
+            }
+        }
+        Ok(progress)
+    }
+    /// Move one original source to its already-paid physical disposal owner.
+    /// Taking a carrier grants no exit, report consumption or refund.
+    pub(crate) fn take_failed_source(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        route: crate::task_proposal_ingress::PairRoute,
+        ordinal: usize,
+    ) -> Result<
+        Option<
+            novarocks_execution_contract::RetainedTaskSource<
+                novarocks_execution::runtime::fragment::ExecutionFailure,
+            >,
+        >,
+        CausalError,
+    > {
+        stage.validate(&self.runtime, self.actor)?;
+        self.ingress.fail();
+        self.ingress
+            .take_failed_source(route, ordinal)
+            .map_err(Into::into)
+    }
+    pub(crate) fn advance_failed_source_pair(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        cut: CutId,
+        ledger: &novarocks_control_runtime::transaction::RuntimeLedger,
+        scope: &novarocks_control_runtime::transaction::ScopeHandle,
+        original_generation: Generation,
+        budget: usize,
+    ) -> Result<CausalSourceProgress, CausalError> {
+        self.validate_failed_scope(stage, scope)?;
+        let mut progressed = false;
+        if budget == 0 {
+            return Ok(CausalSourceProgress {
+                progressed,
+                reaped: None,
+            });
+        }
+        self.ingress.fail();
+        let route = crate::task_proposal_ingress::PairRoute::Cut(cut);
+        for holder in self.ingress.take_unused_pair(route)?.into_iter().flatten() {
+            holder.exit();
+            progressed = true;
+        }
+        for original in self.ingress.pair_inventory(route)? {
+            if let Some(source) = original.source {
+                let core = self.source_core_consumption(cut, source)?;
+                progressed |= original
+                    .custody
+                    .observe_failed_consumers(
+                        stage,
+                        &self.runtime,
+                        self.actor,
+                        original_generation,
+                        core,
+                    )
+                    .map_err(CausalError::Role)?;
+            } else {
+                let before = original.custody.phase();
+                original.custody.try_retire().map_err(CausalError::Role)?;
+                progressed |= before != original.custody.phase();
+            }
+        }
+        let runtime_error = |error| {
+            CausalError::Role(novarocks_control_runtime::exit_role::ExitRoleError::Runtime(error))
+        };
+        progressed |= ledger
+            .reap_scope_ready(scope.id(), budget.min(2))
+            .map_err(runtime_error)?
+            != 0;
+        let [first, second] = self.ingress.prepare_pair_reap(route)?;
+        let reaped = match (first.observe_reaped(), second.observe_reaped()) {
+            (Ok(first), Ok(second)) => Some([first, second]),
+            _ => None,
+        };
+        Ok(CausalSourceProgress { progressed, reaped })
     }
     /// Actual failed-owner teardown takes any values that never transferred.
     /// The runtime still owns a partially handed-off prefix, if one exists.
@@ -1460,6 +1680,24 @@ impl TaskCausalInbox {
                 .host_consumer_consumed = true;
         }
         Ok(true)
+    }
+    /// Positive receipt for this original RPC queued item taken by the real
+    /// failed owner before either of its runtime inputs ever transferred.
+    pub(crate) fn rpc_abandoned_before_fill(&self, cut: CutId) -> Result<bool, CausalError> {
+        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
+        if role.rpc_author.is_none() {
+            return Ok(false);
+        }
+        let Some(delivered) = &role.delivered else {
+            return Ok(false);
+        };
+        Ok(delivered.proof.is_none()
+            && delivered.prefix.is_none()
+            && delivered.event.is_none()
+            && delivered.source_consumption == Consumption::AbandonedByOwnerFailure
+            && delivered.event_consumption == Consumption::AbandonedByOwnerFailure
+            && delivered.rejected.is_none()
+            && self.ingress.cut_consumption(cut) == Some(Consumption::AbandonedByOwnerFailure))
     }
     pub(crate) fn rpc_cut(&self, cut: CutId) -> Result<bool, CausalError> {
         Ok(self

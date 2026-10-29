@@ -56,7 +56,10 @@ const SAFE_DETAIL: &str = "Unexpected failure (reason 13:20)";
 const HEALTHY_SQL: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 1) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(AcceptedPreparedFailureDelayedExit::default())]
+    vec![
+        Box::new(AcceptedPreparedFailureDelayedExit::default()),
+        Box::new(context_owner_panic::ContextOwnerPanicIsolation::default()),
+    ]
 }
 #[derive(Default)]
 struct AcceptedPreparedFailureDelayedExit {
@@ -725,4 +728,270 @@ fn write_artifact(context: &ScenarioContext, name: &str, value: &Value) -> Resul
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+// S8 is a separate owner oracle. The existing prepared-failure scenario above
+// remains unchanged: a typed host failure is not a Context actor panic.
+mod context_owner_panic {
+    use super::*;
+    use crate::scenarios::native_compatibility::{
+        RawUnaryResponse, only_successful_receipt, raw_operation_envelope, raw_unary_response,
+    };
+    use crate::scenarios::native_creation::{await_installed, outcome};
+
+    const OWNER_ACTION: &str = "context-owner-panic-on-renew";
+    const REMOVED: &str = "Original Worker Context Scope removed";
+
+    #[derive(Default)]
+    pub(super) struct ContextOwnerPanicIsolation {
+        intent: DirectIntentOwner,
+    }
+    impl Scenario for ContextOwnerPanicIsolation {
+        fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+            super::super::declarations::for_module(
+                "execution_failure_prepared",
+                self.name(),
+                self.is_explicit_stage(),
+                self.is_compatibility_stage(),
+            )
+        }
+        fn name(&self) -> &'static str {
+            "execution-failure/context-owner-panic-isolation"
+        }
+        fn is_explicit_stage(&self) -> bool {
+            true
+        }
+        fn test_session_plan(
+            &self,
+            _launch: &ScenarioLaunchConfig,
+            _root: &Path,
+            cluster_size: usize,
+            binary: &Path,
+            deadline: Instant,
+        ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>>
+        {
+            ensure!(
+                cluster_size == 3,
+                "Context isolation requires native 1FE+3BE"
+            );
+            Ok(Some(self.intent.freeze(
+                OWNER_ACTION,
+                3,
+                &[(0, 0, None)],
+                false,
+                cluster_size,
+                binary,
+                deadline,
+            )?))
+        }
+        fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
+            let mut launch = ScenarioLaunchConfig::default();
+            // The log is this scene's actual application writer output. It is
+            // not a synthetic state source or a replacement cleanup command.
+            let log = root.join("owner-application-log");
+            launch.config_overlay.be = Some(format!(
+                "sys_log_dir = {:?}\nlog_filter = \"info,novarocks_native_adapter::backend_application=debug,novarocks_worker::control_runtime::node_bootstrap=debug,novarocks_worker::control_runtime::node=debug,novarocks_worker::control_runtime::task=debug,novarocks_worker::control_runtime::context_host::requests=debug,novarocks_worker::control_runtime::causal=debug,novarocks_worker::control_runtime::context_host::task_driver=debug,novarocks_worker::control_runtime::context_host::teardown=debug\"\n[runtime]\ntask_normal_close_max_records = 1\ntask_normal_close_max_bytes = 67108864\n",
+                log.to_string_lossy(),
+            ));
+            Ok(launch)
+        }
+        fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+            ensure!(
+                context.handle().be_count() == 3,
+                "Context isolation requires native 1FE+3BE"
+            );
+            let intent = self.intent.get()?;
+            ensure!(
+                intent.deadline == context.deadline(),
+                "original isolation deadline changed"
+            );
+            let baseline = resource_snapshot(context)?;
+            let processes = context.recheck_live_process_launch_identities()?;
+            let a = &intent.queries[0];
+            let failed = RawBackendSession::establish_declared(context, 0, a.query_id, a.frontend)?;
+            intent.verify_backend(0, failed.backend)?;
+            let b = &intent.queries[1];
+            let sibling =
+                RawBackendSession::establish_declared(context, 0, b.query_id, b.frontend)?;
+            let mut receiver = RawCreate::values(&failed, 1);
+            receiver.pipeline_dop = 1;
+            receiver.exchange_input = true;
+            ensure_accepted(&failed, &receiver)?;
+            await_installed(context, &failed, &receiver)?;
+            context.action("installed an original live receiver on BE0 with the sole paid inbound row before the declared Context failure");
+
+            // A different operation on the SAME Context is not the grant.
+            let normal = renew(
+                &failed,
+                raw_operation_envelope(15_000),
+                1,
+                "unselected same-Context Renew",
+            )?;
+            ensure!(
+                outcome(&normal)? == proto::TaskOperationOutcome::Accepted,
+                "unselected Renew did not preserve its normal decision: {normal:?}"
+            );
+            let trigger = intent
+                .holds
+                .first()
+                .and_then(|hold| hold.trigger_operation)
+                .context("declared original trigger operation missing")?;
+            let mut envelope = raw_operation_envelope(15_000);
+            envelope.operation_id = Some(proto::TaskOperationId {
+                value: trigger.to_vec(),
+            });
+            let receipt = renew(
+                &failed,
+                envelope,
+                2,
+                "declared original Context owner panic",
+            )?;
+            ensure!(
+                outcome(&receipt)? == proto::TaskOperationOutcome::OwnerFailed,
+                "actual owner panic did not return the original R OwnerFailed: {receipt:?}"
+            );
+            ensure!(
+                context
+                    .handle()
+                    .be_log_count(0, "declared Context owner panic context=")?
+                    == 1,
+                "the original actor turn did not report exactly one declared panic"
+            );
+            context.action("unselected same-Context Renew remained normal; the exact declared operation panicked inside its original Context Actor turn and Common returned OwnerFailed through that same R");
+
+            let mut healthy = RawCreate::values(&sibling, 2);
+            healthy.pipeline_dop = 1;
+            ensure_accepted(&sibling, &healthy)?;
+            observe_task_terminal_and_stopped(
+                context,
+                &sibling,
+                &raw_create_identity(&healthy),
+                proto::TaskState::Finished,
+            )?;
+            let connection = mysql_actor::connect_until(
+                context.mysql_user(),
+                context.mysql_port(),
+                context.deadline(),
+            )?;
+            let rows: Vec<i64> = connection.run(|connection| {
+                connection
+                    .query(HEALTHY_SQL)
+                    .context("healthy public SQL after actual Context owner failure")
+            })?;
+            ensure!(
+                rows == [1, 1],
+                "healthy SQL rows changed after owner isolation: {rows:?}"
+            );
+            ensure!(
+                context.recheck_live_process_launch_identities()? == processes,
+                "owner failure replaced a role process instead of isolating its Context"
+            );
+            ensure!(
+                sibling.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
+                "the independent same-BE Context did not really release"
+            );
+            context.action("an independent Context on the SAME BE Finished and actually stopped, public SQL returned exact rows, and its original Release completed without replacing a role");
+
+            // This original transition is emitted only AFTER actual Scope
+            // removal. No missing directory row or terminal bool proves it.
+            let path = context
+                .scenario_root()
+                .join("owner-application-log/novarocks.INFO");
+            let high = format!("query_high={}", a.query_id.hi);
+            let low = format!("query_low={} ", a.query_id.lo);
+            loop {
+                let log = match fs::read_to_string(&path) {
+                    Ok(log) => log,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(error) => {
+                        return Err(error).context("read original Context removal writer output");
+                    }
+                };
+                if let Some(line) = log.lines().find(|line| {
+                    line.contains(REMOVED)
+                        && line.contains(&high)
+                        && line.contains(&low)
+                        && line.contains("attempt=1")
+                }) {
+                    write_artifact(
+                        context,
+                        "owner-scope-removed.json",
+                        &json!({"original_line":line}),
+                    )?;
+                    break;
+                }
+                thread::sleep(
+                    context
+                        .remaining("wait original failed Context Scope removal")?
+                        .min(Duration::from_millis(50)),
+                );
+            }
+            await_resource_convergence(context, &baseline)?;
+            let c = &intent.queries[2];
+            let recovered =
+                RawBackendSession::establish_declared(context, 0, c.query_id, c.frontend)?;
+            let mut replacement = RawCreate::values(&recovered, 3);
+            replacement.pipeline_dop = 1;
+            replacement.exchange_input = true;
+            ensure_accepted(&recovered, &replacement)?;
+            await_installed(context, &recovered, &replacement)?;
+            ensure!(
+                recovered.release_when_ready(context)?
+                    == proto::ReleaseQueryContextOutcome::Released,
+                "recovered receiver did not complete its real normal release"
+            );
+            await_resource_convergence(context, &baseline)?;
+            ensure!(
+                context.recheck_live_process_launch_identities()? == processes,
+                "role process changed before actual failure cleanup/recovered admission"
+            );
+            ensure!(
+                context
+                    .handle()
+                    .be_log_count(0, "declared Context owner panic context=")?
+                    == 1,
+                "the once-grant produced another actor panic"
+            );
+            write_artifact(
+                context,
+                "owner-isolation-oracle.json",
+                &json!({
+                    "owner_failed_original_R":true,"same_BE_healthy_actual_stop":true,
+                    "failed_scope_physically_removed":true,"fresh_receiver_installed_at_record_limit":1,
+                    "healthy_rows":rows,"role_processes_unchanged":true,
+                    "final_required_audit":"original FE+3BE monitor Finals all raw0; no lifetime expiry/owner loss; actual Node joins and cluster/fixture cleanup. Scenario return alone is insufficient."
+                }),
+            )?;
+            context.action("the original failed Context Scope physically disappeared, original quota recovered at the unchanged one-row bound, and a fresh receiver Installed then normally Released; final four raw exits remain independently required");
+            Ok(())
+        }
+    }
+    fn renew(
+        session: &RawBackendSession,
+        envelope: proto::TaskOperationEnvelope,
+        sequence: u64,
+        subject: &str,
+    ) -> Result<proto::TaskOperationReceipt> {
+        let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
+            &session.control_connector,
+            "/novarocks.NovaRocksGrpc/ApplyTaskControlOperations",
+            &session.authorization,
+            proto::ApplyTaskControlOperationsRequest {
+                operations: vec![proto::TaskControlOperation {
+                    envelope: Some(envelope),
+                    control: Some(proto::task_control_operation::Control::RenewLease(
+                        proto::RenewQueryExecutionLeaseRequest {
+                            query_context: Some(session.context_under(session.frontend, 1)),
+                            lease: Some(proto::QueryExecutionLeaseGrant {
+                                sequence,
+                                valid_for_millis: 30_000,
+                            }),
+                        },
+                    )),
+                }],
+            },
+            session.original_deadline,
+        )?;
+        only_successful_receipt(response, subject)
+    }
 }

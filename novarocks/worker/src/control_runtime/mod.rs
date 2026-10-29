@@ -67,4 +67,5 @@ pub(crate) mod source_custody;
 pub(crate) mod source_positions;
 pub(crate) mod source_slot_issuer;
 
+pub(crate) mod task_disposal;
 pub(crate) mod task_host_call;

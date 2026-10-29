@@ -323,6 +323,8 @@ pub(crate) struct ContextRequestCustody {
     submitted: bool,
     started: bool,
     failed_message: Option<WorkerMessage>,
+    #[cfg(novarocks_dev_controls)]
+    owner_panic_on_renew: bool,
     published: Option<(InputId, ActionId)>,
     reply_completed: bool,
     input_retired: bool,
@@ -531,6 +533,8 @@ impl ContextRequestCustody {
                 submitted: false,
                 started: false,
                 failed_message: None,
+                #[cfg(novarocks_dev_controls)]
+                owner_panic_on_renew: false,
                 published: None,
                 reply_completed: false,
                 input_retired: false,
@@ -620,14 +624,34 @@ impl ContextRequestCustody {
             }
             _ => crate::control_runtime::request_observation::ContextObservationKind::Other,
         };
-        let message = WorkerMessage::Context(ContextMessage::Command {
+        let metadata = RequestMetadata {
+            operation: self.request().operation,
+            deadline: self.request().deadline,
+        };
+        let message = ContextMessage::Command {
             work: self.work,
-            request: Some(RequestMetadata {
-                operation: self.request().operation,
-                deadline: self.request().deadline,
-            }),
+            request: Some(metadata),
             command: ContextInput::Request(command),
-        });
+        };
+        #[cfg(novarocks_dev_controls)]
+        let message = if std::mem::take(&mut self.owner_panic_on_renew) {
+            let ContextMessage::Command {
+                work,
+                request: Some(request),
+                command,
+            } = message
+            else {
+                unreachable!("the same admitted Renew retains its metadata");
+            };
+            ContextMessage::TestOwnerPanicOnRenew {
+                work,
+                request,
+                command,
+            }
+        } else {
+            message
+        };
+        let message = WorkerMessage::Context(message);
         match self.permit.take().expect("one original fill").fill(message) {
             Ok(actual) => {
                 assert_eq!(actual, self.request().token);
@@ -723,7 +747,12 @@ impl ContextRequestCustody {
         session: &mut FailurePublicationSession<WorkerActor>,
     ) -> Result<bool, ContextRequestError> {
         if self.endpoint.reply().is_committed() {
+            // The immutable first commitment may already have been taken by
+            // its external reader. Failure cannot replace it, but the original
+            // R must retain its positive publication disposition.
+            self.reply_completed = true;
             self.notification.published();
+            self.endpoint.external().notify();
             return Ok(false);
         }
         let body = Arc::new(ContextReplyBody::Verdict(RequestResult::Outcome(
@@ -776,10 +805,13 @@ impl ContextRequestCustody {
                 task.as_deref_mut()
                     .ok_or(ContextRequestError::UnknownTask)?,
             )?;
-            if self.submitted && self.request.is_none() {
+            if self.submitted && self.request.is_none() && !route.abandoned_before_fill() {
                 return Ok(false);
             }
         }
+        let abandoned_before_fill = route
+            .as_ref()
+            .is_some_and(|route| route.abandoned_before_fill());
         if self.domain.as_ref().is_some_and(|domain| !domain.retired) {
             return Ok(false);
         }
@@ -823,7 +855,7 @@ impl ContextRequestCustody {
                 self.exit_observed = true;
             }
         } else {
-            if !self.input_retired {
+            if !self.input_retired && !abandoned_before_fill {
                 if !self.observe_core()? {
                     return Ok(false);
                 }
@@ -1106,6 +1138,35 @@ impl ContextHostRecord {
             }),
         }
     }
+    /// The adapter has consumed an exact declared session action. Bind its
+    /// neutral marker before filling this already admitted original R input.
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn submit_request_owner_panic(
+        &mut self,
+        work: WorkId,
+        command: ContextCommand,
+    ) -> Result<(), ContextRequestSubmitRefusal> {
+        if !matches!(&command, ContextCommand::Renew { .. }) {
+            return Err(ContextRequestSubmitRefusal {
+                error: ContextRequestError::WrongRequest,
+                command: Some(command),
+            });
+        }
+        let Some(original) = self.resources.requests.get_mut(&work) else {
+            return Err(ContextRequestSubmitRefusal {
+                error: ContextRequestError::UnknownRequest,
+                command: Some(command),
+            });
+        };
+        if original.submitted || original.task_route.is_some() {
+            return Err(ContextRequestSubmitRefusal {
+                error: ContextRequestError::WrongPhase,
+                command: Some(command),
+            });
+        }
+        original.owner_panic_on_renew = true;
+        self.submit_request(work, command)
+    }
     pub(crate) fn publish_request_reply(
         &mut self,
         ticket: EffectTicket<WorkerAction>,
@@ -1127,6 +1188,47 @@ impl ContextHostRecord {
         };
         original.release_observation = released_observation;
         original.publish(ticket)
+    }
+    /// Finish the same original Reply action after the live failure owner has
+    /// preserved the immutable first outbox commitment. This settles action
+    /// metadata only, never the external delivery or any physical R holder.
+    pub(crate) fn finish_failed_reply_effect(
+        &mut self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+        ticket: EffectTicket<WorkerAction>,
+    ) -> Result<(), (ContextRequestError, EffectTicket<WorkerAction>)> {
+        if let Err(error) = stage.validate_scope(&self.control_runtime, self.actor, self.scope()) {
+            return Err((ContextRequestError::Driver(error), ticket));
+        }
+        let reply = match &ticket.effect {
+            WorkerAction::Reply(reply) if ticket.actor == self.actor => reply,
+            _ => return Err((ContextRequestError::WrongRequest, ticket)),
+        };
+        let Some(work) = self.request_inputs.get(&reply.request.token).copied() else {
+            return Err((ContextRequestError::UnknownRequest, ticket));
+        };
+        let original = self
+            .resources
+            .requests
+            .get_mut(&work)
+            .expect("original R reply index");
+        if original.request != Some(reply.request)
+            || original.expected_task != reply.task
+            || !reply.body.matches(reply.result)
+            || !original.endpoint.reply().is_committed()
+            || original
+                .published
+                .is_some_and(|key| key != (ticket.input, ticket.descriptor.id))
+        {
+            return Err((ContextRequestError::WrongRequest, ticket));
+        }
+        if let Err(refusal) = self.control_runtime.effect_completed(ticket) {
+            return Err((ContextRequestError::Driver(refusal.error), refusal.ticket));
+        }
+        original.reply_completed = true;
+        original.notification.published();
+        original.endpoint.external().notify();
+        Ok(())
     }
     /// The same actual input's request wake, if this effect belongs to an R.
     /// No endpoint/body/Work authority is reconstructed from numeric identity.
@@ -1216,7 +1318,17 @@ impl ContextHostRecord {
                 self.request_inputs.remove(&input);
             }
             if let (Some(task), Some(cut)) = (task_identity, cut) {
-                self.task_request_cuts.remove(&(task, cut));
+                if self.task_request_cuts.remove(&(task, cut)).is_some()
+                    && let Some(
+                        super::TaskHostOwner::Ready(host)
+                        | super::TaskHostOwner::Initializing(host),
+                    ) = self.tasks.get(&task)
+                {
+                    // The actual last routing index can disappear after this
+                    // turn's failed-Task sweep. No physical producer need wake
+                    // again; retain one retry on this same still-owned Task.
+                    host.pending_notice().pending();
+                }
                 // The same route just returned its original cut/source funding.
                 // Wake only its Task's genuinely parked Root R positions.
                 self.resources.root_reads.source_progress(task);
@@ -1495,6 +1607,8 @@ impl ContextHostRecord {
             submitted: false,
             started: false,
             failed_message: None,
+            #[cfg(novarocks_dev_controls)]
+            owner_panic_on_renew: false,
             published: None,
             reply_completed: false,
             input_retired: false,

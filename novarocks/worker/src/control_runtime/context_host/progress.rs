@@ -148,6 +148,15 @@ impl ContextHostRecord {
         &mut self,
         handles: &ContextExecutorHandles,
     ) -> Result<ContextHostProgress, ContextHostProgressError> {
+        self.advance_host_io_for_owner(handles, None, 3)
+    }
+
+    pub(super) fn advance_host_io_for_owner(
+        &mut self,
+        handles: &ContextExecutorHandles,
+        failed: Option<&super::failure::ScopePublicationsDrained<'_>>,
+        budget: usize,
+    ) -> Result<ContextHostProgress, ContextHostProgressError> {
         let jobs = self
             .resources
             .host_jobs
@@ -156,14 +165,20 @@ impl ContextHostRecord {
         if !handles.accepts_owner(jobs) {
             return Err(ContextHostJobError::WrongOwner.into());
         }
-        let mut progress = ContextHostProgress {
-            returned: jobs.poll_returns()?,
-            ..Default::default()
-        };
+        let mut progress = ContextHostProgress::default();
+        if let Some(stage) = failed {
+            let returns = jobs.poll_failed_returns(stage, budget)?;
+            progress.returned = returns.observed;
+        } else {
+            progress.returned = jobs.poll_returns()?;
+        }
         if let Some(fault) = jobs.fault() {
             return Err(ContextHostProgressError::Fault(fault));
         }
-        progress.callbacks_retired = jobs.retire_callbacks()?;
+        progress.callbacks_retired = match failed {
+            Some(stage) => jobs.retire_failed_callbacks(stage, budget)?,
+            None => jobs.retire_callbacks()?,
+        };
         progress.holder_retired = jobs.retire_holder()?;
         progress.owner_control_retired = self
             .resources
@@ -178,6 +193,18 @@ impl ContextHostRecord {
         );
 
         let stopped = jobs.scope_stopped().map_err(ContextHostJobError::Runtime)?;
+        if let Some(stage) = failed
+            && self.tasks.is_empty()
+            && self.task_driver.is_idle()
+            && self.resources.pending_host_jobs.root_release_finished
+        {
+            jobs.request_failed_release(stage)?;
+        }
+        if let Some(stage) = failed
+            && let Some(lifecycle) = self.resources.lifecycle.as_mut()
+        {
+            lifecycle.forward_failed_retained(stage, jobs)?;
+        }
         let pending = &mut self.resources.pending_host_jobs;
         if stopped && pending.materialization_submitted && !pending.materialization_cancel_checked {
             // Cancel and physical pop arbitrate in the original queue. A pop

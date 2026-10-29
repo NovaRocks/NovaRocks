@@ -669,6 +669,37 @@ impl WorkerNodeHost {
         deadline: MonotonicInstant,
         command: novarocks_worker_protocol::context::ContextCommand,
     ) -> Result<super::context_host::ContextRequestHandle, NodeHostRefusal> {
+        self.submit_context_selected(context, source, operation, deadline, command, false)
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn submit_context_owner_panic(
+        &self,
+        context: QueryContextRef,
+        source: ActorId,
+        operation: TaskOperationId,
+        deadline: MonotonicInstant,
+        command: novarocks_worker_protocol::context::ContextCommand,
+    ) -> Result<super::context_host::ContextRequestHandle, NodeHostRefusal> {
+        if !matches!(
+            &command,
+            novarocks_worker_protocol::context::ContextCommand::Renew { .. }
+        ) {
+            return Err(NodeHostRefusal::new(
+                "declared owner panic requires its original Renew",
+                command,
+            ));
+        }
+        self.submit_context_selected(context, source, operation, deadline, command, true)
+    }
+    fn submit_context_selected(
+        &self,
+        context: QueryContextRef,
+        source: ActorId,
+        operation: TaskOperationId,
+        deadline: MonotonicInstant,
+        command: novarocks_worker_protocol::context::ContextCommand,
+        _panic_on_renew: bool,
+    ) -> Result<super::context_host::ContextRequestHandle, NodeHostRefusal> {
         use novarocks_worker_protocol::context::ContextCommand;
         if !matches!(
             &command,
@@ -705,7 +736,15 @@ impl WorkerNodeHost {
                 ));
             }
         };
-        match host.submit_request(work, command) {
+        #[cfg(novarocks_dev_controls)]
+        let submitted = if _panic_on_renew {
+            host.submit_request_owner_panic(work, command)
+        } else {
+            host.submit_request(work, command)
+        };
+        #[cfg(not(novarocks_dev_controls))]
+        let submitted = host.submit_request(work, command);
+        match submitted {
             Ok(()) => Ok(handle),
             Err(error) => Err(NodeHostRefusal::new(
                 "Context request submission",

@@ -20,6 +20,8 @@
 //! one finite set of original fragment capabilities outside the actor.
 
 mod domain_return;
+mod failed_retirement;
+pub(crate) use failed_retirement::{FailedTaskAction, FailedTaskNeutral, FailedTaskStep};
 
 use super::{
     actors::{WorkerAction, WorkerActor},
@@ -101,6 +103,11 @@ pub(crate) enum TaskHostError {
     SourceSlots(SourceSlotIssueError),
     SourceStorage(PreparationStorageSplitError),
     SourceInventoryPending,
+    Disposal(super::task_disposal::TaskDisposalError),
+    Loading(LoadingEventError),
+    FailureSettlement(crate::settlement::SettlementDispatchError),
+    FailureProjection(crate::task_port::ProjectionError),
+    DynamicFilters(super::dynamic_filters::DynamicFilterError),
     HostCall(TaskHostCallError),
     OwnerFailed,
     OpenSummary(super::open_summary::OpenSummaryError),
@@ -135,6 +142,19 @@ impl From<RuntimeError> for TaskHostError {
 impl std::fmt::Display for TaskHostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Loading(error) => {
+                write!(f, "original loading failure takeover failed: {error:?}")
+            }
+            Self::FailureSettlement(error) => {
+                write!(f, "original failed settlement dispatch failed: {error:?}")
+            }
+            Self::FailureProjection(error) => {
+                write!(f, "original failed source detachment failed: {error:?}")
+            }
+            Self::DynamicFilters(error) => {
+                write!(f, "original RF failure takeover failed: {error:?}")
+            }
+            Self::Disposal(error) => write!(f, "original Task disposal failed: {error:?}"),
             Self::SourceSlots(error) => write!(f, "source slot admission failed: {error:?}"),
             Self::SourceStorage(error) => {
                 write!(f, "original source storage transfer failed: {error:?}")
@@ -213,6 +233,8 @@ pub(crate) struct UnpublishedTask {
     /// A split fee whose empty reported holder could not be created. It never
     /// acquired a callback or port and stays with this original unpublished Task.
     pub host_call_payments: Vec<CapacityBundle>,
+    pub disposal: Option<super::task_disposal::TaskDisposalRole>,
+    pub disposal_payments: Vec<CapacityBundle>,
 }
 impl UnpublishedTask {
     /// No host job, port, getter or observer was ever exposed. Retire only the
@@ -220,10 +242,17 @@ impl UnpublishedTask {
     pub(crate) fn retire_host_calls(
         &mut self,
         ledger: &novarocks_control_runtime::transaction::RuntimeLedger,
-    ) -> Result<bool, TaskHostCallError> {
+    ) -> Result<bool, TaskHostError> {
         let mut retired = true;
+        if let Some(disposal) = &self.disposal {
+            retired &= disposal
+                .retire_unused(ledger)
+                .map_err(TaskHostError::Disposal)?;
+        }
         for call in &self.host_calls {
-            retired &= call.retire_unused(ledger)?;
+            retired &= call
+                .retire_unused(ledger)
+                .map_err(TaskHostError::HostCall)?;
         }
         if !retired {
             return Ok(false);
@@ -234,6 +263,12 @@ impl UnpublishedTask {
             }
         }
         self.host_call_payments.clear();
+        for fee in &mut self.disposal_payments {
+            if !fee.is_released() {
+                fee.release(&fee.resources()?)?;
+            }
+        }
+        self.disposal_payments.clear();
         Ok(true)
     }
 }
@@ -285,6 +320,7 @@ pub(crate) struct TaskHostResources {
     pub active: CapacityBundle,
     pub port: Arc<TaskRuntimePort>,
     pub host_calls: [TaskHostCall; HOST_CALL_KINDS.len()],
+    pub disposal: super::task_disposal::TaskDisposalRole,
     pub loader: Option<LoaderCustody>,
     pub loading_events: Option<LoadingEvents>,
     pub loading_return: Option<OwnedReturnReader<LoadingJobReturned>>,
@@ -395,6 +431,23 @@ pub(crate) enum HostInstallationOutcome {
     Refused(HostPreparationRefusal),
     WorkRefused(RuntimeError),
 }
+/// Dropped inside PreparationJob's original supervised body even when its
+/// stop/start gate rejects invocation of the unused callback.
+struct FailedPreparationCaptures {
+    binding: Option<HostPreparationBinding>,
+    inbound: Option<crate::TaskInboundPermit>,
+}
+impl Drop for FailedPreparationCaptures {
+    fn drop(&mut self) {
+        if let Some(inbound) = self.inbound.take() {
+            if let Err((error, original)) = inbound.release() {
+                std::mem::forget(original);
+                panic!("Original unexposed inbound payment release failed: {error:?}");
+            }
+        }
+        drop(self.binding.take());
+    }
+}
 struct PreparationPendingWake(Arc<dyn TaskPendingNotice>);
 impl std::task::Wake for PreparationPendingWake {
     fn wake(self: Arc<Self>) {
@@ -457,6 +510,24 @@ impl TaskPreparationJob {
         // registered provider child still owes separate rollback/adoption.
         children.body_exited();
         outcome
+    }
+    /// The actual failed owner took this still-unexposed job from its own
+    /// adoption slot. Dispose all original captures inside the same prepaid
+    /// preparation body, before that custodian observes capture exit.
+    fn dispose_failed_on_host(mut self) {
+        let binding = self.host.take();
+        let children = binding.as_ref().map(|binding| binding.children.clone());
+        let captures = FailedPreparationCaptures {
+            binding,
+            inbound: self.inbound.take(),
+        };
+        let _outcome = self.run(move |_request, input, _parent| {
+            drop(input);
+            drop(captures);
+        });
+        if let Some(children) = children {
+            children.body_exited();
+        }
     }
     pub(crate) fn run<T>(
         mut self,
@@ -545,6 +616,7 @@ pub(crate) struct TaskHostRecord {
         novarocks_worker_protocol::proposal_summary::CutId,
         novarocks_control_runtime_core::identity::WorkId,
     )>,
+    failed_retirement: failed_retirement::FailedRetirementCursor,
     host_cut_cursor: Option<novarocks_worker_protocol::proposal_summary::CutId>,
     host_retired_pairs: BTreeMap<
         novarocks_worker_protocol::proposal_summary::CutId,
@@ -573,6 +645,7 @@ impl TaskHostRecord {
         runtime: &ActorRuntime<WorkerActor>,
         ticket: &EffectTicket<WorkerAction>,
         binding: TaskHostBinding,
+        context_lifetime: &WorkLease,
     ) -> Result<Self, TaskAdoptionRefusal> {
         let (task, payload, reservation) = match &ticket.effect {
             WorkerAction::Context(ContextEffect::LoadInput {
@@ -589,6 +662,12 @@ impl TaskHostRecord {
             .checked_add(2)
             .and_then(|segments| segments.checked_mul(2))
             .ok_or(TaskHostError::InvalidGeometry)?;
+        if !runtime
+            .owns_scope(ticket.actor, context_lifetime.scope())
+            .map_err(TaskHostError::Driver)?
+        {
+            return Err(TaskHostError::WrongTaskOrPayload.into());
+        }
         let guard = runtime
             .take_step_reservation(ticket, reservation)
             .map_err(TaskHostError::Driver)?;
@@ -623,6 +702,8 @@ impl TaskHostRecord {
                         source_partials: vec![refusal.partial],
                         host_calls: Vec::new(),
                         host_call_payments: Vec::new(),
+                        disposal: None,
+                        disposal_payments: Vec::new(),
                     })),
                 });
             }
@@ -644,6 +725,8 @@ impl TaskHostRecord {
                     source_partials: vec![SourceSlotIssuePartial::from_admissions(&scope, sources)],
                     host_calls,
                     host_call_payments,
+                    disposal: None,
+                    disposal_payments: Vec::new(),
                 })),
             }
         };
@@ -705,6 +788,64 @@ impl TaskHostRecord {
             };
             host_calls.push(call);
         }
+        let disposal_payment = match super::task_disposal::TaskDisposalPayment::split_from(
+            &mut active,
+            #[cfg(test)]
+            binding.source_storage_model,
+        ) {
+            Ok(payment) => payment,
+            Err(error) => {
+                return Err(unpublished(
+                    TaskHostError::Runtime(error),
+                    lifetime,
+                    active,
+                    sources,
+                    host_calls,
+                    Vec::new(),
+                ));
+            }
+        };
+        let disposal_reported = match super::task_disposal::admit_disposal_work(context_lifetime) {
+            Ok(role) => role,
+            Err(error) => {
+                let mut refusal = unpublished(
+                    TaskHostError::Runtime(error),
+                    lifetime,
+                    active,
+                    sources,
+                    host_calls,
+                    Vec::new(),
+                );
+                match disposal_payment {
+                    super::task_disposal::TaskDisposalPayment::Paid(fee) => refusal
+                        .unpublished
+                        .as_mut()
+                        .expect("original unpublished Task")
+                        .disposal_payments
+                        .push(fee),
+                    #[cfg(test)]
+                    super::task_disposal::TaskDisposalPayment::ProtocolModel => {}
+                }
+                return Err(refusal);
+            }
+        };
+        let disposal = match super::task_disposal::TaskDisposalRole::from_admitted(
+            super::task_disposal::TaskDisposalBinding {
+                runtime: runtime.clone(),
+                actor: ticket.actor,
+                task,
+                pending: binding.pending.clone(),
+                health: binding.health.clone(),
+            },
+            disposal_reported,
+            disposal_payment,
+        ) {
+            Ok(role) => role,
+            Err(originals) => {
+                std::mem::forget((originals, lifetime, active, sources, host_calls));
+                std::process::abort();
+            }
+        };
         let ingress = match TaskProposalIngress::from_admitted(
             task,
             binding.max_cuts,
@@ -714,14 +855,20 @@ impl TaskHostRecord {
         ) {
             Ok(ingress) => Arc::new(ingress),
             Err((_error, sources)) => {
-                return Err(unpublished(
+                let mut refusal = unpublished(
                     TaskHostError::InvalidGeometry,
                     lifetime,
                     active,
                     sources,
                     host_calls,
                     Vec::new(),
-                ));
+                );
+                refusal
+                    .unpublished
+                    .as_mut()
+                    .expect("original unpublished Task")
+                    .disposal = Some(disposal);
+                return Err(refusal);
             }
         };
         let port = Arc::new(TaskRuntimePort::from_admitted(
@@ -760,6 +907,7 @@ impl TaskHostRecord {
                 active,
                 port,
                 host_calls,
+                disposal,
                 loader: None,
                 loading_events: None,
                 loading_return: None,
@@ -798,6 +946,7 @@ impl TaskHostRecord {
             normal_lifetime_ended: false,
             completion_core_observed: false,
             production_settlement_cut: None,
+            failed_retirement: failed_retirement::FailedRetirementCursor::default(),
             host_cut_cursor: None,
             host_retired_pairs: BTreeMap::new(),
         })
@@ -858,8 +1007,37 @@ impl TaskHostRecord {
             .take_retire_failure_job(drained, &exited)
             .map(Some)
     }
+    pub(crate) fn authorize_failed_disposal(
+        &self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+    ) -> Result<super::task_disposal::TaskDisposalAuthorization, TaskHostError> {
+        stage
+            .validate(self.resources.causal.runtime(), self.actor)
+            .map_err(TaskHostError::Driver)?;
+        self.resources
+            .seal_read_observation()
+            .map_err(|_| TaskHostError::SourceInventoryPending)?;
+        self.resources
+            .disposal
+            .authorize_failure(stage)
+            .map_err(TaskHostError::Disposal)
+    }
+    pub(crate) fn authorize_normal_disposal(
+        &self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<super::task_disposal::TaskDisposalAuthorization, TaskHostError> {
+        self.resources
+            .disposal
+            .authorize_normal(ticket)
+            .map_err(TaskHostError::Disposal)
+    }
     pub(crate) fn task_id(&self) -> TaskIdentity {
         self.task
+    }
+    /// The exact admitted incarnation, including rejected creations that
+    /// never produced a normal RetireTask effect.
+    pub(crate) fn original_payload_id(&self) -> PayloadId {
+        self.payload
     }
     pub(crate) fn request_admission_open(&self) -> bool {
         self.request_admission_open
@@ -3157,7 +3335,7 @@ impl TaskHostRecord {
 }
 
 mod retirement;
-pub(crate) use retirement::RetiredTaskDisposal;
+pub(crate) use retirement::TaskDisposal;
 mod root_retention;
 pub(crate) use root_retention::{
     RetainedRootSeal, RetainedRootSealError, RetainedRootSealPreparation, RootContextRetention,

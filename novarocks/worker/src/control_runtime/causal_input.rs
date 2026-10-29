@@ -41,6 +41,7 @@ pub(crate) struct CausalInputBinding {
 
 struct Custody {
     task: TaskIdentity,
+    scope: novarocks_control_runtime::transaction::ScopeHandle,
     cut: CutId,
     binding: CausalAuthorBinding,
     role: ExitRole,
@@ -92,6 +93,7 @@ impl CausalInputCustody {
         let binding = inbox
             .author_binding(task, cut, admitted.work.id(), &sender)
             .expect("the original input author uses its exact admitted sender and Work");
+        let scope = admitted.work.scope().clone();
         let report = admitted.report.clone();
         let (role, authority) = ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
             admitted.work,
@@ -100,6 +102,7 @@ impl CausalInputCustody {
         ));
         let custody = Arc::new(Custody {
             task,
+            scope,
             cut,
             binding,
             role,
@@ -183,6 +186,55 @@ impl CausalInputCustody {
             self.report()
                 .consume(core)
                 .map_err(CausalInputError::Report)?;
+        }
+        self.try_retire().map_err(CausalInputError::Role)
+    }
+    /// Failure resolves only the original dead Core consumer. The exact report
+    /// validates its original generation; host exit remains a separate fact.
+    pub(crate) fn observe_failed_consumers(
+        &self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+        inbox: &mut TaskCausalInbox,
+        original_generation: novarocks_control_runtime_core::identity::Generation,
+    ) -> Result<bool, CausalInputError> {
+        inbox
+            .validate_failed_scope(stage, &self.0.scope)
+            .map_err(CausalInputError::Causal)?;
+        if self.phase() == ExitRolePhase::Retired {
+            return Ok(true);
+        }
+        let receipt = inbox
+            .failed_author_consumption(stage, &self.0.binding)
+            .map_err(CausalInputError::Causal)?;
+        let core = ConsumerId::new(1).unwrap();
+        if receipt == Consumption::AbandonedByOwnerFailure
+            && self
+                .report()
+                .consumption(core)
+                .map_err(CausalInputError::Report)?
+                == Consumption::Pending
+        {
+            self.report()
+                .abandon_failed_owner(core, &self.0.scope, original_generation)
+                .map_err(CausalInputError::Report)?;
+        }
+        if !self.actual_exit_ready().map_err(CausalInputError::Role)? {
+            return Ok(false);
+        }
+        for consumer in [ConsumerId::new(2).unwrap(), core] {
+            if consumer == core && receipt != Consumption::Consumed {
+                continue;
+            }
+            if self
+                .report()
+                .consumption(consumer)
+                .map_err(CausalInputError::Report)?
+                == Consumption::Pending
+            {
+                self.report()
+                    .consume(consumer)
+                    .map_err(CausalInputError::Report)?;
+            }
         }
         self.try_retire().map_err(CausalInputError::Role)
     }

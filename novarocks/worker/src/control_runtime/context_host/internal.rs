@@ -200,6 +200,37 @@ impl ContextInternal {
     pub(super) fn failed_publications_drained(&self) -> bool {
         self.failed
     }
+    /// The only remaining input is the builtin supervisor, independent of
+    /// this original self-source. No producer can create another callback.
+    pub(super) fn ready_for_failure_tail(&self, supervisor: InputId) -> Result<bool, DriverError> {
+        if !self.failed || !self.source_ended || self.pending || self.rejected_retirement.is_some()
+        {
+            return Ok(false);
+        }
+        let original = self.binding()?;
+        if self
+            .role
+            .as_ref()
+            .map(InputRole::in_flight)
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let snapshot = original.runtime.snapshot(original.registration.actor())?;
+        Ok(!snapshot.external_open
+            && snapshot.inputs == 1
+            && snapshot.roles == usize::from(self.role.is_some())
+            && original
+                .runtime
+                .pending_batches(original.registration.actor(), None, 2)?
+                == [supervisor]
+            && original
+                .runtime
+                .timer_source_state(original.registration.actor())?
+                == TimerSourceState::ClosedDrained)
+    }
     /// Borrow the existing prepaid self-source for one exact completed
     /// disposal. Busy preserves the caller's original Task entry and payload.
     pub(super) fn try_submit_rejected_creation(

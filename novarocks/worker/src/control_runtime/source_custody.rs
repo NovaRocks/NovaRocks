@@ -55,7 +55,9 @@ struct Exits {
 }
 struct Custody {
     task: TaskIdentity,
+    scope: novarocks_control_runtime::transaction::ScopeHandle,
     role: ExitRole,
+    work: novarocks_control_runtime_core::identity::WorkId,
     report: ReportSlot,
     retirement: WorkRetirementObserver,
     exits: Mutex<Exits>,
@@ -113,12 +115,16 @@ impl SourceCustody {
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
     ) -> (Self, SourcePermit) {
+        let scope = reported.work().scope().clone();
+        let work = reported.work().id();
         let report = reported.report().clone();
         let retirement = reported.work().retirement_observer();
         let (role, authority) = ExitRole::from_admitted(reported);
         let shared = Arc::new(Custody {
             task,
+            scope,
             role,
+            work,
             report,
             retirement,
             exits: Mutex::new(Exits {
@@ -139,6 +145,16 @@ impl SourceCustody {
             active: true,
         };
         (custody, permit)
+    }
+    /// Immutable scheduling identity of this actual admitted Source role.
+    /// It neither signs exit nor grants another payload/Work permission.
+    pub(crate) fn queue_key(
+        &self,
+    ) -> (
+        novarocks_control_runtime_core::identity::ScopeId,
+        novarocks_control_runtime_core::identity::WorkId,
+    ) {
+        (self.0.scope.id(), self.0.work)
     }
     pub(crate) fn report(&self) -> &ReportSlot {
         &self.0.report
@@ -214,6 +230,51 @@ impl SourceCustody {
             drop(retained);
         }
         Ok(retired)
+    }
+    /// Classifies only the original Core report leg. Source holders, aliases
+    /// and their unique authority continue to supply physical exit themselves.
+    pub(crate) fn observe_failed_consumers(
+        &self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+        runtime: &novarocks_control_runtime::driver::ActorRuntime<super::actors::WorkerActor>,
+        actor: novarocks_control_runtime_core::identity::ActorId,
+        original_generation: novarocks_control_runtime_core::identity::Generation,
+        core_receipt: novarocks_control_runtime_core::completion::Consumption,
+    ) -> Result<bool, ExitRoleError> {
+        use novarocks_control_runtime_core::{completion::Consumption, identity::ConsumerId};
+        stage
+            .validate_scope(runtime, actor, &self.0.scope)
+            .map_err(|_| {
+                ExitRoleError::Runtime(
+                    novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
+                )
+            })?;
+        if self.phase() == ExitRolePhase::Retired {
+            return Ok(false);
+        }
+        let mut progressed = false;
+        let core = ConsumerId::new(1).unwrap();
+        if core_receipt == Consumption::AbandonedByOwnerFailure
+            && self.report().consumption(core)? == Consumption::Pending
+        {
+            self.report()
+                .abandon_failed_owner(core, &self.0.scope, original_generation)?;
+            progressed = true;
+        }
+        if self.actual_exit_ready()? {
+            for consumer in [ConsumerId::new(2).unwrap(), core] {
+                if consumer == core && core_receipt != Consumption::Consumed {
+                    continue;
+                }
+                if self.report().consumption(consumer)? == Consumption::Pending {
+                    self.report().consume(consumer)?;
+                    progressed = true;
+                }
+            }
+        }
+        let before = self.phase();
+        self.try_retire()?;
+        Ok(progressed || before != self.phase())
     }
     fn report_unresolved(&self) {
         let source_phase = self

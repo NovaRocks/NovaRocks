@@ -187,6 +187,37 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                         };
                     }
                     UpdateQueryContext::RenewLease(request) => {
+                        #[cfg(novarocks_dev_controls)]
+                        if let Some(controls) = self.test_controls.get()
+                            && let Some(mut claim) = controls
+                                .claim_context_owner_panic(
+                                    request.context(),
+                                    request.envelope().operation_id(),
+                                )
+                                .map_err(Status::failed_precondition)?
+                        {
+                            // Authorization is consumed once before this SAME R
+                            // is admitted. No fault owner or callback enters Core.
+                            let deadline =
+                                deadline.min(self.deadline(claim.cancellation().deadline()));
+                            let result = self
+                                .control
+                                .renew_with_context_owner_panic(request, deadline)
+                                .await;
+                            if let Ok(original) = &result
+                                && original.body().matches(WorkerRequestResult::Outcome(
+                                    OperationOutcome::OwnerFailed,
+                                ))
+                            {
+                                claim.record_hit().map_err(Status::failed_precondition)?;
+                            }
+                            return match result {
+                                Ok(original) => {
+                                    encode_context(identity, original, ReplyKind::Context)
+                                }
+                                Err(error) => request_error(identity, error),
+                            };
+                        }
                         self.control.renew(request, deadline).await
                     }
                     UpdateQueryContext::AdvanceDomain(request) => {

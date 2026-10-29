@@ -49,6 +49,7 @@ struct State {
 }
 struct Custody {
     task: TaskIdentity,
+    scope: novarocks_control_runtime::transaction::ScopeHandle,
     role: ExitRole,
     report: ReportSlot,
     state: Mutex<State>,
@@ -171,7 +172,7 @@ impl Drop for Producer {
 }
 struct InFlight {
     input: InputId,
-    consumed: bool,
+    consumption: Consumption,
 }
 #[derive(Debug)]
 pub(crate) enum StatisticsError {
@@ -182,6 +183,7 @@ pub(crate) enum StatisticsError {
     RefusedInput,
     Unresolved,
     OwnerFailed { input: InputId },
+    FailurePublicationRequired,
 }
 impl From<DriverError> for StatisticsError {
     fn from(error: DriverError) -> Self {
@@ -197,6 +199,11 @@ impl From<RuntimeError> for StatisticsError {
 pub(crate) struct StatisticsProgress {
     pub submitted: bool,
     pub consumed: bool,
+    pub retired: bool,
+}
+pub(crate) struct StatisticsFailureProgress {
+    pub units: usize,
+    pub progressed: bool,
     pub retired: bool,
 }
 /// The actual Task owner retains this same fixed input and original report.
@@ -232,12 +239,14 @@ impl TaskStatisticsInbox {
         input: InputRole<WorkerActor>,
         binding: StatisticsBinding,
     ) -> (Self, TaskStatisticsProducer, TaskStatisticsFinalizer) {
+        let scope = role.work.scope().clone();
         let work = role.work.id();
         let report = role.report.clone();
         let (role, authority) =
             ExitRole::from_admitted(adopt_reported_work(role.work, role.capacity, role.report));
         let custody = Arc::new(Custody {
             task: binding.task,
+            scope,
             role,
             report,
             state: Mutex::new(State {
@@ -284,11 +293,127 @@ impl TaskStatisticsInbox {
         &self.custody.report
     }
     pub(crate) fn advance(&mut self) -> Result<StatisticsProgress, StatisticsError> {
+        if !self.closed && self.custody.scope.gates()?.failed {
+            return Err(StatisticsError::FailurePublicationRequired);
+        }
         let (progress, turn) = self.prepare_turn()?;
         match turn {
             Some(turn) => self.apply_turn(progress, turn),
             None => Ok(progress),
         }
+    }
+    /// Failure seals only this original producer's intake. Neutral samples
+    /// can be discarded boundedly, while the last producer/capture exit and
+    /// exact runtime input retirement remain independent mandatory gates.
+    pub(crate) fn advance_failed(
+        &mut self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+        original_generation: novarocks_control_runtime_core::identity::Generation,
+        budget: usize,
+    ) -> Result<StatisticsFailureProgress, StatisticsError> {
+        stage.validate_scope(&self.runtime, self.actor, &self.custody.scope)?;
+        let mut result = StatisticsFailureProgress {
+            units: 0,
+            progressed: false,
+            retired: self.closed,
+        };
+        if budget == 0 || self.closed {
+            return Ok(result);
+        }
+        result.units = 1;
+        let discarded = {
+            let mut state = self
+                .custody
+                .state
+                .lock()
+                .expect("original failed statistics");
+            result.progressed |= !state.sealed;
+            state.sealed = true;
+            (state.pending.take(), state.latest.take())
+        };
+        result.progressed |= discarded.0.is_some() || discarded.1.is_some();
+        drop(discarded);
+        if self.phase() == ExitRolePhase::Unresolved {
+            return Err(StatisticsError::Unresolved);
+        }
+        // A refused WorkerMessage is bounded neutral statistics metadata, not
+        // a source/callback whose disposal could authorize physical exit.
+        let rejected = self.rejected.take();
+        result.progressed |= rejected.is_some();
+        drop(rejected);
+        if let Some(flight) = self.in_flight.as_mut() {
+            if flight.consumption == Consumption::Pending {
+                flight.consumption = match self
+                    .runtime
+                    .input_custody(self.actor, flight.input)?
+                    .ok_or(StatisticsError::MissingOccurrence)?
+                    .phase
+                {
+                    InputPhase::Committed => Consumption::Consumed,
+                    InputPhase::AbandonedByOwnerFailure => Consumption::AbandonedByOwnerFailure,
+                    _ => Consumption::Pending,
+                };
+            }
+            if flight.consumption != Consumption::Pending {
+                match self.runtime.retire_input(self.actor, flight.input) {
+                    Ok(()) => {
+                        self.in_flight = None;
+                        result.progressed = true;
+                    }
+                    Err(
+                        DriverError::InputStillQueued
+                        | DriverError::EffectsRemain
+                        | DriverError::ReservationsRemain,
+                    ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        let core = ConsumerId::new(1).unwrap();
+        if self.custody.report.consumption(core)? == Consumption::Pending {
+            self.custody.report.abandon_failed_owner(
+                core,
+                &self.custody.scope,
+                original_generation,
+            )?;
+            result.progressed = true;
+        }
+        if self
+            .custody
+            .role
+            .actual_exit_ready()
+            .map_err(StatisticsError::Role)?
+        {
+            let observer = ConsumerId::new(2).unwrap();
+            if self.custody.report.consumption(observer)? == Consumption::Pending {
+                self.custody.report.consume(observer)?;
+                result.progressed = true;
+            }
+            if self.in_flight.is_none() && !self.input_closed {
+                self.input.close_after_exit()?;
+                self.input_closed = true;
+                result.progressed = true;
+            }
+            if self.input_closed
+                && self
+                    .custody
+                    .role
+                    .try_retire()
+                    .map_err(StatisticsError::Role)?
+            {
+                self.closed = true;
+                let retained = self
+                    .custody
+                    .retained
+                    .lock()
+                    .expect("original statistics retention")
+                    .take();
+                drop(retained);
+                result.progressed = true;
+                result.retired = true;
+            }
+        }
+        Ok(result)
     }
     fn prepare_turn(
         &mut self,
@@ -321,7 +446,7 @@ impl TaskStatisticsInbox {
         }
         let mut progress = StatisticsProgress::default();
         if let Some(flight) = self.in_flight.as_mut() {
-            if !flight.consumed {
+            if flight.consumption == Consumption::Pending {
                 let phase = self
                     .runtime
                     .input_custody(self.actor, flight.input)?
@@ -335,7 +460,7 @@ impl TaskStatisticsInbox {
                 if phase != InputPhase::Committed {
                     return Ok((progress, None));
                 }
-                flight.consumed = true;
+                flight.consumption = Consumption::Consumed;
             }
             match self.runtime.retire_input(self.actor, flight.input) {
                 Ok(()) => {
@@ -388,7 +513,7 @@ impl TaskStatisticsInbox {
                 Ok(input) => {
                     self.in_flight = Some(InFlight {
                         input,
-                        consumed: false,
+                        consumption: Consumption::Pending,
                     });
                     progress.submitted = true;
                 }

@@ -238,6 +238,55 @@ impl Drop for ObservationFrameDelivery {
 }
 
 impl ContextHostRecord {
+    /// Cancel only the exact original Subscribe action which never issued a
+    /// source subscription. The failed owner already preserved the original
+    /// intake reply; no replacement stream, reply or external exit is minted.
+    pub(crate) fn settle_failed_subscribe(
+        &mut self,
+        stage: &super::super::failure::ScopePublicationsDrained<'_>,
+        ticket: EffectTicket<WorkerAction>,
+    ) -> Result<(), (ContextRequestError, EffectTicket<WorkerAction>)> {
+        if let Err(error) = stage.validate_scope(&self.control_runtime, self.actor, self.scope()) {
+            return Err((ContextRequestError::Driver(error), ticket));
+        }
+        let request = match &ticket.effect {
+            WorkerAction::Context(ContextEffect::Subscribe { request, .. })
+                if ticket.actor == self.actor =>
+            {
+                *request
+            }
+            _ => return Err((ContextRequestError::WrongRequest, ticket)),
+        };
+        let Some(work) = self.request_inputs.get(&request).copied() else {
+            return Err((ContextRequestError::UnknownRequest, ticket));
+        };
+        let original = self
+            .resources
+            .requests
+            .get_mut(&work)
+            .expect("same Subscribe R index");
+        if original.request.map(|request| request.token) != Some(request)
+            || !original.endpoint.reply().is_committed()
+        {
+            return Err((ContextRequestError::WrongRequest, ticket));
+        }
+        let Some(state) = original.observation.as_mut() else {
+            return Err((ContextRequestError::WrongRequest, ticket));
+        };
+        if state.handed_off || state.subscription.is_some() || state.failure.is_some() {
+            return Err((ContextRequestError::WrongPhase, ticket));
+        }
+        if let Err(refusal) = self.control_runtime.effect_completed(ticket) {
+            return Err((ContextRequestError::Driver(refusal.error), refusal.ticket));
+        }
+        // With no issued subscription, there is nothing to unsubscribe. The
+        // real failed Context still supplies typed OwnerFailed to the reader.
+        state.handed_off = true;
+        original.reply_completed = true;
+        original.notification.published();
+        original.endpoint.external().notify();
+        Ok(())
+    }
     pub(in crate::control_runtime::context_host) fn handoff_observation_subscribe(
         &mut self,
         ticket: EffectTicket<WorkerAction>,

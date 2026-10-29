@@ -85,6 +85,14 @@ struct Delivered {
     rejected: Option<ManuallyDrop<WorkerMessage>>,
 }
 
+pub(crate) struct OpenSummaryFailedProgress {
+    pub units: usize,
+    pub progressed: bool,
+    pub input_retired: bool,
+    pub consumption: Option<Consumption>,
+    pub rejected: Option<WorkerMessage>,
+}
+
 #[must_use = "The original open-summary input closes only after actual Task and source retirement"]
 pub(crate) struct TaskOpenSummaryInbox {
     runtime: ActorRuntime<WorkerActor>,
@@ -291,6 +299,61 @@ impl TaskOpenSummaryInbox {
             .as_mut()
             .and_then(|delivered| delivered.rejected.take())
             .map(ManuallyDrop::into_inner))
+    }
+    /// Save the exact original input's real receipt before retiring its header.
+    /// The source pair and Task lifetime remain independent original owners;
+    /// failure publication alone cannot sign either one's physical exit.
+    pub(crate) fn advance_failed(
+        &mut self,
+        stage: &ScopePublicationsDrained<'_>,
+        budget: usize,
+    ) -> Result<OpenSummaryFailedProgress, OpenSummaryError> {
+        stage.validate(&self.runtime, self.actor)?;
+        let mut progress = OpenSummaryFailedProgress {
+            units: 0,
+            progressed: false,
+            input_retired: self.input.in_flight()?.is_none(),
+            consumption: self.delivered.as_ref().map(|d| d.consumption),
+            rejected: None,
+        };
+        if budget == 0 || self.closed || self.delivered.is_none() {
+            return Ok(progress);
+        }
+        progress.units = 1;
+        let before = self.delivered.as_ref().unwrap().consumption;
+        let observed = self.abandon_core(stage)?;
+        progress.consumption = Some(observed);
+        progress.progressed |= observed != before;
+        if observed == Consumption::Pending {
+            return Ok(progress);
+        }
+        progress.rejected = self.take_rejected(stage)?;
+        progress.progressed |= progress.rejected.is_some();
+        if let Some(input) = self.input.in_flight()? {
+            match self.runtime.retire_input(self.actor, input) {
+                Ok(()) => {
+                    progress.input_retired = true;
+                    progress.progressed = true;
+                }
+                Err(
+                    DriverError::InputStillQueued
+                    | DriverError::EffectsRemain
+                    | DriverError::ReservationsRemain,
+                ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(progress)
+    }
+    /// Close only the existing reusable input, with the original lifetime's
+    /// actual exit proof. No task body/capture/report observation is invented.
+    pub(crate) fn close_failed_after_exit(
+        &mut self,
+        stage: &ScopePublicationsDrained<'_>,
+        lifetime: &TaskLifetime,
+    ) -> Result<(), OpenSummaryError> {
+        stage.validate_scope(&self.runtime, self.actor, lifetime.scope())?;
+        self.close_after_exit(lifetime)
     }
     fn check_retirement(&self) -> Result<(), OpenSummaryError> {
         let delivered = self

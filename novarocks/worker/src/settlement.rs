@@ -19,19 +19,25 @@
 //! shared runtime's single continuation-custody implementation.
 
 use crate::{
-    control_runtime::actors::{WorkerAction, WorkerActor},
+    control_runtime::{
+        actors::{WorkerAction, WorkerActor},
+        failure::ScopePublicationsDrained,
+    },
     task_port::TaskRuntimePort,
 };
 pub(crate) use novarocks_control_runtime::continuation::ContinuationPhase as SettlementPhase;
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    continuation::{ContinuationSlot, InvocationResult, RegistrationToken},
+    continuation::{ContinuationDispatch, ContinuationSlot, InvocationResult, RegistrationToken},
     driver::{ActorRuntime, DriverError, EffectTicket, FailurePublicationSession},
     lease::{CapacityBundle, WorkLease},
     publication::PublishedReply,
     transaction::{RuntimeError, ScopeHandle},
 };
-use novarocks_control_runtime_core::{identity::WorkId, scope::ScopeError};
+use novarocks_control_runtime_core::{
+    identity::{ActorId, ScopeId, WorkId},
+    scope::ScopeError,
+};
 use novarocks_execution::{
     runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth},
     runtime::fragment::ExecutionFailure,
@@ -68,6 +74,45 @@ pub(crate) enum SettlementRun {
     Exited,
     Unresolved,
     Deferred,
+}
+
+/// One metadata-claimed invocation of the original prepaid continuation.
+/// The physical queue retains this whole value on Busy; the claim spans
+/// callback preparation, invocation and disposal of this original port loan.
+#[must_use = "Retain the same original settlement dispatch on physical queue refusal"]
+pub(crate) struct FailedSettlementDispatch {
+    role: SettlementRole,
+    dispatch: ContinuationDispatch<InvocationInput>,
+    port: Arc<TaskRuntimePort>,
+    pending: Arc<dyn crate::task_port::TaskPendingNotice>,
+}
+impl FailedSettlementDispatch {
+    pub(crate) fn queue_key(&self) -> (ScopeId, WorkId) {
+        (self.role.scope.id(), self.role.work)
+    }
+    /// Run only on the supervised physical lifecycle lane. No foreign
+    /// callback, input refresh or port destructor runs on the metadata owner.
+    pub(crate) fn run(self) -> Result<SettlementRun, SettlementDispatchError> {
+        let Self {
+            role,
+            mut dispatch,
+            port,
+            pending,
+        } = self;
+        let result = role.run_claimed(&port, &mut dispatch);
+        drop(port);
+        if result
+            .as_ref()
+            .is_ok_and(|run| *run != SettlementRun::Deferred)
+        {
+            role.complete_original_barrier()?;
+            pending.pending();
+        }
+        // Keep the original execution claim through all port-capture cleanup
+        // and original effect completion, including reentrant observers.
+        drop(dispatch);
+        result
+    }
 }
 
 /// A role's already reserved neutral mailbox position. It cannot wait for its
@@ -280,6 +325,50 @@ impl SettlementRole {
         let Some(mut dispatch) = self.slot.try_claim_dispatch() else {
             return Ok(SettlementRun::Deferred);
         };
+        self.run_claimed(port, &mut dispatch)
+    }
+    /// Metadata acquires the same slot claim before queueing. A later owner
+    /// turn cannot enqueue another job while this original call is pending.
+    pub(crate) fn take_failed_dispatch(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        runtime: &ActorRuntime<WorkerActor>,
+        actor: ActorId,
+        port: Arc<TaskRuntimePort>,
+        pending: Arc<dyn crate::task_port::TaskPendingNotice>,
+    ) -> Result<Option<FailedSettlementDispatch>, SettlementDispatchError> {
+        stage
+            .validate_scope(runtime, actor, &self.scope)
+            .map_err(SettlementDispatchError::Driver)?;
+        if port.identity() != self.identity {
+            return Err(SettlementDispatchError::WrongRole);
+        }
+        if !self.barrier_committed()
+            || !matches!(
+                self.slot.phase(),
+                SettlementPhase::Registered | SettlementPhase::Ready
+            )
+        {
+            return Ok(None);
+        }
+        let Some(dispatch) = self.slot.try_claim_dispatch() else {
+            return Ok(None);
+        };
+        Ok(Some(FailedSettlementDispatch {
+            role: self.clone(),
+            dispatch,
+            port,
+            pending,
+        }))
+    }
+    fn run_claimed(
+        &self,
+        port: &TaskRuntimePort,
+        dispatch: &mut ContinuationDispatch<InvocationInput>,
+    ) -> Result<SettlementRun, SettlementDispatchError> {
+        if port.identity() != self.identity {
+            return Err(SettlementDispatchError::WrongRole);
+        }
         if self.slot.phase() == SettlementPhase::Registered {
             let Some(committed) = self.barrier.take_once() else {
                 return Ok(SettlementRun::Deferred);

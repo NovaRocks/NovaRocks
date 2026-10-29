@@ -255,6 +255,23 @@ impl TaskCompletionRoles {
         }
         Ok(result)
     }
+    /// Claim this same admitted continuation before the metadata owner offers
+    /// a physical job. Failure publication is not callback or capture exit.
+    pub(crate) fn take_failed_settlement_dispatch(
+        &self,
+        stage: &crate::control_runtime::failure::ScopePublicationsDrained<'_>,
+        runtime: &novarocks_control_runtime::driver::ActorRuntime<
+            crate::control_runtime::actors::WorkerActor,
+        >,
+        actor: novarocks_control_runtime_core::identity::ActorId,
+        port: Arc<crate::task_port::TaskRuntimePort>,
+    ) -> Result<
+        Option<crate::settlement::FailedSettlementDispatch>,
+        crate::settlement::SettlementDispatchError,
+    > {
+        self.settlement
+            .take_failed_dispatch(stage, runtime, actor, port, self.pending.clone())
+    }
     #[cfg(test)]
     pub(crate) fn publish_settlement_barrier(
         &self,

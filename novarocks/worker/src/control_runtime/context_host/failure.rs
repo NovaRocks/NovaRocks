@@ -19,6 +19,9 @@
 //! failure action and its prepaid Work remain owned here after publication;
 //! source, callback, input, delivery and physical cleanup continue separately.
 
+#[path = "failure_driver.rs"]
+mod driver;
+
 use super::*;
 use crate::control_runtime::{
     context_host::requests::ContextRequestError, open_summary::OpenSummaryError,
@@ -71,6 +74,19 @@ pub(crate) struct ScopePublicationsDrained<'a> {
     session: &'a FailurePublicationSession<WorkerActor>,
 }
 impl ScopePublicationsDrained<'_> {
+    pub(crate) fn validate_scope(
+        &self,
+        runtime: &ActorRuntime<WorkerActor>,
+        actor: ActorId,
+        scope: &ScopeHandle,
+    ) -> Result<(), DriverError> {
+        self.validate(runtime, actor)?;
+        if runtime.owns_scope(actor, scope)? {
+            Ok(())
+        } else {
+            Err(DriverError::PublicationTargetMismatch)
+        }
+    }
     pub(crate) fn validate(
         &self,
         runtime: &ActorRuntime<WorkerActor>,
@@ -105,11 +121,20 @@ enum Phase {
 #[must_use = "The original failure action stays Started through supervised cleanup"]
 pub(super) struct ScopeFailureOwner {
     session: FailurePublicationSession<WorkerActor>,
-    ticket: EffectTicket<WorkerAction>,
+    ticket: Option<EffectTicket<WorkerAction>>,
     phase: Phase,
     pending_projection: Option<Arc<TaskProjection>>,
+    pending_projection_task: Option<TaskIdentity>,
     next_input_class: usize,
     empty_input_classes: usize,
+    physical: Option<(FailurePhysicalPurpose, super::failure_tail::FailureTail)>,
+    completed_tail_input: Option<InputId>,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FailurePhysicalPurpose {
+    Projection(TaskIdentity),
+    Neutral(TaskIdentity),
+    FinalCarrier,
 }
 impl ScopeFailureOwner {
     pub(super) fn is_drained(&self) -> bool {
@@ -152,6 +177,7 @@ impl ScopeFailureOwner {
                     };
                     task_host.close_request_admission();
                     task_host.port().ingress().fail();
+                    task_host.pending_notice().pending();
                     // Visiting this table row and generating its publication
                     // spend distinct work units, including with budget one.
                     self.phase = Phase::TaskProjection(task);
@@ -228,7 +254,11 @@ impl ScopeFailureOwner {
                         .pending_batches(host.actor, after, 1)
                         .map_err(FailurePublicationError::Driver)?;
                     if let Some(&input) = batches.first() {
-                        if input == self.ticket.input {
+                        if self
+                            .ticket
+                            .as_ref()
+                            .is_some_and(|ticket| input == ticket.input)
+                        {
                             self.phase = Phase::Batches(Some(input));
                         } else {
                             self.phase = Phase::Effects { input, after: None };
@@ -349,11 +379,14 @@ impl ContextHostRecord {
         };
         self.resources.failure = Some(ScopeFailureOwner {
             session,
-            ticket,
+            ticket: Some(ticket),
             phase: Phase::Tasks(None),
             pending_projection: None,
+            pending_projection_task: None,
             next_input_class: 0,
             empty_input_classes: 0,
+            physical: None,
+            completed_tail_input: None,
         });
         self.notify_host_progress();
         Ok(())
@@ -476,6 +509,152 @@ impl ContextHostRecord {
             .as_ref()
             .is_some_and(ScopeFailureOwner::is_drained)
     }
+
+    /// Borrow the live failure authority separately from the mutable host
+    /// inventory. The same supervisor is restored on every ordinary refusal.
+    pub(super) fn advance_failed_host_io(
+        &mut self,
+        handles: &crate::control_runtime::context_executors::ContextExecutorHandles,
+        ports: &super::task_driver::TaskDriverPorts,
+        budget: usize,
+    ) -> Result<super::ContextHostProgress, super::ContextDriverError> {
+        let original = self
+            .resources
+            .failure
+            .take()
+            .ok_or(super::ContextDriverError::Failure(
+                FailurePublicationError::NotStarted,
+            ))?;
+        let result = (|| {
+            let stage = original
+                .drained()
+                .map_err(super::ContextDriverError::Failure)?;
+            self.advance_failed_parked_host_actions(&stage, ports)?;
+            self.advance_host_io_for_owner(handles, Some(&stage), budget)
+                .map_err(super::ContextDriverError::HostProgress)
+        })();
+        self.resources.failure = Some(original);
+        result
+    }
+
+    fn advance_failed_parked_host_actions(
+        &mut self,
+        stage: &ScopePublicationsDrained<'_>,
+        ports: &super::task_driver::TaskDriverPorts,
+    ) -> Result<(), super::ContextDriverError> {
+        stage
+            .validate(&self.control_runtime, self.actor)
+            .map_err(super::ContextDriverError::Driver)?;
+        if let Some(ticket) = self.resources.pending_host_jobs.driver_close.take() {
+            let WorkerAction::Context(
+                novarocks_worker_protocol::context::ContextEffect::CloseExternalAdmission {
+                    reason,
+                    ..
+                },
+            ) = ticket.effect
+            else {
+                self.resources.pending_host_jobs.driver_close = Some(ticket);
+                return Err(super::ContextDriverError::WrongOwner);
+            };
+            if let Err(refusal) =
+                self.handoff_failed_context_admission_close(ticket, reason, ports, stage)
+            {
+                self.resources.pending_host_jobs.driver_close = refusal.ticket;
+                return Err(super::ContextDriverError::Task(refusal.error));
+            }
+        }
+        if self.resources.pending_host_jobs.root_release_finished {
+            if let Some(ticket) = self.resources.pending_host_jobs.driver_seal.take()
+                && let Err(refusal) = self.complete_host_effect(ticket)
+            {
+                self.resources.pending_host_jobs.driver_seal = Some(refusal.ticket);
+                return Err(super::ContextDriverError::Driver(refusal.error));
+            }
+            if self.tasks.is_empty() && self.task_driver.is_idle() {
+                self.resources
+                    .host_jobs
+                    .as_ref()
+                    .ok_or(super::ContextDriverError::WrongOwner)?
+                    .request_failed_release(stage)
+                    .map_err(super::ContextDriverError::Host)?;
+                // ReleaseHost means the original R accepted its instruction;
+                // R's actual body/report/header still drain independently.
+                if let Some(ticket) = self.resources.pending_host_jobs.driver_release.take()
+                    && let Err(refusal) = self.complete_host_effect(ticket)
+                {
+                    self.resources.pending_host_jobs.driver_release = Some(refusal.ticket);
+                    return Err(super::ContextDriverError::Driver(refusal.error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Seal the original Root issuers and wait for each physical Root rather
+    /// than treating OwnerFailed publication as producer or reader exit.
+    pub(super) fn advance_failed_root_release(
+        &mut self,
+        ports: &super::task_driver::TaskDriverPorts,
+        budget: usize,
+    ) -> Result<bool, super::ContextDriverError> {
+        if budget == 0 {
+            return Ok(false);
+        }
+        let original =
+            self.resources
+                .failure
+                .as_ref()
+                .ok_or(super::ContextDriverError::Failure(
+                    FailurePublicationError::NotStarted,
+                ))?;
+        original
+            .drained()
+            .map_err(super::ContextDriverError::Failure)?
+            .validate(&self.control_runtime, self.actor)
+            .map_err(super::ContextDriverError::Driver)?;
+        let ticket = original
+            .ticket
+            .as_ref()
+            .ok_or(super::ContextDriverError::WrongOwner)?;
+        let WorkerAction::OwnerFailed { generation, .. } = ticket.effect else {
+            return Err(super::ContextDriverError::WrongOwner);
+        };
+        let author = ticket.descriptor.work;
+        self.root_issuance_sealed = true;
+        if !self
+            .seal_task_roots(
+                self.identity,
+                generation,
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted,
+                author,
+                ports,
+            )
+            .map_err(super::ContextDriverError::Task)?
+        {
+            return Ok(false);
+        }
+        for _ in 0..budget {
+            if self.resources.pending_host_jobs.root_release_finished {
+                break;
+            }
+            match self
+                .resources
+                .root_reads
+                .next_release_root(self.resources.pending_host_jobs.root_release_after)
+            {
+                Some((task, true)) => {
+                    self.resources.pending_host_jobs.root_release_after = Some(task);
+                    self.notify_host_progress();
+                }
+                Some((_, false)) => break,
+                None => {
+                    self.resources.pending_host_jobs.root_release_finished = true;
+                    self.notify_host_progress();
+                }
+            }
+        }
+        Ok(self.resources.pending_host_jobs.root_release_finished)
+    }
     /// Borrow both original owners together. Failure publication and execution
     /// exit remain separate proofs; this method calls no host or destructor.
     pub(crate) fn take_failed_retire_borrowing_job(
@@ -539,16 +718,17 @@ impl ContextHostRecord {
                 .matches_actor_runtime(&self.control_runtime, self.actor)
                 .unwrap()
         );
+        let ticket = original
+            .ticket
+            .expect("the original uncompleted failure effect");
         assert_eq!(
             self.control_runtime
                 .pending_batches(self.actor, None, 2)
                 .unwrap(),
-            [original.ticket.input]
+            [ticket.input]
         );
-        let input = original.ticket.input;
-        self.control_runtime
-            .effect_completed(original.ticket)
-            .unwrap();
+        let input = ticket.input;
+        self.control_runtime.effect_completed(ticket).unwrap();
         self.control_runtime
             .retire_input(self.actor, input)
             .unwrap();

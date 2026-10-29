@@ -742,6 +742,35 @@ impl TaskHostCallJob {
         }
         self.run();
     }
+    /// A normal queued capture may have crossed failure before its body
+    /// started. Reuse that original capture under the actual failure stage;
+    /// never overwrite it with another host/port loan.
+    pub(crate) fn run_failure_retirement(
+        self,
+        owner: Option<Arc<super::task::ProductionPreparation>>,
+        host: Arc<dyn crate::TaskExecutionHost>,
+    ) {
+        assert!(matches!(
+            self.start,
+            StartPermission::FailurePublicationsDrained
+        ));
+        let captured = self
+            .owner
+            .0
+            .state
+            .lock()
+            .expect("original failed receiver capture")
+            .retirement
+            .is_some();
+        if captured {
+            // These additional metadata loans were not installed in the
+            // original capture. Dispose them on this same physical worker.
+            drop((owner, host));
+            self.run();
+        } else {
+            self.run_retirement(owner, host, crate::TaskIngressRetirement::Remove);
+        }
+    }
     fn run_retirement_capture(&self) -> TaskHostCallOutcome {
         use super::task::ExecutionRetirementOutcome;
         let capture = self

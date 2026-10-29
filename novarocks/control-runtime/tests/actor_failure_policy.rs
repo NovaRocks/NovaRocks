@@ -197,20 +197,38 @@ fn child(mode: &str) {
                 .phase,
             InputPhase::AbandonedByOwnerFailure
         );
+        let novarocks_control_runtime::driver::FailureSourceState::ClosedPending(supervisor) =
+            runtime.failure_source_state(actor()).unwrap()
+        else {
+            panic!("the actual isolated failure owns its builtin supervisor input");
+        };
+        assert_ne!(supervisor, input);
+        // The triggering request/source can retire while the original
+        // supervisor action is still pending. Its own storage is not borrowed
+        // by the cleanup which must wait for that request's physical exit.
+        runtime.retire_input(actor(), input).unwrap();
+        assert!(runtime.input_custody(actor(), input).unwrap().is_none());
+        assert_eq!(
+            runtime.pending_batches(actor(), None, 2).unwrap(),
+            [supervisor]
+        );
         let payload = runtime.take_failure_payload(actor()).unwrap().unwrap();
         assert!(payload.downcast_ref::<&str>().is_some());
         drop(payload); // Actual simple panic value is disposed outside all runtime locks.
-        let ready = runtime.ready_effects(actor(), input, 2).unwrap();
+        let ready = runtime.ready_effects(actor(), supervisor, 2).unwrap();
         assert_eq!(ready.len(), 1);
-        let ticket = runtime.take_effect(actor(), input, ready[0]).unwrap();
+        let ticket = runtime.take_effect(actor(), supervisor, ready[0]).unwrap();
         runtime.effect_completed(ticket).unwrap();
+        runtime.retire_input(actor(), supervisor).unwrap();
     } else {
         assert_eq!(mode, "host-error");
         assert!(!runtime.snapshot(actor()).unwrap().failed);
         assert!(!scope.gates().unwrap().failed);
         assert!(runtime.take_failure_payload(actor()).unwrap().is_none());
     }
-    runtime.retire_input(actor(), input).unwrap();
+    if mode != "isolate" {
+        runtime.retire_input(actor(), input).unwrap();
+    }
     runtime.close_actor_admission(actor()).unwrap();
     scope.close_external().unwrap();
     while let Some(original_host_turn) = runtime.claim_host_actor() {

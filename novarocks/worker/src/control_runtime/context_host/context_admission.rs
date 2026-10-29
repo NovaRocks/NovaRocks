@@ -152,6 +152,26 @@ impl ContextHostRecord {
         reason: Option<AbortCause>,
         ports: &TaskDriverPorts,
     ) -> Result<(), TaskDriverRefusal> {
+        self.handoff_context_admission_close_for_owner(ticket, reason, ports, None)
+    }
+
+    pub(in crate::control_runtime::context_host) fn handoff_failed_context_admission_close(
+        &mut self,
+        ticket: EffectTicket<WorkerAction>,
+        reason: Option<AbortCause>,
+        ports: &TaskDriverPorts,
+        stage: &super::super::failure::ScopePublicationsDrained<'_>,
+    ) -> Result<(), TaskDriverRefusal> {
+        self.handoff_context_admission_close_for_owner(ticket, reason, ports, Some(stage))
+    }
+
+    fn handoff_context_admission_close_for_owner(
+        &mut self,
+        ticket: EffectTicket<WorkerAction>,
+        reason: Option<AbortCause>,
+        ports: &TaskDriverPorts,
+        failed: Option<&super::super::failure::ScopePublicationsDrained<'_>>,
+    ) -> Result<(), TaskDriverRefusal> {
         let reject = |error, ticket| TaskDriverRefusal {
             error,
             ticket: Some(ticket),
@@ -162,7 +182,14 @@ impl ContextHostRecord {
         {
             return Err(reject(TaskDriverError::WrongOwner, ticket));
         }
-        if let Err(error) = self.control_runtime.validate_effect_ticket(&ticket) {
+        // The actual failure stage may adopt this already Started close. It
+        // preserves the same ticket, capture payment and physical invocation;
+        // it does not fabricate a new normal-generation publication.
+        let authority = match failed {
+            Some(stage) => stage.validate(&self.control_runtime, self.actor),
+            None => self.control_runtime.validate_effect_ticket(&ticket),
+        };
+        if let Err(error) = authority {
             return Err(reject(TaskDriverError::Driver(error), ticket));
         }
         let Some(host) = ports.execution.as_ref() else {

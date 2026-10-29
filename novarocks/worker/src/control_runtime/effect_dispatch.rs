@@ -476,6 +476,38 @@ impl EffectDispatch {
     pub(crate) fn is_empty(&self) -> bool {
         self.indexed == 0
     }
+    /// Discard only neutral routing markers after the failed owner has really
+    /// drained its original runtime batches. This supplies no action exit.
+    pub(crate) fn drain_failed_index_turn(
+        &mut self,
+        runtime: &ActorRuntime<WorkerActor>,
+        budget: usize,
+    ) -> Result<bool, DispatchError> {
+        if !runtime.snapshot(self.actor)?.failed {
+            return Err(DispatchError::InvalidPublication);
+        }
+        for _ in 0..budget {
+            if let Some(ready) = self.ready.pop_front() {
+                if matches!(ready, Ready::Direct(_)) {
+                    self.indexed -= 1;
+                }
+                continue;
+            }
+            let Some((&key, lane)) = self.lanes.first_key_value() else {
+                break;
+            };
+            let empty = lane.entries.is_empty();
+            if empty {
+                self.lanes.remove(&key);
+            } else {
+                let lane = self.lanes.get_mut(&key).expect("original failed lane");
+                lane.entries.pop_front();
+                lane.in_flight = None;
+                self.indexed -= 1;
+            }
+        }
+        Ok(self.ready.is_empty() && self.lanes.is_empty() && self.indexed == 0)
+    }
     /// Indexes hold only plain references. The failure owner recovers original
     /// runtime/resource custody; clearing these never supplies any exit proof.
     pub(crate) fn clear_failed_index(

@@ -372,12 +372,10 @@ impl ControlRuntimePolicy {
                 crate::control_runtime::preparation_refusal::HOST_REFUSAL_CAPTURE_POSITIONS,
             )
             .ok_or(PolicyError::Overflow)?;
-        // The original Task disposal holds one observer capture until its
-        // physical retained-event callback and capture destruction return.
-        task_base.captures = task_base
-            .captures
-            .checked_add(1)
-            .ok_or(PolicyError::Overflow)?;
+        // The original observer Capture1 now belongs to its own preadmitted
+        // sibling Cleanup Work/report, through physical callback and Drop.
+        task_base =
+            task_base.checked_add(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)?;
         let mut loading = StorageNeed::role(false)
             .checked_mul(TaskLifecycleRole::LOADING.len())?
             .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?;
@@ -420,10 +418,8 @@ impl ControlRuntimePolicy {
         loading = loading.checked_add(host_calls)?;
         // Rejected preparation can reach terminal retention before Accepted;
         // its same physical disposal observer must be funded from first exposure.
-        loading.captures = loading
-            .captures
-            .checked_add(1)
-            .ok_or(PolicyError::Overflow)?;
+        loading =
+            loading.checked_add(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)?;
         let accepted = task_base.checked_sub(loading)?;
         let max_task_cuts = fixed_roles
             .checked_add(request_roles.checked_mul(2).ok_or(PolicyError::Overflow)?)

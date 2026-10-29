@@ -63,6 +63,36 @@ pub(crate) struct ContextDriverProgress {
 }
 
 impl ContextHostRecord {
+    fn is_owner_failure_fence(error: &ContextDriverError) -> bool {
+        let fence = |error: &DriverError| {
+            matches!(
+                error,
+                DriverError::ActorFailed
+                    | DriverError::FailurePublicationRequired
+                    | DriverError::Effect(
+                        novarocks_control_runtime_core::effect::EffectError::StaleGeneration
+                    )
+            )
+        };
+        match error {
+            ContextDriverError::Dispatch(DispatchError::OwnerFailed) => true,
+            ContextDriverError::Driver(error)
+            | ContextDriverError::Task(TaskDriverError::Driver(error))
+            | ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Driver(error)))
+            | ContextDriverError::Host(ContextHostJobError::Driver(error))
+            | ContextDriverError::HostProgress(ContextHostProgressError::Host(ContextHostJobError::Driver(error)))
+            | ContextDriverError::Request(super::requests::ContextRequestError::Driver(error)) => fence(error),
+            ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::OwnerFailed)) => true,
+            ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Statistics(
+                crate::control_runtime::operator_statistics::StatisticsError::FailurePublicationRequired,
+            ))) => true,
+            ContextDriverError::Task(TaskDriverError::DynamicFilter(
+                crate::control_runtime::dynamic_filters::DynamicFilterError::FailurePublicationRequired,
+            )) => true,
+            _ => false,
+        }
+    }
+
     fn retain_driver_refusal(
         &mut self,
         ticket: EffectTicket<WorkerAction>,
@@ -355,6 +385,34 @@ impl ContextHostRecord {
         tasks: &TaskDriverPorts,
         budget: usize,
     ) -> Result<ContextDriverProgress, ContextDriverError> {
+        match self.advance_driver_inner(handles, requests, tasks, budget) {
+            Err(error)
+                if Self::is_owner_failure_fence(&error)
+                    && self
+                        .control_runtime
+                        .snapshot(self.actor)
+                        .is_ok_and(|snapshot| snapshot.failed) =>
+            {
+                // Core and host turns have independent poller claims. A real
+                // failure after the initial snapshot withdraws only normal
+                // publication authority; all original pending jobs stay here.
+                self.notify_host_progress();
+                Ok(ContextDriverProgress {
+                    runnable: true,
+                    ..Default::default()
+                })
+            }
+            result => result,
+        }
+    }
+
+    fn advance_driver_inner(
+        &mut self,
+        handles: &ContextExecutorHandles,
+        requests: &ControlRequestReady,
+        tasks: &TaskDriverPorts,
+        budget: usize,
+    ) -> Result<ContextDriverProgress, ContextDriverError> {
         let mut progress = ContextDriverProgress::default();
         if budget == 0 {
             return Ok(progress);
@@ -376,25 +434,19 @@ impl ContextHostRecord {
         }
         jobs.bind_execution_host(tasks.execution.as_ref())
             .map_err(ContextDriverError::Host)?;
-        if let Some(original) = self.resources.pending_host_jobs.driver_close.take() {
-            self.handoff_driver_effect(original, tasks)?;
-        }
-        if let Some(original) = self.resources.pending_host_jobs.driver_seal.take() {
-            self.handoff_driver_effect(original, tasks)?;
-        }
-        if let Some(original) = self.resources.pending_host_jobs.driver_release.take() {
-            self.handoff_driver_effect(original, tasks)?;
-        }
-        if self
+        let failed = self
             .control_runtime
             .snapshot(self.actor)
             .map_err(ContextDriverError::Driver)?
-            .failed
-        {
-            if self.resources.failure.is_none() {
+            .failed;
+        if failed {
+            if self.failure_tail_started() {
+                progress.runnable |= self.advance_failed_cleanup_tail(tasks, budget)?;
+            }
+            if self.resources.failure.is_none() && !self.failed_owner_completed() {
                 progress.runnable = self.find_driver_failure(tasks, budget)?;
             }
-            if self.resources.failure.is_some() {
+            if self.resources.failure.is_some() && !self.failure_tail_started() {
                 progress.failure_publications_drained = self
                     .advance_failure_publications(budget)
                     .map_err(ContextDriverError::Failure)?;
@@ -405,11 +457,22 @@ impl ContextHostRecord {
                         .advance_failed_runtime_inputs(budget)
                         .map_err(ContextDriverError::Failure)?;
                     progress.runnable |= !inputs.empty;
+                    self.advance_failed_root_release(tasks, budget)?;
+                    progress.runnable |= self.advance_failed_task_cleanup(tasks, budget)?;
                 } else {
                     progress.runnable = true;
                 }
             }
         } else {
+            if let Some(original) = self.resources.pending_host_jobs.driver_close.take() {
+                self.handoff_driver_effect(original, tasks)?;
+            }
+            if let Some(original) = self.resources.pending_host_jobs.driver_seal.take() {
+                self.handoff_driver_effect(original, tasks)?;
+            }
+            if let Some(original) = self.resources.pending_host_jobs.driver_release.take() {
+                self.handoff_driver_effect(original, tasks)?;
+            }
             let allowance = budget.saturating_mul(ContextActor::MAX_STEP_ACTIONS + 1);
             let indexed = self
                 .dispatch
@@ -566,19 +629,30 @@ impl ContextHostRecord {
                 Err(error) => return Err(ContextDriverError::Driver(error)),
             }
         }
-        let task_progress = self
-            .advance_task_driver(tasks, budget)
-            .map_err(ContextDriverError::Task)?;
-        progress.runnable |= task_progress.runnable;
-        progress.tasks = Some(task_progress);
-        progress.host = Some(
-            self.advance_host_io(handles)
-                .map_err(ContextDriverError::HostProgress)?,
-        );
+        if !failed {
+            let task_progress = self
+                .advance_task_driver(tasks, budget)
+                .map_err(ContextDriverError::Task)?;
+            progress.runnable |= task_progress.runnable;
+            progress.tasks = Some(task_progress);
+        }
+        if failed {
+            if progress.failure_publications_drained {
+                progress.host = Some(self.advance_failed_host_io(handles, tasks, budget)?);
+            }
+        } else {
+            progress.host = Some(
+                self.advance_host_io(handles)
+                    .map_err(ContextDriverError::HostProgress)?,
+            );
+        }
         progress.runnable |= self
             .advance_root_reads(tasks, budget)
             .map_err(ContextDriverError::Request)?;
         if self.advance_observation_teardown(budget) {
+            if failed && !self.failed_owner_completed() && !self.failure_tail_started() {
+                progress.runnable |= self.advance_failed_cleanup_tail(tasks, budget)?;
+            }
             progress.metadata_teardown_ready = self
                 .advance_metadata_teardown()
                 .map_err(ContextDriverError::Metadata)?;

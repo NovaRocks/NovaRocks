@@ -70,6 +70,7 @@ pub(super) struct DirectHold {
     pub query_index: usize,
     pub task_id: Option<u32>,
     pub token: String,
+    pub trigger_operation: Option<[u8; 16]>,
 }
 #[derive(Clone)]
 pub(super) struct DirectIntent {
@@ -103,6 +104,7 @@ impl DirectIntentOwner {
                     | "registry-hold"
                     | "preparation-hold"
                     | "prepared-failure-exit-hold"
+                    | "context-owner-panic-on-renew"
             ),
             "unsupported Native direct action"
         );
@@ -161,6 +163,11 @@ impl DirectIntentOwner {
             } else {
                 parameters["frontend_process_id"] = json!(query.frontend.to_string());
             }
+            let trigger_operation = (action == "context-owner-panic-on-renew")
+                .then(|| novarocks_execution_contract::TaskOperationId::new_v7().to_bytes());
+            if let Some(operation) = trigger_operation {
+                parameters["trigger_operation"] = json!(operation);
+            }
             grants.entry(index).or_default().push(DomainGrant {
                 domain: "native".into(),
                 grant_id: format!("direct-{grant_index}"),
@@ -171,6 +178,7 @@ impl DirectIntentOwner {
                 query_index,
                 task_id,
                 token,
+                trigger_operation,
             });
         }
         for index in 0..cluster_size {

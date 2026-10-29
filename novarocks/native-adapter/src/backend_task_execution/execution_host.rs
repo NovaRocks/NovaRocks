@@ -852,6 +852,8 @@ impl NativeTaskExecutionHost {
             Arc::clone(&splits),
         )?;
 
+        #[cfg(novarocks_dev_controls)]
+        let prepared_exit_readiness = preparation_scope.readiness_waker();
         let preparation = preparation_stop.borrow_control();
         let control = TaskPreparationControl::new(task_stop.view(), preparation_stop.clone());
         let type_tracker = self
@@ -1129,7 +1131,11 @@ impl NativeTaskExecutionHost {
         #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.test_controls.as_deref()
             && let Some(cause) = preparation_child
-                .inject_prepared_exit_failure(controls)
+                .inject_prepared_exit_failure(
+                    controls,
+                    self.scan_stream_host.runtime(),
+                    prepared_exit_readiness,
+                )
                 .map_err(|detail| {
                     internal_failure(NativePreparationContractFailure::new(
                         NativePreparationReason::TestControl,

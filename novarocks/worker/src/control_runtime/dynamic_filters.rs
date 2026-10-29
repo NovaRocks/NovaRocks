@@ -104,6 +104,8 @@ struct Flight {
     input: InputId,
     snapshot: Snapshot,
     published: bool,
+    consumption: Consumption,
+    input_retired: bool,
 }
 struct State {
     pending_value: Option<Snapshot>,
@@ -302,6 +304,7 @@ pub(crate) enum DynamicFilterError {
     Unresolved,
     MissingInput,
     WrongPublication,
+    FailurePublicationRequired,
 }
 impl From<RuntimeError> for DynamicFilterError {
     fn from(e: RuntimeError) -> Self {
@@ -427,6 +430,9 @@ impl TaskDynamicFilterInbox {
         Err(DynamicFilterError::WrongPublication)
     }
     pub(crate) fn advance(&mut self) -> Result<DynamicFilterProgress, DynamicFilterError> {
+        if !self.closed && self.custody.scope.gates()?.failed {
+            return Err(DynamicFilterError::FailurePublicationRequired);
+        }
         let mut result = DynamicFilterProgress {
             progressed: false,
             job: None,
@@ -438,46 +444,117 @@ impl TaskDynamicFilterInbox {
         if state.unresolved || state.rejected.is_some() {
             return Err(DynamicFilterError::Unresolved);
         }
-        if let Some(flight) = &state.flight {
-            let input = self
-                .runtime
-                .input_custody(self.actor, flight.input)?
-                .ok_or(DynamicFilterError::MissingInput)?;
-            if input.phase == InputPhase::AbandonedByOwnerFailure {
-                return Err(DynamicFilterError::Unresolved);
+        if let Some(flight) = state.flight.as_mut() {
+            if flight.consumption == Consumption::Pending {
+                let phase = self
+                    .runtime
+                    .input_custody(self.actor, flight.input)?
+                    .ok_or(DynamicFilterError::MissingInput)?
+                    .phase;
+                if phase == InputPhase::AbandonedByOwnerFailure {
+                    return Err(DynamicFilterError::Unresolved);
+                }
+                if phase != InputPhase::Committed {
+                    return Ok(result);
+                }
+                flight.consumption = Consumption::Consumed;
             }
-            if input.phase != InputPhase::Committed {
-                return Ok(result);
-            }
-            match self.runtime.retire_input(self.actor, flight.input) {
-                Ok(()) => {}
-                Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
-                ) => return Ok(result),
-                Err(e) => return Err(e.into()),
-            }
-            let flight = state.flight.take().expect("same original RF occurrence");
-            let dispose = if flight.published {
-                state.latest.replace(flight.snapshot)
-            } else {
-                Some(flight.snapshot)
-            };
-            result.progressed = true;
-            if let Some(original) = dispose {
-                result.job = Some(self.take_disposal(&mut state, original)?);
-                return Ok(result);
+            if !flight.input_retired {
+                match self.runtime.retire_input(self.actor, flight.input) {
+                    Ok(()) => {
+                        flight.input_retired = true;
+                        result.progressed = true;
+                    }
+                    Err(
+                        DriverError::InputStillQueued
+                        | DriverError::EffectsRemain
+                        | DriverError::ReservationsRemain,
+                    ) => return Ok(result),
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         if state.job_active {
             return Ok(result);
         }
+        if let Some(flight) = &state.flight {
+            if flight.published {
+                // Keep the completed flight in its own original cell while an
+                // old read loan pins latest. Busy must not overwrite pending.
+                if let Some(original) = state.latest.take() {
+                    match self.take_disposal(&mut state, original) {
+                        Ok(job) => {
+                            result.job = Some(job);
+                            result.progressed = true;
+                            return Ok(result);
+                        }
+                        Err((error, original)) => {
+                            state.latest = Some(original);
+                            return match error {
+                                DynamicFilterError::Resource(ReadResourceError::Busy) => Ok(result),
+                                error => Err(error),
+                            };
+                        }
+                    }
+                }
+                let flight = state.flight.take().expect("same original RF occurrence");
+                state.latest = Some(flight.snapshot);
+                result.progressed = true;
+            } else {
+                let flight = state.flight.take().expect("same original RF occurrence");
+                let Flight {
+                    input,
+                    snapshot,
+                    published,
+                    consumption,
+                    input_retired,
+                } = flight;
+                match self.take_disposal(&mut state, snapshot) {
+                    Ok(job) => {
+                        result.job = Some(job);
+                        result.progressed = true;
+                        return Ok(result);
+                    }
+                    Err((error, snapshot)) => {
+                        state.flight = Some(Flight {
+                            input,
+                            snapshot,
+                            published,
+                            consumption,
+                            input_retired,
+                        });
+                        return match error {
+                            DynamicFilterError::Resource(ReadResourceError::Busy) => Ok(result),
+                            error => Err(error),
+                        };
+                    }
+                }
+            }
+        }
         if state.producer_exited {
             state.sealed = true;
-            if let Some(original) = state.pending_value.take().or_else(|| state.latest.take()) {
-                result.job = Some(self.take_disposal(&mut state, original)?);
-                result.progressed = true;
+            let pending = state.pending_value.is_some();
+            if let Some(original) = if pending {
+                state.pending_value.take()
+            } else {
+                state.latest.take()
+            } {
+                match self.take_disposal(&mut state, original) {
+                    Ok(job) => {
+                        result.job = Some(job);
+                        result.progressed = true;
+                    }
+                    Err((error, original)) => {
+                        if pending {
+                            state.pending_value = Some(original);
+                        } else {
+                            state.latest = Some(original);
+                        }
+                        if !matches!(error, DynamicFilterError::Resource(ReadResourceError::Busy)) {
+                            return Err(error);
+                        }
+                    }
+                }
                 return Ok(result);
             }
             drop(state);
@@ -505,11 +582,13 @@ impl TaskDynamicFilterInbox {
             }
             if self.custody.role.try_retire()? {
                 self.closed = true;
-                self.custody
+                let retained = self
+                    .custody
                     .retained
                     .lock()
                     .expect("original RF retention")
                     .take();
+                drop(retained);
                 result.progressed = true;
             }
             return Ok(result);
@@ -543,6 +622,8 @@ impl TaskDynamicFilterInbox {
                         input,
                         snapshot,
                         published: false,
+                        consumption: Consumption::Pending,
+                        input_retired: false,
                     });
                     result.progressed = true;
                 }
@@ -555,17 +636,190 @@ impl TaskDynamicFilterInbox {
         }
         Ok(result)
     }
+    /// Only a real publication drain may stop this dead Core's producer. A
+    /// host job still owns every rich destructor; failure never advertises a
+    /// candidate, invents an empty payload or turns a held loan into exit.
+    pub(crate) fn advance_failed(
+        &mut self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+        budget: usize,
+    ) -> Result<DynamicFilterProgress, DynamicFilterError> {
+        stage.validate_scope(&self.runtime, self.actor, &self.custody.scope)?;
+        let mut result = DynamicFilterProgress {
+            progressed: false,
+            job: None,
+        };
+        if budget == 0 || self.closed {
+            return Ok(result);
+        }
+        let mut state = self
+            .custody
+            .state
+            .lock()
+            .expect("original failed RF source");
+        result.progressed |= !state.sealed;
+        state.sealed = true;
+        if state.unresolved {
+            return Err(DynamicFilterError::Unresolved);
+        }
+        // This body contains only the exact neutral Core input. Its rich row
+        // remains in pending/flight/latest and is never dropped here.
+        let rejected = state.rejected.take();
+        result.progressed |= rejected.is_some();
+        drop(state);
+        drop(rejected);
+        let core = ConsumerId::new(1).unwrap();
+        if self.custody.report.consumption(core)? == Consumption::Pending {
+            self.custody.report.abandon_failed_owner(
+                core,
+                &self.custody.scope,
+                self.custody.generation,
+            )?;
+            result.progressed = true;
+        }
+        let mut state = self
+            .custody
+            .state
+            .lock()
+            .expect("original failed RF source");
+        if let Some(flight) = state.flight.as_mut() {
+            if flight.consumption == Consumption::Pending {
+                flight.consumption = match self
+                    .runtime
+                    .input_custody(self.actor, flight.input)?
+                    .ok_or(DynamicFilterError::MissingInput)?
+                    .phase
+                {
+                    InputPhase::Committed => Consumption::Consumed,
+                    InputPhase::AbandonedByOwnerFailure => Consumption::AbandonedByOwnerFailure,
+                    _ => Consumption::Pending,
+                };
+            }
+            if flight.consumption == Consumption::Pending {
+                return Ok(result);
+            }
+            if !flight.input_retired {
+                match self.runtime.retire_input(self.actor, flight.input) {
+                    Ok(()) => {
+                        flight.input_retired = true;
+                        result.progressed = true;
+                    }
+                    Err(
+                        DriverError::InputStillQueued
+                        | DriverError::EffectsRemain
+                        | DriverError::ReservationsRemain,
+                    ) => return Ok(result),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        if state.job_active {
+            return Ok(result);
+        }
+        if let Some(flight) = state.flight.take() {
+            let Flight {
+                input,
+                snapshot,
+                published,
+                consumption,
+                input_retired,
+            } = flight;
+            match self.take_disposal(&mut state, snapshot) {
+                Ok(job) => {
+                    result.job = Some(job);
+                    result.progressed = true;
+                }
+                Err((error, snapshot)) => {
+                    state.flight = Some(Flight {
+                        input,
+                        snapshot,
+                        published,
+                        consumption,
+                        input_retired,
+                    });
+                    if !matches!(error, DynamicFilterError::Resource(ReadResourceError::Busy)) {
+                        return Err(error);
+                    }
+                }
+            }
+            return Ok(result);
+        }
+        let pending = state.pending_value.is_some();
+        if let Some(original) = if pending {
+            state.pending_value.take()
+        } else {
+            state.latest.take()
+        } {
+            match self.take_disposal(&mut state, original) {
+                Ok(job) => {
+                    result.job = Some(job);
+                    result.progressed = true;
+                }
+                Err((error, original)) => {
+                    if pending {
+                        state.pending_value = Some(original);
+                    } else {
+                        state.latest = Some(original);
+                    }
+                    if !matches!(error, DynamicFilterError::Resource(ReadResourceError::Busy)) {
+                        return Err(error);
+                    }
+                }
+            }
+            return Ok(result);
+        }
+        if !state.producer_exited {
+            return Ok(result);
+        }
+        drop(state);
+        if let Some(authority) = self
+            .custody
+            .authority
+            .lock()
+            .expect("original RF authority")
+            .take()
+        {
+            authority.exited()?;
+            result.progressed = true;
+        }
+        if !self.input_closed {
+            self.input.close_after_exit()?;
+            self.input_closed = true;
+            result.progressed = true;
+        }
+        if self.custody.role.actual_exit_ready()? {
+            let observer = ConsumerId::new(2).unwrap();
+            if self.custody.report.consumption(observer)? == Consumption::Pending {
+                self.custody.report.consume(observer)?;
+                result.progressed = true;
+            }
+        }
+        if self.input_closed && self.custody.role.try_retire()? {
+            self.closed = true;
+            let retained = self
+                .custody
+                .retained
+                .lock()
+                .expect("original RF retention")
+                .take();
+            drop(retained);
+            result.progressed = true;
+        }
+        Ok(result)
+    }
+    /// Refusal returns the whole same snapshot for restoration to its exact
+    /// original cell. A loan's Busy cannot consume another pending candidate.
     fn take_disposal(
         &self,
         state: &mut State,
         original: Snapshot,
-    ) -> Result<TaskDynamicFilterHostJob, DynamicFilterError> {
+    ) -> Result<TaskDynamicFilterHostJob, (DynamicFilterError, Snapshot)> {
         if state.job_active {
-            state.unresolved = true;
-            std::mem::forget(original);
-            return Err(DynamicFilterError::Unresolved);
+            return Err((DynamicFilterError::Unresolved, original));
         }
-        original.row.seal()?;
+        if let Err(error) = original.row.seal() {
+            return Err((error.into(), original));
+        }
         let Snapshot {
             version,
             domains,
@@ -575,13 +829,15 @@ impl TaskDynamicFilterInbox {
         let value = match row.try_take() {
             Ok(value) => value,
             Err((error, row)) => {
-                state.pending_value = Some(Snapshot {
-                    version,
-                    domains,
-                    row,
-                    notice,
-                });
-                return Err(error.into());
+                return Err((
+                    error.into(),
+                    Snapshot {
+                        version,
+                        domains,
+                        row,
+                        notice,
+                    },
+                ));
             }
         };
         state.job_active = true;
