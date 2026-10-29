@@ -55,16 +55,25 @@ impl ContextHostRecord {
             .map_err(ContextDriverError::Task)
     }
 
-    fn observe_failed_capture(&mut self, original: &mut ScopeFailureOwner) -> bool {
+    fn observe_failed_capture(
+        &mut self,
+        original: &mut ScopeFailureOwner,
+    ) -> Result<bool, ContextDriverError> {
         let Some((purpose, capture)) = &original.physical else {
-            return true;
+            return Ok(true);
         };
         if !capture.actual_exit_observed() || *purpose == FailurePhysicalPurpose::FinalCarrier {
-            return false;
+            return Ok(false);
         }
         let task = match purpose {
             FailurePhysicalPurpose::Projection(task) | FailurePhysicalPurpose::Neutral(task) => {
                 *task
+            }
+            FailurePhysicalPurpose::RetirementProjection(task) => {
+                let task = *task;
+                self.complete_failed_retirement_projection(task)
+                    .map_err(ContextDriverError::Task)?;
+                task
             }
             FailurePhysicalPurpose::FinalCarrier => unreachable!("checked final carrier"),
         };
@@ -74,7 +83,7 @@ impl ContextHostRecord {
         {
             owner.pending_notice().pending();
         }
-        true
+        Ok(true)
     }
 
     pub(in crate::control_runtime::context_host) fn advance_failed_task_cleanup(
@@ -105,10 +114,15 @@ impl ContextHostRecord {
             .map_err(ContextDriverError::Failure)?
             .validate(&self.control_runtime, self.actor)
             .map_err(ContextDriverError::Driver)?;
+        // Attach original cleanup tickets before a Source header can leave
+        // its original bank. This finite pass invokes no foreign body.
+        if !self.bind_failed_cleanup(original, budget)? {
+            return Ok(true);
+        }
         self.settle_failed_driver_effect(original)?;
         self.flush_task_cleanup_pending(ports, budget)
             .map_err(ContextDriverError::Task)?;
-        if !self.observe_failed_capture(original) {
+        if !self.observe_failed_capture(original)? {
             return Ok(false);
         }
         let health = ports
@@ -123,6 +137,37 @@ impl ContextHostRecord {
             .descriptor
             .work;
         let key = (self.scope().id(), author);
+        if let Some((task, candidate)) = self
+            .failed_retirement_candidate()
+            .map_err(ContextDriverError::Task)?
+        {
+            let port = self
+                .task(task)
+                .ok_or(ContextDriverError::WrongOwner)?
+                .port();
+            let old = original
+                .session
+                .commit_snapshot(port.publication(), candidate)
+                .map_err(|(error, candidate)| {
+                    drop(candidate);
+                    ContextDriverError::Driver(error)
+                })?;
+            self.failed_retirement_projection_committed(task);
+            let (capture, job) = super::super::failure_tail::FailureTail::projection(
+                key,
+                old,
+                self.ready_notice().clone(),
+                health.clone(),
+            );
+            self.queue_failed_capture(
+                original,
+                FailurePhysicalPurpose::RetirementProjection(task),
+                capture,
+                job,
+                ports,
+            )?;
+            return Ok(false);
+        }
         let mut runnable = false;
         for _ in 0..budget {
             let next = if let Some(task) = original.pending_projection_task {
@@ -397,6 +442,28 @@ impl ContextHostRecord {
             return Ok(());
         };
         let stage = original.drained().map_err(ContextDriverError::Failure)?;
+        if matches!(
+            &ticket.effect,
+            WorkerAction::Context(
+                novarocks_worker_protocol::context::ContextEffect::RetireTask { .. }
+                    | novarocks_worker_protocol::context::ContextEffect::FinalizeTaskExecution { .. }
+            )
+        ) {
+            return match self.retain_failed_retirement_ticket(ticket) {
+                Ok(()) => Ok(()),
+                Err((error, ticket)) => {
+                    self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                    if matches!(
+                        error,
+                        task_driver::TaskDriverError::EffectRequiresOriginalOwner
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(ContextDriverError::Task(error))
+                    }
+                }
+            };
+        }
         let result = match &ticket.effect {
             WorkerAction::Reply(_) => self.finish_failed_reply_effect(&stage, ticket),
             WorkerAction::Context(

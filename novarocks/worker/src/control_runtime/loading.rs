@@ -18,9 +18,13 @@
 //! One elected loader borrows the Task-owned input outside all metadata locks.
 //! Its actual work/report and the Task's retained input have different exits.
 
+use super::{
+    actors::WorkerAction, adopted_cleanup::AdoptedCleanupEffect, failure::ScopePublicationsDrained,
+};
 use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
 use novarocks_control_runtime::{
     completion::ReportSlot,
+    driver::DriverError,
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
 };
 use novarocks_control_runtime_core::identity::{ConsumerId, ScopeId, WorkId};
@@ -74,6 +78,7 @@ impl LoadingSources {
 }
 struct Custody {
     task: TaskIdentity,
+    payload: PayloadId,
     work: WorkId,
     scope: novarocks_control_runtime::transaction::ScopeHandle,
     ingress_retained_bytes: usize,
@@ -81,6 +86,7 @@ struct Custody {
     role: ExitRole,
     report: ReportSlot,
     input_role: ExitRole,
+    input_scope: novarocks_control_runtime::transaction::ScopeHandle,
     input_key: (ScopeId, WorkId),
     input_report: ReportSlot,
     input_authority: Mutex<Option<ExitAuthority>>,
@@ -90,6 +96,12 @@ struct Custody {
     pending: Arc<dyn TaskPendingNotice>,
     health: Arc<ExecutionHealth>,
     retained: Mutex<Option<Arc<Self>>>,
+    input_cleanup: Mutex<Option<AdoptedCleanupEffect>>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputCleanupError {
+    Exit(ExitRoleError),
+    Driver(DriverError),
 }
 #[derive(Clone)]
 pub(crate) struct LoaderCustody(Arc<Custody>);
@@ -132,6 +144,7 @@ impl LoaderCustody {
             admitted.report,
         ));
         let input_key = (input_admitted.work.scope().id(), input_admitted.work.id());
+        let input_scope = input_admitted.work.scope().clone();
         let input_report = input_admitted.report.clone();
         let (input_role, input_authority) =
             ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
@@ -141,6 +154,7 @@ impl LoaderCustody {
             ));
         let custody = Arc::new(Custody {
             task: payload.request.identity(),
+            payload: payload.id,
             work,
             scope,
             ingress_retained_bytes: payload.ingress_retained_bytes,
@@ -148,6 +162,7 @@ impl LoaderCustody {
             role,
             report,
             input_role,
+            input_scope,
             input_key,
             input_report,
             input_authority: Mutex::new(Some(input_authority)),
@@ -157,6 +172,7 @@ impl LoaderCustody {
             pending,
             health,
             retained: Mutex::new(None),
+            input_cleanup: Mutex::new(None),
         });
         *custody
             .retained
@@ -199,6 +215,7 @@ impl LoaderCustody {
     pub(crate) fn is_retired(&self) -> bool {
         self.phase() == ExitRolePhase::Retired
             && self.0.input_role.phase() == ExitRolePhase::Retired
+            && self.input_cleanup_completed()
             && self
                 .0
                 .sources
@@ -208,6 +225,68 @@ impl LoaderCustody {
     }
     pub(crate) fn ready_for_exit(&self) -> Result<bool, ExitRoleError> {
         self.0.role.actual_exit_ready()
+    }
+    /// The loader body and the original input destructor are distinct roles.
+    /// A moved-out source or an exited loader cannot stand in for this proof.
+    pub(crate) fn input_actual_exit_ready(&self) -> Result<bool, ExitRoleError> {
+        self.0.input_role.actual_exit_ready()
+    }
+    pub(crate) fn adopt_input_cleanup(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        cleanup: AdoptedCleanupEffect,
+    ) -> Result<(), (DriverError, AdoptedCleanupEffect)> {
+        if cleanup.is_completed()
+            || !self.0.scope.same_scope(&self.0.input_scope)
+            || !matches!(cleanup.effect(), WorkerAction::Context(
+                novarocks_worker_protocol::context::ContextEffect::DisposeLoadedInput { task, payload }
+            ) if *task == self.0.task && *payload == self.0.payload)
+        {
+            return Err((DriverError::PublicationTargetMismatch, cleanup));
+        }
+        if let Err(error) = cleanup.validate_scope(stage, &self.0.input_scope) {
+            return Err((error, cleanup));
+        }
+        let mut slot = self
+            .0
+            .input_cleanup
+            .lock()
+            .expect("original loaded input cleanup effect");
+        if slot.is_some() {
+            return Err((DriverError::RoleBusy, cleanup));
+        }
+        *slot = Some(cleanup);
+        drop(slot);
+        self.0.pending.pending();
+        Ok(())
+    }
+    /// This consumes only the original cleanup effect, never an input report,
+    /// consumer or physical exit authority. A panic leaves that effect pending.
+    pub(crate) fn advance_input_cleanup(&self) -> Result<bool, InputCleanupError> {
+        if !self
+            .input_actual_exit_ready()
+            .map_err(InputCleanupError::Exit)?
+        {
+            return Ok(false);
+        }
+        let progressed = self
+            .0
+            .input_cleanup
+            .lock()
+            .expect("original loaded input cleanup effect")
+            .as_mut()
+            .map_or(Ok(false), |cleanup| cleanup.complete())
+            .map_err(InputCleanupError::Driver)?;
+        self.release_retention_if_transferred();
+        Ok(progressed)
+    }
+    fn input_cleanup_completed(&self) -> bool {
+        self.0
+            .input_cleanup
+            .lock()
+            .expect("original loaded input cleanup effect")
+            .as_ref()
+            .is_none_or(AdoptedCleanupEffect::is_completed)
     }
     fn take_sources(&self) -> Option<LoadingSources> {
         self.0
@@ -286,6 +365,7 @@ impl LoaderCustody {
     fn release_retention_if_transferred(&self) {
         if self.phase() == ExitRolePhase::Retired
             && self.0.input_role.phase() == ExitRolePhase::Retired
+            && self.input_cleanup_completed()
             && self
                 .0
                 .sources

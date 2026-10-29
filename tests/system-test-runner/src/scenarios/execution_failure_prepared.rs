@@ -59,6 +59,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(AcceptedPreparedFailureDelayedExit::default()),
         Box::new(context_owner_panic::ContextOwnerPanicIsolation::default()),
+        Box::new(context_owner_panic::ContextOwnerPanicIsolation::with_prepared_holder()),
     ]
 }
 #[derive(Default)]
@@ -745,6 +746,15 @@ mod context_owner_panic {
     #[derive(Default)]
     pub(super) struct ContextOwnerPanicIsolation {
         intent: DirectIntentOwner,
+        held_prepared: bool,
+    }
+    impl ContextOwnerPanicIsolation {
+        pub(super) fn with_prepared_holder() -> Self {
+            Self {
+                intent: DirectIntentOwner::default(),
+                held_prepared: true,
+            }
+        }
     }
     impl Scenario for ContextOwnerPanicIsolation {
         fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -756,7 +766,11 @@ mod context_owner_panic {
             )
         }
         fn name(&self) -> &'static str {
-            "execution-failure/context-owner-panic-isolation"
+            if self.held_prepared {
+                "execution-failure/context-owner-panic-held-prepared-isolation"
+            } else {
+                "execution-failure/context-owner-panic-isolation"
+            }
         }
         fn is_explicit_stage(&self) -> bool {
             true
@@ -774,6 +788,16 @@ mod context_owner_panic {
                 cluster_size == 3,
                 "Context isolation requires native 1FE+3BE"
             );
+            if self.held_prepared {
+                return Ok(Some(self.intent.freeze_actions(
+                    3,
+                    &[(OWNER_ACTION, 0, 0, None), (ACTION, 0, 0, Some(1))],
+                    false,
+                    cluster_size,
+                    binary,
+                    deadline,
+                )?));
+            }
             Ok(Some(self.intent.freeze(
                 OWNER_ACTION,
                 3,
@@ -816,9 +840,44 @@ mod context_owner_panic {
             let mut receiver = RawCreate::values(&failed, 1);
             receiver.pipeline_dop = 1;
             receiver.exchange_input = true;
+            let mut prepared_gate = if self.held_prepared {
+                receiver.sink = RawSink::CountOnly;
+                let hold = intent
+                    .holds
+                    .iter()
+                    .find(|hold| hold.task_id == Some(1))
+                    .context("original prepared holder grant missing")?;
+                Some(PreparedExitGate::bind(&hold.token)?)
+            } else {
+                None
+            };
             ensure_accepted(&failed, &receiver)?;
-            await_installed(context, &failed, &receiver)?;
-            context.action("installed an original live receiver on BE0 with the sole paid inbound row before the declared Context failure");
+            let held_bytes = if let Some(gate) = &mut prepared_gate {
+                let marker = gate.await_entered(context, &failed, &receiver)?;
+                let before = observe_prepared_status(context, &failed, &receiver, ExitPhase::Held)?;
+                nominal_failure(&before.status)?;
+                let charged = await_snapshot_at(context, 0, 1, 0, 0)?;
+                ensure!(
+                    charged.bytes > 0 && charged.context_positions == 1,
+                    "the original prepared holder lost its physical charges: {charged:?}"
+                );
+                await_retained_fragment(context, &baseline)?;
+                write_artifact(
+                    context,
+                    "owner-held-prepared-before-panic.json",
+                    &json!({
+                        "marker_sha256":format!("{:x}",Sha256::digest(marker.as_bytes())),
+                        "covered":before.json(),"preparation_bytes":charged.bytes,
+                        "scope":"real prepared kernel/charges remain live; does not prove an old Stop/DisposeSource ticket is pending"
+                    }),
+                )?;
+                context.action("the existing exact prepared-failure-exit gate retained the real original kernel, covered Failing with no actual-stop and nonzero preparation charges before the Context actor panic; no old cleanup-ticket phase is inferred");
+                Some(charged.bytes)
+            } else {
+                await_installed(context, &failed, &receiver)?;
+                context.action("installed an original live receiver on BE0 with the sole paid inbound row before the declared Context failure");
+                None
+            };
 
             // A different operation on the SAME Context is not the grant.
             let normal = renew(
@@ -892,6 +951,40 @@ mod context_owner_panic {
             );
             context.action("an independent Context on the SAME BE Finished and actually stopped, public SQL returned exact rows, and its original Release completed without replacing a role");
 
+            if let Some(gate) = &mut prepared_gate {
+                // This is still the exact un-released physical holder. Do not
+                // mistake logical OwnerFailed or the missing Core for its exit.
+                let charged = await_snapshot_at(context, 0, 1, 0, 0)?;
+                ensure!(
+                    Some(charged.bytes) == held_bytes && charged.context_positions == 1,
+                    "owner failure or sibling progress prematurely refunded the prepared holder: {charged:?}"
+                );
+                await_retained_fragment(context, &baseline)?;
+                let owner_log = fs::read_to_string(
+                    context
+                        .scenario_root()
+                        .join("owner-application-log/novarocks.INFO"),
+                )?;
+                ensure!(
+                    !owner_log.lines().any(|line| line.contains(REMOVED)
+                        && line.contains(&format!("query_high={}", a.query_id.hi))
+                        && line.contains(&format!("query_low={} ", a.query_id.lo))
+                        && line.contains("attempt=1")),
+                    "original Scope disappeared before its prepared kernel holder exited"
+                );
+                context.action("after actual OwnerFailed the same prepared gate remained closed with its original charges and fragment, while the independent same-BE Task/SQL/Release completed; original failed Scope has not physically disappeared");
+                let token = intent
+                    .holds
+                    .iter()
+                    .find(|hold| hold.task_id == Some(1))
+                    .context("same original prepared holder grant missing")?
+                    .token
+                    .clone();
+                gate.release(context.deadline())?;
+                await_explicit_release(context, &failed, &receiver, &token)?;
+                context.action("the original scenario owner explicitly released the same prepared-holder rendezvous after OwnerFailed; real gate release is observed without signing physical exit or cleanup-ticket completion");
+            }
+
             // This original transition is emitted only AFTER actual Scope
             // removal. No missing directory row or terminal bool proves it.
             let path = context
@@ -959,6 +1052,8 @@ mod context_owner_panic {
                     "owner_failed_original_R":true,"same_BE_healthy_actual_stop":true,
                     "failed_scope_physically_removed":true,"fresh_receiver_installed_at_record_limit":1,
                     "healthy_rows":rows,"role_processes_unchanged":true,
+                    "prepared_holder_kept_through_owner_failure":self.held_prepared,
+                    "old_stop_or_source_ticket_pending":"NOT_PROVED; this scene covers the actual prepared holder only",
                     "final_required_audit":"original FE+3BE monitor Finals all raw0; no lifetime expiry/owner loss; actual Node joins and cluster/fixture cleanup. Scenario return alone is insufficient."
                 }),
             )?;

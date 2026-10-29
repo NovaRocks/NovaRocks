@@ -140,6 +140,7 @@ pub(super) struct TaskDriverState {
     // from a later same-identity attempt admitted after its Core release fact.
     retiring_tasks: BTreeMap<(TaskIdentity, u64), Arc<crate::control_runtime::task::TaskDisposal>>,
     disposal_cursor: Option<(TaskIdentity, u64)>,
+    failed_retirement_cursor: Option<TaskIdentity>,
     publication_refusal:
         Option<std::mem::ManuallyDrop<super::super::task_publication::TaskPublicationRefusal>>,
 }
@@ -779,6 +780,7 @@ impl ContextHostRecord {
         }
         if let WorkerAction::Context(ContextEffect::StopTask { task, .. }) = &ticket.effect {
             let task = *task;
+            let notice = self.request_notice_for_input(ticket.input);
             let Some(executor) = ports.lifecycle.as_ref() else {
                 return Err(reject(TaskDriverError::MissingLifecyclePort, ticket));
             };
@@ -790,7 +792,7 @@ impl ContextHostRecord {
             };
             let job = match owner
                 .host_call(crate::control_runtime::task_host_call::TaskHostCallKind::Stop)
-                .handoff_stop_effect(ticket)
+                .handoff_stop_effect(ticket, notice)
             {
                 Ok(job) => TaskDriverHostJob::Stop { job },
                 Err((error, ticket)) => {
@@ -1719,12 +1721,138 @@ impl ContextHostRecord {
         Ok(Some((task, step)))
     }
 
+    pub(super) fn retain_failed_retirement_ticket(
+        &mut self,
+        ticket: EffectTicket<WorkerAction>,
+    ) -> Result<(), (TaskDriverError, EffectTicket<WorkerAction>)> {
+        let (task, finalize_execution_only, retained_payload) = match &ticket.effect {
+            WorkerAction::Context(ContextEffect::FinalizeTaskExecution { task, .. }) => {
+                (*task, true, None)
+            }
+            WorkerAction::Context(ContextEffect::RetireTask { task, payload, .. }) => {
+                (*task, false, Some(*payload))
+            }
+            _ => return Err((TaskDriverError::WrongOwner, ticket)),
+        };
+        if self.task_driver.retirements.contains_key(&task) {
+            return Err((TaskDriverError::EffectRequiresOriginalOwner, ticket));
+        }
+        let Some(owner) = self.task(task) else {
+            return Err((TaskDriverError::WrongOwner, ticket));
+        };
+        if retained_payload.is_some_and(|payload| payload != owner.original_payload_id()) {
+            return Err((TaskDriverError::WrongOwner, ticket));
+        }
+        self.task_driver.retirements.insert(
+            task,
+            TaskRetirement {
+                ticket: Some(ticket),
+                execution_job_issued: false,
+                projection_committed: false,
+                finalize_execution_only,
+                disposal_authorization: None,
+                retained_payload,
+            },
+        );
+        Ok(())
+    }
+
+    /// Inspect one original retirement row. Normal jobs that already own the
+    /// ticket stay on that job; this path never duplicates their old Arc.
+    pub(super) fn failed_retirement_candidate(
+        &mut self,
+    ) -> Result<Option<(TaskIdentity, Arc<crate::task_port::TaskProjection>)>, TaskDriverError>
+    {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = self
+            .task_driver
+            .retirements
+            .range((
+                self.task_driver
+                    .failed_retirement_cursor
+                    .map_or(Unbounded, Excluded),
+                Unbounded,
+            ))
+            .next()
+            .or_else(|| self.task_driver.retirements.first_key_value())
+            .map(|(&task, row)| {
+                (
+                    task,
+                    row.ticket.is_some(),
+                    row.projection_committed,
+                    row.finalize_execution_only,
+                )
+            });
+        let Some((task, owns_ticket, committed, finalize_only)) = next else {
+            return Ok(None);
+        };
+        self.task_driver.failed_retirement_cursor = Some(task);
+        let Some(owner) = self.task(task) else {
+            return Err(TaskDriverError::WrongOwner);
+        };
+        if !owns_ticket {
+            if owner
+                .retirement_projection_exited(finalize_only)
+                .map_err(TaskDriverError::Host)?
+            {
+                self.task_driver.retirements.remove(&task);
+                if let Some(owner) = self.task(task) {
+                    owner.pending_notice().pending();
+                }
+            }
+            return Ok(None);
+        }
+        if committed || !owner.production_retired() {
+            return Ok(None);
+        }
+        let candidate = owner
+            .port()
+            .prepare_source_retirement()
+            .map_err(|_| TaskDriverError::Publication)?;
+        Ok(Some((task, Arc::new(candidate))))
+    }
+
+    pub(super) fn failed_retirement_projection_committed(&mut self, task: TaskIdentity) {
+        self.task_driver
+            .retirements
+            .get_mut(&task)
+            .expect("original failed retirement")
+            .projection_committed = true;
+    }
+
+    pub(super) fn complete_failed_retirement_projection(
+        &mut self,
+        task: TaskIdentity,
+    ) -> Result<(), TaskDriverError> {
+        let row = self
+            .task_driver
+            .retirements
+            .get_mut(&task)
+            .ok_or(TaskDriverError::WrongOwner)?;
+        let ticket = row.ticket.take().ok_or(TaskDriverError::WrongOwner)?;
+        if let Err(refusal) = self.complete_host_effect(ticket) {
+            self.task_driver.retirements.get_mut(&task).unwrap().ticket = Some(refusal.ticket);
+            return Err(TaskDriverError::Driver(refusal.error));
+        }
+        self.task_driver.retirements.remove(&task);
+        if let Some(owner) = self.task(task) {
+            owner.pending_notice().pending();
+        }
+        Ok(())
+    }
+
     pub(super) fn retire_failed_task_owner(
         &mut self,
         stage: &super::failure::ScopePublicationsDrained<'_>,
         task: TaskIdentity,
         ports: &TaskDriverPorts,
     ) -> Result<bool, TaskDriverError> {
+        // A completed physical callback and deletion of its original
+        // retirement row are separate transitions. Preserve the Task until
+        // this bounded owner visit has positively settled that same row.
+        if self.task_driver.retirements.contains_key(&task) {
+            return Ok(false);
+        }
         let (authorization, payload) = match self.tasks.get(&task) {
             Some(
                 super::TaskHostOwner::Ready(owner) | super::TaskHostOwner::Initializing(owner),
@@ -1915,6 +2043,13 @@ impl ContextHostRecord {
                     return Err(TaskDriverError::Publication);
                 }
             };
+            let observer = match self.control_runtime.effect_completion_observer(&ticket) {
+                Ok(observer) => observer,
+                Err(error) => {
+                    self.task_driver.retirements.get_mut(&task).unwrap().ticket = Some(ticket);
+                    return Err(TaskDriverError::Driver(error));
+                }
+            };
             let old = match self.control_runtime.commit_snapshot(
                 &ticket,
                 port.publication(),
@@ -1928,6 +2063,10 @@ impl ContextHostRecord {
                     return Err(TaskDriverError::Driver(error));
                 }
             };
+            let finalize_only = self.task_driver.retirements[&task].finalize_execution_only;
+            self.task(task)
+                .expect("same original Task")
+                .retain_retirement_projection(finalize_only, observer);
             self.dispatch
                 .publication_committed(&self.control_runtime, &ticket)
                 .map_err(TaskDriverError::Dispatch)?;

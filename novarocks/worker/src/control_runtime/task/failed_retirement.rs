@@ -224,6 +224,25 @@ impl TaskHostRecord {
             .ok_or(TaskHostError::Causal(CausalError::IngressGeometry))?;
         Ok(owner.custody.queue_key())
     }
+    fn advance_source_cleanups(
+        positions: impl IntoIterator<Item = super::super::source_positions::SourcePositionObservation>,
+    ) -> Result<bool, TaskHostError> {
+        let mut progressed = false;
+        for position in positions {
+            progressed |= position
+                .custody
+                .advance_cleanup()
+                .map_err(|error| match error {
+                    super::super::source_custody::SourceCleanupError::Exit(error) => {
+                        TaskHostError::Causal(CausalError::Role(error))
+                    }
+                    super::super::source_custody::SourceCleanupError::Driver(error) => {
+                        TaskHostError::Driver(error)
+                    }
+                })?;
+        }
+        Ok(progressed)
+    }
     /// Visit at most budget original owner classes, and return at most one
     /// physical action. Awaiting a foreign call or alias does not self-wake.
     pub(crate) fn advance_failed_retirement(
@@ -334,6 +353,19 @@ impl TaskHostRecord {
     ) -> Result<(), TaskHostError> {
         if let Some(loader) = &self.resources.loader {
             loader.cancel();
+            // Actual input-role exit, not loader return or a missing carrier,
+            // settles an adopted old DisposeLoadedInput effect independently
+            // of its runtime input's later header retirement.
+            step.progressed |= loader
+                .advance_input_cleanup()
+                .map_err(|error| match error {
+                    super::super::loading::InputCleanupError::Exit(error) => {
+                        TaskHostError::Loading(LoadingEventError::Role(error))
+                    }
+                    super::super::loading::InputCleanupError::Driver(error) => {
+                        TaskHostError::Driver(error)
+                    }
+                })?;
         }
         if let Some(job) = self.resources.pending_loading.take() {
             step.action = Some(self.failed_action(Physical::Loader(job)));
@@ -646,7 +678,14 @@ impl TaskHostRecord {
             step.progressed = true;
             return Ok(());
         }
-        if !self.host_retired_pairs.is_empty() {
+        if let Some((_, retired)) = self.host_retired_pairs.first_key_value() {
+            let positions = self
+                .resources
+                .port
+                .ingress()
+                .owned_pair_inventory(&retired.pair)
+                .map_err(|error| TaskHostError::Causal(error.into()))?;
+            step.progressed |= Self::advance_source_cleanups(positions)?;
             // The normal helper's first branch only drains an already-returned
             // pair and does not enter its normal Core-observation path.
             step.progressed |= self.advance_production_cut(ledger)?;
@@ -699,6 +738,13 @@ impl TaskHostRecord {
             step.neutral = Some(FailedTaskNeutral::Rejected(prefix, event));
             return Ok(());
         }
+        // Prepaid future authors are real Pending holders. Their pair still
+        // contains unsealed funding until this original event is delivered or
+        // actually withdrawn. Waiting for input retirement here would instead
+        // recreate the old DisposeSource effect/source-header dependency cycle.
+        if !self.resources.causal.failed_source_pair_ready(stage, cut)? {
+            return Ok(());
+        }
         for ordinal in 0..2 {
             let key = Self::failed_source_key(
                 self.resources.port.ingress(),
@@ -718,6 +764,26 @@ impl TaskHostRecord {
                 return Ok(());
             }
         }
+        let positions = self
+            .resources
+            .port
+            .ingress()
+            .pair_inventory(PairRoute::Cut(cut))
+            .map_err(|error| TaskHostError::Causal(error.into()))?;
+        step.progressed |= Self::advance_source_cleanups(positions)?;
+        // The old input can still own a cleanup effect whose resource
+        // owner is waiting for this Source's actual report/header retirement.
+        // Advance those independent original roles first; only final cut/input
+        // detach waits for the old batch to complete.
+        let sources = self.resources.causal.advance_failed_source_pair(
+            stage,
+            cut,
+            ledger,
+            &self.scope,
+            self.core_generation,
+            1,
+        )?;
+        step.progressed |= sources.progressed;
         if !turn.inputs_retired {
             return Ok(());
         }
@@ -734,16 +800,7 @@ impl TaskHostRecord {
                 if !waiting_cut(refusal.error) {
                     return Err(TaskHostError::Causal(refusal.error));
                 }
-                let turn = self.resources.causal.advance_failed_source_pair(
-                    stage,
-                    cut,
-                    ledger,
-                    &self.scope,
-                    self.core_generation,
-                    1,
-                )?;
-                step.progressed |= turn.progressed;
-                if let Some(reaped) = turn.reaped {
+                if let Some(reaped) = sources.reaped {
                     match self
                         .resources
                         .causal
@@ -790,7 +847,7 @@ impl TaskHostRecord {
                 step.neutral = Some(FailedTaskNeutral::OpenRejected(rejected));
                 return Ok(());
             }
-            if !turn.input_retired || turn.consumption.is_none() {
+            if turn.consumption.is_none() {
                 return Ok(());
             }
             for ordinal in 0..2 {
@@ -808,6 +865,10 @@ impl TaskHostRecord {
                     return Ok(());
                 }
             }
+            let positions = ingress
+                .pair_inventory(PairRoute::ConsumingOpen)
+                .map_err(|error| TaskHostError::Causal(error.into()))?;
+            step.progressed |= Self::advance_source_cleanups(positions)?;
             for holder in ingress
                 .take_unused_pair(PairRoute::ConsumingOpen)
                 .map_err(|error| TaskHostError::Causal(error.into()))?
@@ -845,6 +906,12 @@ impl TaskHostRecord {
                 }
             }
             step.progressed |= ledger.reap_scope_ready(self.scope.id(), 1)? != 0;
+            // Source exit, adopted cleanup and its independent report/header
+            // may advance while the old batch is still live. Moving this pair
+            // remains gated by the original input and saved Core receipt.
+            if !turn.input_retired || turn.consumption == Some(Consumption::Pending) {
+                return Ok(());
+            }
             let [a, b] = ingress
                 .prepare_pair_reap(PairRoute::ConsumingOpen)
                 .map_err(|error| TaskHostError::Causal(error.into()))?
@@ -936,6 +1003,10 @@ impl TaskHostRecord {
                     return Ok(());
                 }
             }
+            let positions = ingress
+                .pair_inventory(route)
+                .map_err(|error| TaskHostError::Causal(error.into()))?;
+            step.progressed |= Self::advance_source_cleanups(positions)?;
             for holder in ingress
                 .take_unused_pair(route)
                 .map_err(|error| TaskHostError::Causal(error.into()))?
@@ -985,6 +1056,9 @@ impl TaskHostRecord {
             return Ok(());
         }
         if !self.normal_lifetime_ended {
+            if !self.retirement_projections_exited()? {
+                return Ok(());
+            }
             if self.resources.host_calls.iter().any(|c| !c.is_retired())
                 || self
                     .resources

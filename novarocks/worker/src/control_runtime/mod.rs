@@ -19,6 +19,7 @@
 
 pub(crate) mod actors;
 pub(crate) mod admitted_role;
+pub(crate) mod adopted_cleanup;
 pub(crate) mod context_executors;
 pub(crate) mod context_host;
 pub(crate) mod context_host_jobs;

@@ -253,6 +253,30 @@ impl EffectBatchState {
         self.effects.get_mut(&id).expect("validated action").state = EffectState::Started;
         Ok(())
     }
+    /// The live failure owner takes over an old cleanup obligation without
+    /// claiming that its abandoned normal predecessors were published.
+    /// Runtime code must qualify the actual failure session before this call.
+    pub fn start_after_owner_failure(
+        &mut self,
+        id: ActionId,
+        failure_generation: Generation,
+    ) -> Result<(), EffectError> {
+        if self.phase != BatchPhase::Committed {
+            return Err(EffectError::NotCommitted);
+        }
+        if self.generation >= failure_generation {
+            return Err(EffectError::StaleGeneration);
+        }
+        let record = self
+            .effects
+            .get_mut(&id)
+            .ok_or(EffectError::UnknownAction)?;
+        if record.state != EffectState::Pending || !record.descriptor.kind.allowed_after_failure() {
+            return Err(EffectError::InvalidTransition);
+        }
+        record.state = EffectState::Started;
+        Ok(())
+    }
     pub fn published(&mut self, id: ActionId) -> Result<(), EffectError> {
         let record = self
             .effects

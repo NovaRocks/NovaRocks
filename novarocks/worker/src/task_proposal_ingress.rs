@@ -952,6 +952,33 @@ impl TaskProposalIngress {
             .sources
             .take_source(id)
     }
+    /// Select the exact original source under the cut fence, then validate and
+    /// adopt its unique cleanup outside it. No source absence is exit proof.
+    pub(crate) fn adopt_source_cleanup(
+        &self,
+        stage: &crate::control_runtime::failure::ScopePublicationsDrained<'_>,
+        cleanup: crate::control_runtime::adopted_cleanup::AdoptedCleanupEffect,
+    ) -> Result<
+        (),
+        (
+            novarocks_control_runtime::driver::DriverError,
+            crate::control_runtime::adopted_cleanup::AdoptedCleanupEffect,
+        ),
+    > {
+        use crate::control_runtime::actors::WorkerAction;
+        use novarocks_control_runtime::driver::DriverError;
+        let source = match cleanup.effect() {
+            WorkerAction::Context(
+                novarocks_worker_protocol::context::ContextEffect::DisposeSource { source, .. },
+            ) => *source,
+            _ => return Err((DriverError::PublicationTargetMismatch, cleanup)),
+        };
+        let original = match self.source_inventory(source) {
+            Ok(original) => original,
+            Err(_) => return Err((DriverError::UnknownInput, cleanup)),
+        };
+        original.custody.adopt_cleanup(stage, cleanup)
+    }
     pub(crate) fn source_inventory(
         &self,
         id: SourceId,

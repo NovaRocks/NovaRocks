@@ -756,6 +756,61 @@ impl<E> std::fmt::Debug for EffectCompletionRefusal<E> {
             .finish()
     }
 }
+/// Read-only completion evidence from one original Started/Published ticket.
+/// It retains no effect payload, Work permission or actor core. Construction
+/// qualifies the original record; arbitrary missing IDs cannot create it.
+pub struct EffectCompletionObserver<A: Actor> {
+    runtime: ActorRuntime<A>,
+    origin: Arc<()>,
+    actor: ActorId,
+    input: InputId,
+    action: ActionId,
+}
+impl<A: Actor> std::fmt::Debug for EffectCompletionObserver<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EffectCompletionObserver")
+            .field("actor", &self.actor)
+            .field("input", &self.input)
+            .field("action", &self.action)
+            .finish()
+    }
+}
+impl<A: Actor> EffectCompletionObserver<A> {
+    pub fn is_completed(&self) -> Result<bool, DriverError> {
+        let node = match self.runtime.node(self.actor) {
+            Ok(node) => node,
+            // This observer was issued while its actual action was Started.
+            // Removing that registration requires every input/batch empty;
+            // a Started/Published action cannot be abandoned on that path.
+            Err(DriverError::UnknownActor) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if !Arc::ptr_eq(&node.origin, &self.origin) {
+            // A fresh registration can reuse the public actor/input numbers,
+            // but only after the original actor passed the removal gate.
+            return Ok(true);
+        }
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let Some(batch) = inbox.batches.get(&self.input) else {
+            if inbox.inputs.contains_key(&self.input) {
+                return Err(DriverError::UnknownInput);
+            }
+            // The same registration never reuses InputIds. Its committed
+            // input can disappear only via retire_input, which requires all
+            // effects terminal; this original Started action had to complete.
+            return Ok(true);
+        };
+        let record = batch
+            .state
+            .record(self.action)
+            .ok_or(EffectError::UnknownAction)?;
+        match record.state() {
+            EffectState::Completed => Ok(true),
+            EffectState::Started | EffectState::Published => Ok(false),
+            _ => Err(EffectError::InvalidTransition.into()),
+        }
+    }
+}
 /// Exclusive publication authority within one actual failure supervision job.
 /// It signs no work and never reads the failed core. Each commit touches one
 /// actual target; application failure policy and bounded inventory loops remain
@@ -764,6 +819,7 @@ impl<E> std::fmt::Debug for EffectCompletionRefusal<E> {
 pub struct FailurePublicationSession<A: Actor> {
     runtime: ActorRuntime<A>,
     actor: ActorId,
+    origin: Arc<()>,
     // ActorIds may be registered again after actual removal, and WorkIds are
     // scope-local. Preserve the original scope and ledger identity even after
     // its work exits; a later incarnation cannot inherit this authority.
@@ -816,6 +872,9 @@ impl<A: Actor> FailurePublicationSession<A> {
         ledger: &crate::transaction::LedgerState,
         target: &ScopeHandle,
     ) -> Result<(), DriverError> {
+        if !Arc::ptr_eq(&node.origin, &self.origin) {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
         if node.scope.id() != self.scope.id()
             || !Arc::ptr_eq(&node.scope.runtime.shared, &self.scope.runtime.shared)
             || node.scope.id() != target.id()
@@ -851,6 +910,58 @@ impl<A: Actor> FailurePublicationSession<A> {
             .checked_add(1)
             .and_then(ActionId::new)
             .ok_or(DriverError::IdentityExhausted)
+    }
+    /// Take the same old, pending cleanup obligation after the actual failure
+    /// publication owner has replaced its normal predecessor ordering. This
+    /// grants no business start, publication, Work or physical-exit fact.
+    /// Refusal leaves both the action and its neutral payload in the batch.
+    pub fn take_cleanup(
+        &mut self,
+        input: InputId,
+        action: ActionId,
+    ) -> Result<EffectTicket<A::Effect>, DriverError> {
+        let node = self.runtime.node(self.actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let ledger = node
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        self.validate(&node, &inbox, &ledger, &self.scope)?;
+        if input == self.input {
+            return Err(EffectError::InvalidTransition.into());
+        }
+        let batch = inbox
+            .batches
+            .get_mut(&input)
+            .ok_or(DriverError::UnknownInput)?;
+        if batch.state.scope() != self.scope.id() {
+            return Err(DriverError::PublicationTargetMismatch);
+        }
+        batch
+            .state
+            .start_after_owner_failure(action, self.generation)?;
+        let effect = batch
+            .payloads
+            .remove(&action)
+            .expect("pending cleanup owns its neutral payload");
+        Ok(EffectTicket {
+            view: EffectTicketView {
+                effect,
+                actor: self.actor,
+                input,
+                generation: batch.state.generation(),
+                descriptor: batch
+                    .state
+                    .record(action)
+                    .expect("started original cleanup")
+                    .descriptor()
+                    .clone(),
+            },
+            origin: self.origin.clone(),
+        })
     }
     pub fn commit_snapshot<T>(
         &mut self,
@@ -2332,6 +2443,7 @@ impl<A: Actor> ActorRuntime<A> {
         Ok(FailurePublicationSession {
             runtime: self.clone(),
             actor: ticket.actor,
+            origin: ticket.origin.clone(),
             scope: node.scope.clone(),
             input: ticket.input,
             generation: ticket.generation,
@@ -2555,6 +2667,38 @@ impl<A: Actor> ActorRuntime<A> {
             });
         }
         self.effect_completed(ticket)
+    }
+    /// Observe an actual original dispatch without consuming or cloning its
+    /// ticket. Failure generations do not revoke physical completion evidence.
+    pub fn effect_completion_observer(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+    ) -> Result<EffectCompletionObserver<A>, DriverError> {
+        let node = self.node(ticket.actor)?;
+        Self::validate_ticket_origin(&node, ticket)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let record = inbox
+            .batches
+            .get(&ticket.input)
+            .ok_or(DriverError::UnknownInput)?
+            .state
+            .record(ticket.descriptor.id)
+            .ok_or(EffectError::UnknownAction)?;
+        if record.descriptor() != &ticket.descriptor
+            || !matches!(
+                record.state(),
+                EffectState::Started | EffectState::Published
+            )
+        {
+            return Err(EffectError::InvalidTransition.into());
+        }
+        Ok(EffectCompletionObserver {
+            runtime: self.clone(),
+            origin: ticket.origin.clone(),
+            actor: ticket.actor,
+            input: ticket.input,
+            action: ticket.descriptor.id,
+        })
     }
     pub fn effect_completed(
         &self,

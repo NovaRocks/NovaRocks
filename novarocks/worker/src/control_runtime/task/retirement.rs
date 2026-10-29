@@ -286,6 +286,9 @@ impl TaskHostRecord {
             progress = true;
         }
         if !self.normal_lifetime_ended {
+            if !self.retirement_projections_exited()? {
+                return Ok(progress);
+            }
             // All foreign execution captures have actually been dropped by
             // the physical Retire job. All remaining owner fields are neutral
             // metadata, and no source/header may still derive from this Work.

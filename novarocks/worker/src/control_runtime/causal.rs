@@ -1312,6 +1312,20 @@ impl TaskCausalInbox {
         }
         Ok(progress)
     }
+    /// A reserved future author has not captured its predecessor prefix yet.
+    /// Only this original delivered receipt or the author's actual unused
+    /// withdrawal permits retiring that cut's current Source pair. Runtime
+    /// input/effect retirement is deliberately not this gate: an old cleanup
+    /// can itself wait for the independent Source's actual report/header exit.
+    pub(crate) fn failed_source_pair_ready(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        cut: CutId,
+    ) -> Result<bool, CausalError> {
+        stage.validate(&self.runtime, self.actor)?;
+        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
+        Ok(role.delivered.is_some() || self.ingress.event_unused(cut)?)
+    }
     /// Move one original source to its already-paid physical disposal owner.
     /// Taking a carrier grants no exit, report consumption or refund.
     pub(crate) fn take_failed_source(

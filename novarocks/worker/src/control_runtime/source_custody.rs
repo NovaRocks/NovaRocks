@@ -21,9 +21,13 @@
 //! Other typed shared owners still need their author-owned retention boundary;
 //! this custodian is not an arbitrary error-graph or resource-alias tracer.
 
+use super::{
+    actors::WorkerAction, adopted_cleanup::AdoptedCleanupEffect, failure::ScopePublicationsDrained,
+};
 use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
 use novarocks_control_runtime::{
     completion::ReportSlot,
+    driver::DriverError,
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
     lease::WorkRetirementObserver,
     reported_work::ReportedWork,
@@ -64,6 +68,12 @@ struct Custody {
     pending: Arc<dyn TaskPendingNotice>,
     health: Arc<ExecutionHealth>,
     retained: Mutex<Option<Arc<Self>>>,
+    cleanup: Mutex<Option<AdoptedCleanupEffect>>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceCleanupError {
+    Exit(ExitRoleError),
+    Driver(DriverError),
 }
 #[derive(Clone)]
 #[must_use = "The original source Work/report remain until actual retirement"]
@@ -134,6 +144,7 @@ impl SourceCustody {
             pending,
             health,
             retained: Mutex::new(None),
+            cleanup: Mutex::new(None),
         });
         *shared
             .retained
@@ -165,6 +176,71 @@ impl SourceCustody {
     pub(crate) fn actual_exit_ready(&self) -> Result<bool, ExitRoleError> {
         self.0.role.actual_exit_ready()
     }
+    /// The exact bank lookup selected this source. Its original role supplies
+    /// physical exit; the cleanup effect cannot supply that evidence itself.
+    pub(crate) fn adopt_cleanup(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        cleanup: AdoptedCleanupEffect,
+    ) -> Result<(), (DriverError, AdoptedCleanupEffect)> {
+        if cleanup.is_completed()
+            || !matches!(cleanup.effect(), WorkerAction::Context(
+                novarocks_worker_protocol::context::ContextEffect::DisposeSource { task, .. }
+            ) if *task == self.0.task)
+        {
+            return Err((DriverError::PublicationTargetMismatch, cleanup));
+        }
+        if let Err(error) = cleanup.validate_scope(stage, &self.0.scope) {
+            return Err((error, cleanup));
+        }
+        let mut slot = self
+            .0
+            .cleanup
+            .lock()
+            .expect("original source cleanup effect");
+        if slot.is_some() {
+            return Err((DriverError::RoleBusy, cleanup));
+        }
+        *slot = Some(cleanup);
+        drop(slot);
+        // The physical exit may already have happened before this transfer.
+        // Revisit the original owner once; waiting alone does not self-wake.
+        self.0.pending.pending();
+        Ok(())
+    }
+    /// Run before waiting for the old input's effect retirement. The same
+    /// source holder AND retained graph must have positively exited first.
+    pub(crate) fn advance_cleanup(&self) -> Result<bool, SourceCleanupError> {
+        if !self.actual_exit_ready().map_err(SourceCleanupError::Exit)? {
+            return Ok(false);
+        }
+        let progressed = self
+            .0
+            .cleanup
+            .lock()
+            .expect("original source cleanup effect")
+            .as_mut()
+            .map_or(Ok(false), |cleanup| cleanup.complete())
+            .map_err(SourceCleanupError::Driver)?;
+        if self.phase() == ExitRolePhase::Retired && self.cleanup_completed() {
+            let retained = self
+                .0
+                .retained
+                .lock()
+                .expect("source original custody retention")
+                .take();
+            drop(retained);
+        }
+        Ok(progressed)
+    }
+    fn cleanup_completed(&self) -> bool {
+        self.0
+            .cleanup
+            .lock()
+            .expect("original source cleanup effect")
+            .as_ref()
+            .is_none_or(AdoptedCleanupEffect::is_completed)
+    }
     /// Body/report/capacity retirement alone does not free the original pure
     /// Work header. Only the common reaper's exact observation permits reuse.
     /// This query signs no new permit and acknowledges no consumer.
@@ -175,7 +251,10 @@ impl SourceCustody {
             .lock()
             .expect("source capture exits")
             .unresolved;
-        !unresolved && self.phase() == ExitRolePhase::Retired && self.0.retirement.is_retired()
+        !unresolved
+            && self.phase() == ExitRolePhase::Retired
+            && self.0.retirement.is_retired()
+            && self.cleanup_completed()
     }
     /// Read only original capture/role metadata. A claimed position with a
     /// pending inventory fault cannot be published Ready before its host has
@@ -220,7 +299,8 @@ impl SourceCustody {
             return Ok(false);
         }
         let retired = self.phase() == ExitRolePhase::Retired || self.0.role.try_retire()?;
-        if retired {
+        let complete = retired && self.cleanup_completed();
+        if complete {
             let retained = self
                 .0
                 .retained
@@ -229,7 +309,7 @@ impl SourceCustody {
                 .take();
             drop(retained);
         }
-        Ok(retired)
+        Ok(complete)
     }
     /// Classifies only the original Core report leg. Source holders, aliases
     /// and their unique authority continue to supply physical exit themselves.

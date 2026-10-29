@@ -22,8 +22,10 @@
 use super::{
     actors::{WorkerAction, WorkerActor},
     admitted_role::adopt_reported_work,
+    adopted_cleanup::AdoptedCleanupEffect,
     failure::ScopePublicationsDrained,
     preparation::QueuedPreparation,
+    request_endpoint::RequestNotice,
 };
 use crate::{
     control_runtime_policy::StorageNeed,
@@ -215,7 +217,7 @@ struct State {
     observer_consumed: bool,
     payment: Option<CapacityBundle>,
     retired: bool,
-    effect: Option<EffectTicket<WorkerAction>>,
+    effect: Option<AdoptedCleanupEffect>,
 }
 struct Custody {
     kind: TaskHostCallKind,
@@ -526,15 +528,90 @@ impl TaskHostCall {
     pub(crate) fn handoff_stop_effect(
         &self,
         ticket: EffectTicket<WorkerAction>,
+        notice: Option<RequestNotice>,
     ) -> Result<TaskHostCallJob, (TaskHostCallError, EffectTicket<WorkerAction>)> {
-        let job = match self.take_stop_effect_job(&ticket) {
+        let effect = match AdoptedCleanupEffect::from_normal(&self.0.runtime, ticket, notice) {
+            Ok(effect) => effect,
+            Err((error, ticket)) => return Err((TaskHostCallError::Driver(error), ticket)),
+        };
+        let job = match self.take_stop_effect_job(effect.ticket()) {
             Ok(job) => job,
-            Err(error) => return Err((error, ticket)),
+            Err(error) => return Err((error, effect.into_ticket())),
         };
         let mut state = self.0.state.lock().expect("original Task host effect");
         assert!(state.effect.is_none(), "one original Stop effect");
-        state.effect = Some(ticket);
+        state.effect = Some(effect);
         Ok(job)
+    }
+    /// Move the old cleanup ticket into this same original Stop holder. The
+    /// actual drained stage authorizes takeover, not the callback's exit.
+    pub(crate) fn adopt_failed_stop_effect(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        mut effect: AdoptedCleanupEffect,
+    ) -> Result<(), (TaskHostCallError, AdoptedCleanupEffect)> {
+        if self.0.kind != TaskHostCallKind::Stop
+            || effect.is_completed()
+            || !matches!(effect.effect(), WorkerAction::Context(ContextEffect::StopTask { task, .. }) if *task == self.0.task)
+        {
+            return Err((TaskHostCallError::WrongTask, effect));
+        }
+        if let Err(error) = effect.validate_scope(stage, &self.0.scope) {
+            return Err((TaskHostCallError::Driver(error), effect));
+        }
+        {
+            let state = self.0.state.lock().expect("original failed Stop ticket");
+            if state.effect.is_some() {
+                return Err((TaskHostCallError::AlreadyCaptured, effect));
+            }
+            if state.handoff == CallHandoff::Withdrawn {
+                return Err((TaskHostCallError::Withdrawn, effect));
+            }
+        }
+        if self.actual_call_exited() {
+            if let Err(error) = effect.complete() {
+                return Err((TaskHostCallError::Driver(error), effect));
+            }
+            return Ok(());
+        }
+        let mut state = self.0.state.lock().expect("original adopted Stop ticket");
+        assert!(state.effect.is_none(), "one original adopted Stop effect");
+        state.effect = Some(effect);
+        drop(state);
+        // The physical return may have raced the move into this field.
+        // A later owner visit retries completion from actual call exit only.
+        self.0.pending.pending();
+        Ok(())
+    }
+    fn complete_stop_effect(&self) -> Result<bool, TaskHostCallError> {
+        if !self.actual_call_exited() {
+            return Ok(false);
+        }
+        let effect = self
+            .0
+            .state
+            .lock()
+            .expect("original Stop completion")
+            .effect
+            .take();
+        let Some(mut effect) = effect else {
+            return Ok(false);
+        };
+        // Runtime completion and the exact original R notice occur outside
+        // the custody lock. On refusal the same ticket returns to this field.
+        match effect.complete() {
+            Ok(completed) => Ok(completed),
+            Err(error) => {
+                let mut state = self
+                    .0
+                    .state
+                    .lock()
+                    .expect("refused original Stop completion");
+                assert!(state.effect.is_none(), "one original Stop completion owner");
+                state.effect = Some(effect);
+                Err(TaskHostCallError::Driver(error))
+            }
+        }
     }
     pub(crate) fn take_stop_effect_job(
         &self,
@@ -642,6 +719,7 @@ impl TaskHostCall {
         &self,
         ledger: &RuntimeLedger,
     ) -> Result<bool, TaskHostCallError> {
+        self.complete_stop_effect()?;
         let returned = self.poll_return()?;
         if !matches!(returned, Some(TaskHostCallOutcome::Completed)) {
             return Ok(false);
@@ -945,26 +1023,9 @@ impl TaskHostCallJob {
             std::mem::forget(refusal);
             std::process::abort();
         }
-        if exited {
-            let ticket = self
-                .owner
-                .0
-                .state
-                .lock()
-                .expect("original completed host effect")
-                .effect
-                .take();
-            if let Some(ticket) = ticket {
-                if let Err(refusal) = self.owner.0.runtime.effect_completed(ticket) {
-                    self.owner
-                        .0
-                        .state
-                        .lock()
-                        .expect("refused original host effect")
-                        .effect = Some(refusal.ticket);
-                    self.owner.unresolved();
-                }
-            }
+        if exited && let Err(error) = self.owner.complete_stop_effect() {
+            tracing::error!(?error, "Original Stop effect completion failed");
+            self.owner.unresolved();
         }
         self.owner.0.pending.pending();
     }

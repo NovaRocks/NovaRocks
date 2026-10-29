@@ -19,6 +19,8 @@
 //! failure action and its prepaid Work remain owned here after publication;
 //! source, callback, input, delivery and physical cleanup continue separately.
 
+#[path = "failure_cleanup.rs"]
+mod cleanup;
 #[path = "failure_driver.rs"]
 mod driver;
 
@@ -129,10 +131,17 @@ pub(super) struct ScopeFailureOwner {
     empty_input_classes: usize,
     physical: Option<(FailurePhysicalPurpose, super::failure_tail::FailureTail)>,
     completed_tail_input: Option<InputId>,
+    cleanup_bindings: CleanupBindingCursor,
+}
+enum CleanupBindingCursor {
+    Batches(Option<InputId>),
+    Effects(InputId, Option<ActionId>),
+    Bound,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum FailurePhysicalPurpose {
     Projection(TaskIdentity),
+    RetirementProjection(TaskIdentity),
     Neutral(TaskIdentity),
     FinalCarrier,
 }
@@ -387,6 +396,7 @@ impl ContextHostRecord {
             empty_input_classes: 0,
             physical: None,
             completed_tail_input: None,
+            cleanup_bindings: CleanupBindingCursor::Batches(None),
         });
         self.notify_host_progress();
         Ok(())

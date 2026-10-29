@@ -617,6 +617,10 @@ pub(crate) struct TaskHostRecord {
         novarocks_control_runtime_core::identity::WorkId,
     )>,
     failed_retirement: failed_retirement::FailedRetirementCursor,
+    // Each Task has one execution finalization and one terminal retirement.
+    // These observe their original physical projection jobs, not new work.
+    retirement_projections:
+        [Option<novarocks_control_runtime::driver::EffectCompletionObserver<WorkerActor>>; 2],
     host_cut_cursor: Option<novarocks_worker_protocol::proposal_summary::CutId>,
     host_retired_pairs: BTreeMap<
         novarocks_worker_protocol::proposal_summary::CutId,
@@ -947,6 +951,7 @@ impl TaskHostRecord {
             completion_core_observed: false,
             production_settlement_cut: None,
             failed_retirement: failed_retirement::FailedRetirementCursor::default(),
+            retirement_projections: [None, None],
             host_cut_cursor: None,
             host_retired_pairs: BTreeMap::new(),
         })
@@ -1038,6 +1043,36 @@ impl TaskHostRecord {
     /// never produced a normal RetireTask effect.
     pub(crate) fn original_payload_id(&self) -> PayloadId {
         self.payload
+    }
+    pub(crate) fn retain_retirement_projection(
+        &mut self,
+        finalize_only: bool,
+        observer: novarocks_control_runtime::driver::EffectCompletionObserver<WorkerActor>,
+    ) {
+        let slot = &mut self.retirement_projections[usize::from(!finalize_only)];
+        assert!(
+            slot.is_none(),
+            "one original projection disposal per retirement decision"
+        );
+        *slot = Some(observer);
+    }
+    pub(crate) fn retirement_projection_exited(
+        &self,
+        finalize_only: bool,
+    ) -> Result<bool, TaskHostError> {
+        self.retirement_projections[usize::from(!finalize_only)]
+            .as_ref()
+            .ok_or(TaskHostError::WrongEffect)?
+            .is_completed()
+            .map_err(TaskHostError::Driver)
+    }
+    fn retirement_projections_exited(&self) -> Result<bool, TaskHostError> {
+        for observer in self.retirement_projections.iter().flatten() {
+            if !observer.is_completed().map_err(TaskHostError::Driver)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     pub(crate) fn request_admission_open(&self) -> bool {
         self.request_admission_open
