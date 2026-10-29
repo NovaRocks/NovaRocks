@@ -33,7 +33,6 @@ use novarocks_control_runtime_core::{
     mailbox::InputClass,
     scope::WorkKind,
 };
-use novarocks_worker_protocol::context::ContextCore;
 
 pub(crate) const CONTEXT_IO_ROLES: usize = 3;
 pub(crate) const CONTEXT_IO_CALLBACKS: usize = 2;
@@ -44,7 +43,7 @@ pub(crate) const CONTEXT_IO_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
     inputs: CONTEXT_IO_CALLBACKS,
     batches: CONTEXT_IO_CALLBACKS,
-    effects: CONTEXT_IO_CALLBACKS * ContextCore::MAX_STEP_WORK,
+    effects: CONTEXT_IO_CALLBACKS * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
     work: CONTEXT_IO_ROLES,
     completions: CONTEXT_IO_ROLES,
     captures: CONTEXT_IO_ROLES,

@@ -335,10 +335,12 @@ mod tests {
                     ActorConfig {
                         mailbox: [16, 16, 16, 1],
                         max_batches: 49,
-                        max_effects_per_step: ContextCore::MAX_STEP_WORK,
-                        max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
-                        turn_budget: 64,
-                        max_step_work: ContextCore::MAX_STEP_WORK,
+                        max_effects_per_step:
+                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        max_dependencies_per_effect:
+                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
+                        max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
                     },
                     &roles[0].0,
                 )

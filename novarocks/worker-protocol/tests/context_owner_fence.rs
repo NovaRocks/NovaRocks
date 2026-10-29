@@ -133,7 +133,7 @@ impl Model {
         model
     }
     fn check(step: &ContextStep) {
-        assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+        assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
     }
     fn fact(&mut self, now: u64, input: ContextInput) -> ContextStep {
         let step = self.core.handle(at(now), input, &mut self.port).unwrap();

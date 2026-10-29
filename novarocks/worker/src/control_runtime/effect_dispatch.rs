@@ -26,10 +26,7 @@ use novarocks_control_runtime_core::{
     identity::{ActionId, ActorId, BatchId, InputId},
 };
 use novarocks_execution_contract::{QueryContextRef, TaskIdentity};
-use novarocks_worker_protocol::{
-    context::{ContextCore, ContextEffect},
-    control::ControlEffect,
-};
+use novarocks_worker_protocol::{context::ContextEffect, control::ControlEffect};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,8 +230,12 @@ impl EffectDispatch {
             else {
                 break;
             };
-            let records =
-                runtime.effect_inventory(self.actor, input, None, ContextCore::MAX_STEP_WORK)?;
+            let records = runtime.effect_inventory(
+                self.actor,
+                input,
+                None,
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            )?;
             let units = 1 + records.len();
             if units > budget - result.units {
                 break;
@@ -365,9 +366,12 @@ impl EffectDispatch {
         // Worker adapters declare these edges as publication conditions.
         // Satisfy them from the actual runtime fact, independently of slow
         // notification, capture destruction or final effect completion.
-        for (descriptor, state) in
-            runtime.effect_inventory(self.actor, ticket.input, None, ContextCore::MAX_STEP_WORK)?
-        {
+        for (descriptor, state) in runtime.effect_inventory(
+            self.actor,
+            ticket.input,
+            None,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )? {
             if state == EffectState::Pending && descriptor.dependencies.contains(&effect.action) {
                 runtime.acknowledge_dependency(
                     self.actor,
@@ -430,9 +434,12 @@ impl EffectDispatch {
         }
         // The actual completed predecessor, not caller-supplied success,
         // acknowledges the same committed batch's original reply dependency.
-        for (descriptor, state) in
-            runtime.effect_inventory(self.actor, effect.input, None, ContextCore::MAX_STEP_WORK)?
-        {
+        for (descriptor, state) in runtime.effect_inventory(
+            self.actor,
+            effect.input,
+            None,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )? {
             if state == EffectState::Pending && descriptor.dependencies.contains(&effect.action) {
                 runtime.acknowledge_dependency(
                     self.actor,

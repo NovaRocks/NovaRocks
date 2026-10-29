@@ -102,7 +102,7 @@ pub struct ContextConfig {
     pub max_preparing: usize,
     pub max_task_bytes: u64,
     /// Maximum charged work in one actor step. This core uses one-record
-    /// continuation slices; 15 reserves the complete atomic effect batch.
+    /// continuation slices; the bound includes internal class probes, not storage.
     pub step_budget: usize,
     pub lease_bounds: LeaseBounds,
     pub metric_publish_interval: std::time::Duration,
@@ -260,6 +260,8 @@ impl ContextCommand {
 )]
 #[derive(Debug)]
 pub enum ContextInput {
+    /// Select one currently runnable internal slice; never an RPC request.
+    NextInternal,
     /// Transport-only neutral body. `handle_request` binds its original token;
     /// the lifecycle-only `handle` entry rejects this wrapper.
     Request(ContextCommand),
@@ -413,6 +415,8 @@ pub enum ContextInput {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextEffect {
+    /// Coalescible scheduling metadata. The Core retains every actual cursor.
+    WakeInternal,
     EstablishProbed {
         context: QueryContextRef,
         request: RequestContext,
@@ -634,6 +638,28 @@ struct Closing {
     request: Option<InputId>,
     scan_finished: bool,
 }
+#[derive(Clone, Copy, Debug)]
+enum InternalClass {
+    TaskDomain,
+    RequestReplies,
+    CreationReplies,
+    Quiesce,
+    Close,
+    Maintenance,
+}
+impl InternalClass {
+    const ALL: [Self; 6] = [
+        Self::TaskDomain,
+        Self::RequestReplies,
+        Self::CreationReplies,
+        Self::Quiesce,
+        Self::Close,
+        Self::Maintenance,
+    ];
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
 #[derive(Debug)]
 pub struct ContextCore {
     identity: QueryContextRef,
@@ -669,6 +695,15 @@ pub struct ContextCore {
     request_tasks: BTreeMap<InputId, TaskIdentity>,
     request_deadlines: BTreeSet<(MonotonicInstant, InputId)>,
     pending_replies: BTreeMap<InputId, PendingReply>,
+    // Ready indexes contain only keys into the original protocol owners.
+    // Awaiting host returns never occupy a runnable class. Task identities
+    // are cumulative and bounded by max_tasks; each rotating cursor is one
+    // key, not a lazy queue of stale membership or a second Task owner.
+    runnable_task_domains: BTreeSet<TaskIdentity>,
+    creation_reply_tasks: BTreeSet<TaskIdentity>,
+    internal_cursor: usize,
+    domain_cursor: Option<TaskIdentity>,
+    creation_reply_cursor: Option<TaskIdentity>,
 }
 impl ContextCore {
     /// One slice visits at most one task/domain member/request/catch-up member.
@@ -677,7 +712,12 @@ impl ContextCore {
     /// 5 predecessor effects + 5 supplied-summary effects + 1 cut receipt +
     /// 1 record visit = 15. Request-producing inputs have only one such cut;
     /// reply fanout and every variable-size traversal use a continuation.
-    pub const MAX_STEP_WORK: usize = 15;
+    pub const MAX_BODY_WORK: usize = 15;
+    /// Effects and replies are outputs; class probes need no output slots.
+    pub const MAX_STEP_ACTIONS: usize = 15;
+    pub const INTERNAL_CLASSES: usize = InternalClass::ALL.len();
+    /// One existing body plus at most one probe of each internal class.
+    pub const MAX_STEP_WORK: usize = Self::MAX_BODY_WORK + Self::INTERNAL_CLASSES;
     pub fn max_step_work(&self) -> usize {
         Self::MAX_STEP_WORK
     }
@@ -736,6 +776,11 @@ impl ContextCore {
             request_tasks: BTreeMap::new(),
             request_deadlines: BTreeSet::new(),
             pending_replies: BTreeMap::new(),
+            runnable_task_domains: BTreeSet::new(),
+            creation_reply_tasks: BTreeSet::new(),
+            internal_cursor: 0,
+            domain_cursor: None,
+            creation_reply_cursor: None,
         })
     }
     pub fn identity(&self) -> QueryContextRef {
@@ -782,6 +827,78 @@ impl ContextCore {
         .chain(self.metric_deadlines.first().map(|(at, _)| *at))
         .chain(self.request_deadlines.first().map(|(at, _)| *at))
         .min()
+    }
+    /// Pure readiness, not permission to start a host job or to consume a reply.
+    /// Future deadlines and owners awaiting a host return do not cause a wake.
+    pub fn has_internal_work(&self) -> bool {
+        !self.runnable_task_domains.is_empty()
+            || !self.pending_replies.is_empty()
+            || !self.creation_reply_tasks.is_empty()
+            || self.pending_quiesce.is_some()
+            || (self.quiesce_decision.is_some() && !self.quiesce_waiters.is_empty())
+            || self.closing.is_some_and(|closing| {
+                !closing.scan_finished || (self.close_applied && !self.abort_waiters.is_empty())
+            })
+            || self.next_deadline().is_some_and(|at| at <= self.now)
+    }
+    fn next_internal(&mut self) -> (ContextInput, usize) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        for offset in 0..Self::INTERNAL_CLASSES {
+            let class =
+                InternalClass::ALL[(self.internal_cursor + offset) % Self::INTERNAL_CLASSES];
+            let input = match class {
+                InternalClass::TaskDomain => self
+                    .domain_cursor
+                    .and_then(|cursor| {
+                        self.runnable_task_domains
+                            .range((Excluded(cursor), Unbounded))
+                            .next()
+                    })
+                    .or_else(|| self.runnable_task_domains.first())
+                    .map(|&task| ContextInput::ContinueTaskDomain { task }),
+                // Original tokens, not wire operation IDs. Always select the
+                // lowest ready token; higher-token churn cannot pass it.
+                InternalClass::RequestReplies => self
+                    .pending_replies
+                    .first_key_value()
+                    .map(|(&operation, _)| ContextInput::ContinueRequestReplies { operation }),
+                InternalClass::CreationReplies => self
+                    .creation_reply_cursor
+                    .and_then(|cursor| {
+                        self.creation_reply_tasks
+                            .range((Excluded(cursor), Unbounded))
+                            .next()
+                    })
+                    .or_else(|| self.creation_reply_tasks.first())
+                    .map(|&task| ContextInput::ContinueReplies { task }),
+                InternalClass::Quiesce => (self.pending_quiesce.is_some()
+                    || (self.quiesce_decision.is_some() && !self.quiesce_waiters.is_empty()))
+                .then_some(ContextInput::ContinueQuiesce),
+                InternalClass::Close => self
+                    .closing
+                    .filter(|closing| {
+                        !closing.scan_finished
+                            || (self.close_applied && !self.abort_waiters.is_empty())
+                    })
+                    .map(|_| ContextInput::ContinueClose),
+                InternalClass::Maintenance => self
+                    .next_deadline()
+                    .is_some_and(|at| at <= self.now)
+                    .then_some(ContextInput::Tick),
+            };
+            if let Some(input) = input {
+                self.internal_cursor = (class.index() + 1) % Self::INTERNAL_CLASSES;
+                match input {
+                    ContextInput::ContinueTaskDomain { task } => self.domain_cursor = Some(task),
+                    ContextInput::ContinueReplies { task } => {
+                        self.creation_reply_cursor = Some(task)
+                    }
+                    _ => {}
+                }
+                return (input, offset + 1);
+            }
+        }
+        (ContextInput::NextInternal, Self::INTERNAL_CLASSES)
     }
     /// RPC entry used by the actor consuming this exact admitted input.
     /// Entity/domain rules decide replay; operation IDs never join reply roles.
@@ -905,7 +1022,15 @@ impl ContextCore {
         {
             self.begin_abort(None, AbortCause::LeaseExpired, &mut step)?;
         }
+        // Time and the lease fence are applied once. Selection never recurses
+        // through handle and never repeats the public request admission path.
+        let (input, internal_probes) = if matches!(input, ContextInput::NextInternal) {
+            self.next_internal()
+        } else {
+            (input, 0)
+        };
         match input {
+            ContextInput::NextInternal => {}
             ContextInput::Request(command) => self.handle_command(
                 now,
                 request_token.ok_or(CoreError::WrongIdentity)?,
@@ -1470,7 +1595,8 @@ impl ContextCore {
             });
         }
         let decisions_visited = self.settle_request_decisions(&mut step);
-        step.records_visited = 1 + decisions_visited + usize::from(!step.requests.is_empty());
+        step.records_visited =
+            1 + decisions_visited + usize::from(!step.requests.is_empty()) + internal_probes;
         Ok(step)
     }
     fn handle_command(
@@ -1973,7 +2099,10 @@ impl ContextCore {
             (request, body)
         });
         if !t.waiting_replies.is_empty() {
+            self.creation_reply_tasks.insert(task);
             step.effects.push(ContextEffect::ContinueReplies { task });
+        } else {
+            self.creation_reply_tasks.remove(&task);
         }
         if let Some((request, body)) = reply {
             self.complete_request_at(request, Arc::new(body), decided_at, step);
@@ -2424,6 +2553,7 @@ impl ContextCore {
             );
             return Ok(());
         };
+        self.runnable_task_domains.insert(task);
         self.pending_task_updates.insert(
             task,
             PendingTaskUpdate {
@@ -2471,6 +2601,7 @@ impl ContextCore {
             }
         }
         pending.completing = true;
+        self.runnable_task_domains.insert(task);
         step.effects
             .push(ContextEffect::ContinueTaskDomain { task });
         Ok(())
@@ -2491,8 +2622,10 @@ impl ContextCore {
             self.pending_task_updates.insert(task, pending);
             return Err(CoreError::IllegalFact);
         }
+        self.runnable_task_domains.remove(&task);
         match pending.transaction.advance() {
             P::Pending => {
+                self.runnable_task_domains.insert(task);
                 self.pending_task_updates.insert(task, pending);
                 step.effects
                     .push(ContextEffect::ContinueTaskDomain { task });
@@ -2837,6 +2970,9 @@ impl ContextCore {
         {
             // Remove only this RPC waiter, never the entity's admitted work.
             record.waiting_replies.remove(&token);
+            if record.waiting_replies.is_empty() {
+                self.creation_reply_tasks.remove(&task);
+            }
         }
         Some(request)
     }
@@ -2911,3 +3047,7 @@ impl ContextCore {
         visited
     }
 }
+
+#[cfg(test)]
+#[path = "context/internal_tests.rs"]
+mod internal_tests;

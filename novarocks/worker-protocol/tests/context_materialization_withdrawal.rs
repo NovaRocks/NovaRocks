@@ -106,7 +106,7 @@ fn command_step(
             &mut NoAdmission,
         )
         .unwrap();
-    assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
     step
 }
 
@@ -118,7 +118,7 @@ impl AdmissionPort for NoAdmission {
 }
 fn step(core: &mut ContextCore, now: u64, input: ContextInput) -> ContextStep {
     let step = core.handle(at(now), input, &mut NoAdmission).unwrap();
-    assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
     step
 }
 fn assert_decision(core: &ContextCore, step: &ContextStep, expected: OperationOutcome) {

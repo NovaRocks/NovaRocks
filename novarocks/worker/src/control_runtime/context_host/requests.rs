@@ -55,7 +55,7 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution_contract::{OperationOutcome, TaskIdentity, TaskOperationId};
 use novarocks_worker_protocol::{
-    context::{ContextCommand, ContextCore, ContextInput, ContextReplyBody, RequestResult},
+    context::{ContextCommand, ContextInput, ContextReplyBody, RequestResult},
     creation::RequestContext,
     lease::MonotonicInstant,
 };
@@ -67,7 +67,7 @@ pub(crate) const CONTEXT_REQUEST_STORAGE: StorageNeed = StorageNeed {
     requests: 1,
     inputs: 1,
     batches: 1,
-    effects: ContextCore::MAX_STEP_WORK,
+    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
     cuts: 0,
     replies: 1,
     completions: 1,

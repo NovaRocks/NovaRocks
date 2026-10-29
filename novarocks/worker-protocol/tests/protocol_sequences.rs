@@ -299,7 +299,7 @@ fn loaded(core: &mut ContextCore, port: &mut Port, n: u8) -> LoadedSteps {
     };
     loop {
         let step = core.handle(at(0), input, port).unwrap();
-        assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+        assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
         let more = step
             .effects
             .iter()
@@ -374,7 +374,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
             &mut port,
         )
         .unwrap();
-    assert!(second.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(second.charged_work() <= ContextCore::MAX_BODY_WORK);
     let publication = second
         .effects
         .iter()
@@ -2275,7 +2275,7 @@ fn a_new_establish_with_an_unknown_ticket_keeps_the_original_gone_verdict() {
 }
 
 fn establishment_decision(step: &ContextStep) -> (Generation, ContextEstablishmentDecision) {
-    assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
     let decisions: Vec<_> = step
         .effects
         .iter()
@@ -2593,7 +2593,7 @@ fn an_abort_before_establishment_keeps_its_original_closed_outcome() {
             &mut port,
         )
         .unwrap();
-    assert!(aborted.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(aborted.charged_work() <= ContextCore::MAX_BODY_WORK);
     for now in [at(1), at(31)] {
         let closed = context_core
             .handle(
@@ -2628,7 +2628,7 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
         .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
         .unwrap();
     let first_token = port.request_token(operation(2));
-    assert!(quiesce.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(quiesce.charged_work() <= ContextCore::MAX_BODY_WORK);
     assert_eq!(context_core.state(), QueryContextState::Quiescing);
     assert!(
         quiesce
@@ -2648,7 +2648,7 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
         .unwrap();
     let second_token = port.request_token(operation(2));
     assert_ne!(first_token, second_token);
-    assert!(waiting.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(waiting.charged_work() <= ContextCore::MAX_BODY_WORK);
     assert!(waiting.requests.is_empty());
     assert!(waiting.requests.is_empty());
     for now in [at(1), at(2)] {
@@ -2684,7 +2684,7 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
     let completed = context_core
         .handle(at(2), ContextInput::ContinueQuiesce, &mut port)
         .unwrap();
-    assert!(completed.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(completed.charged_work() <= ContextCore::MAX_BODY_WORK);
     assert_eq!(completed.requests.len(), 1);
     assert_eq!(completed.requests[0].request.token, first_token);
     assert_eq!(
@@ -2707,7 +2707,7 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
     let idempotent = context_core
         .handle(at(2), ContextInput::ContinueQuiesce, &mut port)
         .unwrap();
-    assert!(idempotent.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(idempotent.charged_work() <= ContextCore::MAX_BODY_WORK);
     assert_eq!(idempotent.requests.len(), 1);
     assert_eq!(idempotent.requests[0].request.token, second_token);
     assert_eq!(
@@ -4563,7 +4563,7 @@ fn succeeded_proposal_requires_actual_stop_and_complete_output_before_handoff() 
             &mut port,
         )
         .unwrap();
-    assert!(stopped.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(stopped.charged_work() <= ContextCore::MAX_BODY_WORK);
     let accepted = core
         .handle(
             at(0),
@@ -4574,7 +4574,7 @@ fn succeeded_proposal_requires_actual_stop_and_complete_output_before_handoff() 
             &mut port,
         )
         .unwrap();
-    assert!(accepted.charged_work() <= ContextCore::MAX_STEP_WORK);
+    assert!(accepted.charged_work() <= ContextCore::MAX_BODY_WORK);
     core.handle(at(0), ContextInput::Adjudicate { task: task(1) }, &mut port)
         .unwrap();
     assert_eq!(
@@ -4606,7 +4606,7 @@ fn completion_step(
     let label = format!("{input:?}");
     let step = core.apply_fixture(at(0), input, port).unwrap();
     assert!(
-        step.charged_work() <= ContextCore::MAX_STEP_WORK,
+        step.charged_work() <= ContextCore::MAX_BODY_WORK,
         "{label}: actual charged work {} exceeds {}: {:?}",
         step.charged_work(),
         ContextCore::MAX_STEP_WORK,
@@ -5270,7 +5270,7 @@ fn completion_summary_with_lease_expiry_source_release_and_task_retirement_stays
                         .unwrap();
                     maximum = maximum.max(step.charged_work());
                     assert!(
-                        step.charged_work() <= ContextCore::MAX_STEP_WORK,
+                        step.charged_work() <= ContextCore::MAX_BODY_WORK,
                         "candidate sequence {a},{b},{c},{d} charges {}: {:?}",
                         step.charged_work(),
                         step.effects
@@ -6292,7 +6292,7 @@ fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_
                     let tick = context_core
                         .handle(at(30), ContextInput::Tick, &mut port)
                         .unwrap();
-                    assert!(tick.charged_work() <= ContextCore::MAX_STEP_WORK);
+                    assert!(tick.charged_work() <= ContextCore::MAX_BODY_WORK);
                     assert_eq!(context_core.state(), QueryContextState::Aborting);
                 }
             }

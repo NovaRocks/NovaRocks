@@ -620,10 +620,12 @@ impl Fixture {
                     None => ActorConfig {
                         mailbox: [16, 16, 16, 1],
                         max_batches: 49,
-                        max_effects_per_step: ContextCore::MAX_STEP_WORK,
-                        max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
-                        turn_budget: 64,
-                        max_step_work: ContextCore::MAX_STEP_WORK,
+                        max_effects_per_step:
+                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        max_dependencies_per_effect:
+                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
+                        max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
                     },
                 },
                 &roles[0].0,
@@ -741,7 +743,12 @@ impl Fixture {
         loop {
             let inventory = self
                 .runtime
-                .effect_inventory(target, input, None, ContextCore::MAX_STEP_WORK)
+                .effect_inventory(
+                    target,
+                    input,
+                    None,
+                    crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                )
                 .unwrap();
             let states: BTreeMap<_, _> = inventory.iter().map(|(d, s)| (d.id, *s)).collect();
             for (descriptor, state) in inventory {
@@ -757,7 +764,11 @@ impl Fixture {
             }
             let ready = self
                 .runtime
-                .ready_effects(target, input, ContextCore::MAX_STEP_WORK)
+                .ready_effects(
+                    target,
+                    input,
+                    crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                )
                 .unwrap();
             if ready.is_empty() {
                 break;
@@ -1469,7 +1480,7 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
         .unwrap()[0];
     let mut dispatch = crate::control_runtime::effect_dispatch::EffectDispatch::new(
         actor(),
-        ContextCore::MAX_STEP_WORK,
+        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
     );
     dispatch.index_committed(&f.runtime, 16).unwrap();
     assert!(!dispatch.is_empty());
@@ -1572,12 +1583,14 @@ fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generati
     let close = aborted
         .iter()
         .find_map(|action| match action {
-            WorkerAction::Context(ContextEffect::ContinueClose { generation }) => Some(*generation),
+            WorkerAction::Context(ContextEffect::CloseExternalAdmission { generation, .. }) => {
+                Some(*generation)
+            }
             _ => None,
         })
         .unwrap();
     assert_eq!(close.get(), 2);
-    let outputs = f.run(ContextInput::ContinueClose, None);
+    let outputs = f.run(ContextInput::NextInternal, None);
     assert!(outputs.iter().any(|action| matches!(action,
         WorkerAction::Context(ContextEffect::ApplyTaskClose { task, generation }) if *task == identity && *generation == close)));
     let outputs = f.run(
@@ -1890,7 +1903,10 @@ fn host_publications_follow_core_order_without_waiting_for_old_body_capture_reti
         2,
     );
     f.runtime.poll_one(Tick(1)).unwrap();
-    let mut dispatch = EffectDispatch::new(actor(), ContextCore::MAX_STEP_WORK * 2);
+    let mut dispatch = EffectDispatch::new(
+        actor(),
+        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * 2,
+    );
     assert!(
         dispatch
             .index_committed(&f.runtime, 1)
@@ -1998,7 +2014,10 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
         2,
     );
     f.runtime.poll_one(Tick(2)).unwrap();
-    let mut dispatch = EffectDispatch::new(actor(), ContextCore::MAX_STEP_WORK);
+    let mut dispatch = EffectDispatch::new(
+        actor(),
+        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+    );
     dispatch.index_committed(&f.runtime, 32).unwrap();
     let conclusion = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
     assert!(matches!(
@@ -2063,7 +2082,12 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
         f.runtime.effect_completed(ticket).unwrap();
         for (dependent, state) in f
             .runtime
-            .effect_inventory(actor(), input, None, ContextCore::MAX_STEP_WORK)
+            .effect_inventory(
+                actor(),
+                input,
+                None,
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            )
             .unwrap()
         {
             if state == EffectState::Pending && dependent.dependencies.contains(&action) {
@@ -3630,11 +3654,12 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
         }),
         Some(operation(2)),
     );
-    assert!(closing.iter().any(|effect| matches!(
-        effect,
-        WorkerAction::Context(ContextEffect::ContinueClose { .. })
-    )));
-    closing.extend(h.fixture.run(ContextInput::ContinueClose, None));
+    assert!(
+        closing
+            .iter()
+            .any(|effect| matches!(effect, WorkerAction::Context(ContextEffect::WakeInternal)))
+    );
+    closing.extend(h.fixture.run(ContextInput::NextInternal, None));
     let next = closing
         .iter()
         .find_map(|effect| match effect {
@@ -4044,3 +4069,6 @@ fn source_core_receipt_names_its_real_prefix_and_retirement_returns_both_reap_wi
 
 #[path = "tests/host_call_bootstrap.rs"]
 mod host_call_bootstrap;
+
+#[path = "tests/context_internal_budget.rs"]
+mod context_internal_budget;

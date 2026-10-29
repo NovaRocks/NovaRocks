@@ -45,8 +45,8 @@ use novarocks_control_runtime_core::{
 use novarocks_execution_contract::QueryContextRef;
 use novarocks_worker_protocol::{
     context::{
-        ContextCore, ContextEffect, ContextInput, EstablishCredentialComparison,
-        EstablishReplayRequest, EstablishReplayResult,
+        ContextEffect, ContextInput, EstablishCredentialComparison, EstablishReplayRequest,
+        EstablishReplayResult,
     },
     control::{ControlCore, ControlInput},
     creation::RequestContext,
@@ -60,7 +60,7 @@ pub(crate) const CONTEXT_ROUTE_ESCROW_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
     inputs: 1,
     batches: 1,
-    effects: ContextCore::MAX_STEP_WORK,
+    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
     work: 1,
     completions: 1,
     captures: 1,

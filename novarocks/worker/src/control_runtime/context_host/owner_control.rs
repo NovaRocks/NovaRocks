@@ -31,15 +31,12 @@ use novarocks_control_runtime_core::{
     mailbox::InputClass,
 };
 use novarocks_execution_contract::QueryContextRef;
-use novarocks_worker_protocol::{
-    context::{ContextCore, ContextInput},
-    control::ControlEffect,
-};
+use novarocks_worker_protocol::{context::ContextInput, control::ControlEffect};
 
 pub(super) const OWNER_CONTROL_STORAGE: StorageNeed = StorageNeed {
     inputs: 1,
     batches: 1,
-    effects: ContextCore::MAX_STEP_WORK,
+    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
     requests: 0,
     cuts: 0,
     replies: 0,
@@ -274,6 +271,7 @@ impl ContextHostRecord {
         &mut self,
         ticket: &EffectTicket<WorkerAction>,
     ) -> Result<(), DriverError> {
-        self.resources.owner_control.authorize_removal(ticket)
+        self.resources.owner_control.authorize_removal(ticket)?;
+        self.resources.internal.authorize_removal(ticket)
     }
 }

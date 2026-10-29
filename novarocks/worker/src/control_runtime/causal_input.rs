@@ -399,7 +399,10 @@ mod tests {
             Self::with_byte_limits(100)
         }
         fn with_byte_limits(bytes: u64) -> Self {
-            Self::with_actor_turn_budget(bytes, 64)
+            Self::with_actor_turn_budget(
+                bytes,
+                crate::control_runtime::actors::ContextActor::TURN_BUDGET,
+            )
         }
         fn with_actor_turn_budget(bytes: u64, turn_budget: usize) -> Self {
             let ledger = RuntimeLedger::new(
@@ -469,10 +472,12 @@ mod tests {
                     ActorConfig {
                         mailbox: [16, 16, 16, 1],
                         max_batches: 49,
-                        max_effects_per_step: ContextCore::MAX_STEP_WORK,
-                        max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
+                        max_effects_per_step:
+                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        max_dependencies_per_effect:
+                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
                         turn_budget,
-                        max_step_work: ContextCore::MAX_STEP_WORK,
+                        max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
                     },
                     &roles[0].0,
                 )
@@ -534,7 +539,12 @@ mod tests {
             loop {
                 let inventory = self
                     .runtime
-                    .effect_inventory(target, input, None, ContextCore::MAX_STEP_WORK)
+                    .effect_inventory(
+                        target,
+                        input,
+                        None,
+                        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    )
                     .unwrap();
                 let states: BTreeMap<_, _> = inventory.iter().map(|(d, s)| (d.id, *s)).collect();
                 for (descriptor, state) in inventory {
@@ -555,7 +565,11 @@ mod tests {
                 }
                 let ready = self
                     .runtime
-                    .ready_effects(target, input, ContextCore::MAX_STEP_WORK)
+                    .ready_effects(
+                        target,
+                        input,
+                        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    )
                     .unwrap();
                 if ready.is_empty() {
                     break;

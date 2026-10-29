@@ -143,7 +143,7 @@ impl Model {
             "one bounded slice owns at most one reply: {step:?}"
         );
         assert!(
-            step.charged_work() <= ContextCore::MAX_STEP_WORK,
+            step.charged_work() <= ContextCore::MAX_BODY_WORK,
             "every actual reply/continuation slice stays charged: {step:?}"
         );
     }

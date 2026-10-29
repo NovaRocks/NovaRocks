@@ -54,8 +54,11 @@ fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_t
         )
     });
     f.runtime.poll_one(Tick(2)).unwrap();
-    let mut dispatch =
-        EffectDispatch::context(f.runtime.clone(), actor(), ContextCore::MAX_STEP_WORK * 2);
+    let mut dispatch = EffectDispatch::context(
+        f.runtime.clone(),
+        actor(),
+        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * 2,
+    );
     let indexed = dispatch.index_committed(&f.runtime, 32).unwrap();
     let first = dispatch.take_ready(&f.runtime, 8).unwrap().unwrap();
     let first_ref = EffectRef {
@@ -175,11 +178,19 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
     f.runtime.poll_one(Tick(2)).unwrap();
     let request_effects = f
         .runtime
-        .effect_inventory(actor(), request, None, ContextCore::MAX_STEP_WORK)
+        .effect_inventory(
+            actor(),
+            request,
+            None,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap()
         .len();
-    let mut dispatch =
-        EffectDispatch::context(f.runtime.clone(), actor(), ContextCore::MAX_STEP_WORK * 4);
+    let mut dispatch = EffectDispatch::context(
+        f.runtime.clone(),
+        actor(),
+        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * 4,
+    );
     dispatch.index_committed(&f.runtime, 64).unwrap();
     let publication = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
     let snapshot = match &publication.effect {
@@ -201,7 +212,12 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
         f.runtime.effect_completed(ticket).unwrap();
         let inventory = f
             .runtime
-            .effect_inventory(actor(), input, None, ContextCore::MAX_STEP_WORK)
+            .effect_inventory(
+                actor(),
+                input,
+                None,
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            )
             .unwrap();
         let exited = inventory.iter().any(|(descriptor, state)| {
             descriptor.id == predecessor && *state == EffectState::Completed
@@ -260,7 +276,12 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
         .collect();
     let publication_still_held = f
         .runtime
-        .effect_inventory(actor(), publishing, None, ContextCore::MAX_STEP_WORK)
+        .effect_inventory(
+            actor(),
+            publishing,
+            None,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap()
         .iter()
         .any(|(descriptor, state)| {
@@ -412,11 +433,19 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
 
     let read_effects = f
         .runtime
-        .effect_inventory(actor(), read, None, ContextCore::MAX_STEP_WORK)
+        .effect_inventory(
+            actor(),
+            read,
+            None,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap()
         .len();
-    let mut dispatch =
-        EffectDispatch::context(f.runtime.clone(), actor(), ContextCore::MAX_STEP_WORK * 4);
+    let mut dispatch = EffectDispatch::context(
+        f.runtime.clone(),
+        actor(),
+        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * 4,
+    );
     dispatch.index_committed(&f.runtime, 64).unwrap();
     let prepare = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
     let exact_prepare = matches!(&prepare.effect,

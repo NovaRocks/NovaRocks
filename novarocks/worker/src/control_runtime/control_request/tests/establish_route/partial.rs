@@ -94,7 +94,7 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
     let occupier_need = StorageNeed {
         inputs: control_positions,
         batches: control_positions,
-        effects: ContextCore::MAX_STEP_WORK * control_positions,
+        effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * control_positions,
         ..header_storage()
     };
     let mut f = RouteFixture::with_geometry(

@@ -163,6 +163,18 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
             .close_for_teardown()
             .unwrap()
     );
+    assert!(
+        fixture
+            .service
+            .context(fixture.identity)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .resources
+            .internal
+            .close_for_teardown()
+            .unwrap()
+    );
     fixture.runtime.seal_actor(context_actor()).unwrap();
     let callback_refused = matches!(
         fixture

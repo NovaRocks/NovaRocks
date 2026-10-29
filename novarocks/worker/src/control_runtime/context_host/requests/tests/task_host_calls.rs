@@ -599,9 +599,12 @@ fn normal_stop_ticket(
         .lock()
         .unwrap()
         .dispatch
-        .index_committed(&runtime, ContextCore::MAX_STEP_WORK)
+        .index_committed(
+            &runtime,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap();
-    for _ in 0..ContextCore::MAX_STEP_WORK {
+    for _ in 0..crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS {
         let ticket = f
             .service
             .context(f.identity)
@@ -609,7 +612,10 @@ fn normal_stop_ticket(
             .lock()
             .unwrap()
             .dispatch
-            .take_ready(&runtime, ContextCore::MAX_STEP_WORK)
+            .take_ready(
+                &runtime,
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            )
             .unwrap()
             .expect("the real summary has a ready publication or StopTask action");
         if matches!(

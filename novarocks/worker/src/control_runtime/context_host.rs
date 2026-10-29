@@ -20,7 +20,9 @@
 //! it does not run materialization, publish Active, or infer any host exit.
 
 pub(super) mod failure;
+mod internal;
 mod owner_control;
+pub(crate) use internal::ContextInternalAdvance;
 mod progress;
 pub(crate) use owner_control::OwnerFenceDelivery;
 pub(crate) use progress::{ContextHostProgress, ContextHostProgressError};
@@ -77,15 +79,18 @@ pub(crate) const CONTEXT_BOOTSTRAP_STORAGE: StorageNeed = StorageNeed {
     inputs: 1
         + CONTEXT_IO_STORAGE.inputs
         + CONTEXT_LIFECYCLE_STORAGE.inputs
-        + owner_control::OWNER_CONTROL_STORAGE.inputs,
+        + owner_control::OWNER_CONTROL_STORAGE.inputs
+        + internal::CONTEXT_INTERNAL_STORAGE.inputs,
     batches: 1
         + CONTEXT_IO_STORAGE.batches
         + CONTEXT_LIFECYCLE_STORAGE.batches
-        + owner_control::OWNER_CONTROL_STORAGE.batches,
-    effects: ContextCore::MAX_STEP_WORK
+        + owner_control::OWNER_CONTROL_STORAGE.batches
+        + internal::CONTEXT_INTERNAL_STORAGE.batches,
+    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
         + CONTEXT_IO_STORAGE.effects
         + CONTEXT_LIFECYCLE_STORAGE.effects
-        + owner_control::OWNER_CONTROL_STORAGE.effects,
+        + owner_control::OWNER_CONTROL_STORAGE.effects
+        + internal::CONTEXT_INTERNAL_STORAGE.effects,
     cuts: 0,
     replies: 0,
     completions: CONTEXT_IO_STORAGE.completions,
@@ -141,6 +146,7 @@ pub(crate) struct ContextHostResources {
     registration: Option<ActorRegistration>,
     pub routes: BTreeMap<InputId, Arc<EstablishRouteCustody>>,
     pub owner_control: owner_control::OwnerControl,
+    pub(in crate::control_runtime) internal: internal::ContextInternal,
     pub io: Option<ContextIoInventory>,
     pub host_jobs: Option<ContextHostJobs>,
     pending_host_jobs: progress::PendingHostJobs,
@@ -258,12 +264,14 @@ impl ContextHostRecord {
         .checked_add(max_routes)
         .and_then(|n| n.checked_add(CONTEXT_IO_CALLBACKS))
         .and_then(|n| n.checked_add(owner_control::OWNER_CONTROL_STORAGE.inputs))
+        .and_then(|n| n.checked_add(internal::CONTEXT_INTERNAL_STORAGE.inputs))
         .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
         actor_config.max_batches = actor_config
             .max_batches
             .checked_add(max_routes)
             .and_then(|n| n.checked_add(CONTEXT_IO_CALLBACKS))
             .and_then(|n| n.checked_add(owner_control::OWNER_CONTROL_STORAGE.batches))
+            .and_then(|n| n.checked_add(internal::CONTEXT_INTERNAL_STORAGE.batches))
             .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
         let task_work = binding
             .policy
@@ -301,7 +309,7 @@ impl ContextHostRecord {
             .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
         let effect_limit = actor_config
             .max_batches
-            .checked_mul(ContextCore::MAX_STEP_WORK)
+            .checked_mul(crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS)
             .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
         let need = CONTEXT_BOOTSTRAP_STORAGE
             .resources()
@@ -328,6 +336,7 @@ impl ContextHostRecord {
             registration: None,
             routes: BTreeMap::new(),
             owner_control: owner_control::OwnerControl::default(),
+            internal: internal::ContextInternal::default(),
             io: None,
             host_jobs: None,
             pending_host_jobs: Default::default(),
@@ -399,6 +408,19 @@ impl ContextHostRecord {
             resources.registered = true;
             resources
                 .owner_control
+                .admit(
+                    runtime,
+                    resources
+                        .registration
+                        .as_ref()
+                        .expect("original Context registration"),
+                    ticket.actor,
+                    context,
+                    &resources.roles[TIMER].work,
+                )
+                .map_err(ContextHostError::Driver)?;
+            resources
+                .internal
                 .admit(
                     runtime,
                     resources
@@ -1083,7 +1105,7 @@ mod tests {
                         2 + context_storage.inputs + request_storage.inputs
                     }
                     Dimension::Effects => {
-                        2 * ContextCore::MAX_STEP_WORK
+                        2 * ControlCore::MAX_STEP_WORK
                             + context_storage.effects
                             + request_storage.effects
                     }
@@ -1107,7 +1129,7 @@ mod tests {
                 if index != 0 {
                     need.inputs = 1;
                     need.batches = 1;
-                    need.effects = ContextCore::MAX_STEP_WORK;
+                    need.effects = ControlCore::MAX_STEP_WORK;
                 }
                 if index == 2 {
                     need.replies = 2;
@@ -1497,6 +1519,7 @@ mod tests {
             actor: ActorId,
         ) {
             assert!(resources.owner_control.close_for_teardown().unwrap());
+            assert!(resources.internal.close_for_teardown().unwrap());
             Self::release_drained_effect_claims(runtime);
             if resources.registered {
                 runtime.close_actor_admission(actor).unwrap();

@@ -818,11 +818,12 @@ mod tests {
             2,
         );
         let outputs = committed_world_input(f, input);
-        assert!(outputs.iter().any(|effect| matches!(
-            effect,
-            WorkerAction::Context(ContextEffect::ContinueClose { .. })
-        )));
-        let outputs = world(f, ContextInput::ContinueClose);
+        assert!(
+            outputs
+                .iter()
+                .any(|effect| matches!(effect, WorkerAction::Context(ContextEffect::WakeInternal)))
+        );
+        let outputs = world(f, ContextInput::NextInternal);
         let epoch = outputs
             .iter()
             .find_map(|effect| match effect {

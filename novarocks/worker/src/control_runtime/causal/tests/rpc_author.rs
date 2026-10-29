@@ -22,7 +22,6 @@
 use super::*;
 use crate::control_runtime::admitted_role::dispose_unused_completion;
 use novarocks_control_runtime::exit_role::ExitRolePhase;
-use novarocks_worker_protocol::context::ContextCore;
 
 fn metadata() -> RequestMetadata {
     RequestMetadata {
@@ -70,7 +69,12 @@ fn complete_model_effects(h: &Harness, input: InputId) -> Vec<WorkerAction> {
         let inventory = h
             .fixture
             .runtime
-            .effect_inventory(actor(), input, None, ContextCore::MAX_STEP_WORK)
+            .effect_inventory(
+                actor(),
+                input,
+                None,
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            )
             .unwrap();
         for (descriptor, state) in &inventory {
             if *state == EffectState::Pending {
@@ -89,7 +93,11 @@ fn complete_model_effects(h: &Harness, input: InputId) -> Vec<WorkerAction> {
         let ready = h
             .fixture
             .runtime
-            .ready_effects(actor(), input, ContextCore::MAX_STEP_WORK)
+            .ready_effects(
+                actor(),
+                input,
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            )
             .unwrap();
         if ready.is_empty() {
             break;

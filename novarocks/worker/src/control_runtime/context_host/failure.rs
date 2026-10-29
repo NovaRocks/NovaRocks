@@ -456,6 +456,20 @@ impl ContextHostRecord {
             .map_err(FailurePublicationError::Driver)?;
         Ok(stage)
     }
+    /// Withdraw only a pure resume hint after the actual failed-owner stage.
+    /// The original queued input and every effect/report still drain normally.
+    pub(crate) fn discard_failed_internal_hint(&mut self) -> Result<(), FailurePublicationError> {
+        let original = self
+            .resources
+            .failure
+            .as_ref()
+            .ok_or(FailurePublicationError::NotStarted)?;
+        let stage = original.drained()?;
+        self.resources
+            .internal
+            .discard_failed_hint(&stage)
+            .map_err(FailurePublicationError::Driver)
+    }
     pub(crate) fn failure_publications_drained(&self) -> bool {
         self.resources
             .failure

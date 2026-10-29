@@ -31,7 +31,7 @@ use crate::{
         },
         context_host::{
             CONTEXT_BOOTSTRAP_STORAGE, ContextHostBinding, ContextHostProgressError,
-            ContextHostRecord,
+            ContextHostRecord, ContextInternalAdvance,
         },
         context_host_jobs::{ContextHostJob, ContextHostJobs},
         context_ready::ContextReadyNotice,
@@ -40,9 +40,7 @@ use crate::{
     },
     control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits},
 };
-use novarocks_control_runtime::{
-    actor::ActorConfig, driver::InputRole, publication::PublishedSnapshot,
-};
+use novarocks_control_runtime::{actor::ActorConfig, publication::PublishedSnapshot};
 use novarocks_control_runtime_core::{
     effect::EffectState, fair_queue::FairQueueError, mailbox::InputClass,
 };
@@ -63,14 +61,13 @@ fn context_actor() -> ActorId {
     ActorId::new(4).unwrap()
 }
 
-// This producer has its own actual input/batch/effect/Work/capture funding.
-// Its pre-reserved input can finish the zero-task Core close after admission
-// closes, without asking the closed scope for a fresh external position.
+// Root lifecycle commands have their own actual producer funding. Context
+// continuations instead use the original host's prepaid internal source.
 const BRIDGE_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
     inputs: 1,
     batches: 1,
-    effects: ContextCore::MAX_STEP_WORK,
+    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
     work: 1,
     captures: 1,
     cuts: 0,
@@ -353,6 +350,20 @@ fn complete_context(f: &mut Fixture, ticket: EffectTicket<WorkerAction>) {
     let context = f.context;
     if matches!(
         &ticket.effect,
+        WorkerAction::Context(ContextEffect::WakeInternal)
+    ) {
+        f.root
+            .service()
+            .context(context)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .handoff_internal_wake(ticket)
+            .unwrap();
+        return;
+    }
+    if matches!(
+        &ticket.effect,
         WorkerAction::Context(ContextEffect::EstablishmentDecided { .. })
     ) {
         f.root
@@ -394,7 +405,12 @@ fn complete_context(f: &mut Fixture, ticket: EffectTicket<WorkerAction>) {
         .unwrap();
     for (descriptor, _) in f
         .runtime
-        .effect_inventory(context_actor(), input, None, ContextCore::MAX_STEP_WORK)
+        .effect_inventory(
+            context_actor(),
+            input,
+            None,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap()
     {
         if descriptor.dependencies.contains(&completed) {
@@ -403,6 +419,23 @@ fn complete_context(f: &mut Fixture, ticket: EffectTicket<WorkerAction>) {
                 .unwrap();
         }
     }
+}
+
+fn assert_context_internal_idle(f: &mut Fixture) {
+    let context = f.context;
+    let advanced = f
+        .root
+        .service()
+        .context(context)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .advance_internal()
+        .unwrap();
+    assert!(
+        matches!(advanced, ContextInternalAdvance::Idle),
+        "the zero-task Tick completed its real close scan without residual work: {advanced:?}"
+    );
 }
 
 fn context_effects(f: &mut Fixture) -> Vec<EffectTicket<WorkerAction>> {
@@ -455,6 +488,7 @@ fn dispose_context_metadata(f: &mut Fixture) {
     let mut host = host_address.lock().unwrap();
     let resources = host.resources_for_test();
     assert!(resources.owner_control.close_for_teardown().unwrap());
+    assert!(resources.internal.close_for_teardown().unwrap());
     runtime.seal_actor(context_actor()).unwrap();
     let scope = resources.scope.as_ref().unwrap().clone();
     for role in resources.roles.iter_mut().rev() {
@@ -817,10 +851,12 @@ fn removed_owner_rejects_reused_actor(
             ActorConfig {
                 mailbox: [1; 4],
                 max_batches: 1,
-                max_effects_per_step: ContextCore::MAX_STEP_WORK,
-                max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
-                turn_budget: 64,
-                max_step_work: ContextCore::MAX_STEP_WORK,
+                max_effects_per_step:
+                    crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                max_dependencies_per_effect:
+                    crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
+                max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
             },
         )
         .unwrap_or_else(|(error, _pure_actor)| {
@@ -856,7 +892,11 @@ fn removed_owner_rejects_reused_actor(
     assert!(f.runtime.poll_one(now).unwrap());
     let action = f
         .runtime
-        .ready_effects(context_actor(), input, ContextCore::MAX_STEP_WORK)
+        .ready_effects(
+            context_actor(),
+            input,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap()[0];
     let ticket = f
         .runtime
@@ -963,22 +1003,6 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
         &f.root.resources().scope,
         Arc::new(QueryContextState::Absent),
     );
-    let (mut bridge_work, mut bridge_capacity) = scope
-        .reserve_next(
-            generation(),
-            BRIDGE_STORAGE.resources().unwrap(),
-            WorkKind::Step,
-            WorkAdmission::External,
-        )
-        .unwrap()
-        .bind(WorkKind::Step)
-        .unwrap();
-    bridge_work.start().unwrap();
-    let permit = f
-        .runtime
-        .reserve_input(context_actor(), actor(), InputClass::Control)
-        .unwrap();
-    let mut continuation: InputRole<WorkerActor> = permit.into_role().unwrap();
 
     let host_address = f.root.service().context(f.context).unwrap();
     let mut host = host_address.lock().unwrap();
@@ -1035,12 +1059,12 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     let fee_while_running = f.ledger.used(Dimension::Replies.id());
 
     // This is the actual Context lease timer, independent of the blocked host
-    // thread. Its real ContinueClose uses the already-paid metadata producer.
+    // thread. Zero tasks let this same Tick finish its real close scan.
     let now = Tick(30_000_000_002);
     let advanced = f.runtime.advance_time(now, 1).unwrap();
     let timer_polled = f.runtime.poll_one(now).unwrap();
     let mut timer_input = None;
-    let mut saw_continue = false;
+    let mut saw_internal_wake = false;
     let mut released_by_core = false;
     let mut direct_completion_woke_original = false;
     for effect in context_effects(&mut f) {
@@ -1052,8 +1076,8 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
             WorkerAction::Context(ContextEffect::SealRoot { .. }) => {
                 // No Task or result root has ever been admitted in this scope.
             }
-            WorkerAction::Context(ContextEffect::ContinueClose { .. }) => {
-                saw_continue = true;
+            WorkerAction::Context(ContextEffect::WakeInternal) => {
+                saw_internal_wake = true;
             }
             WorkerAction::Context(ContextEffect::ReleaseHost { .. }) => {
                 released_by_core = true;
@@ -1082,34 +1106,10 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     f.runtime
         .retire_input(context_actor(), timer_input.unwrap())
         .unwrap();
-    let continuation_id = continuation
-        .fill(WorkerMessage::Context(ContextMessage::Command {
-            work: bridge_work.id(),
-            request: None,
-            command: ContextInput::ContinueClose,
-        }))
-        .unwrap();
-    assert!(f.runtime.poll_one(now).unwrap());
-    for effect in context_effects(&mut f) {
-        match &effect.effect {
-            WorkerAction::Context(ContextEffect::ReleaseHost { .. }) => {
-                released_by_core = true;
-                handoff_release(&mut f, effect);
-                continue;
-            }
-            _ => panic!("the real zero-task close requests its original host release"),
-        }
-    }
-    f.runtime
-        .retire_input(context_actor(), continuation_id)
-        .unwrap();
-    continuation.close_after_exit().unwrap();
-    bridge_work.body_exited().unwrap();
-    bridge_work.captures_exited().unwrap();
-    f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
-    bridge_capacity
-        .release(&bridge_capacity.resources().unwrap())
-        .unwrap();
+    // Tick already performed the zero-task scan and requested real R.
+    // A filtered stale ContinueClose must not create another input or Wake.
+    assert!(!saw_internal_wake && released_by_core);
+    assert_context_internal_idle(&mut f);
 
     let release_notice = f.root.service().next_host_ready().unwrap().unwrap();
     let release_progress = f
@@ -1380,7 +1380,7 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
     assert!(!callbacks_before_release);
     assert_eq!(fee_while_running, 1);
     assert_eq!(advanced, 1);
-    assert!(timer_polled && saw_continue && released_by_core && retained);
+    assert!(timer_polled && !saw_internal_wake && released_by_core && retained);
     assert_eq!(release_count_while_m_blocked, 1);
     assert_eq!(r_callbacks, 1);
     assert!(!callbacks_with_m_blocked);
@@ -1521,28 +1521,12 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
     let release_calls_while_active = releases.load(Ordering::SeqCst);
 
     // Retire the actual Active Context through its own lease and actual R.
-    // Prepay the close continuation while external admission is still open.
-    let (mut bridge_work, mut bridge_capacity) = scope
-        .reserve_next(
-            generation(),
-            BRIDGE_STORAGE.resources().unwrap(),
-            WorkKind::Step,
-            WorkAdmission::External,
-        )
-        .unwrap()
-        .bind(WorkKind::Step)
-        .unwrap();
-    bridge_work.start().unwrap();
-    let permit = f
-        .runtime
-        .reserve_input(context_actor(), actor(), InputClass::Control)
-        .unwrap();
-    let mut continuation: InputRole<WorkerActor> = permit.into_role().unwrap();
+    // Its original prepaid source remains Idle when this Tick finishes the scan.
     let closed_at = Tick(30_000_000_002);
     let advanced = f.runtime.advance_time(closed_at, 1).unwrap();
     let timer_polled = f.runtime.poll_one(closed_at).unwrap();
     let mut timer_input = None;
-    let mut continued_close = false;
+    let mut saw_internal_wake = false;
     let mut core_requested_release = false;
     for effect in context_effects(&mut f) {
         timer_input = Some(effect.input);
@@ -1553,8 +1537,8 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
             WorkerAction::Context(ContextEffect::SealRoot { .. }) => {
                 // No Task or result root was admitted by this fixture.
             }
-            WorkerAction::Context(ContextEffect::ContinueClose { .. }) => {
-                continued_close = true;
+            WorkerAction::Context(ContextEffect::WakeInternal) => {
+                saw_internal_wake = true;
             }
             WorkerAction::Context(ContextEffect::ReleaseHost { .. }) => {
                 core_requested_release = true;
@@ -1568,34 +1552,8 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
     f.runtime
         .retire_input(context_actor(), timer_input.unwrap())
         .unwrap();
-    let continuation_input = continuation
-        .fill(WorkerMessage::Context(ContextMessage::Command {
-            work: bridge_work.id(),
-            request: None,
-            command: ContextInput::ContinueClose,
-        }))
-        .unwrap();
-    assert!(f.runtime.poll_one(closed_at).unwrap());
-    for effect in context_effects(&mut f) {
-        match &effect.effect {
-            WorkerAction::Context(ContextEffect::ReleaseHost { .. }) => {
-                core_requested_release = true;
-                handoff_release(&mut f, effect);
-                continue;
-            }
-            _ => panic!("only actual zero-task Core close may request release"),
-        }
-    }
-    f.runtime
-        .retire_input(context_actor(), continuation_input)
-        .unwrap();
-    continuation.close_after_exit().unwrap();
-    bridge_work.body_exited().unwrap();
-    bridge_work.captures_exited().unwrap();
-    f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
-    bridge_capacity
-        .release(&bridge_capacity.resources().unwrap())
-        .unwrap();
+    assert!(!saw_internal_wake && core_requested_release);
+    assert_context_internal_idle(&mut f);
 
     let release = jobs.take_release_job().unwrap().unwrap();
     thread::spawn(move || release.run_on_host()).join().unwrap();
@@ -1731,7 +1689,7 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
     assert_eq!(drops_while_active, 3);
     assert_eq!(release_calls_while_active, 0);
     assert_eq!(advanced, 1);
-    assert!(timer_polled && continued_close && core_requested_release && actual_retention);
+    assert!(timer_polled && !saw_internal_wake && core_requested_release && actual_retention);
     assert_eq!(r_callbacks, 1);
     assert!(!before_r_handoff);
     assert!(callbacks_retired && holder_retired);
@@ -1807,22 +1765,6 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
         &f.root.resources().scope,
         Arc::new(QueryContextState::Absent),
     );
-    let (mut bridge_work, mut bridge_capacity) = scope
-        .reserve_next(
-            generation(),
-            BRIDGE_STORAGE.resources().unwrap(),
-            WorkKind::Step,
-            WorkAdmission::External,
-        )
-        .unwrap()
-        .bind(WorkKind::Step)
-        .unwrap();
-    bridge_work.start().unwrap();
-    let permit = f
-        .runtime
-        .reserve_input(context_actor(), actor(), InputClass::Control)
-        .unwrap();
-    let mut continuation: InputRole<WorkerActor> = permit.into_role().unwrap();
 
     let original_key = job.queue_key();
     let prestop_scope = scope.snapshot().unwrap();
@@ -1845,7 +1787,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     let advanced = f.runtime.advance_time(closed_at, 1).unwrap();
     let timer_polled = f.runtime.poll_one(closed_at).unwrap();
     let mut timer_input = None;
-    let mut saw_continue = false;
+    let mut saw_internal_wake = false;
     let mut core_requested_release = false;
     let mut pending_release_effects = Vec::new();
     for effect in context_effects(&mut f) {
@@ -1857,8 +1799,8 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
             WorkerAction::Context(ContextEffect::SealRoot { .. }) => {
                 // No Task or result root has ever been admitted.
             }
-            WorkerAction::Context(ContextEffect::ContinueClose { .. }) => {
-                saw_continue = true;
+            WorkerAction::Context(ContextEffect::WakeInternal) => {
+                saw_internal_wake = true;
             }
             WorkerAction::Context(ContextEffect::ReleaseHost { .. }) => {
                 pending_release_effects.push(effect);
@@ -1868,23 +1810,9 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
         }
         complete_context(&mut f, effect);
     }
-    let continuation_input = continuation
-        .fill(WorkerMessage::Context(ContextMessage::Command {
-            work: bridge_work.id(),
-            request: None,
-            command: ContextInput::ContinueClose,
-        }))
-        .unwrap();
-    assert!(f.runtime.poll_one(closed_at).unwrap());
-    for effect in context_effects(&mut f) {
-        match &effect.effect {
-            WorkerAction::Context(ContextEffect::ReleaseHost { .. }) => {
-                pending_release_effects.push(effect);
-                continue;
-            }
-            _ => panic!("only the actual zero-task close may request release"),
-        }
-    }
+    assert!(!saw_internal_wake && !pending_release_effects.is_empty());
+    assert_context_internal_idle(&mut f);
+
     let committed_stop_before_release_effect = scope.gates().unwrap();
     let release_effect_still_unexecuted =
         !core_requested_release && !pending_release_effects.is_empty();
@@ -1923,16 +1851,6 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     }
     f.runtime
         .retire_input(context_actor(), timer_input.unwrap())
-        .unwrap();
-    f.runtime
-        .retire_input(context_actor(), continuation_input)
-        .unwrap();
-    continuation.close_after_exit().unwrap();
-    bridge_work.body_exited().unwrap();
-    bridge_work.captures_exited().unwrap();
-    f.ledger.reap_scope_ready(scope.id(), 8).unwrap();
-    bridge_capacity
-        .release(&bridge_capacity.resources().unwrap())
         .unwrap();
     // The coalesced host notice is held, but it may also have been marked by
     // an earlier Direct effect completion. It proves no cell return or exit.
@@ -2154,7 +2072,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     assert_eq!(raw_drops_before_m, 0);
     assert_eq!(rpc_fee_before_m, 1);
     assert_eq!(advanced, 1);
-    assert!(timer_polled && saw_continue && core_requested_release);
+    assert!(timer_polled && !saw_internal_wake && core_requested_release);
     assert!(committed_stop_before_release_effect.stopped);
     assert!(!committed_stop_before_release_effect.failed);
     assert_eq!(

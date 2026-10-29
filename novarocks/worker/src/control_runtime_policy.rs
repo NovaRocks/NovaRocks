@@ -20,7 +20,6 @@
 //! not import transport defaults or assume a single-node deployment.
 
 use novarocks_control_runtime::actor::ActorConfig;
-use novarocks_worker_protocol::context::ContextCore;
 
 /// Physical listener positions and the exact codec batch bound. Waiting calls
 /// are included so their ownership can move without acquiring another slot.
@@ -223,7 +222,8 @@ impl StorageNeed {
         Self {
             inputs: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
             batches: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
-            effects: ContextCore::MAX_STEP_WORK * crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
+            effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
+                * crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
             cuts: 1,
             replies: usize::from(reply),
             requests: usize::from(reply),
@@ -416,10 +416,11 @@ impl ControlRuntimePolicy {
         ActorConfig {
             mailbox: [lifecycle, control, ordinary, 1],
             max_batches: inputs,
-            max_effects_per_step: ContextCore::MAX_STEP_WORK,
-            max_dependencies_per_effect: ContextCore::MAX_STEP_WORK,
-            turn_budget: 64,
-            max_step_work: ContextCore::MAX_STEP_WORK,
+            max_effects_per_step: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            max_dependencies_per_effect:
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
+            max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
         }
         .validate()
         .map_err(|_| PolicyError::InvalidActorBudget)
@@ -603,7 +604,10 @@ mod tests {
         // its two host calls add Work/report/capture only, never input/cut.
         assert_eq!(policy.loading.inputs, 5);
         assert_eq!(policy.loading.batches, 5);
-        assert_eq!(policy.loading.effects, 5 * ContextCore::MAX_STEP_WORK);
+        assert_eq!(
+            policy.loading.effects,
+            5 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
+        );
         assert_eq!(policy.loading.cuts, 2);
         assert_eq!(policy.loading.work, 13);
         assert_eq!(policy.loading.completions, 12);
@@ -613,6 +617,31 @@ mod tests {
             policy.task_base
         );
         assert_eq!(policy.accepted.inputs, 62);
+    }
+
+    #[test]
+    fn actor_cpu_includes_selector_and_wake_while_storage_pays_only_output_slots() {
+        use crate::control_runtime::actors::ContextActor;
+        let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
+        let config = policy.context_actor(1).unwrap();
+        assert_eq!(config.max_step_work, 22);
+        assert_eq!(config.max_effects_per_step, 16);
+        assert_eq!(config.turn_budget, 92);
+        let mut insufficient = config;
+        insufficient.turn_budget -= 1;
+        assert!(
+            insufficient.validate().is_err(),
+            "every class retains dispatch plus one complete step"
+        );
+        assert_eq!(
+            policy.loading.effects,
+            policy.loading.inputs * ContextActor::MAX_STEP_ACTIONS
+        );
+        assert_eq!(
+            policy.accepted.effects,
+            policy.accepted.inputs * ContextActor::MAX_STEP_ACTIONS
+        );
+        assert!(config.max_effects_per_step < config.max_step_work);
     }
 
     #[test]

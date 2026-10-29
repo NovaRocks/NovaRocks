@@ -109,13 +109,11 @@ fn fixture() -> (
             }),
         },
     );
-    while loaded.iter().any(|effect| {
-        matches!(
-            effect,
-            WorkerAction::Context(ContextEffect::ContinueReplies { .. })
-        )
-    }) {
-        loaded = command(&mut f, ContextInput::ContinueReplies { task: identity });
+    while loaded
+        .iter()
+        .any(|effect| matches!(effect, WorkerAction::Context(ContextEffect::WakeInternal)))
+    {
+        loaded = command(&mut f, ContextInput::NextInternal);
     }
     command(&mut f, ContextInput::Installed { task: identity });
     // This role's separate position is charged explicitly before any producer

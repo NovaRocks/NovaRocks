@@ -45,7 +45,7 @@ pub(crate) const OPEN_SUMMARY_STORAGE: crate::control_runtime_policy::StorageNee
         requests: 0,
         inputs: 1,
         batches: 1,
-        effects: novarocks_worker_protocol::context::ContextCore::MAX_STEP_WORK,
+        effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
         cuts: 0,
         replies: 0,
         completions: 0,

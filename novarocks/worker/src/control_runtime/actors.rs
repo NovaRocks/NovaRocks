@@ -84,6 +84,11 @@ pub(crate) struct ContextActor {
     lifetime_work: WorkId,
 }
 impl ContextActor {
+    // One pure bounded body, at most six selector probes, and at most one
+    // coalesced scheduling effect. CPU work and paid output slots differ.
+    pub(crate) const MAX_STEP_WORK: usize = ContextCore::MAX_STEP_WORK + 1;
+    pub(crate) const MAX_STEP_ACTIONS: usize = ContextCore::MAX_STEP_ACTIONS + 1;
+    pub(crate) const TURN_BUDGET: usize = 4 * (Self::MAX_STEP_WORK + 1);
     pub(crate) fn new(
         core: ContextCore,
         scope: ScopeHandle,
@@ -150,6 +155,7 @@ impl Actor for ContextActor {
             None => self.core.handle(now, command, &mut admission),
         }
         .expect("context protocol input preserves its frozen invariants");
+        let internal_ready = self.core.has_internal_work();
         if matches!(
             self.core.state(),
             QueryContextState::Aborting
@@ -179,6 +185,18 @@ impl Actor for ContextActor {
         let mut publications = BTreeMap::<TaskIdentity, ActionId>::new();
         let mut reply_preparations = BTreeMap::<InputId, Vec<ActionId>>::new();
         for effect in result.effects {
+            // These hints carry no host facts or payload. The Core retains
+            // its cursors; one prepaid self-source selects the next slice.
+            if matches!(
+                &effect,
+                ContextEffect::ContinueTaskDomain { .. }
+                    | ContextEffect::ContinueRequestReplies { .. }
+                    | ContextEffect::ContinueQuiesce
+                    | ContextEffect::ContinueClose { .. }
+                    | ContextEffect::ContinueReplies { .. }
+            ) {
+                continue;
+            }
             let mut dependencies = Vec::new();
             let mut effect_work = work;
             let kind = match &effect {
@@ -288,6 +306,19 @@ impl Actor for ContextActor {
                 WorkerAction::Reply(reply),
             )
             .unwrap_or_else(|(error, _)| panic!("bounded context reply handoff: {error:?}"));
+        }
+        if internal_ready {
+            next += 1;
+            step.effect(
+                EffectDescriptor {
+                    id: ActionId::new(next).unwrap(),
+                    work: self.timer_work,
+                    kind: EffectKind::Publication,
+                    dependencies: Vec::new(),
+                },
+                WorkerAction::Context(ContextEffect::WakeInternal),
+            )
+            .unwrap_or_else(|(error, _)| panic!("bounded Context internal wake: {error:?}"));
         }
     }
     fn next_deadline(&self) -> Option<Tick> {

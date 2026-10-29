@@ -175,14 +175,14 @@ impl Model {
                 &mut self.port,
             )
             .unwrap();
-        assert!(step.charged_work() <= ContextCore::MAX_STEP_WORK);
+        assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
         step
     }
     fn apply(&mut self, input: ContextInput) -> ContextStep {
         let label = format!("{input:?}");
         let step = self.core.handle(self.now, input, &mut self.port).unwrap();
         assert!(
-            step.charged_work() <= ContextCore::MAX_STEP_WORK,
+            step.charged_work() <= ContextCore::MAX_BODY_WORK,
             "{label}: charged {}: {:?}",
             step.charged_work(),
             step.effects

@@ -107,7 +107,11 @@ fn submit_renew(f: &mut Harness, work: WorkId) {
 fn reply(f: &Harness, input: InputId) -> EffectTicket<WorkerAction> {
     let effects = f
         .runtime
-        .ready_effects(context_actor(), input, ContextCore::MAX_STEP_WORK)
+        .ready_effects(
+            context_actor(),
+            input,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap();
     assert_eq!(effects.len(), 1, "one complete Core-authored Renew reply");
     f.runtime
@@ -639,7 +643,11 @@ fn delayed_quiesce_reply_uses_its_original_token_after_the_initial_input_retires
     let mut continue_seen = false;
     for action in f
         .runtime
-        .ready_effects(context_actor(), request.token, ContextCore::MAX_STEP_WORK)
+        .ready_effects(
+            context_actor(),
+            request.token,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap()
     {
         let ticket = f
@@ -647,7 +655,17 @@ fn delayed_quiesce_reply_uses_its_original_token_after_the_initial_input_retires
             .take_effect(context_actor(), request.token, action)
             .unwrap();
         match &ticket.effect {
-            WorkerAction::Context(ContextEffect::ContinueQuiesce) => continue_seen = true,
+            WorkerAction::Context(ContextEffect::WakeInternal) => {
+                continue_seen = true;
+                f.service
+                    .context(f.identity)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .handoff_internal_wake(ticket)
+                    .unwrap();
+                continue;
+            }
             WorkerAction::Context(ContextEffect::CloseExternalAdmission { .. }) => {
                 f.runtime.close_actor_admission(context_actor()).unwrap();
             }
@@ -668,26 +686,19 @@ fn delayed_quiesce_reply_uses_its_original_token_after_the_initial_input_retires
         .input_custody(context_actor(), request.token)
         .unwrap()
         .is_none();
-    // Use the actual Context's already-paid serial metadata Step holder. This
-    // exercises Core continuation/reply correlation, not a Native Q runner or
-    // membership snapshot structural-funding acceptance claim.
-    let continuation = {
-        let host_address = f.service.context(f.identity).unwrap();
-        let host = host_address.lock().unwrap();
-        f.runtime
-            .reserve_admitted_input(
-                context_actor(),
-                ActorId::new(96).unwrap(),
-                InputClass::Lifecycle,
-                &host.resources.roles[TIMER].work,
-            )
-            .unwrap()
-            .fill(WorkerMessage::Context(ContextMessage::Command {
-                work: host.resources.roles[TIMER].work.id(),
-                request: None,
-                command: ContextInput::ContinueQuiesce,
-            }))
-            .unwrap()
+    // The actual Wake fills the Context's original prepaid self-source. It
+    // neither reserves another position nor borrows a second Work identity.
+    let continuation = match f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .advance_internal()
+        .unwrap()
+    {
+        crate::control_runtime::context_host::ContextInternalAdvance::Submitted(input) => input,
+        other => panic!("the original quiesce continuation is ready: {other:?}"),
     };
     f.runtime.poll_one(Tick(2)).unwrap();
     let ticket = reply(&f, continuation);
@@ -1033,7 +1044,12 @@ fn complete_model_effects_with_preparation(
     loop {
         let inventory = f
             .runtime
-            .effect_inventory(context_actor(), input, None, ContextCore::MAX_STEP_WORK)
+            .effect_inventory(
+                context_actor(),
+                input,
+                None,
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            )
             .unwrap();
         for (action, phase) in &inventory {
             if *phase == EffectState::Pending {
@@ -1050,7 +1066,11 @@ fn complete_model_effects_with_preparation(
         }
         let ready = f
             .runtime
-            .ready_effects(context_actor(), input, ContextCore::MAX_STEP_WORK)
+            .ready_effects(
+                context_actor(),
+                input,
+                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            )
             .unwrap();
         if ready.is_empty() {
             break;
@@ -1155,7 +1175,11 @@ fn pending_loading_task_fixture(
     f.runtime.poll_one(Tick(3)).unwrap();
     let load_action = f
         .runtime
-        .ready_effects(context_actor(), input, ContextCore::MAX_STEP_WORK)
+        .ready_effects(
+            context_actor(),
+            input,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap()[0];
     let load = f
         .runtime
@@ -1640,7 +1664,12 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
     assert_eq!(owner.identity, original.identity);
     let before = original
         .runtime
-        .step_reservations(load.actor, load.input, None, ContextCore::MAX_STEP_WORK)
+        .step_reservations(
+            load.actor,
+            load.input,
+            None,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap();
     assert_eq!(before.len(), 1);
     let binding = || crate::control_runtime::task::TaskHostBinding {
@@ -1664,7 +1693,12 @@ fn task_adoption_rejects_a_foreign_original_runtime_even_with_identical_wire_and
     let wrong_runtime = matches!(refused, Err(ContextHostError::WrongRuntime));
     let guard_preserved = original
         .runtime
-        .step_reservations(load.actor, load.input, None, ContextCore::MAX_STEP_WORK)
+        .step_reservations(
+            load.actor,
+            load.input,
+            None,
+            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        )
         .unwrap()
         == before;
     let foreign_not_owned = owner
@@ -1729,3 +1763,6 @@ mod failed_runtime_inputs;
 
 #[path = "tests/task_host_calls.rs"]
 mod task_host_calls;
+
+#[path = "tests/internal.rs"]
+mod internal;

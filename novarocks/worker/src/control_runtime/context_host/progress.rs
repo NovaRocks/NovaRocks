@@ -55,6 +55,8 @@ pub(crate) struct ContextHostProgress {
     pub callbacks_retired: bool,
     pub holder_retired: bool,
     pub owner_control_retired: bool,
+    pub internal: Option<super::ContextInternalAdvance>,
+    pub internal_source_retired: bool,
 }
 
 impl ContextHostRecord {
@@ -139,6 +141,12 @@ impl ContextHostRecord {
             .owner_control
             .close()
             .map_err(ContextHostJobError::Driver)?;
+        progress.internal = Some(
+            self.resources
+                .internal
+                .advance()
+                .map_err(ContextHostJobError::Driver)?,
+        );
 
         let stopped = jobs.scope_stopped().map_err(ContextHostJobError::Runtime)?;
         let pending = &mut self.resources.pending_host_jobs;
@@ -180,6 +188,9 @@ impl ContextHostRecord {
             }
             progress.submitted += 1;
         }
+        progress.internal_source_retired = self
+            .retire_internal_source()
+            .map_err(ContextHostJobError::Driver)?;
         Ok(progress)
     }
 }
