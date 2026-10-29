@@ -859,3 +859,16 @@ impl WorkerTaskControl {
         self.node.metrics_snapshot()
     }
 }
+
+impl WorkerTaskControl {
+    /// Nonblocking reads of the actual charged-preparation owner and physical
+    /// fair queue. Busy means unavailable, never zero or a stale replay.
+    pub fn try_preparation_snapshot(
+        &self,
+    ) -> Result<
+        Option<super::node_metrics::WorkerPreparationSnapshot>,
+        super::node_metrics::WorkerPreparationObservationError,
+    > {
+        self.node.try_preparation_snapshot()
+    }
+}

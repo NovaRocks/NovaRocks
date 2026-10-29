@@ -137,6 +137,17 @@ impl Actor for ContextActor {
             self.storage.clone(),
         )
         .with_parent(self.lifetime_work);
+        // Keep failure diagnostics neutral and finite. The command may own
+        // large domain inputs; never format its payload during unwinding.
+        let (input_kind, input_task) = match &command {
+            ContextInput::RejectedCreationRetired { task, .. } => {
+                ("RejectedCreationRetired", Some(*task))
+            }
+            ContextInput::LoadedTask { task, .. } => ("LoadedTask", Some(*task)),
+            ContextInput::Loaded { task, .. } => ("Loaded", Some(*task)),
+            ContextInput::Request(_) => ("Request", None),
+            _ => ("OtherContextInput", None),
+        };
         let result = match request {
             Some(request) => {
                 let ContextInput::Request(command) = command else {
@@ -155,7 +166,11 @@ impl Actor for ContextActor {
             }
             None => self.core.handle(now, command, &mut admission),
         }
-        .expect("context protocol input preserves its frozen invariants");
+        .unwrap_or_else(|error| {
+            panic!(
+                "context protocol input preserves its frozen invariants: input={input_kind}, task={input_task:?}, error={error:?}"
+            )
+        });
         let internal_ready = self.core.has_internal_work();
         if matches!(
             self.core.state(),
@@ -225,7 +240,7 @@ impl Actor for ContextActor {
                 | ContextEffect::PublishTaskConvergence { task, .. }
                 | ContextEffect::SummaryConsumed { task, .. }
                 | ContextEffect::RetireTask { task, .. }
-                | ContextEffect::FinalizeTaskExecution { task }
+                | ContextEffect::FinalizeTaskExecution { task, .. }
                 | ContextEffect::PublishConclusion { task, .. } => {
                     if let Some(previous) = publications.get(task) {
                         dependencies.push(*previous);
@@ -246,6 +261,7 @@ impl Actor for ContextActor {
                     EffectKind::Publication
                 }
                 ContextEffect::DisposeSource { .. }
+                | ContextEffect::DisposeLoadedInput { .. }
                 | ContextEffect::CancelLoader { .. }
                 | ContextEffect::ReleaseHost { .. }
                 | ContextEffect::SealRoot { .. } => EffectKind::Cleanup,
@@ -261,7 +277,7 @@ impl Actor for ContextActor {
                 | ContextEffect::PublishTaskConvergence { task, .. }
                 | ContextEffect::SummaryConsumed { task, .. }
                 | ContextEffect::RetireTask { task, .. }
-                | ContextEffect::FinalizeTaskExecution { task }
+                | ContextEffect::FinalizeTaskExecution { task, .. }
                 | ContextEffect::PublishConclusion { task, .. } => {
                     publications.insert(*task, id);
                 }

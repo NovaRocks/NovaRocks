@@ -27,11 +27,12 @@ use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
     driver::{
         ActorRegistration, ActorRuntime, DriverError, EffectCompletionRefusal, EffectTicket,
-        InputPermit, InputRole, TimerSourceState,
+        InputPermit, InputPhase, InputRole, TimerSourceState,
     },
     lease::WorkLease,
 };
 use novarocks_control_runtime_core::{
+    completion::Consumption,
     identity::{ActorId, InputId, WorkId},
     mailbox::InputClass,
 };
@@ -39,6 +40,7 @@ use novarocks_execution_contract::QueryContextRef;
 use novarocks_worker_protocol::{
     context::{ContextEffect, ContextInput},
     control::ControlEffect,
+    creation::PayloadId,
 };
 
 pub(super) const CONTEXT_INTERNAL_STORAGE: StorageNeed = StorageNeed {
@@ -68,6 +70,9 @@ pub(in crate::control_runtime) struct ContextInternal {
     permit: Option<InputPermit<WorkerActor>>,
     role: Option<InputRole<WorkerActor>>,
     pending: bool,
+    // The same single input is borrowed by its physical-disposal owner until
+    // that owner has saved the exact Core receipt. Wake hints cannot reap it.
+    rejected_retirement: Option<InputId>,
     source_ended: bool,
     failed: bool,
     closed: bool,
@@ -152,6 +157,9 @@ impl ContextInternal {
         let original = self.binding()?;
         let role = self.role.as_ref().ok_or(DriverError::UnknownRole)?;
         if let Some(input) = role.in_flight()? {
+            if self.rejected_retirement == Some(input) {
+                return Ok(ContextInternalAdvance::Waiting(input));
+            }
             match original
                 .runtime
                 .retire_input(original.registration.actor(), input)
@@ -186,6 +194,87 @@ impl ContextInternal {
             .map_err(|(error, _neutral)| error)?;
         self.pending = false;
         Ok(ContextInternalAdvance::Submitted(input))
+    }
+    /// This bit is set only by discard_failed_hint after validating the
+    /// original ScopePublicationsDrained stage; it is not a scope-state guess.
+    pub(super) fn failed_publications_drained(&self) -> bool {
+        self.failed
+    }
+    /// Borrow the existing prepaid self-source for one exact completed
+    /// disposal. Busy preserves the caller's original Task entry and payload.
+    pub(super) fn try_submit_rejected_creation(
+        &mut self,
+        task: novarocks_execution_contract::TaskIdentity,
+        payload: PayloadId,
+    ) -> Result<Option<InputId>, DriverError> {
+        if self.closed || self.failed {
+            return Err(DriverError::Closed);
+        }
+        if self.rejected_retirement.is_some() {
+            return Ok(None);
+        }
+        let original = self.binding()?;
+        let role = self.role.as_ref().ok_or(DriverError::UnknownRole)?;
+        if let Some(input) = role.in_flight()? {
+            match original
+                .runtime
+                .retire_input(original.registration.actor(), input)
+            {
+                Ok(()) => {}
+                Err(
+                    DriverError::InputStillQueued
+                    | DriverError::EffectsRemain
+                    | DriverError::ReservationsRemain,
+                ) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        let input = role
+            .fill(WorkerMessage::Context(ContextMessage::Command {
+                work: original.author,
+                request: None,
+                command: ContextInput::RejectedCreationRetired { task, payload },
+            }))
+            .map_err(|(error, _neutral)| error)?;
+        self.rejected_retirement = Some(input);
+        Ok(Some(input))
+    }
+    /// Save this same input's positive consumption before actually retiring
+    /// its header. Failure abandonment remains distinct from Core consumption.
+    pub(super) fn finish_rejected_creation(
+        &mut self,
+        input: InputId,
+    ) -> Result<Consumption, DriverError> {
+        let original = self.binding()?;
+        let role = self.role.as_ref().ok_or(DriverError::UnknownRole)?;
+        if self.rejected_retirement != Some(input) || role.in_flight()? != Some(input) {
+            return Err(DriverError::InputAuthorMismatch);
+        }
+        let receipt = match original
+            .runtime
+            .input_custody(original.registration.actor(), input)?
+        {
+            Some(custody) if custody.phase == InputPhase::Committed => Consumption::Consumed,
+            Some(custody) if custody.phase == InputPhase::AbandonedByOwnerFailure => {
+                Consumption::AbandonedByOwnerFailure
+            }
+            Some(_) => return Ok(Consumption::Pending),
+            None => return Err(DriverError::UnknownInput),
+        };
+        match original
+            .runtime
+            .retire_input(original.registration.actor(), input)
+        {
+            Ok(()) => {}
+            Err(
+                DriverError::InputStillQueued
+                | DriverError::EffectsRemain
+                | DriverError::ReservationsRemain,
+            ) => return Ok(Consumption::Pending),
+            Err(error) => return Err(error),
+        }
+        self.rejected_retirement = None;
+        Ok(receipt)
     }
     pub(super) fn authorize_removal(
         &mut self,
@@ -238,7 +327,7 @@ impl ContextInternal {
         if self.closed {
             return Ok(true);
         }
-        if !self.source_ended || self.pending {
+        if !self.source_ended || self.pending || self.rejected_retirement.is_some() {
             return Ok(false);
         }
         let original = self.binding()?;

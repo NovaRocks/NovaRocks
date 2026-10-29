@@ -119,6 +119,8 @@ pub(crate) struct NodeReservationGeometry {
     pub task_source_work: usize,
     pub task_source_payments: usize,
     pub task_host_payments: usize,
+    /// Retained normal-close payments outlive ActiveTask permits.
+    pub inbound_payments: usize,
     pub shared_requests: usize,
     pub root_data_work: usize,
     pub total: usize,
@@ -136,9 +138,14 @@ pub struct NodeGeometry {
     pub(crate) context_scope: NodeScopeGeometry,
     pub(crate) source_scope: NodeScopeGeometry,
     pub(crate) max_scopes: usize,
+    /// Same-ledger PreparingTasks index metadata, not Work/reservation rows.
+    pub(crate) capacity_owner_usage_entries: usize,
     pub(crate) max_actors: usize,
     pub(crate) max_roots: usize,
     pub(crate) root_data_positions: usize,
+    /// Original inbound-payment rows can outlive TaskActive, but each Context
+    /// admits at most T cumulative Tasks and the process owns at most I rows.
+    max_inbound_payments_per_context: usize,
     pub(crate) request_positions: NonZeroUsize,
     pub(crate) inputs: NodeGeometryInputs,
 }
@@ -188,6 +195,10 @@ impl NodeGeometry {
     /// The one shared actual external request-position budget.
     pub fn request_positions(&self) -> NonZeroUsize {
         self.request_positions
+    }
+
+    pub fn max_inbound_payments_per_context(&self) -> usize {
+        self.max_inbound_payments_per_context
     }
 
     pub fn try_new(inputs: NodeGeometryInputs) -> Result<Self, NodeGeometryError> {
@@ -366,6 +377,9 @@ impl NodeGeometry {
             task_source_work: task_source_positions,
             task_source_payments: source_payment_rows,
             task_host_payments: task_host_payment_rows,
+            // Each nonempty original permit owns exactly InboundRecords1.
+            // ActiveTasks can return earlier, so this bound is global I, not A.
+            inbound_payments: inputs.inbound.max_records(),
             shared_requests: mul(request_row_peak, r)?,
             root_data_work: data_positions,
             total: 0,
@@ -378,9 +392,15 @@ impl NodeGeometry {
             reservations.task_source_work,
             reservations.task_source_payments,
             reservations.task_host_payments,
+            reservations.inbound_payments,
             reservations.shared_requests,
             reservations.root_data_work,
         ])?;
+        let max_scopes = sum([1, c, r])?;
+        // Every indexed nonzero scope needs at least one actual P permit.
+        // Include all runtime scopes, not just the Context scope count.
+        let indexed_owners = max_scopes.min(inputs.preparing_tasks.get());
+        let capacity_owner_usage_entries = add(mul(indexed_owners, 2)?, 1)?;
         Ok(Self {
             limits,
             admission,
@@ -396,10 +416,12 @@ impl NodeGeometry {
             },
             // One Root, C Context children and at most R actual Establish
             // source children. Parent links consume Work, not another scope.
-            max_scopes: sum([1, c, r])?,
+            max_scopes,
+            capacity_owner_usage_entries,
             max_actors: add(1, c)?,
             max_roots: roots,
             root_data_positions: data_positions,
+            max_inbound_payments_per_context: t.min(inputs.inbound.max_records()),
             request_positions: requests,
             inputs,
         })

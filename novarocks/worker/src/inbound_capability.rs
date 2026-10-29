@@ -241,13 +241,21 @@ struct TaskInboundCapabilityState {
     delivery_gates: HashMap<UniqueId, Arc<RwLock<()>>>,
     normally_closed: HashMap<UniqueId, NormalClosedInboundRecord>,
     normal_closed_executions: HashSet<QueryExecutionId>,
-    reserved: HashMap<TaskIdentity, usize>,
+    reserved: HashMap<TaskIdentity, InboundCloseReservation>,
     reserved_bytes: usize,
     /// A descriptor carries no frontend process identity. The worker context
     /// owner admits at most one context per execution, so the execution is
     /// the complete key this data-plane owner must fence.
     closed_executions: HashSet<QueryExecutionId>,
     aborted_executions: HashSet<QueryExecutionId>,
+}
+
+#[derive(Debug)]
+struct InboundCloseReservation {
+    bytes: usize,
+    // Production moves the original Accepted permit here. It follows this
+    // actual row through normal close; no Task-retirement copy refunds it.
+    permit: Option<crate::TaskInboundPermit>,
 }
 
 #[derive(Debug)]
@@ -351,7 +359,7 @@ impl TaskInboundCapabilities {
     }
 
     fn record_bytes(descriptor: &TaskDescriptor) -> Option<usize> {
-        novarocks_worker_protocol::inbound_cost::record_bytes(descriptor)
+        crate::task_creation_cost::inbound_record_bytes(descriptor)
     }
 
     pub fn reserve_normal_close(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
@@ -362,7 +370,7 @@ impl TaskInboundCapabilities {
         }
         let mut state = self.state.lock().expect(CAPABILITY_LOCK);
         if let Some(existing) = state.reserved.get(&descriptor.identity()) {
-            return if *existing == bytes {
+            return if existing.bytes == bytes {
                 Ok(())
             } else {
                 Err(capability_rejection(
@@ -385,9 +393,136 @@ impl TaskInboundCapabilities {
                 limit: self.max_bytes,
             }));
         }
-        state.reserved.insert(descriptor.identity(), bytes);
+        state.reserved.insert(
+            descriptor.identity(),
+            InboundCloseReservation {
+                bytes,
+                permit: None,
+            },
+        );
         state.reserved_bytes += bytes;
         Ok(())
+    }
+
+    /// Adopt the same Accepted reservation before any physical preparation.
+    /// Refusal returns its original owner; it never substitutes another fee.
+    pub fn reserve_normal_close_with_permit(
+        &self,
+        descriptor: &TaskDescriptor,
+        permit: Option<crate::TaskInboundPermit>,
+    ) -> Result<(), crate::InboundCloseReservationRefusal> {
+        let refuse = |failure, permit| crate::InboundCloseReservationRefusal {
+            rejection: capability_rejection(failure),
+            permit,
+        };
+        let Some(bytes) = Self::record_bytes(descriptor) else {
+            return Err(refuse(InboundCapabilityFailure::RecordSize, permit));
+        };
+        let valid = match &permit {
+            None => bytes == 0,
+            Some(original) => {
+                bytes != 0
+                    && original.identity() == descriptor.identity()
+                    && original.retained_bytes() == bytes as u64
+            }
+        };
+        if !valid {
+            return Err(refuse(
+                InboundCapabilityFailure::ReservationConflict {
+                    task: descriptor.identity(),
+                },
+                permit,
+            ));
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+        if state
+            .closed_executions
+            .contains(&descriptor.identity().query_execution_id())
+        {
+            return Err(refuse(
+                InboundCapabilityFailure::ContextClosed {
+                    task: descriptor.identity(),
+                },
+                permit,
+            ));
+        }
+        if state.reserved.contains_key(&descriptor.identity()) {
+            return Err(refuse(
+                InboundCapabilityFailure::ReservationConflict {
+                    task: descriptor.identity(),
+                },
+                permit,
+            ));
+        }
+        if state.reserved.len() >= self.max_records {
+            return Err(refuse(
+                InboundCapabilityFailure::CountLimit {
+                    committed: state.reserved.len(),
+                    limit: self.max_records,
+                },
+                permit,
+            ));
+        }
+        if bytes > self.max_bytes.saturating_sub(state.reserved_bytes) {
+            return Err(refuse(
+                InboundCapabilityFailure::ByteLimit {
+                    requested: bytes,
+                    committed: state.reserved_bytes,
+                    limit: self.max_bytes,
+                },
+                permit,
+            ));
+        }
+        state.reserved.insert(
+            descriptor.identity(),
+            InboundCloseReservation { bytes, permit },
+        );
+        state.reserved_bytes += bytes;
+        Ok(())
+    }
+
+    /// Release only after all capability and delivery locks have returned.
+    /// An invariant refusal retains the same original row and fee; the actual
+    /// supervising host body observes the panic as unresolved cleanup.
+    fn release_removed_reservation(
+        &self,
+        identity: TaskIdentity,
+        row: Option<InboundCloseReservation>,
+    ) {
+        let Some(mut row) = row else {
+            return;
+        };
+        if let Some(permit) = row.permit.take()
+            && let Err((error, permit)) = permit.release()
+        {
+            row.permit = Some(permit);
+            let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+            state.reserved_bytes = state
+                .reserved_bytes
+                .checked_add(row.bytes)
+                .expect("restore the original unresolved inbound reservation");
+            assert!(
+                state.reserved.insert(identity, row).is_none(),
+                "one original inbound reservation"
+            );
+            drop(state);
+            panic!("original inbound reservation release failed: {error:?}");
+        }
+    }
+
+    fn remove_and_release_reservation(&self, identity: TaskIdentity) {
+        let row = {
+            let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+            let row = state.reserved.remove(&identity);
+            if let Some(row) = &row {
+                state.reserved_bytes -= row.bytes;
+            }
+            row
+        };
+        self.release_removed_reservation(identity, row);
     }
 
     /// Authorizes one frame from only frozen task facts.
@@ -738,62 +873,66 @@ impl TaskInboundCapabilities {
     }
 
     pub fn abort_context(&self, context: QueryContextRef) {
-        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        let execution = context.query_execution_id();
-        state.closed_executions.insert(execution);
-        state.aborted_executions.insert(execution);
-        state.normal_closed_executions.remove(&execution);
-        let keys: Vec<_> = state
-            .normally_closed
-            .iter()
-            .filter(|(_, record)| record.destination.query_execution_id() == execution)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in keys {
-            if let Some(record) = state.normally_closed.remove(&key)
-                && let Some(bytes) = state.reserved.remove(&record.destination)
-            {
-                state.reserved_bytes -= bytes;
+        let reservations = {
+            let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+            let execution = context.query_execution_id();
+            state.closed_executions.insert(execution);
+            state.aborted_executions.insert(execution);
+            state.normal_closed_executions.remove(&execution);
+            let keys: Vec<_> = state
+                .normally_closed
+                .iter()
+                .filter(|(_, record)| record.destination.query_execution_id() == execution)
+                .map(|(key, record)| (*key, record.destination))
+                .collect();
+            for (key, _) in &keys {
+                state.normally_closed.remove(key);
             }
+            keys
+        };
+        for (_, identity) in reservations {
+            self.remove_and_release_reservation(identity);
         }
     }
 
     pub fn forget_context(&self, context: QueryContextRef) {
-        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        debug_assert!(state.installed.values().all(|descriptor| {
-            descriptor.identity().query_execution_id() != context.query_execution_id()
-        }));
-        state
-            .closed_executions
-            .remove(&context.query_execution_id());
-        state
-            .aborted_executions
-            .remove(&context.query_execution_id());
-        state
-            .normal_closed_executions
-            .remove(&context.query_execution_id());
-        state.normally_closed.retain(|_, record| {
-            record.destination.query_execution_id() != context.query_execution_id()
-        });
-        let live_keys: HashSet<_> = state
-            .installed
-            .keys()
-            .chain(state.normally_closed.keys())
-            .copied()
-            .collect();
-        state
-            .delivery_gates
-            .retain(|key, _| live_keys.contains(key));
-        let reservations: Vec<_> = state
-            .reserved
-            .keys()
-            .copied()
-            .filter(|identity| identity.query_execution_id() == context.query_execution_id())
-            .collect();
+        let reservations = {
+            let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+            debug_assert!(state.installed.values().all(|descriptor| {
+                descriptor.identity().query_execution_id() != context.query_execution_id()
+            }));
+            state
+                .closed_executions
+                .remove(&context.query_execution_id());
+            state
+                .aborted_executions
+                .remove(&context.query_execution_id());
+            state
+                .normal_closed_executions
+                .remove(&context.query_execution_id());
+            state.normally_closed.retain(|_, record| {
+                record.destination.query_execution_id() != context.query_execution_id()
+            });
+            let live_keys: HashSet<_> = state
+                .installed
+                .keys()
+                .chain(state.normally_closed.keys())
+                .copied()
+                .collect();
+            state
+                .delivery_gates
+                .retain(|key, _| live_keys.contains(key));
+            state
+                .reserved
+                .keys()
+                .copied()
+                .filter(|identity| identity.query_execution_id() == context.query_execution_id())
+                .collect::<Vec<_>>()
+        };
+        // The actual H body has forgotten the records. Its same original
+        // Context lifetime still owns these unique fees until each refund.
         for identity in reservations {
-            if let Some(bytes) = state.reserved.remove(&identity) {
-                state.reserved_bytes -= bytes;
-            }
+            self.remove_and_release_reservation(identity);
         }
     }
 
@@ -837,11 +976,21 @@ impl TaskInboundCapabilities {
             .normally_closed
             .get(&key)
             .is_some_and(|record| record.destination == descriptor.identity());
-        if !retained && let Some(bytes) = state.reserved.remove(&descriptor.identity()) {
-            state.reserved_bytes -= bytes;
-        }
         drop(state);
-        detach()
+        let captured = detach();
+        let row = if !retained {
+            let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+            let row = state.reserved.remove(&descriptor.identity());
+            if let Some(row) = &row {
+                state.reserved_bytes -= row.bytes;
+            }
+            row
+        } else {
+            None
+        };
+        drop(_retirement);
+        self.release_removed_reservation(descriptor.identity(), row);
+        captured
     }
 
     /// Existing DemandDriven retirement adapter. It records explicit withdrawal,
@@ -883,6 +1032,18 @@ impl TaskInboundCapabilities {
         mut closes: Vec<ExchangeStreamClose>,
         retire_receiver: impl FnOnce(),
     ) -> Result<(), HostRejection> {
+        closes.sort_unstable_by_key(|close| close.stream);
+        Self::validate_normal_close_facts(descriptor, &closes)?;
+        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver)
+    }
+
+    /// Check the receiver author's exact, canonical facts before publishing
+    /// successful Task completion. This grants no route or close authority;
+    /// the later writer-fenced close still consumes the original reservation.
+    pub fn validate_normal_close_facts(
+        descriptor: &TaskDescriptor,
+        closes: &[ExchangeStreamClose],
+    ) -> Result<(), HostRejection> {
         let invalid = || {
             capability_rejection(InboundCapabilityFailure::InvalidCloseFacts {
                 task: descriptor.identity(),
@@ -899,10 +1060,9 @@ impl TaskInboundCapabilities {
         if closes.len() != expected {
             return Err(invalid());
         }
-        closes.sort_unstable_by_key(|close| close.stream);
         if closes
             .windows(2)
-            .any(|pair| pair[0].stream == pair[1].stream)
+            .any(|pair| pair[0].stream >= pair[1].stream)
         {
             return Err(invalid());
         }
@@ -928,7 +1088,7 @@ impl TaskInboundCapabilities {
                 }
             }
         }
-        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver)
+        Ok(())
     }
 
     /// Atomically replaces the installed capability while holding the existing
@@ -966,6 +1126,7 @@ impl TaskInboundCapabilities {
         // route is removed; a pending delivery rechecks the final verdict.
         retire_receiver();
         let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+        let mut removed = None;
         let held = state
             .installed
             .get(&key)
@@ -1001,10 +1162,16 @@ impl TaskInboundCapabilities {
                 .normally_closed
                 .get(&key)
                 .is_some_and(|record| record.destination == descriptor.identity());
-            if !retained && let Some(bytes) = state.reserved.remove(&descriptor.identity()) {
-                state.reserved_bytes -= bytes;
+            if !retained {
+                removed = state.reserved.remove(&descriptor.identity());
+                if let Some(row) = &removed {
+                    state.reserved_bytes -= row.bytes;
+                }
             }
         }
+        drop(state);
+        drop(_retirement);
+        self.release_removed_reservation(descriptor.identity(), removed);
         Ok(())
     }
 }

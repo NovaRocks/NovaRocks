@@ -107,12 +107,88 @@ pub struct ReservationRequest {
     pub admission: WorkAdmission,
     pub kind: WorkKind,
 }
+/// Same-transaction projection of the original reservations for one dimension.
+/// Only nonzero owners occupy rows; the histogram is an index, not a payer or
+/// a second resource ledger. Its maximum is observable without an owner scan.
+#[derive(Debug)]
+struct OwnerUsageIndex {
+    by_scope: BTreeMap<ScopeId, u64>,
+    histogram: BTreeMap<u64, usize>,
+    max_owners: usize,
+}
+impl OwnerUsageIndex {
+    fn check_add(
+        &self,
+        scope: ScopeId,
+        amount: u64,
+        replacing: Option<ScopeId>,
+    ) -> Result<(), CapacityError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.by_scope
+            .get(&scope)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(amount)
+            .ok_or(CapacityError::Overflow)?;
+        if !self.by_scope.contains_key(&scope)
+            && self.by_scope.len() == self.max_owners
+            && replacing.is_none_or(|old| self.by_scope.get(&old).copied() != Some(amount))
+        {
+            return Err(CapacityError::Scope(ScopeError::SlotCapacity));
+        }
+        Ok(())
+    }
+    fn replace(&mut self, scope: ScopeId, next: u64) {
+        if let Some(old) = self.by_scope.remove(&scope) {
+            let count = self
+                .histogram
+                .get_mut(&old)
+                .expect("indexed original owner usage");
+            *count = count.checked_sub(1).expect("owner usage histogram count");
+            if *count == 0 {
+                self.histogram.remove(&old);
+            }
+        }
+        if next != 0 {
+            self.by_scope.insert(scope, next);
+            let count = self.histogram.entry(next).or_default();
+            *count = count.checked_add(1).expect("bounded owner usage histogram");
+        }
+    }
+    fn add(&mut self, scope: ScopeId, amount: u64) {
+        if amount != 0 {
+            let next = self
+                .by_scope
+                .get(&scope)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(amount)
+                .expect("validated aggregate owner addition");
+            self.replace(scope, next);
+        }
+    }
+    fn subtract(&mut self, scope: ScopeId, amount: u64) {
+        if amount != 0 {
+            let next = self
+                .by_scope
+                .get(&scope)
+                .copied()
+                .expect("original indexed resource owner")
+                .checked_sub(amount)
+                .expect("original owner resources cover release");
+            self.replace(scope, next);
+        }
+    }
+}
 #[derive(Debug)]
 pub struct CapacityLedger {
     limits: ResourceVector,
     used: ResourceVector,
     reservations: BTreeMap<ReservationId, ReservationRecord>,
     owner_counts: BTreeMap<ScopeId, usize>,
+    owner_usage: BTreeMap<DimensionId, OwnerUsageIndex>,
     max_reservations: usize,
     last_reservation: u64,
     healthy: bool,
@@ -124,9 +200,91 @@ impl CapacityLedger {
             used: ResourceVector::default(),
             reservations: BTreeMap::new(),
             owner_counts: BTreeMap::new(),
+            owner_usage: BTreeMap::new(),
             max_reservations,
             last_reservation: 0,
             healthy: true,
+        }
+    }
+    /// Configure only dimensions needed by an actual owner read port. With
+    /// integer permits, each nonzero scope owns at least one global unit.
+    /// The explicit scope bound covers all runtime scopes, not just Contexts.
+    pub fn with_owner_usage_dimensions(
+        limits: ResourceVector,
+        max_reservations: usize,
+        max_scopes: usize,
+        dimensions: impl IntoIterator<Item = DimensionId>,
+    ) -> Result<Self, CapacityError> {
+        let mut ledger = Self::new(limits, max_reservations);
+        for dimension in dimensions {
+            let limit = *ledger
+                .limits
+                .0
+                .get(&dimension)
+                .ok_or(CapacityError::UnknownDimension)?;
+            let max_owners =
+                usize::try_from(limit).map_or(max_scopes, |limit| max_scopes.min(limit));
+            max_owners
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(1))
+                .ok_or(CapacityError::Overflow)?;
+            if ledger
+                .owner_usage
+                .insert(
+                    dimension,
+                    OwnerUsageIndex {
+                        by_scope: BTreeMap::new(),
+                        histogram: BTreeMap::new(),
+                        max_owners,
+                    },
+                )
+                .is_some()
+            {
+                return Err(CapacityError::DuplicateDimension);
+            }
+        }
+        Ok(ledger)
+    }
+    /// Maximum actual charged units for a configured dimension. None means
+    /// no index was configured, never an observed zero-resource owner.
+    pub fn max_owner_usage(&self, dimension: DimensionId) -> Option<u64> {
+        self.owner_usage.get(&dimension).map(|index| {
+            index
+                .histogram
+                .last_key_value()
+                .map_or(0, |(&usage, _)| usage)
+        })
+    }
+    /// Bounded metadata entries: one dimension row plus at most one owner and
+    /// one histogram row per nonzero scope. These are not Work/reservation IDs.
+    pub fn owner_usage_metadata_entries(&self, dimension: DimensionId) -> Option<usize> {
+        self.owner_usage.get(&dimension).map(|index| {
+            index
+                .max_owners
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(1))
+                .expect("validated owner index geometry")
+        })
+    }
+    fn check_owner_add(
+        &self,
+        scope: ScopeId,
+        resources: &ResourceVector,
+        replacing: Option<ScopeId>,
+    ) -> Result<(), CapacityError> {
+        for (&dimension, index) in &self.owner_usage {
+            index.check_add(scope, resources.get(dimension), replacing)?;
+        }
+        Ok(())
+    }
+    fn add_owner_usage(&mut self, scope: ScopeId, resources: &ResourceVector) {
+        for (&dimension, index) in &mut self.owner_usage {
+            index.add(scope, resources.get(dimension));
+        }
+    }
+    fn subtract_owner_usage(&mut self, scope: ScopeId, resources: &ResourceVector) {
+        for (&dimension, index) in &mut self.owner_usage {
+            index.subtract(scope, resources.get(dimension));
         }
     }
     pub fn used(&self, dimension: DimensionId) -> u64 {
@@ -134,6 +292,12 @@ impl CapacityLedger {
     }
     pub fn limit(&self, dimension: DimensionId) -> u64 {
         self.limits.get(dimension)
+    }
+    pub fn dimension_usage(&self, dimension: DimensionId) -> Option<(u64, u64)> {
+        self.limits
+            .0
+            .get(&dimension)
+            .map(|&limit| (self.used(dimension), limit))
     }
     pub fn reservation(&self, id: ReservationId) -> Option<&ReservationRecord> {
         self.reservations.get(&id)
@@ -220,6 +384,7 @@ impl CapacityLedger {
             }
         }
         let next = self.used.checked_add(&request.resources)?;
+        self.check_owner_add(scope.id(), &request.resources, None)?;
         scope.admit_guard(
             request.generation,
             request.guard,
@@ -227,6 +392,7 @@ impl CapacityLedger {
             request.admission,
         )?;
         self.used = next;
+        self.add_owner_usage(scope.id(), &request.resources);
         self.last_reservation = request.id.get();
         self.reservations.insert(
             request.id,
@@ -281,8 +447,10 @@ impl CapacityLedger {
             return Err(CapacityError::BoundReservation);
         }
         let next = self.used.checked_sub(&record.resources)?;
+        let resources = record.resources.clone();
         scope.rollback_guard(record.work)?;
         self.used = next;
+        self.subtract_owner_usage(scope.id(), &resources);
         self.reservations.remove(&id);
         self.remove_owner_record(scope.id());
         Ok(())
@@ -304,6 +472,7 @@ impl CapacityLedger {
         let remaining = record.resources.checked_sub(resources)?;
         let next = self.used.checked_sub(resources)?;
         self.used = next;
+        self.subtract_owner_usage(owner, resources);
         if remaining.is_empty() {
             self.reservations.remove(&id);
             self.remove_owner_record(owner);
@@ -366,16 +535,26 @@ impl CapacityLedger {
         }
         let record = self
             .reservations
-            .get_mut(&id)
+            .get(&id)
             .ok_or(CapacityError::UnknownReservation)?;
         if !record.bound {
             return Err(CapacityError::UnboundReservation);
         }
         let old_owner = record.scope;
+        let resources = record.resources.clone();
+        if old_owner != target.id() {
+            self.check_owner_add(target.id(), &resources, Some(old_owner))?;
+        }
+        let record = self
+            .reservations
+            .get_mut(&id)
+            .expect("validated original transfer");
         record.scope = target.id();
         record.generation = target.generation();
         record.work = work;
         if old_owner != target.id() {
+            self.subtract_owner_usage(old_owner, &resources);
+            self.add_owner_usage(target.id(), &resources);
             self.remove_owner_record(old_owner);
             self.add_owner_record(target.id());
         }

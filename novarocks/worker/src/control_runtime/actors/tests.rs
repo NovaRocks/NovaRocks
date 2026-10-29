@@ -2385,8 +2385,11 @@ fn exercise_fragment_roles_with_preparation(
         novarocks_execution_contract::ExchangeTopology::try_new(vec![], vec![inbound]).unwrap(),
     )
     .unwrap();
-    let inbound_bytes =
-        novarocks_worker_protocol::inbound_cost::record_bytes(&descriptor).unwrap() as u64;
+    let inbound_bytes = novarocks_worker_protocol::inbound_cost::record_bytes(
+        &descriptor,
+        std::mem::size_of::<Option<crate::TaskInboundPermit>>(),
+    )
+    .unwrap() as u64;
     let cleanup_descriptor = transfer_bundle.then(|| descriptor.clone());
     let request = Arc::new(
         novarocks_execution_contract::CreateTask::try_new(

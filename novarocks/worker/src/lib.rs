@@ -55,6 +55,7 @@ mod failure_reason;
 pub mod guarded_bytes;
 mod host;
 mod inbound_capability;
+mod inbound_permit;
 mod ingress;
 mod lease;
 mod lease_expiry_index;
@@ -139,10 +140,9 @@ pub use control_runtime::context_host::observation::{
 pub use control_runtime::lifecycle_read::TaskReadError;
 pub use control_runtime::node_api::{
     WorkerContextDelivery, WorkerContextReplyBody, WorkerControlDelivery, WorkerControlReplyBody,
-    WorkerCreateDelivery, WorkerCreateReply,
-    WorkerMonotonicInstant, WorkerRequestError, WorkerRequestRefusal, WorkerRequestResult,
-    WorkerRootDelivery, WorkerRootRead, WorkerRootReadError, WorkerRootReadErrorKind,
-    WorkerTaskControl, WorkerTaskDelivery,
+    WorkerCreateDelivery, WorkerCreateReply, WorkerMonotonicInstant, WorkerRequestError,
+    WorkerRequestRefusal, WorkerRequestResult, WorkerRootDelivery, WorkerRootRead,
+    WorkerRootReadError, WorkerRootReadErrorKind, WorkerTaskControl, WorkerTaskDelivery,
 };
 pub use control_runtime::node_bootstrap::{
     NODE_CONTEXT_STEP_BUDGET, NODE_CONTROL_STEP_BUDGET, NodeAdmissionTicketConfig,
@@ -150,7 +150,9 @@ pub use control_runtime::node_bootstrap::{
     WorkerNodeShutdownError, WorkerNodeStartRefusal,
 };
 pub use control_runtime::node_geometry::{NodeGeometry, NodeGeometryError, NodeGeometryInputs};
-pub use control_runtime::node_metrics::WorkerNodeMetricsSnapshot;
+pub use control_runtime::node_metrics::{
+    WorkerNodeMetricsSnapshot, WorkerPreparationObservationError, WorkerPreparationSnapshot,
+};
 pub use control_runtime::operator_statistics::{
     StatisticsSubmission, TaskStatisticsFinalizer, TaskStatisticsProducer,
 };
@@ -167,14 +169,16 @@ pub use drain::WorkerDrainState;
 #[cfg(novarocks_dev_controls)]
 pub use host::TestTaskUpdateConsumptionReservation;
 pub use host::{
-    HostRejection, PreparationControlLoan, PreparedTaskInstallation, QueryContextHost,
-    QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence, RunnableTask,
-    SharedFactsRequest, TaskExecutionHost,
+    HostRejection, InboundCloseReservationRefusal, PreparationControlLoan,
+    PreparedTaskInstallation, QueryContextHost, QueryContextHostFactory, QueryContextHostInstance,
+    ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
+    TaskIngressRetirement,
 };
 pub use inbound_capability::{
     InboundFrameAdmission, InboundFrameClaim, InboundFrameDelivery, NormalClosedInbound,
     TaskInboundCapabilities, TaskInboundCapabilityLimits,
 };
+pub use inbound_permit::{TaskInboundPermit, TaskInboundPermitError};
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};
 pub use lifecycle::{

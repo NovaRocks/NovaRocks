@@ -422,7 +422,8 @@ impl EstablishRouteCustody {
             .context_leg
             .lock()
             .expect("original Context route")
-            .phase.clone()
+            .phase
+            .clone()
         {
             ProbePhase::Waiting(result) => Some(result),
             _ => None,

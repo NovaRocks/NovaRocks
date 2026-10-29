@@ -208,9 +208,27 @@ pub struct ScopeSnapshot {
     pub retirement_ready: bool,
     pub unresolved: usize,
 }
+/// Read-only actual capacity samples under one original ledger transaction.
+/// Owner maxima require an explicitly configured same-transaction index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacityUsageSnapshot<const N: usize> {
+    pub used: [u64; N],
+    pub limits: [u64; N],
+    pub max_owner_usage: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapacityObservationError {
+    OwnerIndexNotConfigured(DimensionId),
+    UnknownDimension(DimensionId),
+    Poisoned,
+}
 impl RuntimeLedger {
     pub fn new(limits: ResourceVector, max_reservations: usize, max_scopes: usize) -> Self {
-        Self::build(limits, max_reservations, max_scopes, None)
+        Self::build(
+            CapacityLedger::new(limits, max_reservations),
+            max_scopes,
+            None,
+        )
     }
     pub fn with_history(
         limits: ResourceVector,
@@ -218,18 +236,35 @@ impl RuntimeLedger {
         max_scopes: usize,
         history: crate::history::HistoryCapture,
     ) -> Self {
-        Self::build(limits, max_reservations, max_scopes, Some(history))
+        Self::build(
+            CapacityLedger::new(limits, max_reservations),
+            max_scopes,
+            Some(history),
+        )
     }
-    fn build(
+    pub fn with_owner_usage_dimensions(
         limits: ResourceVector,
         max_reservations: usize,
+        max_scopes: usize,
+        dimensions: impl IntoIterator<Item = DimensionId>,
+    ) -> Result<Self, RuntimeError> {
+        let ledger = CapacityLedger::with_owner_usage_dimensions(
+            limits,
+            max_reservations,
+            max_scopes,
+            dimensions,
+        )?;
+        Ok(Self::build(ledger, max_scopes, None))
+    }
+    fn build(
+        ledger: CapacityLedger,
         max_scopes: usize,
         history: Option<crate::history::HistoryCapture>,
     ) -> Self {
         Self {
             shared: Arc::new(LedgerShared {
                 state: Mutex::new(LedgerState {
-                    ledger: CapacityLedger::new(limits, max_reservations),
+                    ledger,
                     scopes: BTreeMap::new(),
                     slots: BTreeMap::new(),
                     unresolved: BTreeSet::new(),
@@ -499,6 +534,47 @@ impl RuntimeLedger {
             runtime: self.clone(),
             id,
         })
+    }
+    /// Nonblocking metadata-only read. No Scope, Work or reservation scan is
+    /// performed, and neither missing configuration nor a busy lock means zero.
+    pub fn try_capacity_usage<const N: usize>(
+        &self,
+        dimensions: [DimensionId; N],
+        owner_dimension: DimensionId,
+    ) -> Result<Option<CapacityUsageSnapshot<N>>, CapacityObservationError> {
+        let state = match self.shared.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(CapacityObservationError::Poisoned);
+            }
+        };
+        let max_owner_usage = state.ledger.max_owner_usage(owner_dimension).ok_or(
+            CapacityObservationError::OwnerIndexNotConfigured(owner_dimension),
+        )?;
+        let mut used = [0; N];
+        let mut limits = [0; N];
+        for (index, dimension) in dimensions.into_iter().enumerate() {
+            let (value, limit) = state
+                .ledger
+                .dimension_usage(dimension)
+                .ok_or(CapacityObservationError::UnknownDimension(dimension))?;
+            used[index] = value;
+            limits[index] = limit;
+        }
+        Ok(Some(CapacityUsageSnapshot {
+            used,
+            limits,
+            max_owner_usage,
+        }))
+    }
+    pub fn owner_usage_metadata_entries(&self, dimension: DimensionId) -> Option<usize> {
+        self.shared
+            .state
+            .lock()
+            .expect("runtime ledger metadata geometry")
+            .ledger
+            .owner_usage_metadata_entries(dimension)
     }
     pub fn used(&self, dimension: DimensionId) -> u64 {
         self.shared

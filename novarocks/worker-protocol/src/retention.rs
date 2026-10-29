@@ -30,6 +30,9 @@ pub enum RetentionError {
 pub struct RetentionIndex<K: Copy + Ord> {
     records: BTreeMap<K, (MonotonicInstant, u64)>,
     deadlines: BTreeSet<(MonotonicInstant, K)>,
+    // Addresses into the same records, never a second retained owner. Protected
+    // records remain deadline-indexed but cannot be capacity-eviction victims.
+    eligible: BTreeSet<(MonotonicInstant, K)>,
     bytes: u64,
     max_records: usize,
     max_bytes: u64,
@@ -39,6 +42,7 @@ impl<K: Copy + Ord> RetentionIndex<K> {
         Self {
             records: BTreeMap::new(),
             deadlines: BTreeSet::new(),
+            eligible: BTreeSet::new(),
             bytes: 0,
             max_records,
             max_bytes,
@@ -49,6 +53,24 @@ impl<K: Copy + Ord> RetentionIndex<K> {
         key: K,
         until: MonotonicInstant,
         bytes: u64,
+    ) -> Result<(), RetentionError> {
+        self.insert_internal(key, until, bytes, None)
+    }
+    pub fn insert_with_protection(
+        &mut self,
+        key: K,
+        until: MonotonicInstant,
+        bytes: u64,
+        protected: bool,
+    ) -> Result<(), RetentionError> {
+        self.insert_internal(key, until, bytes, Some(protected))
+    }
+    fn insert_internal(
+        &mut self,
+        key: K,
+        until: MonotonicInstant,
+        bytes: u64,
+        protection: Option<bool>,
     ) -> Result<(), RetentionError> {
         if self.records.contains_key(&key) {
             return Err(RetentionError::Duplicate);
@@ -62,6 +84,9 @@ impl<K: Copy + Ord> RetentionIndex<K> {
         }
         self.records.insert(key, (until, bytes));
         self.deadlines.insert((until, key));
+        if protection == Some(false) {
+            self.eligible.insert((until, key));
+        }
         self.bytes = total;
         Ok(())
     }
@@ -71,6 +96,7 @@ impl<K: Copy + Ord> RetentionIndex<K> {
             self.deadlines.remove(&(until, key)),
             "retention indexes agree"
         );
+        self.eligible.remove(&(until, key));
         self.bytes -= bytes;
         Ok(bytes)
     }
@@ -87,6 +113,12 @@ impl<K: Copy + Ord> RetentionIndex<K> {
     }
     pub fn oldest(&self) -> Option<K> {
         self.deadlines.first().map(|(_, key)| *key)
+    }
+    pub fn oldest_eligible(&self) -> Option<K> {
+        self.eligible.first().map(|(_, key)| *key)
+    }
+    pub fn eligible_len(&self) -> usize {
+        self.eligible.len()
     }
     pub fn contains(&self, key: K) -> bool {
         self.records.contains_key(&key)

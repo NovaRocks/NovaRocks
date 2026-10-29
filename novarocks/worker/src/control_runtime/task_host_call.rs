@@ -75,6 +75,10 @@ pub(crate) const HOST_CALL_KINDS: [TaskHostCallKind; 2] =
 pub(crate) enum TaskHostCallOutcome {
     Completed,
     Panicked,
+    /// The checked cleanup returned its typed refusal; body/captures exited.
+    CleanupRefused,
+    /// A cleanup invocation or capture failed to establish actual exit.
+    CleanupUnresolved,
     StartRefused(ExitRoleError),
 }
 #[derive(Debug)]
@@ -190,6 +194,14 @@ enum CallHandoff {
     AwaitingFailurePublication,
     Withdrawn,
 }
+/// This is an additional field of the same original call capture, not a
+/// second Work/return author. It remains with that custody on failure.
+struct ExecutionRetirementCall {
+    // None is issued only from the actual never-exposed RetireTask branch.
+    owner: Option<Arc<super::task::ProductionPreparation>>,
+    host: Arc<dyn crate::TaskExecutionHost>,
+    ingress: crate::TaskIngressRetirement,
+}
 struct State {
     port: Option<Weak<TaskRuntimePort>>,
     authority: Option<ExitAuthority>,
@@ -197,6 +209,7 @@ struct State {
     reader: OwnedReturnReader<TaskHostCallOutcome>,
     returned: Option<TaskHostCallOutcome>,
     capture: Option<ManuallyDrop<Arc<TaskRuntimePort>>>,
+    retirement: Option<ManuallyDrop<ExecutionRetirementCall>>,
     panic: Option<PanicPayload>,
     handoff: CallHandoff,
     observer_consumed: bool,
@@ -390,6 +403,7 @@ impl TaskHostCall {
                 reader,
                 returned: None,
                 capture: None,
+                retirement: None,
                 panic: None,
                 handoff: CallHandoff::Available,
                 observer_consumed: false,
@@ -499,7 +513,7 @@ impl TaskHostCall {
     ) -> Result<TaskHostCallJob, TaskHostCallError> {
         if self.0.kind != TaskHostCallKind::RetireBorrowing
             || ticket.actor != self.0.actor
-            || !matches!(&ticket.effect, WorkerAction::Context(ContextEffect::RetireTask {task,..} | ContextEffect::FinalizeTaskExecution {task}) if *task==self.0.task)
+            || !matches!(&ticket.effect, WorkerAction::Context(ContextEffect::RetireTask {task,..} | ContextEffect::FinalizeTaskExecution {task,..}) if *task==self.0.task)
             || !exited.matches(self.0.task, &self.0.scope)
         {
             return Err(TaskHostCallError::WrongTask);
@@ -547,7 +561,13 @@ impl TaskHostCall {
         let port = original_port
             .upgrade()
             .ok_or(TaskHostCallError::MissingPort)?;
-        if port.publication().borrow().neutral_accepted().is_none() {
+        // Stop publishes an accepted conclusion to execution observers.
+        // RetireBorrowing only closes borrowing, under its separately checked
+        // Core retirement effect and actual borrower-exit inventory. A refused
+        // creation has no accepted Task conclusion to publish.
+        if self.0.kind == TaskHostCallKind::Stop
+            && port.publication().borrow().neutral_accepted().is_none()
+        {
             return Err(TaskHostCallError::MissingConclusion);
         }
         let mut state = self
@@ -694,6 +714,90 @@ impl QueuedPreparation for TaskHostCallJob {
     }
 }
 impl TaskHostCallJob {
+    /// The same originally admitted role covers the checked receiver call and
+    /// every actual host capture Drop before its authority can sign exit.
+    pub(crate) fn run_retirement(
+        self,
+        owner: Option<Arc<super::task::ProductionPreparation>>,
+        host: Arc<dyn crate::TaskExecutionHost>,
+        ingress: crate::TaskIngressRetirement,
+    ) {
+        assert_eq!(self.owner.0.kind, TaskHostCallKind::RetireBorrowing);
+        {
+            let mut state = self
+                .owner
+                .0
+                .state
+                .lock()
+                .expect("original execution cleanup capture");
+            assert!(
+                state.retirement.is_none(),
+                "one original receiver retirement capture"
+            );
+            state.retirement = Some(ManuallyDrop::new(ExecutionRetirementCall {
+                owner,
+                host,
+                ingress,
+            }));
+        }
+        self.run();
+    }
+    fn run_retirement_capture(&self) -> TaskHostCallOutcome {
+        use super::task::ExecutionRetirementOutcome;
+        let capture = self
+            .owner
+            .0
+            .state
+            .lock()
+            .expect("original receiver cleanup capture")
+            .retirement
+            .take();
+        let Some(capture) = capture else {
+            return TaskHostCallOutcome::Completed;
+        };
+        let ingress = match self.start {
+            StartPermission::Normal(_) => capture.ingress,
+            // A real failure-publication session grants cleanup only, never
+            // the earlier queued decision's normal-close permission.
+            StartPermission::FailurePublicationsDrained => crate::TaskIngressRetirement::Remove,
+        };
+        let outcome = capture
+            .owner
+            .as_ref()
+            .map_or(ExecutionRetirementOutcome::Completed, |owner| {
+                owner.retire_execution_on_host(capture.host.as_ref(), ingress)
+            });
+        if outcome == ExecutionRetirementOutcome::Unresolved {
+            self.owner
+                .0
+                .state
+                .lock()
+                .expect("unresolved original receiver capture")
+                .retirement = Some(capture);
+            return TaskHostCallOutcome::CleanupUnresolved;
+        }
+        // Neither the host nor its original returned source is destroyed
+        // under a metadata lock. A capture destructor panic is Unknown even
+        // when the checked operation itself returned a known typed refusal.
+        if let Err(payload) =
+            catch_unwind(AssertUnwindSafe(|| drop(ManuallyDrop::into_inner(capture))))
+        {
+            self.owner
+                .0
+                .state
+                .lock()
+                .expect("receiver capture panic retention")
+                .panic = Some(ManuallyDrop::new(payload));
+            return TaskHostCallOutcome::CleanupUnresolved;
+        }
+        match outcome {
+            ExecutionRetirementOutcome::Completed => TaskHostCallOutcome::Completed,
+            ExecutionRetirementOutcome::Rejected => TaskHostCallOutcome::CleanupRefused,
+            ExecutionRetirementOutcome::Unresolved => {
+                unreachable!("original unresolved capture retained above")
+            }
+        }
+    }
     pub(crate) fn run(mut self) {
         let mut authority = self.authority.take().expect("one original host authority");
         let port = self
@@ -758,20 +862,36 @@ impl TaskHostCallJob {
                         state.panic = Some(ManuallyDrop::new(payload));
                         (TaskHostCallOutcome::Panicked, false)
                     }
-                    Ok(()) => match catch_unwind(AssertUnwindSafe(|| drop(port))) {
-                        Ok(()) => (TaskHostCallOutcome::Completed, true),
-                        Err(payload) => {
-                            let mut state = self
-                                .owner
+                    Ok(()) => {
+                        let cleanup = self.run_retirement_capture();
+                        if matches!(cleanup, TaskHostCallOutcome::CleanupUnresolved) {
+                            self.owner
                                 .0
                                 .state
                                 .lock()
-                                .expect("host capture panic retention");
-                            assert!(state.panic.is_none(), "one original Task host-call panic");
-                            state.panic = Some(ManuallyDrop::new(payload));
-                            (TaskHostCallOutcome::Panicked, false)
+                                .expect("unresolved original host port")
+                                .capture = Some(ManuallyDrop::new(port));
+                            (cleanup, false)
+                        } else {
+                            match catch_unwind(AssertUnwindSafe(|| drop(port))) {
+                                Ok(()) => (cleanup, true),
+                                Err(payload) => {
+                                    let mut state = self
+                                        .owner
+                                        .0
+                                        .state
+                                        .lock()
+                                        .expect("host capture panic retention");
+                                    assert!(
+                                        state.panic.is_none(),
+                                        "one original Task host-call panic"
+                                    );
+                                    state.panic = Some(ManuallyDrop::new(payload));
+                                    (TaskHostCallOutcome::Panicked, false)
+                                }
+                            }
                         }
-                    },
+                    }
                 }
             }
         };

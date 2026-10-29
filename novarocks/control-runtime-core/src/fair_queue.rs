@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bounded group-fair work, with at most one running item per queue.
+//! Bounded work scheduling, with at most one running item per group.
 //! Fairness keys are independent of the original owner-qualified job keys.
 
 use crate::identity::{ScopeId, WorkId};
@@ -58,11 +58,19 @@ struct WorkNode<W> {
     previous: Option<W>,
     next: Option<W>,
     running: bool,
+    enqueue_order: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Discipline {
+    RoundRobin,
+    EligibleFifo,
 }
 /// A finite FIFO per complete fairness group, independent of job ownership.
 /// Membership is unique by `(G, W)`, preserving scope-local WorkIds in the
 /// default API. When a group covers multiple scopes, W retains the original
 /// owner-qualified job identity. Keys are neutral deterministic values.
+/// The default discipline rotates eligible groups after each body. The
+/// `eligible_fifo` constructor instead preserves each head's enqueue priority.
 #[derive(Debug)]
 pub struct FairWorkQueue<G = ScopeId, W = WorkId> {
     max_groups: usize,
@@ -74,9 +82,23 @@ pub struct FairWorkQueue<G = ScopeId, W = WorkId> {
     // fairness key retain the complete original owner identity in W instead.
     work: BTreeMap<(G, W), WorkNode<W>>,
     next_order: u64,
+    discipline: Discipline,
 }
 impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
     pub fn new(max_groups: usize, max_work: usize, per_group: usize) -> Self {
+        Self::with_discipline(max_groups, max_work, per_group, Discipline::RoundRobin)
+    }
+    /// Select the oldest enqueued head among groups without a running item.
+    /// Finishing a body restores its queued head's original priority.
+    pub fn eligible_fifo(max_groups: usize, max_work: usize, per_group: usize) -> Self {
+        Self::with_discipline(max_groups, max_work, per_group, Discipline::EligibleFifo)
+    }
+    fn with_discipline(
+        max_groups: usize,
+        max_work: usize,
+        per_group: usize,
+        discipline: Discipline,
+    ) -> Self {
         Self {
             max_groups,
             max_work,
@@ -85,6 +107,7 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
             ready: BTreeSet::new(),
             work: BTreeMap::new(),
             next_order: 1,
+            discipline,
         }
     }
     pub fn len(&self) -> usize {
@@ -114,12 +137,11 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
             .groups
             .get(&group)
             .is_none_or(|c| c.running.is_none() && c.ready_order.is_none());
-        let next_order = if ready {
-            self.next_order
-                .checked_add(1)
-                .ok_or(FairQueueError::OrderExhausted)?
+        let order = self.next_order;
+        let next_order = if ready || self.discipline == Discipline::EligibleFifo {
+            order.checked_add(1).ok_or(FairQueueError::OrderExhausted)?
         } else {
-            self.next_order
+            order
         };
         let queue = self.groups.entry(group).or_default();
         let previous = queue.tail;
@@ -129,6 +151,7 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
                 previous,
                 next: None,
                 running: false,
+                enqueue_order: order,
             },
         );
         if let Some(tail) = previous {
@@ -142,10 +165,10 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
         queue.tail = Some(work);
         queue.queued += 1;
         if ready {
-            queue.ready_order = Some(self.next_order);
-            self.ready.insert((self.next_order, group));
-            self.next_order = next_order;
+            queue.ready_order = Some(order);
+            self.ready.insert((order, group));
         }
+        self.next_order = next_order;
         Ok(())
     }
     pub fn pop(&mut self) -> Option<(G, W)> {
@@ -178,7 +201,7 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
         if queue.running != Some(work) {
             return Err(FairQueueError::WrongRunningWork);
         }
-        let next_order = if queue.queued > 0 {
+        let next_order = if queue.queued > 0 && self.discipline == Discipline::RoundRobin {
             self.next_order
                 .checked_add(1)
                 .ok_or(FairQueueError::OrderExhausted)?
@@ -189,8 +212,18 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
         queue.running = None;
         self.work.remove(&(group, work));
         if queue.queued > 0 {
-            queue.ready_order = Some(self.next_order);
-            self.ready.insert((self.next_order, group));
+            let head = queue.head.expect("queued group has a head");
+            let order = match self.discipline {
+                Discipline::EligibleFifo => {
+                    self.work
+                        .get(&(group, head))
+                        .expect("queued head exists")
+                        .enqueue_order
+                }
+                Discipline::RoundRobin => self.next_order,
+            };
+            queue.ready_order = Some(order);
+            self.ready.insert((order, group));
             self.next_order = next_order;
         } else {
             self.groups.remove(&group);
@@ -208,6 +241,15 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
             return Err(FairQueueError::UnknownWork);
         }
         let queue = self.groups.get_mut(&group).expect("work retains group");
+        // Removing an eligible head must not lend its old priority to the
+        // next item. A running group has no ready entry to replace.
+        let replace_ready = self.discipline == Discipline::EligibleFifo
+            && node.previous.is_none()
+            && queue.running.is_none();
+        if replace_ready {
+            let order = queue.ready_order.take().expect("queued group is eligible");
+            assert!(self.ready.remove(&(order, group)));
+        }
         match node.previous {
             Some(previous) => {
                 self.work
@@ -235,6 +277,15 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
             if queue.running.is_none() {
                 self.groups.remove(&group);
             }
+        } else if replace_ready {
+            let head = queue.head.expect("remaining queued head exists");
+            let order = self
+                .work
+                .get(&(group, head))
+                .expect("remaining head work exists")
+                .enqueue_order;
+            queue.ready_order = Some(order);
+            self.ready.insert((order, group));
         }
         Ok(())
     }

@@ -63,6 +63,7 @@ struct State {
     exit_report_retired: bool,
     transferred: bool,
     task_source_storage_transferred: bool,
+    inbound_payment_transferred: bool,
     unresolved: bool,
     // One original body and one independent input-disposal boundary. Panic
     // graphs are retained without invoking their destructor a second time.
@@ -291,6 +292,7 @@ impl PreparationCustody {
                 exit_report_retired: false,
                 transferred: false,
                 task_source_storage_transferred: false,
+                inbound_payment_transferred: false,
                 unresolved: false,
                 panics: [None, None],
             }),
@@ -344,6 +346,47 @@ impl PreparationCustody {
             .map_err(PreparationStorageSplitError::Runtime)?;
         state.task_source_storage_transferred = true;
         Ok(storage)
+    }
+    pub(crate) fn take_inbound_payment(
+        &self,
+    ) -> Result<Option<crate::TaskInboundPermit>, PreparationStorageSplitError> {
+        let mut state = self.0.state.lock().expect("original inbound payment split");
+        if state.inbound_payment_transferred {
+            return Err(PreparationStorageSplitError::AlreadyTransferred);
+        }
+        if state.transferred || state.unresolved || state.exit_published {
+            return Err(PreparationStorageSplitError::Unavailable);
+        }
+        let capacity = state
+            .capacity
+            .as_mut()
+            .ok_or(PreparationStorageSplitError::Unavailable)?;
+        let resources = capacity
+            .resources()
+            .map_err(PreparationStorageSplitError::Runtime)?;
+        let records = resources.get(Dimension::InboundRecords.id());
+        let bytes = resources.get(Dimension::InboundBytes.id());
+        if records == 0 && bytes == 0 {
+            state.inbound_payment_transferred = true;
+            return Ok(None);
+        }
+        if records != 1 || bytes == 0 {
+            return Err(PreparationStorageSplitError::InvalidResources);
+        }
+        let need = ResourceVector::new([
+            (Dimension::InboundRecords.id(), records),
+            (Dimension::InboundBytes.id(), bytes),
+        ])
+        .expect("two fixed inbound dimensions");
+        let payment = capacity
+            .split_next(&need)
+            .map_err(PreparationStorageSplitError::Runtime)?;
+        state.inbound_payment_transferred = true;
+        Ok(Some(crate::TaskInboundPermit::from_original(
+            self.0.task,
+            bytes,
+            payment,
+        )))
     }
     pub(crate) fn key(&self) -> Key {
         (self.0.parent.scope.id(), self.0.parent.work)
@@ -710,6 +753,18 @@ struct Queue<J: QueuedPreparation = PreparationJob> {
     state: Mutex<QueueState<J>>,
     workers: usize,
 }
+/// Actual physical queue membership sampled under its one original mutex.
+/// A body may leave this queue before its independent preparation fee exits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparationQueueSnapshot {
+    pub queued: usize,
+    pub running: usize,
+    pub worker_limit: usize,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparationQueueSnapshotError {
+    Poisoned,
+}
 pub(crate) struct PreparationQueue<J: QueuedPreparation = PreparationJob>(Arc<Queue<J>>);
 impl<J: QueuedPreparation> Clone for PreparationQueue<J> {
     fn clone(&self) -> Self {
@@ -724,14 +779,65 @@ pub(crate) struct RunningPreparation<J: QueuedPreparation = PreparationJob> {
 }
 impl<J: QueuedPreparation> PreparationQueue<J> {
     pub(crate) fn new(contexts: usize, jobs: usize, per_context: usize, workers: usize) -> Self {
+        Self::with_queue(
+            FairWorkQueue::new(contexts, jobs, per_context),
+            contexts,
+            jobs,
+            per_context,
+            workers,
+        )
+    }
+    pub(crate) fn eligible_fifo(
+        contexts: usize,
+        jobs: usize,
+        per_context: usize,
+        workers: usize,
+    ) -> Self {
+        Self::with_queue(
+            FairWorkQueue::eligible_fifo(contexts, jobs, per_context),
+            contexts,
+            jobs,
+            per_context,
+            workers,
+        )
+    }
+    fn with_queue(
+        fair: FairWorkQueue<HostFairnessGroup, Key>,
+        contexts: usize,
+        jobs: usize,
+        per_context: usize,
+        workers: usize,
+    ) -> Self {
         assert!(contexts > 0 && jobs > 0 && per_context > 0 && workers > 0);
         Self(Arc::new(Queue {
             state: Mutex::new(QueueState {
-                fair: FairWorkQueue::new(contexts, jobs, per_context),
+                fair,
                 jobs: BTreeMap::new(),
                 running: 0,
             }),
             workers,
+        }))
+    }
+    /// Observation grants no exit or capacity. Busy owners are unavailable;
+    /// the caller must not replace this original sample with zero or a cache.
+    pub(crate) fn try_snapshot(
+        &self,
+    ) -> Result<Option<PreparationQueueSnapshot>, PreparationQueueSnapshotError> {
+        let state = match self.0.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(PreparationQueueSnapshotError::Poisoned);
+            }
+        };
+        Ok(Some(PreparationQueueSnapshot {
+            queued: state
+                .fair
+                .len()
+                .checked_sub(state.running)
+                .expect("running queue membership"),
+            running: state.running,
+            worker_limit: self.0.workers,
         }))
     }
     /// True only when neither queued jobs nor actual running bodies remain.

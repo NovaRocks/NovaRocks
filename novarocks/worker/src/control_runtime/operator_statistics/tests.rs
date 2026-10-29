@@ -193,6 +193,7 @@ fn final_info_with_snapshot(
                 intent: TerminalIntent::SuccessfulProduction {
                     completed_output: Some(TaskOutputFacts::new(true)),
                 },
+                normal_close_validated: false,
                 output_released: true,
                 final_statistics: snapshot,
             },

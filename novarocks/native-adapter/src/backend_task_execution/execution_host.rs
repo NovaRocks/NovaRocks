@@ -281,6 +281,8 @@ struct TaskRuntime {
     /// Physical ingress survives actual driver stop until the original
     /// capability owner closes its route. Taken synchronously on retirement.
     exchange_retirement: Mutex<Option<ExchangeReceiverRetirement>>,
+    // Frozen receiver-authored facts survive removal from the live registry.
+    normal_close_facts: Mutex<Option<Vec<novarocks_execution_contract::ExchangeStreamClose>>>,
     edges: Arc<ExchangeEdgeGates>,
     splits: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
     #[cfg(novarocks_dev_controls)]
@@ -409,6 +411,62 @@ impl novarocks_execution_contract::failure::FailureProjection for ReceiverCaptur
                 std::num::NonZeroU16::new(reason as u16).unwrap(),
             ),
         )
+    }
+}
+
+fn receiver_close_facts(
+    runtime: &TaskRuntime,
+    descriptor: &TaskDescriptor,
+) -> Result<Vec<novarocks_execution_contract::ExchangeStreamClose>, HostRejection> {
+    let retirement = runtime
+        .exchange_retirement
+        .lock()
+        .expect("original receiver author");
+    let mut closes = Vec::new();
+    for node in descriptor.topology().inbound() {
+        let expected = node
+            .sources()
+            .iter()
+            .map(|source| {
+                novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                    *source,
+                    descriptor.identity(),
+                    descriptor.fragment_instance_id(),
+                    node.node_id(),
+                )
+                .expect("original frozen inbound stream")
+            })
+            .collect::<Vec<_>>();
+        let author = retirement.as_ref().ok_or_else(|| {
+            internal_failure(NativePreparationContractFailure::new(
+                NativePreparationReason::ReceiverCloseFactsMissing,
+                "registered inbound input has no original receiver close observer",
+            ))
+        })?;
+        let key = novarocks_execution::runtime::fragment::io::ExchangeReceiverKey {
+            fragment_instance_id: descriptor.fragment_instance_id(),
+            node_id: node.node_id().get(),
+        };
+        closes.extend(
+            author
+                .stream_close_facts(key, &expected)
+                .map_err(host_failure)?,
+        );
+    }
+    closes.sort_unstable_by_key(|close| close.stream);
+    Ok(closes)
+}
+
+fn dispose_receiver_capture(captured: Option<NativeReceiverRetirement>) {
+    if let Some(mut captured) = captured {
+        captured.request_stop();
+        captured.close_split_queues();
+        let (source, registration) = captured.take_registration_after_ingress();
+        // The original physical retirement body owns each foreign destructor.
+        drop(source);
+        drop(registration);
+        captured.dispose_runtime_capture();
+        captured.dispose_queue_capture();
     }
 }
 
@@ -1091,6 +1149,7 @@ impl NativeTaskExecutionHost {
                 final_statistics: Mutex::new(Some(final_statistics)),
                 completion_exit: Mutex::new(Some(completion_exit)),
                 exchange_retirement: Mutex::new(exchange_retirement),
+                normal_close_facts: Mutex::new(None),
                 edges,
                 splits,
                 #[cfg(novarocks_dev_controls)]
@@ -1558,8 +1617,49 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         self.capabilities.reserve_normal_close(descriptor)
     }
 
+    fn reserve_inbound_close_capacity_with_permit(
+        &self,
+        descriptor: &TaskDescriptor,
+        permit: Option<novarocks_worker::TaskInboundPermit>,
+    ) -> Result<(), novarocks_worker::InboundCloseReservationRefusal> {
+        self.capabilities
+            .reserve_normal_close_with_permit(descriptor, permit)
+    }
+
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
         self.capabilities.remove(descriptor);
+    }
+
+    fn retire_receiver_checked(
+        &self,
+        descriptor: &TaskDescriptor,
+        retirement: novarocks_worker::TaskIngressRetirement,
+    ) -> Result<(), HostRejection> {
+        if retirement == novarocks_worker::TaskIngressRetirement::Remove {
+            let captured = self.capture_receiver_after_removal(descriptor)?;
+            dispose_receiver_capture(captured);
+            return Ok(());
+        }
+        let runtime = self.task_runtime(descriptor.identity()).ok_or_else(|| {
+            internal_failure(NativePreparationContractFailure::new(
+                NativePreparationReason::ReceiverCloseFactsMissing,
+                "checked normal retirement has no original receiver owner",
+            ))
+        })?;
+        let closes = runtime
+            .normal_close_facts
+            .lock()
+            .expect("original terminal receiver facts")
+            .take()
+            .ok_or_else(|| {
+                internal_failure(NativePreparationContractFailure::new(
+                    NativePreparationReason::ReceiverCloseFactsMissing,
+                    "checked normal retirement has no original terminal close facts",
+                ))
+            })?;
+        let captured = self.capture_receiver_after_normal_close(descriptor, closes)?;
+        dispose_receiver_capture(captured);
+        Ok(())
     }
 
     fn retire_receiver_normally(&self, descriptor: &TaskDescriptor) {
@@ -1658,6 +1758,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .expect("the original prepared Task owns one terminal observation");
         let completion_reporter = reporter.clone();
         let completion_runtime = Arc::clone(&runtime);
+        let close_descriptor = descriptor.clone();
         let mut final_statistics = runtime
             .final_statistics
             .lock()
@@ -1702,6 +1803,24 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     {
                         retirement.record_terminal(fact);
                     }
+                    let close_facts = receiver_close_facts(&completion_runtime, &close_descriptor);
+                    let close_failure = match close_facts {
+                        Ok(closes) => {
+                            let checked = novarocks_worker::TaskInboundCapabilities::validate_normal_close_facts(
+                                &close_descriptor, &closes,
+                            );
+                            match checked {
+                                Ok(()) => {
+                                    *completion_runtime.normal_close_facts.lock()
+                                        .expect("original receiver close facts") = Some(closes);
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            }
+                        }
+                        Err(error) => Some(error),
+                    };
+                    let normal_close_validated = close_failure.is_none();
                     let final_snapshot = fact.profile().map(|profile| {
                         let mut statistics = project_operator_statistics(profile).into_statistics();
                         let truncated = statistics.len()
@@ -1718,7 +1837,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         .expect("one original terminal observation")
                         .seal_for_terminal(final_snapshot);
                     completion_runtime.operator_statistics.stop_sampling();
-                    let observed = observe_compiled_terminal(
+                    let mut observed = observe_compiled_terminal(
                         &completion_reporter,
                         sink_kind,
                         root_channel.as_deref(),
@@ -1726,6 +1845,14 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         completion_worker.stand_down(),
                         final_statistics,
                     );
+                    observed.normal_close_validated = normal_close_validated;
+                    if let Some(error) = close_failure
+                        && matches!(observed.intent, novarocks_worker::TaskTerminalIntent::SuccessfulProduction { .. })
+                    {
+                        completion_reporter.failing(error.into_failure(),
+                            novarocks_execution_contract::TaskFailurePhase::Execution);
+                        observed.intent = novarocks_worker::TaskTerminalIntent::FinishExistingTermination { output: None };
+                    }
                     observation.handoff(observed).unwrap_or_else(|_retained| {
                         std::panic::panic_any(NativePreparationUnresolved)
                     });
@@ -2414,6 +2541,7 @@ fn observe_compiled_terminal(
     TaskTerminalObservation {
         intent,
         output_released: true,
+        normal_close_validated: false,
         final_statistics,
     }
 }
@@ -2819,6 +2947,7 @@ enum NativePreparationReason {
     PreparationTaskMismatch = 9622,
     ReceiverTaskInventoryPoisoned = 9623,
     ReceiverRetirementInventoryPoisoned = 9624,
+    ReceiverCloseFactsMissing = 9625,
 }
 #[derive(Debug)]
 struct NativePreparationContractFailure {

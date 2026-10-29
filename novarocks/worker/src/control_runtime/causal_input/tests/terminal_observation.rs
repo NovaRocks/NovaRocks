@@ -30,6 +30,7 @@ fn observation() -> crate::TaskTerminalObservation {
         intent: crate::TaskTerminalIntent::FinishExistingTermination {
             output: Some(TaskOutputFacts::new(true)),
         },
+        normal_close_validated: false,
         output_released: true,
         final_statistics: Some(crate::TaskTerminalStatistics {
             statistics: vec![

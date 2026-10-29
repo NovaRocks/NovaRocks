@@ -18,6 +18,9 @@
 //! The Context's actual Task I/O handoff. Unconfigured I/O never acknowledges
 //! an effect; its exact ticket remains in the caller's existing paid slot.
 
+#[path = "context_admission.rs"]
+mod context_admission;
+
 use super::{ContextHostError, ContextHostRecord};
 use crate::control_runtime::{
     actors::{WorkerAction, WorkerActor},
@@ -63,6 +66,7 @@ impl TaskDriverPorts {
 pub(crate) enum TaskDriverError {
     WrongOwner,
     MissingExecutionPort,
+    MissingExecutionHealth,
     MissingLoadingPort,
     MissingPreparationPort,
     MissingLifecyclePort,
@@ -132,8 +136,11 @@ pub(super) struct TaskDriverState {
     jobs: BTreeMap<TaskIdentity, TaskDriverHostJob>,
     physical_pending: VecDeque<TaskDriverHostJob>,
     retirements: BTreeMap<TaskIdentity, TaskRetirement>,
-    retiring_tasks: BTreeMap<TaskIdentity, Arc<crate::control_runtime::task::RetiredTaskDisposal>>,
-    disposal_cursor: Option<TaskIdentity>,
+    // Original payload disambiguates a physically retired rejected creation
+    // from a later same-identity attempt admitted after its Core release fact.
+    retiring_tasks:
+        BTreeMap<(TaskIdentity, u64), Arc<crate::control_runtime::task::RetiredTaskDisposal>>,
+    disposal_cursor: Option<(TaskIdentity, u64)>,
     publication_refusal:
         Option<std::mem::ManuallyDrop<super::super::task_publication::TaskPublicationRefusal>>,
 }
@@ -143,6 +150,8 @@ struct TaskRetirement {
     projection_committed: bool,
     finalize_execution_only: bool,
     retained_state: Option<novarocks_execution_contract::TaskState>,
+    rejected_payload: Option<novarocks_worker_protocol::creation::PayloadId>,
+    retained_payload: Option<novarocks_worker_protocol::creation::PayloadId>,
 }
 impl TaskDriverState {
     pub(super) fn is_idle(&self) -> bool {
@@ -166,17 +175,63 @@ impl TaskDriverState {
 }
 impl ContextHostRecord {
     pub(crate) fn trace_drain_inventory(&self, budget: usize) {
+        // Bound diagnostics by the same caller budget; counts describe only
+        // this prefix of the original inventory, never all queued captures.
+        let mut pending_kinds = [0usize; 6];
+        for job in self.task_driver.physical_pending.iter().take(budget) {
+            let index = match job {
+                TaskDriverHostJob::Activate { .. } => 0,
+                TaskDriverHostJob::DisposeProjection { .. } => 1,
+                TaskDriverHostJob::RetireExecution { .. } => 2,
+                TaskDriverHostJob::DisposeTask { .. } => 3,
+                TaskDriverHostJob::RollbackPreparation { .. } => 4,
+                _ => 5,
+            };
+            pending_kinds[index] += 1;
+        }
         tracing::debug!(pid = std::process::id(), context = ?self.identity,
             actor = ?self.control_runtime.snapshot(self.actor), scope = ?self.scope().snapshot(),
             tasks = self.tasks.len(), jobs = self.task_driver.jobs.len(),
             cleanup = self.task_driver.physical_pending.len(), retirements = self.task_driver.retirements.len(),
+            pending_kinds_activate_projection_retire_dispose_rollback_other = ?pending_kinds,
+            pending_kinds_complete = self.task_driver.physical_pending.len() <= budget,
             "Worker original Context inventory at process drain");
         for request in self.resources.requests.values().take(budget) {
             request.trace_drain_inventory();
         }
-        for (_, owner) in self.tasks.iter().take(budget) {
+        for (task, owner) in self.tasks.iter().take(budget) {
             match owner {
                 super::TaskHostOwner::Ready(owner) | super::TaskHostOwner::Initializing(owner) => {
+                    let task = *task;
+                    let retirement_flags =
+                        self.task_driver.retirements.get(&task).map(|original| {
+                            (
+                                original.ticket.is_some(),
+                                original.execution_job_issued,
+                                original.projection_committed,
+                                original.finalize_execution_only,
+                            )
+                        });
+                    // Observe each original lock independently. These samples
+                    // are diagnostics, not a coherent transition or exit proof.
+                    let ready = self
+                        .task_driver
+                        .ready
+                        .lock()
+                        .expect("original Task drain readiness")
+                        .contains(&task);
+                    let notice_active =
+                        self.task_driver.notices.get(&task).map(|notice| {
+                            *notice.active.lock().expect("original Task drain notice")
+                        });
+                    tracing::debug!(
+                        pid = std::process::id(),
+                        ?task,
+                        ?retirement_flags,
+                        ready,
+                        ?notice_active,
+                        "Worker original Task retirement route at process drain"
+                    );
                     owner.trace_draining_originals();
                 }
                 super::TaskHostOwner::Unpublished(_) => {}
@@ -299,6 +354,42 @@ impl ContextHostRecord {
                 .complete_host_effect(ticket)
                 .map_err(|refusal| reject(TaskDriverError::Driver(refusal.error), refusal.ticket));
         }
+        if let WorkerAction::Context(ContextEffect::DisposeLoadedInput { task, .. }) =
+            &ticket.effect
+        {
+            let task = *task;
+            if ports.lifecycle.is_none() {
+                return Err(reject(TaskDriverError::MissingLifecyclePort, ticket));
+            }
+            let Some(owner) = self.task(task) else {
+                return Err(reject(
+                    TaskDriverError::Task(ContextHostError::TaskNotOwned),
+                    ticket,
+                ));
+            };
+            let job = match owner.take_rejected_loader_input(&ticket) {
+                Ok(job) => job,
+                Err(error) => return Err(reject(TaskDriverError::Host(error), ticket)),
+            };
+            let pending = owner.pending_notice();
+            let key = (self.scope().id(), ticket.descriptor.work);
+            if let Err(error) = self.queue_task_cleanup(
+                TaskDriverHostJob::DisposeLoadedInput {
+                    key,
+                    runtime: self.control_runtime.clone(),
+                    ticket: std::mem::ManuallyDrop::new(ticket),
+                    job,
+                    pending,
+                },
+                ports,
+            ) {
+                return Err(TaskDriverRefusal {
+                    error,
+                    ticket: None,
+                });
+            }
+            return Ok(());
+        }
         if let WorkerAction::Context(ContextEffect::EnqueuePreparation {
             task,
             initial_progressions,
@@ -327,16 +418,25 @@ impl ContextHostRecord {
                     .clone(),
                 route: Mutex::new(RootWakeRoute::Task),
             });
-            let Some(owner) = self.task(task) else {
-                return Err(reject(
-                    TaskDriverError::Task(ContextHostError::TaskNotOwned),
-                    ticket,
-                ));
+            let owner = match self.tasks.get_mut(&task) {
+                Some(super::TaskHostOwner::Ready(owner)) => owner.as_mut(),
+                _ => {
+                    return Err(reject(
+                        TaskDriverError::Task(ContextHostError::TaskNotOwned),
+                        ticket,
+                    ));
+                }
             };
             let mut job = match owner.adopt_preparation(&runtime, &ticket) {
                 Ok(job) => job,
                 Err(error) => return Err(reject(TaskDriverError::Host(error), ticket)),
             };
+            if let Err(error) =
+                owner.bind_inbound_payment(&mut job, &self.resources.roles[super::LIFETIME].work)
+            {
+                owner.retain_preparation_job(job);
+                return Err(reject(TaskDriverError::Host(error), ticket));
+            }
             let roles = match owner.preparation_roles() {
                 Ok(roles) => roles,
                 Err(error) => {
@@ -477,7 +577,8 @@ impl ContextHostRecord {
                 .map_err(|refusal| reject(TaskDriverError::Driver(refusal.error), refusal.ticket));
         }
         if let WorkerAction::Context(
-            ContextEffect::RetireTask { task, .. } | ContextEffect::FinalizeTaskExecution { task },
+            ContextEffect::RetireTask { task, .. }
+            | ContextEffect::FinalizeTaskExecution { task, .. },
         ) = &ticket.effect
         {
             let task = *task;
@@ -487,6 +588,18 @@ impl ContextHostRecord {
             );
             let retained_state = match &ticket.effect {
                 WorkerAction::Context(ContextEffect::RetireTask { state, .. }) => Some(*state),
+                _ => None,
+            };
+            let retained_payload = match &ticket.effect {
+                WorkerAction::Context(ContextEffect::RetireTask { payload, .. }) => Some(*payload),
+                _ => None,
+            };
+            let rejected_payload = match &ticket.effect {
+                WorkerAction::Context(ContextEffect::RetireTask {
+                    never_accepted: true,
+                    payload,
+                    ..
+                }) => Some(*payload),
                 _ => None,
             };
             let Some(owner) = self.task(task) else {
@@ -510,6 +623,8 @@ impl ContextHostRecord {
                             projection_committed: false,
                             finalize_execution_only,
                             retained_state,
+                            rejected_payload,
+                            retained_payload,
                         }
                     )
                     .is_none(),
@@ -617,25 +732,14 @@ impl ContextHostRecord {
                 .task(task)
                 .and_then(|owner| owner.take_production_activation())
             {
-                let Some(executor) = ports.preparation.as_ref() else {
-                    self.task_driver.jobs.insert(task, job);
-                    return Err(TaskDriverRefusal {
-                        error: TaskDriverError::MissingPreparationPort,
+                // The prepared runnable owns the continuation. Activation
+                // must not queue behind another preparation body waiting for
+                // this Task's completion; it shares the paid rollback slot.
+                self.queue_task_cleanup(job, ports)
+                    .map_err(|error| TaskDriverRefusal {
+                        error,
                         ticket: None,
-                    });
-                };
-                let before = ports.capacity.as_ref().map(|capacity| capacity.revision());
-                if let Err((_, job)) = executor.try_submit(job) {
-                    assert!(self.task_driver.jobs.insert(task, job).is_none());
-                    if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
-                        capacity
-                            .register_waiter(self.registration(), before)
-                            .map_err(|error| TaskDriverRefusal {
-                                error: TaskDriverError::Capacity(error),
-                                ticket: None,
-                            })?;
-                    }
-                }
+                    })?;
             }
             return Ok(());
         }
@@ -1006,13 +1110,14 @@ impl ContextHostRecord {
             }
             self.advance_task_retirement(task, ports)?;
         }
-        self.advance_retired_task_disposals(budget);
-        progress.runnable = !self
-            .task_driver
-            .ready
-            .lock()
-            .expect("Task ready metadata")
-            .is_empty();
+        let disposal_progress = self.advance_retired_task_disposals(budget)?;
+        progress.runnable = disposal_progress
+            || !self
+                .task_driver
+                .ready
+                .lock()
+                .expect("Task ready metadata")
+                .is_empty();
         Ok(progress)
     }
     pub(crate) fn close_task_driver_admission(
@@ -1177,6 +1282,17 @@ impl crate::task_port::TaskPendingNotice for TaskDriverPending {
 /// One original queued preparation or its ordered activation capture. The
 /// physical executor owns this value until its complete body/tail returns.
 pub(crate) enum TaskDriverHostJob {
+    CloseContextAdmission(context_admission::ContextAdmissionCloseJob),
+    DisposeLoadedInput {
+        key: (
+            novarocks_control_runtime_core::identity::ScopeId,
+            novarocks_control_runtime_core::identity::WorkId,
+        ),
+        runtime: novarocks_control_runtime::driver::ActorRuntime<WorkerActor>,
+        ticket: std::mem::ManuallyDrop<EffectTicket<WorkerAction>>,
+        job: crate::control_runtime::loading::InputDisposalJob,
+        pending: Arc<dyn crate::task_port::TaskPendingNotice>,
+    },
     DisposeCreate(super::requests::create_disposal::TaskCreateDisposalJob),
     RequestObservation(crate::control_runtime::request_observation::RequestObservationJob),
     DynamicFilter(crate::control_runtime::dynamic_filters::TaskDynamicFilterHostJob),
@@ -1214,8 +1330,9 @@ pub(crate) enum TaskDriverHostJob {
     RetireExecution {
         job: crate::control_runtime::task_host_call::TaskHostCallJob,
         call: crate::control_runtime::task_host_call::TaskHostCall,
-        owner: Arc<crate::control_runtime::task::ProductionPreparation>,
+        owner: Option<Arc<crate::control_runtime::task::ProductionPreparation>>,
         host: Arc<dyn crate::TaskExecutionHost>,
+        ingress: crate::TaskIngressRetirement,
         pending: Arc<dyn crate::task_port::TaskPendingNotice>,
     },
     DisposeTask {
@@ -1292,6 +1409,7 @@ impl crate::control_runtime::preparation::QueuedPreparation for TaskDriverHostJo
         novarocks_control_runtime_core::identity::WorkId,
     ) {
         match self {
+            Self::CloseContextAdmission(job) => job.queue_key(),
             Self::RollbackPreparation { preparation, .. } => preparation.key(),
             Self::DisposeCreate(job) => job.queue_key(),
             Self::RequestObservation(job) => job.queue_key(),
@@ -1299,7 +1417,8 @@ impl crate::control_runtime::preparation::QueuedPreparation for TaskDriverHostJo
             Self::RetireExecution { job, .. } => {
                 crate::control_runtime::preparation::QueuedPreparation::queue_key(job)
             }
-            Self::DisposeTask { key, .. }
+            Self::DisposeLoadedInput { key, .. }
+            | Self::DisposeTask { key, .. }
             | Self::DisposeSource { key, .. }
             | Self::SealRetainedRoot { key, .. } => *key,
             Self::ReplyNotification(job) => job.queue_key(),
@@ -1322,12 +1441,33 @@ impl crate::control_runtime::preparation::QueuedPreparation for TaskDriverHostJo
 impl TaskDriverHostJob {
     pub(crate) fn run_on_host(self) {
         match self {
+            Self::CloseContextAdmission(job) => job.run(),
             Self::RollbackPreparation {
                 preparation,
                 owner,
                 host,
                 pending,
             } => owner.rollback_on_host(&preparation, host.as_ref(), pending.as_ref()),
+            Self::DisposeLoadedInput {
+                runtime,
+                ticket,
+                job,
+                pending,
+                ..
+            } => {
+                if !job.run() {
+                    // The original child retains its panic/Unknown exit. Do
+                    // not complete this effect or retry a foreign destructor.
+                    std::mem::forget((runtime, ticket, pending));
+                    return;
+                }
+                let ticket = std::mem::ManuallyDrop::into_inner(ticket);
+                if let Err(refusal) = runtime.effect_completed(ticket) {
+                    std::mem::forget((refusal, pending));
+                    std::process::abort();
+                }
+                pending.pending();
+            }
             Self::DisposeCreate(job) => job.run(),
             Self::RequestObservation(job) => job.run(),
             Self::DynamicFilter(job) => job.run(),
@@ -1369,13 +1509,11 @@ impl TaskDriverHostJob {
                 call,
                 owner,
                 host,
+                ingress,
                 pending,
             } => {
-                job.run();
-                if call.actual_call_exited() {
-                    owner.retire_execution_on_host(host.as_ref());
-                }
-                drop((host, call, owner));
+                job.run_retirement(owner, host, ingress);
+                drop(call);
                 pending.pending();
             }
             Self::DisposeTask { owner, notice, .. } => {
@@ -1483,10 +1621,12 @@ impl ContextHostRecord {
         job: TaskDriverHostJob,
         ports: &TaskDriverPorts,
     ) -> Result<(), TaskDriverError> {
-        let executor = ports
-            .lifecycle
-            .as_ref()
-            .ok_or(TaskDriverError::MissingLifecyclePort)?;
+        let Some(executor) = ports.lifecycle.as_ref() else {
+            // The same original physical job remains owned even when startup
+            // supplied no lifecycle executor; refusal cannot drop its captures.
+            self.task_driver.physical_pending.push_back(job);
+            return Err(TaskDriverError::MissingLifecyclePort);
+        };
         let before = ports.capacity.as_ref().map(|capacity| capacity.revision());
         if let Err((_, job)) = executor.try_submit(job) {
             self.task_driver.physical_pending.push_back(job);
@@ -1532,6 +1672,20 @@ impl ContextHostRecord {
                     .expect("same retirement")
                     .execution_job_issued = true;
                 self.queue_task_cleanup(job, ports)?;
+            } else if owner.production_retired() {
+                // An actually rejected pre-preparation Task has no foreign
+                // execution owner. Both original unused host calls have now
+                // really retired; continue its normal publication/Source tail.
+                self.task_driver
+                    .retirements
+                    .get_mut(&task)
+                    .expect("same original rejection retirement")
+                    .execution_job_issued = true;
+                self.task_driver
+                    .ready
+                    .lock()
+                    .expect("same original Task ready")
+                    .insert(task);
             }
             return Ok(());
         }
@@ -1639,6 +1793,7 @@ impl ContextHostRecord {
                 ports.protocol_events.clone(),
                 task,
                 state,
+                self.task_driver.retirements[&task].rejected_payload,
             ),
         );
         let key = disposal.key();
@@ -1647,11 +1802,14 @@ impl ContextHostRecord {
             .lock()
             .expect("removed original Task ready address")
             .remove(&task);
+        let original_payload = self.task_driver.retirements[&task]
+            .retained_payload
+            .expect("original Core Task retirement payload");
         self.task_driver.retirements.remove(&task);
         assert!(
             self.task_driver
                 .retiring_tasks
-                .insert(task, disposal.clone())
+                .insert((task, original_payload.0), disposal.clone())
                 .is_none()
         );
         self.notify_deferred_root_source_progress(task);
@@ -1669,8 +1827,10 @@ impl ContextHostRecord {
             ports,
         )
     }
-    fn advance_retired_task_disposals(&mut self, budget: usize) {
+    fn advance_retired_task_disposals(&mut self, budget: usize) -> Result<bool, TaskDriverError> {
+        use novarocks_control_runtime_core::completion::Consumption;
         use std::ops::Bound::{Excluded, Unbounded};
+        let mut progress = false;
         for _ in 0..budget {
             let next = self
                 .task_driver
@@ -1682,14 +1842,68 @@ impl ContextHostRecord {
                 .next()
                 .or_else(|| self.task_driver.retiring_tasks.first_key_value())
                 .map(|(task, _)| *task);
-            let Some(task) = next else {
+            let Some(key) = next else {
                 break;
             };
-            self.task_driver.disposal_cursor = Some(task);
-            if self.task_driver.retiring_tasks[&task].complete() {
-                self.task_driver.retiring_tasks.remove(&task);
+            self.task_driver.disposal_cursor = Some(key);
+            let task = key.0;
+            let owner = self.task_driver.retiring_tasks[&key].clone();
+            if !owner.complete() {
+                // One actual ready header is one bounded progress unit. Do not
+                // equate payload Drop or ledger absence with its original exit.
+                progress |= self
+                    .ledger
+                    .reap_scope_ready(self.scope().id(), 1)
+                    .map_err(|error| TaskDriverError::Host(TaskHostError::Runtime(error)))?
+                    != 0;
+                if !owner.complete() {
+                    continue;
+                }
             }
+            if let Some(payload) = owner.rejected_payload()
+                && !(owner.retirement_input().is_none()
+                    && self.resources.internal.failed_publications_drained())
+            {
+                if let Some(input) = owner.retirement_input() {
+                    match self
+                        .resources
+                        .internal
+                        .finish_rejected_creation(input)
+                        .map_err(TaskDriverError::Driver)?
+                    {
+                        Consumption::Pending => continue,
+                        Consumption::Consumed | Consumption::AbandonedByOwnerFailure => {}
+                    }
+                } else {
+                    if let Some(input) = self
+                        .resources
+                        .internal
+                        .try_submit_rejected_creation(task, payload)
+                        .map_err(TaskDriverError::Driver)?
+                    {
+                        owner.bind_retirement_input(input);
+                        // The original disposal is complete. Remove only this
+                        // rejected owner's sealed read row before a later new
+                        // LoadInput can run under the same Context cell lock.
+                        self.retired_task_reads
+                            .remove(&task)
+                            .ok_or(TaskDriverError::Publication)?;
+                        progress = true;
+                    }
+                    continue;
+                }
+            }
+            self.task_driver.retiring_tasks.remove(&key);
+            progress = true;
+            // ReleaseHost may have parked earlier in this same turn. Notify
+            // only this positive inventory transition, never an I/O wait.
+            self.resources
+                .notice
+                .as_ref()
+                .expect("original Context disposal notice")
+                .notify();
         }
+        Ok(progress)
     }
 }
 
@@ -1725,8 +1939,10 @@ impl ContextHostRecord {
             self.task_driver.physical_pending.len(),
             self.task_driver
                 .retiring_tasks
-                .get(&task)
-                .map(|owner| owner.complete()),
+                .iter()
+                .filter(|((identity, _), _)| *identity == task)
+                .map(|(_, owner)| owner.complete())
+                .collect::<Vec<_>>(),
             self.task_driver
                 .sources
                 .values()

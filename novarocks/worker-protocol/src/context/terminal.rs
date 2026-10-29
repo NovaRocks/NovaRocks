@@ -41,6 +41,9 @@ pub struct TerminalStatistics {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalObservation {
     pub intent: TerminalIntent,
+    /// The actual receiver author validated every frozen stream's close rule.
+    /// Task terminal/Installed or a withdrawn MustDrain stream is not proof.
+    pub normal_close_validated: bool,
     /// Positive output-responsibility exit, independent of physical runtime exit.
     pub output_released: bool,
     pub final_statistics: Option<TerminalStatistics>,
@@ -93,6 +96,7 @@ impl ContextCore {
         }
         record.statistics_sealed = true;
         record.terminal_observation_received = true;
+        record.normal_close_validated = observation.normal_close_validated;
         if let Some(facts) = output {
             record.output = facts;
         }

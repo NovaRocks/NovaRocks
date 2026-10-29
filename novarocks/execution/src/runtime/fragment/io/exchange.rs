@@ -167,6 +167,31 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
             )
     }
 
+    fn register_with_close_observer(
+        &self,
+        registration: super::ExchangeReceiverRegistration,
+    ) -> Result<
+        crate::runtime::exchange::ExchangeReceiverCloseObserver,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
+        self.registry
+            .try_register_expected_chunk_schema_with_close_observer(
+                Self::key(registration.key),
+                registration.expected_senders,
+                registration.expected_chunk_schema,
+                registration.column_binding,
+                registration.creation_factory,
+            )
+    }
+    fn close_observer(
+        &self,
+        key: super::ExchangeReceiverKey,
+    ) -> Result<
+        crate::runtime::exchange::ExchangeReceiverCloseObserver,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
+        self.registry.close_observer(Self::key(key))
+    }
     fn push(
         &self,
         key: super::ExchangeReceiverKey,

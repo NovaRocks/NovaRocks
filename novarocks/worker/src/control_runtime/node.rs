@@ -160,6 +160,7 @@ pub(crate) struct WorkerNodeHost {
     runtime: ActorRuntime<WorkerActor>,
     root_registration: ActorRegistration,
     root: RootHostCell,
+    metrics_ledger: novarocks_control_runtime::transaction::RuntimeLedger,
     root_ready_scan: AtomicUsize,
     draining: AtomicBool,
     directory: ContextDirectory,
@@ -528,6 +529,7 @@ impl WorkerNodeHost {
             root_registration: root.registration().clone(),
             directory: root.service().directory(),
             requests: root.request_ready().clone(),
+            metrics_ledger: root.ledger().clone(),
             root: RootHostCell::new(root),
             root_ready_scan: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
@@ -776,7 +778,10 @@ impl WorkerNodeHost {
             protocol_generation,
             max_cuts: self.config.policy.max_task_cuts,
             pending: Arc::new(NodeTaskNotice(host.ready_notice().clone())),
-            health: self.tasks.protocol_events.as_ref()
+            health: self
+                .tasks
+                .protocol_events
+                .as_ref()
                 .expect("original role execution ports were validated at Node startup")
                 .execution_health(),
             #[cfg(test)]
@@ -1426,10 +1431,25 @@ impl WorkerNodeHost {
             }
         }
     }
+    pub(crate) fn try_preparation_snapshot(
+        &self,
+    ) -> Result<
+        Option<super::node_metrics::WorkerPreparationSnapshot>,
+        super::node_metrics::WorkerPreparationObservationError,
+    > {
+        let original =
+            self.tasks.preparation.as_ref().ok_or(
+                super::node_metrics::WorkerPreparationObservationError::MissingPhysicalOwner,
+            )?;
+        super::node_metrics::WorkerPreparationSnapshot::sample(
+            &self.metrics_ledger,
+            original,
+            self.config.core.max_preparing,
+        )
+    }
     pub(crate) fn metrics_snapshot(&self) -> super::node_metrics::WorkerNodeMetricsSnapshot {
-        // Release the Root metadata guard before sampling the actual ledger;
-        // no Context lock, owner enumeration or foreign callback is involved.
-        let ledger = { self.root.lock().ledger().clone() };
-        super::node_metrics::WorkerNodeMetricsSnapshot::sample(&ledger)
+        // This is the same ledger retained at original composition, without
+        // a Root/Context inventory lock, enumeration or foreign callback.
+        super::node_metrics::WorkerNodeMetricsSnapshot::sample(&self.metrics_ledger)
     }
 }

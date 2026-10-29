@@ -30,12 +30,14 @@ pub struct NormalClosedInboundRecord {
     pub closes: Box<[ExchangeStreamClose]>,
 }
 
-pub fn record_bytes(descriptor: &TaskDescriptor) -> Option<usize> {
+pub fn record_bytes(descriptor: &TaskDescriptor, retained_owner_bytes: usize) -> Option<usize> {
     if descriptor.topology().inbound().is_empty() {
         return Some(0);
     }
     descriptor.topology().inbound().iter().try_fold(
-        size_of::<NormalClosedInboundRecord>() + 128,
+        size_of::<NormalClosedInboundRecord>()
+            .checked_add(128)?
+            .checked_add(retained_owner_bytes)?,
         |bytes, node| {
             bytes
                 .checked_add(size_of::<ExchangeInbound>() + 64)?

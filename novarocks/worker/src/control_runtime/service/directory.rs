@@ -168,7 +168,10 @@ impl ContextDirectory {
             "only the same physically removed Context can leave its directory"
         );
         state.contexts.remove(&context);
-        assert_eq!(state.executions.remove(&context.query_execution_id()), Some(context));
+        assert_eq!(
+            state.executions.remove(&context.query_execution_id()),
+            Some(context)
+        );
         assert_eq!(
             state.actors.remove(&address.0.registration.actor()),
             Some(context)

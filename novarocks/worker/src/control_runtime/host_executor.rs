@@ -226,6 +226,14 @@ impl<J: QueuedPreparation> Clone for HostExecutorHandle<J> {
     }
 }
 impl<J: QueuedPreparation> HostExecutorHandle<J> {
+    pub(crate) fn try_preparation_snapshot(
+        &self,
+    ) -> Result<
+        Option<super::preparation::PreparationQueueSnapshot>,
+        super::preparation::PreparationQueueSnapshotError,
+    > {
+        self.shared.queue.try_snapshot()
+    }
     pub(crate) fn try_submit(&self, job: J) -> Result<(), (HostSubmitError, J)> {
         // The original trait method is foreign code. Only our fixed metadata
         // implementation of HostJob::queue_key runs behind the submit gate.
@@ -296,7 +304,7 @@ where
         limits: HostExecutorLimits,
         runner: F,
     ) -> Result<Self, (std::io::Error, Self)> {
-        Self::start_inner(limits, runner, None)
+        Self::start_inner(limits, runner, None, false)
     }
     /// The original driver retries retained jobs after real physical capacity
     /// or shutdown state changes. Its standard I/O waker runs without any
@@ -306,21 +314,40 @@ where
         runner: F,
         waker: Waker,
     ) -> Result<Self, (std::io::Error, Self)> {
-        Self::start_inner(limits, runner, Some(waker))
+        Self::start_inner(limits, runner, Some(waker), false)
+    }
+    /// Task preparation preserves the original enqueue order among currently
+    /// eligible Context heads. Other host pools retain group round-robin.
+    pub(crate) fn start_eligible_fifo_with_waker(
+        limits: HostExecutorLimits,
+        runner: F,
+        waker: Waker,
+    ) -> Result<Self, (std::io::Error, Self)> {
+        Self::start_inner(limits, runner, Some(waker), true)
     }
     fn start_inner(
         limits: HostExecutorLimits,
         runner: F,
         waker: Option<Waker>,
+        eligible_fifo: bool,
     ) -> Result<Self, (std::io::Error, Self)> {
         let count = limits.workers.get();
         let shared = Arc::new(Shared {
-            queue: PreparationQueue::new(
-                limits.contexts.get(),
-                limits.jobs.get(),
-                limits.per_context.get(),
-                count,
-            ),
+            queue: if eligible_fifo {
+                PreparationQueue::eligible_fifo(
+                    limits.contexts.get(),
+                    limits.jobs.get(),
+                    limits.per_context.get(),
+                    count,
+                )
+            } else {
+                PreparationQueue::new(
+                    limits.contexts.get(),
+                    limits.jobs.get(),
+                    limits.per_context.get(),
+                    count,
+                )
+            },
             gate: Mutex::new(Gate {
                 accepting: true,
                 workers: (0..count)

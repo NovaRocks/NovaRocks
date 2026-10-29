@@ -379,6 +379,8 @@ pub(crate) struct TaskPreparationJob {
     job: Option<PreparationJob>,
     request: Option<Arc<novarocks_execution_contract::CreateTask>>,
     host: Option<HostPreparationBinding>,
+    inbound: Option<crate::TaskInboundPermit>,
+    inbound_bound: bool,
 }
 struct HostPreparationBinding {
     port: Arc<TaskRuntimePort>,
@@ -1301,6 +1303,34 @@ impl TaskHostRecord {
         }
         self.observe_loading_exit_report()
     }
+    /// Only the original Core's measured rejection can release this loader
+    /// input. A caller timeout, terminal snapshot or missing preparation is
+    /// not permission to destroy an input still waiting for an Accepted handoff.
+    pub(crate) fn take_rejected_loader_input(
+        &self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<super::loading::InputDisposalJob, TaskHostError> {
+        if ticket.actor != self.actor
+            || !matches!(&ticket.effect,
+                WorkerAction::Context(ContextEffect::DisposeLoadedInput { task, payload })
+                if *task == self.task && *payload == self.payload)
+            || self.resources.preparation.is_some()
+            || self.resources.pending_preparation_adoption.is_some()
+            || self.resources.production.is_some()
+        {
+            return Err(TaskHostError::WrongEffect);
+        }
+        self.resources
+            .causal
+            .runtime()
+            .validate_effect_ticket(ticket)
+            .map_err(TaskHostError::Driver)?;
+        self.resources
+            .loader
+            .as_ref()
+            .and_then(LoaderCustody::take_input_disposal)
+            .ok_or(TaskHostError::InputNotReady)
+    }
     pub(crate) fn loader(&self) -> Option<&LoaderCustody> {
         self.resources.loader.as_ref()
     }
@@ -1355,6 +1385,8 @@ impl TaskHostRecord {
             job: Some(job),
             request: Some(request),
             host: None,
+            inbound: None,
+            inbound_bound: false,
         };
         loader.input_transferred();
         #[cfg(test)]
@@ -1371,6 +1403,32 @@ impl TaskHostRecord {
             }
         }
         Ok(job)
+    }
+    pub(crate) fn bind_inbound_payment(
+        &self,
+        job: &mut TaskPreparationJob,
+        context_lifetime: &novarocks_control_runtime::lease::WorkLease,
+    ) -> Result<(), TaskHostError> {
+        if job.inbound_bound {
+            return Err(TaskHostError::DuplicatePreparation);
+        }
+        let owner = self
+            .resources
+            .preparation
+            .as_ref()
+            .ok_or(TaskHostError::InputNotReady)?;
+        job.inbound = owner
+            .take_inbound_payment()
+            .map_err(TaskHostError::SourceStorage)?;
+        job.inbound_bound = true;
+        if let Some(permit) = &mut job.inbound {
+            permit
+                .transfer_to(context_lifetime)
+                .map_err(|error| match error {
+                    crate::TaskInboundPermitError::Runtime(error) => TaskHostError::Runtime(error),
+                })?;
+        }
+        Ok(())
     }
     pub(crate) fn preparation(&self) -> Option<&PreparationCustody> {
         self.resources.preparation.as_ref()
@@ -1906,15 +1964,29 @@ struct ProductionPreparedState {
     activated: bool,
     activation_queued: bool,
     retired: bool,
-    retirement_panic: Option<std::mem::ManuallyDrop<Box<dyn std::any::Any + Send>>>,
+    retirement_started: bool,
+    inbound: Option<crate::TaskInboundPermit>,
+    // One fixed cold-failure position: typed refusal OR panic, never both.
+    retirement_failure: Option<ExecutionRetirementFailure>,
     terminal_return: Option<Arc<crate::task_lifecycle::PreparationTerminalReturn>>,
     rollback_job_active: bool,
     rollback_finished: bool,
+}
+enum ExecutionRetirementFailure {
+    Rejected(std::mem::ManuallyDrop<Box<crate::HostRejection>>),
+    Panicked(std::mem::ManuallyDrop<Box<dyn std::any::Any + Send>>),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutionRetirementOutcome {
+    Completed,
+    Rejected,
+    Unresolved,
 }
 #[derive(Default)]
 pub(crate) struct ProductionPreparation {
     root_wake: Option<Arc<super::context_host::task_driver::TaskRootWake>>,
     root_binding: Option<(TaskIdentity, QueryContextRef, ScopeHandle)>,
+    health: Option<Arc<ExecutionHealth>>,
     state: std::sync::Mutex<ProductionPreparedState>,
 }
 impl ProductionPreparation {
@@ -1972,6 +2044,18 @@ impl TaskHostRecord {
             preparation_body = self.resources.preparation.as_ref().map(|p| p.body_and_captures_exited()),
             preparation_report = self.resources.preparation.as_ref().map(|p| p.exit_report_retired()),
             remainder = self.resources.preparation_remainder.is_some(), ?production, ?inputs, ?cuts, ?calls,
+            normal_source_detached = ?self.normal_source_detached,
+            normal_lifetime_ended = self.normal_lifetime_ended,
+            lifetime = ?self.resources.lifetime.id(),
+            lifetime_actual_exit = ?self.resources.lifetime.actual_exit_ready(),
+            completion_core_observed = self.completion_core_observed,
+            completion_retired = ?self.resources.completion.as_ref().map(|roles| roles.is_retired()),
+            completion_action_retired = ?self.resources.completion_action.as_ref()
+                .map(|action| action.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Retired),
+            statistics_retired = ?self.resources.statistics.as_ref().map(|source| source.is_retired()),
+            dynamic_filters_retired = ?self.resources.dynamic_filters.as_ref().map(|source| source.is_retired()),
+            open_summary_closed = ?self.resources.open_summary.as_ref().map(|source| source.is_closed()),
+            open_summary_drained = self.resources.port.ingress().open_summary_drained(),
             "Worker original Task inventory at process drain");
         self.resources.causal.trace_drain_inventory(8);
     }
@@ -2056,6 +2140,7 @@ impl ProductionPreparation {
                                 intent: crate::TaskTerminalIntent::FinishExistingTermination {
                                     output: None,
                                 },
+                                normal_close_validated: false,
                                 // Root work requires the original whole child
                                 // registration before creation. A sealed, fully
                                 // exited scope that never registered a child
@@ -2106,6 +2191,7 @@ impl TaskHostRecord {
         let owner = Arc::new(ProductionPreparation {
             root_wake: Some(root_wake),
             root_binding: Some((self.task, self.context, self.scope.clone())),
+            health: Some(self.health.clone()),
             ..ProductionPreparation::default()
         });
         self.resources.production = Some(owner.clone());
@@ -2164,6 +2250,18 @@ impl TaskPreparationJob {
         installed: InputAuthor,
         owner: Arc<ProductionPreparation>,
     ) -> PreparationOutcome<()> {
+        assert!(
+            self.inbound_bound,
+            "physical preparation requires its original inbound payment decision"
+        );
+        {
+            let mut state = owner
+                .state
+                .lock()
+                .expect("original preparation inbound payment");
+            assert!(state.inbound.is_none(), "one original inbound payment");
+            state.inbound = self.inbound.take();
+        }
         let diagnostic_task = self
             .request
             .as_ref()
@@ -2241,6 +2339,22 @@ impl TaskPreparationJob {
                         novarocks_execution_contract::TaskFailureCategory::Protocol,
                         conflict,
                     ));
+                }
+                let permit = owner
+                    .state
+                    .lock()
+                    .expect("original inbound reservation handoff")
+                    .inbound
+                    .take();
+                if let Err(refusal) =
+                    host.reserve_inbound_close_capacity_with_permit(request.descriptor(), permit)
+                {
+                    owner
+                        .state
+                        .lock()
+                        .expect("original refused inbound payment")
+                        .inbound = refusal.permit;
+                    return Err(refusal.rejection);
                 }
                 owner
                     .state

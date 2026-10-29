@@ -34,6 +34,18 @@ impl TaskHostRecord {
         ledger: &RuntimeLedger,
     ) -> Result<Option<super::super::context_host::task_driver::TaskDriverHostJob>, TaskHostError>
     {
+        if ticket.actor != self.actor
+            || !matches!(&ticket.effect,
+                WorkerAction::Context(ContextEffect::RetireTask { task, .. }
+                    | ContextEffect::FinalizeTaskExecution { task, .. }) if *task == self.task)
+        {
+            return Err(TaskHostError::WrongEffect);
+        }
+        self.resources
+            .causal
+            .runtime()
+            .validate_effect_ticket(ticket)
+            .map_err(TaskHostError::Driver)?;
         // RetireTask is the original Core's positive final authority: a
         // healthy Task may never have needed Stop. Revoke only that original
         // unexposed capability; a queued/started capture still owes real exit.
@@ -53,8 +65,25 @@ impl TaskHostRecord {
         {
             return Ok(None);
         }
-        let Some(owner) = self.resources.production.as_ref() else {
-            return Ok(None);
+        let owner = match &self.resources.production {
+            Some(owner) => Some(owner.clone()),
+            None => {
+                // This actual Core retirement and the original never-created
+                // preparation inventory prove that no Native execution port
+                // was exposed. The existing RetireBorrowing role must still
+                // run its real port-close/observer notifications on a host.
+                if !matches!(
+                    &ticket.effect,
+                    WorkerAction::Context(ContextEffect::RetireTask { .. })
+                ) || self.resources.preparation.is_some()
+                    || self.resources.pending_preparation_adoption.is_some()
+                    || self.resources.completion.is_some()
+                    || self.resources.completion_action.is_some()
+                {
+                    return Err(TaskHostError::WrongEffect);
+                }
+                None
+            }
         };
         let exited = TaskExecutionBorrowersExited { owner: self };
         let call = self.host_call(TaskHostCallKind::RetireBorrowing).clone();
@@ -65,17 +94,39 @@ impl TaskHostRecord {
             super::super::context_host::task_driver::TaskDriverHostJob::RetireExecution {
                 job,
                 call,
-                owner: owner.clone(),
+                owner,
                 host,
+                ingress: match &ticket.effect {
+                    WorkerAction::Context(ContextEffect::FinalizeTaskExecution {
+                        normally_stopped: true,
+                        ..
+                    }) => crate::TaskIngressRetirement::PreserveNormalClose,
+                    _ => crate::TaskIngressRetirement::Remove,
+                },
                 pending: self.pending.clone(),
             },
         ))
     }
     pub(crate) fn production_retired(&self) -> bool {
-        self.resources
-            .production
-            .as_ref()
-            .is_some_and(|owner| owner.is_retired())
+        match &self.resources.production {
+            Some(owner) => {
+                owner.is_retired()
+                    && self
+                        .host_call(TaskHostCallKind::RetireBorrowing)
+                        .actual_call_exited()
+            }
+            None => {
+                self.resources.preparation.is_none()
+                    && self.resources.pending_preparation_adoption.is_none()
+                    && self.resources.completion.is_none()
+                    && self.resources.completion_action.is_none()
+                    && self
+                        .resources
+                        .host_calls
+                        .iter()
+                        .all(|call| call.is_retired())
+            }
+        }
     }
     /// Consume each actual report at most once. The CompletionExited author's
     /// saved real Core receipt authorizes the fixed completion reports; an
@@ -289,21 +340,56 @@ impl TaskHostRecord {
 impl ProductionPreparation {
     /// The original Task lifetime retains this whole custody until this real
     /// host call and the last captured runnable/refusal destructor return.
-    pub(crate) fn retire_execution_on_host(&self, host: &dyn crate::TaskExecutionHost) -> bool {
+    pub(crate) fn retire_execution_on_host(
+        &self,
+        host: &dyn crate::TaskExecutionHost,
+        ingress: crate::TaskIngressRetirement,
+    ) -> ExecutionRetirementOutcome {
         let descriptor = {
-            let state = self.state.lock().expect("original execution retirement");
+            let mut state = self.state.lock().expect("original execution retirement");
             if state.retired {
-                return true;
+                return ExecutionRetirementOutcome::Completed;
             }
-            if state.retirement_panic.is_some() {
-                return false;
+            if state.retirement_started {
+                return match &state.retirement_failure {
+                    Some(ExecutionRetirementFailure::Rejected(original)) => {
+                        let _original_source = std::ptr::from_ref(&**original);
+                        ExecutionRetirementOutcome::Rejected
+                    }
+                    Some(ExecutionRetirementFailure::Panicked(original)) => {
+                        let _original_panic = std::ptr::from_ref(&**original);
+                        ExecutionRetirementOutcome::Unresolved
+                    }
+                    None => ExecutionRetirementOutcome::Unresolved,
+                };
             }
+            state.retirement_started = true;
             state.descriptor.clone()
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(descriptor) = &descriptor {
-                host.remove_inbound_capability(descriptor);
-                host.remove_receiver(descriptor);
+                host.retire_receiver_checked(descriptor, ingress)?;
+            }
+            // A failed/never-run reservation still owns its original permit
+            // here. Checked Remove completed before this refund; a bank-owned
+            // normal-close permit is absent and remains with that actual row.
+            let payment = self
+                .state
+                .lock()
+                .expect("original unattached inbound payment")
+                .inbound
+                .take();
+            if let Some(payment) = payment {
+                if let Err((error, payment)) = payment.release() {
+                    self.state
+                        .lock()
+                        .expect("failed original inbound refund")
+                        .inbound = Some(payment);
+                    return Err(crate::HostRejection::from_domain(
+                        novarocks_execution_contract::TaskFailureCategory::Internal,
+                        error,
+                    ));
+                }
             }
             let (runnable, refusal, descriptor) = {
                 let mut state = self
@@ -324,27 +410,59 @@ impl ProductionPreparation {
             }
             drop(runnable.map(ManuallyDrop::into_inner));
             drop(descriptor);
+            Ok::<(), crate::HostRejection>(())
         }));
         let mut state = self
             .state
             .lock()
             .expect("actual execution retirement result");
-        match result {
-            Ok(()) => {
+        let (outcome, fact) = match result {
+            Ok(Ok(())) => {
                 state.retired = true;
-                true
+                return ExecutionRetirementOutcome::Completed;
+            }
+            Ok(Err(rejection)) => {
+                let fact = novarocks_execution_contract::failure::FailureProjection::failure_fact(
+                    &rejection,
+                );
+                state.retirement_failure = Some(ExecutionRetirementFailure::Rejected(
+                    ManuallyDrop::new(Box::new(rejection)),
+                ));
+                (ExecutionRetirementOutcome::Rejected, fact)
             }
             Err(payload) => {
-                state.retirement_panic = Some(ManuallyDrop::new(payload));
-                false
+                state.retirement_failure = Some(ExecutionRetirementFailure::Panicked(
+                    ManuallyDrop::new(payload),
+                ));
+                (
+                    ExecutionRetirementOutcome::Unresolved,
+                    novarocks_execution_contract::failure::FailureFact::new(
+                        novarocks_execution_contract::failure::FailureClass::Invariant,
+                        crate::failure_reason::WorkerFailureReason::CompletionWorkUnresolved
+                            .reason(),
+                    ),
+                )
             }
+        };
+        drop(state);
+        if let (Some(health), Some((task, _, _))) = (&self.health, &self.root_binding) {
+            health.report_unresolved(
+                novarocks_execution::runtime::execution_health::ExecutionExitOrigin::Task {
+                    identity: *task,
+                    phase: novarocks_execution_contract::TaskFailurePhase::Execution,
+                },
+                fact,
+            );
         }
+        outcome
     }
 }
 /// The actual removed Task owner remains in the Context's finite Task slot
 /// until its physical payload destruction and original payment release finish.
 /// Unexpected foreign Drop retains the same payment and panic inventory.
 pub(crate) struct RetiredTaskDisposal {
+    retirement: novarocks_control_runtime::lease::WorkRetirementObserver,
+    rejected_payload: Option<PayloadId>,
     state: std::sync::Mutex<RetiredTaskDisposalState>,
 }
 struct RetiredTaskDisposalState {
@@ -367,6 +485,7 @@ struct RetiredTaskDisposalState {
     )>,
     panic: Option<ManuallyDrop<Box<dyn std::any::Any + Send>>>,
     complete: bool,
+    retirement_input: Option<novarocks_control_runtime_core::identity::InputId>,
 }
 impl RetiredTaskDisposal {
     pub(crate) fn from_original(
@@ -374,11 +493,13 @@ impl RetiredTaskDisposal {
         ports: Option<crate::TaskExecutionPorts>,
         task: TaskIdentity,
         retained_state: novarocks_execution_contract::TaskState,
+        rejected_payload: Option<PayloadId>,
     ) -> Self {
         assert!(
             resources.seal_read_observation().is_ok(),
             "original Task inventory is still live"
         );
+        let retirement = resources.lifetime.retirement_observer();
         let TaskHostResources {
             active,
             preparation_remainder,
@@ -403,6 +524,8 @@ impl RetiredTaskDisposal {
             production,
         } = resources;
         Self {
+            retirement,
+            rejected_payload,
             state: std::sync::Mutex::new(RetiredTaskDisposalState {
                 observation: ports
                     .map(|ports| Box::new(ManuallyDrop::new((ports, task, retained_state)))),
@@ -434,6 +557,7 @@ impl RetiredTaskDisposal {
                 )),
                 panic: None,
                 complete: false,
+                retirement_input: None,
             }),
         }
     }
@@ -451,7 +575,28 @@ impl RetiredTaskDisposal {
         (lifetime.scope().id(), lifetime.id())
     }
     pub(crate) fn complete(&self) -> bool {
-        self.state.lock().expect("actual Task disposal").complete
+        self.state.lock().expect("actual Task disposal").complete && self.retirement.is_retired()
+    }
+    pub(crate) fn rejected_payload(&self) -> Option<PayloadId> {
+        self.rejected_payload
+    }
+    pub(crate) fn retirement_input(
+        &self,
+    ) -> Option<novarocks_control_runtime_core::identity::InputId> {
+        self.state
+            .lock()
+            .expect("original disposal receipt")
+            .retirement_input
+    }
+    pub(crate) fn bind_retirement_input(
+        &self,
+        input: novarocks_control_runtime_core::identity::InputId,
+    ) {
+        let mut state = self.state.lock().expect("original disposal receipt");
+        assert!(
+            state.retirement_input.replace(input).is_none(),
+            "one original disposal receipt"
+        );
     }
     pub(crate) fn run_on_host(&self) -> Result<(), RuntimeError> {
         let (payload, observation) = {
@@ -503,10 +648,15 @@ impl RetiredTaskDisposal {
                 capacity.release(&capacity.resources()?)?;
             }
             active.release(&active.resources()?)?;
-            state.complete = true;
             state.payment.take()
         };
         drop(payment);
+        // No observer may release an identity before the original payment and
+        // all of this physical invocation's payload captures actually dropped.
+        self.state
+            .lock()
+            .expect("actual Task disposal completion")
+            .complete = true;
         Ok(())
     }
 }
@@ -537,7 +687,7 @@ impl TaskHostRecord {
                 state.activated,
                 state.runnable.is_some(),
                 state.refusal.is_some(),
-                state.retirement_panic.is_some(),
+                state.retirement_failure.is_some(),
                 state.root.is_some(),
                 state.root_ownership_reported,
                 state.root_handoff.is_some(),

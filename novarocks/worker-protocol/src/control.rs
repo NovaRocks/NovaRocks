@@ -136,6 +136,10 @@ struct DirectoryRecord {
     // obligation in this same paid row until its last operation moves to R.
     removal_pending: bool,
     removal_requested: bool,
+    // The first actual retained transition fixes the horizon. A late or repeated
+    // host observation never extends it; unknown is not evidence of no record.
+    first_retained_at: Option<MonotonicInstant>,
+    normal_close: Option<bool>,
 }
 #[derive(Debug)]
 pub enum ControlInput {
@@ -187,6 +191,8 @@ pub enum ControlInput {
     },
     Retained {
         context: QueryContextRef,
+        /// Observed on the original physical Release call after Task retirement.
+        normal_close: bool,
     },
     HostRemoved {
         context: QueryContextRef,
@@ -387,6 +393,10 @@ pub struct ControlCore {
     admission: AdmissionCore,
     directory: BTreeMap<QueryContextRef, DirectoryRecord>,
     owners: BTreeMap<QueryExecutionId, FrontendProcessId>,
+    // Paid directory geometry: at most C retained record/deadline pairs and
+    // at most min(C, K) eligible address nodes, all referring to these same
+    // C directory rows. Each row adds one first-retained instant and one
+    // optional physical observation; neither index stores another host owner.
     retained: RetentionIndex<QueryContextRef>,
     gone: RetentionIndex<QueryContextRef>,
     frontend_members: BTreeMap<FrontendProcessId, BTreeSet<QueryContextRef>>,
@@ -442,7 +452,10 @@ impl ControlCore {
             admission: AdmissionCore::new(admission, issuer),
             directory: BTreeMap::new(),
             owners: BTreeMap::new(),
-            retained: RetentionIndex::new(config.retained_contexts, u64::MAX),
+            // Every retained row already occupies one of the original C directory
+            // positions. K limits only early-evictable rows; protected rows cannot
+            // consume a new directory position or enlarge admission capacity.
+            retained: RetentionIndex::new(config.max_contexts, u64::MAX),
             gone: RetentionIndex::new(config.gone_fences, u64::MAX),
             frontend_members: BTreeMap::new(),
             fenced: BTreeSet::new(),
@@ -1133,6 +1146,8 @@ impl ControlCore {
                                             reply: None,
                                             removal_pending: false,
                                             removal_requested: false,
+                                            first_retained_at: None,
+                                            normal_close: None,
                                         },
                                     );
                                     self.owners.insert(
@@ -1215,7 +1230,10 @@ impl ControlCore {
                 )?;
             }
             ControlInput::ContinueReplies { context } => self.replies(context, &mut step)?,
-            ControlInput::Retained { context } => self.retain_context(context, &mut step)?,
+            ControlInput::Retained {
+                context,
+                normal_close,
+            } => self.retain_context(context, Some(normal_close), &mut step)?,
             ControlInput::HostRemoved { context } => {
                 let record = self
                     .directory
@@ -1524,41 +1542,67 @@ impl ControlCore {
     fn retain_context(
         &mut self,
         context: QueryContextRef,
+        normal_close: Option<bool>,
         step: &mut ControlStep,
     ) -> Result<(), CoreError> {
-        if !self.directory.contains_key(&context) {
-            return Err(CoreError::WrongIdentity);
+        let record = self
+            .directory
+            .get(&context)
+            .ok_or(CoreError::WrongIdentity)?;
+        if let (Some(original), Some(observed)) = (record.normal_close, normal_close)
+            && original != observed
+        {
+            return Err(CoreError::IllegalFact);
         }
-        // This original context-to-ticket owner is consumed exactly once.
-        // Repeated terminal facts neither repeat retirement nor extend TTL.
-        let Some(ticket) = self.admission.close_context(context, self.now) else {
-            return Ok(());
-        };
+        // Consume the original ticket once, independently of a late physical
+        // retention observation. Establishment may announce TerminalRetained
+        // before that same R's Retained input reaches Root.
+        let ticket = self.admission.close_context(context, self.now);
         let record = self.directory.get_mut(&context).expect("known context");
+        let first = *record.first_retained_at.get_or_insert(self.now);
+        if let Some(observed) = normal_close {
+            record.normal_close = Some(observed);
+        }
         record.state = QueryContextState::TerminalRetained;
-        // Pure retention requests retirement. Original Work/report holders
-        // still gate actual release; this is not an I/O-exit observation.
-        step.effects.push(ControlEffect::RetireReservation(ticket));
-        step.effects.push(ControlEffect::Route {
-            context,
-            state: record.state,
-            generation: record.generation,
-        });
-        if self.retained.len() == self.config.retained_contexts {
-            let oldest = self
-                .retained
-                .oldest()
-                .expect("full retained set has an oldest");
-            self.retained.remove(oldest).expect("oldest exists");
-            self.request_host_removal(oldest, step)?;
+        if let Some(ticket) = ticket {
+            step.effects.push(ControlEffect::RetireReservation(ticket));
+            step.effects.push(ControlEffect::Route {
+                context,
+                state: record.state,
+                generation: record.generation,
+            });
+        }
+        if record.removal_requested || record.removal_pending || self.retained.contains(context) {
+            return Ok(());
         }
         if self.process_draining && self.process_ingress_closed {
-            self.request_host_removal(context, step)?;
-        } else {
-            self.retained
-                .insert(context, self.now.saturating_add(self.config.retention), 0)
-                .map_err(|_| CoreError::IllegalFact)?;
+            // Real listener/body exit ends external replay obligations. Original
+            // Task, R, H and Scope exit gates remain independently mandatory.
+            return self.request_host_removal(context, step);
         }
+        let Some(protected) = record.normal_close else {
+            // Wait for the original R fact, not H: H requires RemoveHost, whose
+            // normal-horizon decision in turn needs this observation.
+            return Ok(());
+        };
+        if !protected && self.retained.eligible_len() == self.config.retained_contexts {
+            let oldest = self
+                .retained
+                .oldest_eligible()
+                .expect("full eligible set has an oldest");
+            self.retained
+                .remove(oldest)
+                .expect("eligible retained row exists");
+            self.request_host_removal(oldest, step)?;
+        }
+        self.retained
+            .insert_with_protection(
+                context,
+                first.saturating_add(self.config.retention),
+                0,
+                protected,
+            )
+            .map_err(|_| CoreError::IllegalFact)?;
         Ok(())
     }
     fn establishment_decided(
@@ -1579,7 +1623,7 @@ impl ControlCore {
             return self.replies(context, step);
         }
         if decision.state == QueryContextState::TerminalRetained {
-            self.retain_context(context, step)?;
+            self.retain_context(context, None, step)?;
         }
         let record = self.directory.get_mut(&context).expect("known context");
         let ContextEstablishmentDecision {

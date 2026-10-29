@@ -232,6 +232,11 @@ impl Drop for RootResultRegistration {
 pub(crate) struct ExchangeRegistration {
     port: Arc<dyn ExchangeReceiverPort>,
     keys: Vec<ExchangeReceiverKey>,
+    close_observers: Vec<(
+        ExchangeReceiverKey,
+        crate::runtime::exchange::ExchangeReceiverCloseObserver,
+    )>,
+    _close_observer_storage: novarocks_type_contract::ValueTypeStorageLifetime,
     active: bool,
     cleanup_should_fail: bool,
     construction_stop: Option<ReceiverInputConstructionStopOwner>,
@@ -249,20 +254,64 @@ impl ExchangeRegistration {
         if registrations.is_empty() {
             return Ok(None);
         }
+        // One fixed observer slot per original receiver. The same admitted
+        // input-construction owner pays its actual metadata, not another Work
+        // or a copied stream-facts table. Its lifetime outlasts all these pins.
+        let first = registrations
+            .first()
+            .expect("nonempty original receiver set");
+        let storage = first
+            .creation_factory
+            .begin_typed_construction(&first.expected_chunk_schema)
+            .map_err(registration_error)?;
+        let layout = std::alloc::Layout::array::<(
+            ExchangeReceiverKey,
+            crate::runtime::exchange::ExchangeReceiverCloseObserver,
+        )>(registrations.len())
+        .map_err(|_| {
+            registration_error(crate::exec::pipeline::operator::ConstructionFailure::from(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            ))
+        })?;
+        storage.request(layout).map_err(registration_error)?;
+        let mut close_observers = Vec::new();
+        close_observers
+            .try_reserve_exact(registrations.len())
+            .map_err(|source| {
+                registration_error(super::ExecutionFailure::from_domain(
+                    novarocks_functions::allocation_failure::AllocationRefusal::new(
+                        "reserve original exchange close observers",
+                        source,
+                    ),
+                ))
+            })?;
+        if close_observers.capacity() > registrations.len() {
+            return Err(registration_error(
+                crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                    "exchange observer metadata exceeds its admitted layout".into(),
+                ),
+            ));
+        }
         let mut registration = Self {
             port,
             keys: Vec::with_capacity(registrations.len()),
+            close_observers,
+            _close_observer_storage: storage.storage_lifetime(),
             active: true,
             cleanup_should_fail,
             construction_stop,
         };
         for entry in registrations {
             let key = entry.key;
-            if let Err(error) = registration.port.register(entry) {
-                let diagnostics = registration.rollback().err().into_iter().collect();
-                return Err(registration_error(error).with_cleanup_diagnostics(diagnostics));
-            }
+            let observer = match registration.port.register_with_close_observer(entry) {
+                Ok(observer) => observer,
+                Err(error) => {
+                    let diagnostics = registration.rollback().err().into_iter().collect();
+                    return Err(registration_error(error).with_cleanup_diagnostics(diagnostics));
+                }
+            };
             registration.keys.push(key);
+            registration.close_observers.push((key, observer));
         }
         Ok(Some(registration))
     }
@@ -336,6 +385,25 @@ enum ExchangeRetirementDisposition {
 }
 
 impl ExchangeReceiverRetirement {
+    /// Read this exact original registration, including after kernel cancel
+    /// removed its route. These facts never authorize normal close by themselves.
+    pub fn stream_close_facts(
+        &self,
+        key: ExchangeReceiverKey,
+        expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+    ) -> Result<
+        Vec<novarocks_execution_contract::ExchangeStreamClose>,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
+        let observer = self
+            .registration
+            .close_observers
+            .iter()
+            .find(|(actual, _)| *actual == key)
+            .map(|(_, observer)| observer)
+            .ok_or_else(crate::runtime::exchange::ExchangeFailure::receiver_unavailable)?;
+        observer.stream_close_facts(expected)
+    }
     /// Record the kernel's fact before publishing task convergence. This does
     /// not remove or cancel a receiver; the application's gate still owns that.
     pub fn record_terminal(&mut self, fact: &super::FragmentTerminalFact) {
@@ -749,8 +817,9 @@ struct RuntimeExchange {
 }
 
 /// Original registrations, split only at the dormant-to-running transfer.
-/// Every dynamically sized cell comes from the original registered key vector;
-/// no observer list, rejected-work queue, or process parking table is created.
+/// Every dynamically sized cleanup cell comes from the original registered
+/// keys. The paid read-only observer pins remain with that same registration;
+/// no rejected-work queue, copied stream-facts table or parking owner is created.
 pub(crate) struct RuntimeFragmentResources {
     root: Option<ResourceCell<RootResultRegistration>>,
     result: Option<ResourceCell<ResultRegistration>>,

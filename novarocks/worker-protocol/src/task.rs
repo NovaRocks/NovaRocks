@@ -49,6 +49,9 @@ pub struct TaskRecord {
     pub initial_domain_receipts:
         std::sync::Arc<Vec<novarocks_execution_contract::TaskDomainReceipt>>,
     pub creation_refusal: Option<AdmissionRefusal>,
+    /// The original Context self-source observed physical rejection disposal;
+    /// identity remains owned until its bounded neutral inventory drain ends.
+    pub(crate) rejected_retirement_observed: bool,
     pub(crate) initial_creation: Option<crate::context::InitialCreation>,
     pub state: TaskState,
     pub version: u64,
@@ -62,6 +65,7 @@ pub struct TaskRecord {
     /// One original terminal observation seals final statistics against late samples.
     pub statistics_sealed: bool,
     pub terminal_observation_received: bool,
+    pub normal_close_validated: bool,
     pub loader_exited: bool,
     pub preparation_body_exited: bool,
     pub preparation_exited: bool,
@@ -113,6 +117,7 @@ impl TaskRecord {
             creation_reply: None,
             initial_domain_receipts: std::sync::Arc::new(Vec::new()),
             creation_refusal: None,
+            rejected_retirement_observed: false,
             initial_creation: None,
             state: TaskState::Planned,
             version: 1,
@@ -125,6 +130,7 @@ impl TaskRecord {
             operator_statistics_truncated: false,
             statistics_sealed: false,
             terminal_observation_received: false,
+            normal_close_validated: false,
             loader_exited: false,
             preparation_body_exited: false,
             preparation_exited: false,

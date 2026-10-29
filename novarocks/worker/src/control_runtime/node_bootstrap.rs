@@ -107,6 +107,7 @@ pub(crate) enum NodeBootstrapPhase {
 #[derive(Debug)]
 pub(crate) enum NodeBootstrapError {
     Geometry(NodeGeometryError),
+    CapacityIndex(novarocks_control_runtime::transaction::RuntimeError),
     InvalidConfiguration(&'static str),
     Core(novarocks_worker_protocol::context::CoreError),
     OriginalOwner,
@@ -195,8 +196,8 @@ impl TaskPhysicalGeometry {
         let preparation = HostExecutorLimits {
             contexts: nz(add(c, config.workers.preparation.get())?)?,
             jobs: nz(add(p, config.workers.preparation.get())?)?,
-            // Prepare/Activate share the same original preparation key; they
-            // cannot occupy two actual queue positions for that Task.
+            // Preparation membership includes the actual running body tail.
+            // Its later activation uses the paid lifecycle continuation slot.
             per_context: nz(t.min(add(per_preparing, config.workers.preparation.get())?))?,
             workers: config.workers.preparation,
         };
@@ -204,7 +205,9 @@ impl TaskPhysicalGeometry {
         // an output-storage bound, not CPU work multiplied by a guess. Fixed
         // cleanup holders may also run without a normal Core effect in S8:
         // Stop/Retire(2), Settlement(1), Task Root seal(1), Task disposal(1),
-        // and the original preparation's single provider-rollback body(1).
+        // and the original preparation's continuation(1): Activate or provider
+        // rollback. The same owner cannot issue both: activation requires its
+        // runnable, while rollback requires that no runnable was adopted.
         let fixed_task_jobs = add(super::task_host_call::HOST_CALL_KINDS.len(), 4)?;
         let projection_jobs = g.storage.effects;
         // Each R has independent notification and protocol-observation
@@ -350,11 +353,31 @@ impl OwnedNodeRuntime {
             }
         };
         let runtime = ActorRuntime::new(state.config.geometry.max_actors);
-        let ledger = RuntimeLedger::new(
+        let ledger = match RuntimeLedger::with_owner_usage_dimensions(
             state.config.geometry.limits.clone(),
             state.config.geometry.reservations.total,
             state.config.geometry.max_scopes,
-        );
+            [crate::control_admission::Dimension::PreparingTasks.id()],
+        ) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                return Err(state.refuse(
+                    NodeBootstrapPhase::Validate,
+                    NodeBootstrapError::CapacityIndex(error),
+                ));
+            }
+        };
+        if ledger
+            .owner_usage_metadata_entries(crate::control_admission::Dimension::PreparingTasks.id())
+            != Some(state.config.geometry.capacity_owner_usage_entries)
+        {
+            return Err(state.refuse(
+                NodeBootstrapPhase::Validate,
+                NodeBootstrapError::InvalidConfiguration(
+                    "preparation owner index differs from actual Node geometry",
+                ),
+            ));
+        }
         state.runtime = Some(runtime.clone());
         state.ledger = Some(ledger.clone());
         let r = state.config.geometry.request_positions.get();
@@ -453,7 +476,11 @@ impl OwnedNodeRuntime {
             }
         }
         let runner: fn(TaskDriverHostJob) = run_task;
-        match HostExecutor::start_with_waker(physical.preparation, runner, signal.waker()) {
+        match HostExecutor::start_eligible_fifo_with_waker(
+            physical.preparation,
+            runner,
+            signal.waker(),
+        ) {
             Ok(owner) => state.preparation = Some(owner),
             Err((error, owner)) => {
                 state.preparation = Some(owner);

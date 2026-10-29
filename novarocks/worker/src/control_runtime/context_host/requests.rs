@@ -1128,6 +1128,21 @@ impl ContextHostRecord {
         original.release_observation = released_observation;
         original.publish(ticket)
     }
+    /// The same actual input's request wake, if this effect belongs to an R.
+    /// No endpoint/body/Work authority is reconstructed from numeric identity.
+    pub(super) fn request_notice_for_input(
+        &self,
+        input: InputId,
+    ) -> Option<crate::control_runtime::request_endpoint::RequestNotice> {
+        self.request_inputs
+            .get(&input)
+            .and_then(|work| self.resources.requests.get(work))
+            .map(|original| {
+                crate::control_runtime::request_endpoint::RequestNotice(
+                    original.endpoint.external().slot().clone(),
+                )
+            })
+    }
     /// One original ready address per call, without scanning another Context.
     pub(crate) fn advance_request(&mut self, work: WorkId) -> Result<bool, ContextRequestError> {
         self.advance_observation_request(work, 1)?;

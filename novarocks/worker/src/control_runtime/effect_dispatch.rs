@@ -190,7 +190,7 @@ impl EffectDispatch {
                 | ContextEffect::SummaryConsumed { task, .. }
                 | ContextEffect::PublishConclusion { task, .. }
                 | ContextEffect::RetireTask { task, .. }
-                | ContextEffect::FinalizeTaskExecution { task }
+                | ContextEffect::FinalizeTaskExecution { task, .. }
                 | ContextEffect::SettlementBarrier { task, .. },
             ) => Some((LaneKey::Task(*task), Release::Published)),
             WorkerAction::Context(ContextEffect::PrepareReadPayload { task, .. }) => {
@@ -202,6 +202,7 @@ impl EffectDispatch {
                 ContextEffect::StopTask { task, .. }
                 | ContextEffect::DisposeSource { task, .. }
                 | ContextEffect::EnqueuePreparation { task, .. }
+                | ContextEffect::DisposeLoadedInput { task, .. }
                 | ContextEffect::InitialPreparationReady { task, .. }
                 | ContextEffect::ApplyTaskClose { task, .. },
             ) => Some((LaneKey::Task(*task), Release::Started)),

@@ -786,6 +786,21 @@ pub trait TestTaskUpdateConsumptionReservation: Send {
 /// transaction commits them, and `submit_runnable` is last. It prepares a
 /// dormant runnable; `commit_creation` starts executable work only after the
 /// registry has installed the Live record.
+/// The original Core's receiver retirement decision. Preserving normal close
+/// requires the receiver owner's checked facts; it is never a removal fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskIngressRetirement {
+    Remove,
+    PreserveNormalClose,
+}
+
+/// A refused bank reservation returns the exact original optional payment.
+#[derive(Debug)]
+pub struct InboundCloseReservationRefusal {
+    pub rejection: HostRejection,
+    pub permit: Option<crate::TaskInboundPermit>,
+}
+
 pub trait TaskExecutionHost: Send + Sync {
     /// Closes data-plane admission for every task of this exact query
     /// execution. The registry calls this while it linearizes context
@@ -828,7 +843,23 @@ pub trait TaskExecutionHost: Send + Sync {
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);
 
+    /// Retire the exact receiver only after its owner checks the frozen mode.
+    /// A refusal preserves original Worker cleanup custody and is not success.
+    fn retire_receiver_checked(
+        &self,
+        descriptor: &TaskDescriptor,
+        retirement: TaskIngressRetirement,
+    ) -> Result<(), HostRejection>;
+
     fn install_inbound_capability(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection>;
+
+    /// Attach the already-paid original inbound capacity to its actual bank
+    /// row. None denotes the measured zero-inbound geometry, never a fallback.
+    fn reserve_inbound_close_capacity_with_permit(
+        &self,
+        descriptor: &TaskDescriptor,
+        permit: Option<crate::TaskInboundPermit>,
+    ) -> Result<(), InboundCloseReservationRefusal>;
 
     /// Reserve the bounded late-frame record before Create is Accepted.
     fn reserve_inbound_close_capacity(

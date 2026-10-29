@@ -335,6 +335,33 @@ pub struct TaskDomains {
     closed_destinations: ExchangeDestinationClosureDomain,
 }
 impl TaskDomains {
+    /// Retire at most one original neutral member or empty nested row. False
+    /// means one real member/row was removed; true means every owned dynamic
+    /// collection is empty and dropping the outer value performs no traversal.
+    pub(crate) fn retire_one(&mut self) -> bool {
+        if self.split_members.pop_first().is_some()
+            || self.destinations.pop_first().is_some()
+            || self.splits.nodes.pop_first().is_some()
+            || self.edges.members.pop_first().is_some()
+            || self.edges.opened.pop_first().is_some()
+        {
+            return false;
+        }
+        if let Some(mut row) = self.edges.opened_sets.first_entry() {
+            if row.get_mut().pop_first().is_none() {
+                // The nested original set is already empty, so removing this
+                // version row cannot hide another member traversal in Drop.
+                row.remove();
+            }
+            return false;
+        }
+        if self.closed_destinations.accepted.pop_first().is_some()
+            || self.closed_destinations.closed.pop_first().is_some()
+        {
+            return false;
+        }
+        true
+    }
     pub fn new(
         split_nodes: impl IntoIterator<Item = PlanNodeId>,
         edges: impl IntoIterator<Item = ExchangeEdgeId>,

@@ -182,7 +182,9 @@ impl WorkerService {
         // Context cell has been published here.
         let mut directory = self.directory.state();
         if directory.contexts.contains_key(&context)
-            || directory.executions.contains_key(&context.query_execution_id())
+            || directory
+                .executions
+                .contains_key(&context.query_execution_id())
         {
             return Err(ServiceHostError::ContextAlreadyOwned);
         }
@@ -209,7 +211,12 @@ impl WorkerService {
             }));
         }
         assert_eq!(host.identity(), context);
-        assert!(directory.executions.insert(context.query_execution_id(), context).is_none());
+        assert!(
+            directory
+                .executions
+                .insert(context.query_execution_id(), context)
+                .is_none()
+        );
         assert!(directory.actors.insert(host.actor(), context).is_none());
         assert!(
             directory

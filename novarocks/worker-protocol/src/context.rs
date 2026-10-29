@@ -288,6 +288,12 @@ impl ContextCommand {
 pub enum ContextInput {
     /// Select one currently runnable internal slice; never an RPC request.
     NextInternal,
+    /// The original never-Accepted Task owner has actually destroyed its
+    /// captures and returned its payment. Only the Context self-source emits it.
+    RejectedCreationRetired {
+        task: TaskIdentity,
+        payload: PayloadId,
+    },
     /// Transport-only neutral body. `handle_request` binds its original token;
     /// the lifecycle-only `handle` entry rejects this wrapper.
     Request(ContextCommand),
@@ -573,6 +579,12 @@ pub enum ContextEffect {
         payload: PayloadId,
         reservation: ReservationId,
     },
+    /// The original measured Create was refused before preparation admission.
+    /// Dispose its original loader-owned input on the physical cleanup host.
+    DisposeLoadedInput {
+        task: TaskIdentity,
+        payload: PayloadId,
+    },
     EnqueuePreparation {
         task: TaskIdentity,
         payload: PayloadId,
@@ -614,6 +626,8 @@ pub enum ContextEffect {
     /// This grants no physical convergence or capacity-release fact.
     FinalizeTaskExecution {
         task: TaskIdentity,
+        /// Frozen by this exact terminal decision; later close cannot grant it.
+        normally_stopped: bool,
     },
     StopTask {
         task: TaskIdentity,
@@ -627,6 +641,8 @@ pub enum ContextEffect {
     CloseExternalAdmission {
         context: QueryContextRef,
         generation: Generation,
+        /// The original close winner; None is normal Quiesce, not Abort.
+        reason: Option<AbortCause>,
     },
     ContinueClose {
         generation: Generation,
@@ -640,6 +656,9 @@ pub enum ContextEffect {
     },
     RetireTask {
         task: TaskIdentity,
+        /// Frozen entity decision; Retained alone does not prove non-admission.
+        never_accepted: bool,
+        payload: PayloadId,
         state: TaskState,
         active: ReservationId,
         preparation: Option<ReservationId>,
@@ -1159,6 +1178,9 @@ impl ContextCore {
                 capacity,
                 &mut step,
             )?,
+            ContextInput::RejectedCreationRetired { task, payload } => {
+                self.begin_rejected_creation_retirement(task, payload, &mut step)?;
+            }
             ContextInput::OwnerFenced => {
                 self.begin_abort(None, AbortCause::QueryFailed, &mut step)?;
             }
@@ -1420,6 +1442,9 @@ impl ContextCore {
                 self.flush(task, &mut step)?;
                 let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
                 if !record.state.is_terminal() {
+                    if !record.accepted() {
+                        return Err(CoreError::IllegalFact);
+                    }
                     if self
                         .dynamic_filters
                         .get(&task)
@@ -1443,6 +1468,9 @@ impl ContextCore {
                 self.flush(task, &mut step)?;
                 let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
                 if !record.state.is_terminal() && !record.statistics_sealed {
+                    if !record.accepted() {
+                        return Err(CoreError::IllegalFact);
+                    }
                     if statistics.len() > FINAL_TASK_INFO_MAX_OPERATORS {
                         return Err(CoreError::IllegalFact);
                     }
@@ -1457,6 +1485,9 @@ impl ContextCore {
                 writer,
             } => {
                 self.flush(task, &mut step)?;
+                if !self.tasks[&task].accepted() {
+                    return Err(CoreError::IllegalFact);
+                }
                 if self.metrics.get(&task) != Some(&facts)
                     || writer.is_some_and(|value| self.tasks[&task].writer != Some(value))
                 {
@@ -1469,6 +1500,7 @@ impl ContextCore {
                         }
                         let due = self.metric_due.entry(task).or_insert(now);
                         if now.has_reached(*due) {
+                            self.metric_deadlines.remove(&(*due, task));
                             record.bump_version();
                             let snapshot = Self::compose(record)?;
                             record.published = snapshot.clone();
@@ -1816,7 +1848,7 @@ impl ContextCore {
             });
         }
         let decisions_visited = self.settle_request_decisions(&mut step);
-        step.records_visited =
+        step.records_visited +=
             1 + decisions_visited + usize::from(!step.requests.is_empty()) + internal_probes;
         Ok(step)
     }
@@ -2038,6 +2070,7 @@ impl ContextCore {
                         step.effects.push(ContextEffect::CloseExternalAdmission {
                             context: self.identity,
                             generation: self.generation,
+                            reason: None,
                         });
                     }
                     self.pending_quiesce = Some(PendingQuiesce {
@@ -2384,6 +2417,13 @@ impl ContextCore {
                 let outcome = refusal.outcome();
                 t.creation_refusal = Some(refusal);
                 t.phase = CreationPhase::Rejected;
+                // The decision survives RPC timeout/removal. Its original
+                // loader child still owns opaque input and must really Drop
+                // before the independent LoaderExited author can publish.
+                step.effects.push(ContextEffect::DisposeLoadedInput {
+                    task,
+                    payload: t.payload,
+                });
                 // No preparation/runtime holder was ever admitted. Only the
                 // original loader/captures still owe a real exit fact.
                 t.preparation_body_exited = true;
@@ -2511,6 +2551,8 @@ impl ContextCore {
             self.unretired_tasks -= 1;
             step.effects.push(ContextEffect::RetireTask {
                 task,
+                never_accepted: !t.accepted(),
+                payload: t.payload,
                 state: t.state,
                 active: t.active_reservation,
                 preparation: t.preparation_reservation,
@@ -2565,6 +2607,10 @@ impl ContextCore {
             .accepted
             .as_ref()
             .ok_or(CoreError::IllegalFact)?;
+        let normal_cancellation = matches!(
+            accepted,
+            TaskConclusion::Terminated(TerminationDetail::Canceled(_))
+        );
         if matches!(accepted, TaskConclusion::Succeeded)
             && (!record.actual_stopped || !record.output.responsibility_complete())
         {
@@ -2581,9 +2627,22 @@ impl ContextCore {
                 .note_conclusion_stable()
                 .map_err(|_| CoreError::IllegalFact)?;
             record.bump_version();
+            let normally_stopped = record.installed
+                && record.normal_close_validated
+                && self.closing.is_none()
+                && matches!(
+                    self.state,
+                    QueryContextState::Active
+                        | QueryContextState::Quiescing
+                        | QueryContextState::Releasing
+                )
+                && (record.state == TaskState::Finished
+                    || (record.state == TaskState::Canceled && normal_cancellation));
             Self::publish(record, step)?;
-            step.effects
-                .push(ContextEffect::FinalizeTaskExecution { task });
+            step.effects.push(ContextEffect::FinalizeTaskExecution {
+                task,
+                normally_stopped,
+            });
             self.final_info.insert(
                 task,
                 Arc::new(
@@ -2713,6 +2772,7 @@ impl ContextCore {
         step.effects.push(ContextEffect::CloseExternalAdmission {
             context: self.identity,
             generation: self.generation,
+            reason: Some(cause),
         });
         step.effects.push(ContextEffect::SealRoot {
             context: self.identity,
@@ -2903,7 +2963,7 @@ impl ContextCore {
             return Ok(false);
         }
         self.flush(task, step)?;
-        if self.tasks[&task].phase == CreationPhase::Loading {
+        if !self.tasks[&task].accepted() {
             step.reply(
                 request,
                 ContextReplyBody::Verdict(RequestResult::Outcome(
@@ -3063,6 +3123,13 @@ impl ContextCore {
         capacity: &mut impl AdmissionPort,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
+        if self
+            .tasks
+            .get(&task)
+            .is_some_and(|record| record.rejected_retirement_observed)
+        {
+            return self.advance_rejected_creation_retirement(task, step);
+        }
         if self
             .tasks
             .get(&task)
@@ -3597,3 +3664,6 @@ impl ContextCore {
 #[cfg(test)]
 #[path = "context/internal_tests.rs"]
 mod internal_tests;
+
+#[path = "context/rejected_creation.rs"]
+mod rejected_creation;

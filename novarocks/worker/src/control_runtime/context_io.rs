@@ -36,6 +36,14 @@ use novarocks_control_runtime_core::{
 
 pub(crate) const CONTEXT_IO_ROLES: usize = 3;
 pub(crate) const CONTEXT_IO_CALLBACKS: usize = 2;
+/// One actual Task host capture is retained by the same Context through R/H;
+/// physical release/forget borrow it without introducing a new Work or role.
+pub(crate) const CONTEXT_EXECUTION_HOST_CAPTURES: usize = 1;
+/// The Core can issue at most one Quiesce and one first-Abort close effect.
+/// Their concrete physical capture containers are prepaid at Context admission,
+/// not allocated new credit at close. Original batches retain this parent fee
+/// until both actual effects complete and the Context Scope really exits.
+pub(crate) const CONTEXT_ADMISSION_CLOSE_CAPTURES: usize = 2;
 /// Fixed capture containers, rather than one credit per Arc alias. The holder
 /// keeps the actual instance, credential and retained host sources separately
 /// from each call's body/report. U has not been included in this inventory.
@@ -46,7 +54,7 @@ pub(crate) const CONTEXT_IO_STORAGE: StorageNeed = StorageNeed {
     effects: CONTEXT_IO_CALLBACKS * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
     work: CONTEXT_IO_ROLES,
     completions: CONTEXT_IO_ROLES,
-    captures: CONTEXT_IO_ROLES,
+    captures: CONTEXT_IO_ROLES + CONTEXT_EXECUTION_HOST_CAPTURES + CONTEXT_ADMISSION_CLOSE_CAPTURES,
     cuts: 0,
     replies: 0,
 };

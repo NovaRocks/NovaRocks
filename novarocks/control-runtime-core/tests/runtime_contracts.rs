@@ -711,3 +711,156 @@ fn independent_scope_work_ordinals_never_collide_or_cancel_each_other() {
     queue.finish(b, work(2)).unwrap();
     assert!(queue.is_empty());
 }
+
+#[test]
+fn indexed_owner_usage_follows_split_partial_release_and_cross_scope_transfer() {
+    let mut ledger = CapacityLedger::with_owner_usage_dimensions(
+        vector(&[(1, 8), (2, 100)]),
+        8,
+        4,
+        [dimension(1)],
+    )
+    .unwrap();
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(9));
+    assert_eq!(ledger.max_owner_usage(dimension(2)), None);
+    let mut a = scope(1);
+    let mut b = scope(2);
+    let first = ledger
+        .try_reserve_bundle(&mut a, request(1, &[(1, 4), (2, 20)]))
+        .unwrap();
+    ledger.bind(&mut a, first, WorkKind::Business).unwrap();
+    let second = ledger
+        .try_reserve_bundle(&mut b, request(2, &[(1, 2), (2, 10)]))
+        .unwrap();
+    ledger.bind(&mut b, second, WorkKind::Business).unwrap();
+    assert_eq!(
+        (
+            ledger.used(dimension(1)),
+            ledger.max_owner_usage(dimension(1))
+        ),
+        (6, Some(4))
+    );
+    let split = ReservationId::new(3).unwrap();
+    ledger
+        .split(first, split, &vector(&[(1, 1), (2, 5)]))
+        .unwrap();
+    assert_eq!(ledger.max_owner_usage(dimension(1)), Some(4));
+    b.admit(
+        generation(),
+        work(3),
+        WorkKind::Cleanup,
+        WorkAdmission::External,
+    )
+    .unwrap();
+    ledger.transfer(split, &b, work(3)).unwrap();
+    assert_eq!(
+        (
+            ledger.used(dimension(1)),
+            ledger.max_owner_usage(dimension(1))
+        ),
+        (6, Some(3))
+    );
+    ledger.release(first, &vector(&[(1, 2)])).unwrap();
+    assert_eq!(ledger.max_owner_usage(dimension(1)), Some(3));
+    ledger.release(second, &vector(&[(1, 2), (2, 10)])).unwrap();
+    finish(&mut b, work(2));
+    assert_eq!(
+        (
+            ledger.used(dimension(1)),
+            ledger.max_owner_usage(dimension(1))
+        ),
+        (2, Some(1))
+    );
+    ledger.release(first, &vector(&[(1, 1), (2, 15)])).unwrap();
+    finish(&mut a, work(1));
+    ledger.release(split, &vector(&[(1, 1), (2, 5)])).unwrap();
+    finish(&mut b, work(3));
+    assert_eq!(ledger.max_owner_usage(dimension(1)), Some(0));
+    assert_eq!(ledger.reservation_count(), 0);
+}
+
+#[test]
+fn indexed_owner_usage_survives_refused_transactions_and_real_unbound_rollback() {
+    let mut ledger = CapacityLedger::with_owner_usage_dimensions(
+        vector(&[(1, 2), (2, 10)]),
+        8,
+        2,
+        [dimension(1)],
+    )
+    .unwrap();
+    let mut a = scope(1);
+    let mut b = scope(2);
+    let original = ledger
+        .try_reserve_bundle(&mut a, request(1, &[(1, 1), (2, 8)]))
+        .unwrap();
+    assert_eq!(
+        ledger.try_reserve_bundle(&mut b, request(2, &[(1, 1), (2, 3)])),
+        Err(CapacityError::Exhausted(dimension(2)))
+    );
+    assert_eq!(
+        (
+            ledger.reservation_count(),
+            b.work_count(),
+            ledger.max_owner_usage(dimension(1))
+        ),
+        (1, 0, Some(1))
+    );
+    ledger.rollback_unbound(&mut a, original).unwrap();
+    assert_eq!(ledger.max_owner_usage(dimension(1)), Some(0));
+    let original = ledger
+        .try_reserve_bundle(&mut a, request(2, &[(1, 2)]))
+        .unwrap();
+    assert_eq!(
+        ledger.bind(&mut b, original, WorkKind::Business),
+        Err(CapacityError::WrongOwner)
+    );
+    ledger.bind(&mut a, original, WorkKind::Business).unwrap();
+    assert!(
+        ledger
+            .split(original, ReservationId::new(3).unwrap(), &vector(&[(1, 3)]))
+            .is_err()
+    );
+    assert_eq!(
+        ledger.transfer(original, &b, work(99)),
+        Err(CapacityError::Scope(ScopeError::UnknownWork))
+    );
+    assert_eq!(
+        (
+            ledger.used(dimension(1)),
+            ledger.max_owner_usage(dimension(1))
+        ),
+        (2, Some(2))
+    );
+    b.admit(
+        generation(),
+        work(1),
+        WorkKind::Cleanup,
+        WorkAdmission::External,
+    )
+    .unwrap();
+    ledger.transfer(original, &b, work(1)).unwrap();
+    ledger.release(original, &vector(&[(1, 1)])).unwrap();
+    let last = ledger
+        .try_reserve_bundle(&mut a, request(3, &[(1, 1)]))
+        .unwrap();
+    ledger.bind(&mut a, last, WorkKind::Business).unwrap();
+    assert_eq!(
+        (
+            ledger.used(dimension(1)),
+            ledger.max_owner_usage(dimension(1))
+        ),
+        (2, Some(1))
+    );
+    ledger.release(original, &vector(&[(1, 1)])).unwrap();
+    finish(&mut b, work(1));
+    finish(&mut a, work(2));
+    ledger.release(last, &vector(&[(1, 1)])).unwrap();
+    finish(&mut a, work(3));
+    assert_eq!(
+        (
+            ledger.reservation_count(),
+            ledger.max_owner_usage(dimension(1))
+        ),
+        (0, Some(0))
+    );
+}

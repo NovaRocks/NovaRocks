@@ -236,6 +236,7 @@ fn success(output_released: bool) -> TerminalObservation {
         intent: TerminalIntent::SuccessfulProduction {
             completed_output: Some(TaskOutputFacts::new(true)),
         },
+        normal_close_validated: false,
         output_released,
         final_statistics: Some(TerminalStatistics {
             statistics: statistics(7),
@@ -248,6 +249,7 @@ fn finish(output_released: bool) -> TerminalObservation {
         intent: TerminalIntent::FinishExistingTermination {
             output: Some(TaskOutputFacts::new(true)),
         },
+        normal_close_validated: false,
         output_released,
         final_statistics: Some(TerminalStatistics {
             statistics: statistics(7),
@@ -433,6 +435,7 @@ fn incomplete_positive_output_and_finish_without_a_prior_termination_are_rejecte
                 task: task(),
                 observation: TerminalObservation {
                     intent,
+                    normal_close_validated: false,
                     output_released: true,
                     final_statistics: None,
                 },

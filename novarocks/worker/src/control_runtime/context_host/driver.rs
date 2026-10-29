@@ -157,6 +157,21 @@ impl ContextHostRecord {
                     }
                     self.resources.pending_host_jobs.root_release_finished = true;
                 }
+                // R samples the original normal-close retention bank. Core's
+                // terminal/RetireTask intent does not prove that the physical
+                // Finalize/Retire call has installed its normal-close record.
+                // Roots are already sealed and fully idle above; now wait for
+                // the same Task cleanup and its real Context notices, not R.
+                if !self.tasks.is_empty() || !self.task_driver.is_idle() {
+                    assert!(
+                        self.resources
+                            .pending_host_jobs
+                            .driver_release
+                            .replace(ticket)
+                            .is_none()
+                    );
+                    return Ok(());
+                }
                 self.handoff_host_release(ticket)
                     .map_err(|(error, ticket)| {
                         self.retain_driver_refusal(ticket, ContextDriverError::Host(error))
@@ -170,6 +185,7 @@ impl ContextHostRecord {
             WorkerAction::Context(ContextEffect::CloseExternalAdmission {
                 context,
                 generation,
+                reason,
             }) if *context == self.identity => {
                 if let Err(error) = self
                     .control_runtime
@@ -181,12 +197,17 @@ impl ContextHostRecord {
                     );
                 }
                 match self.close_task_driver_admission(*context, *generation, tasks) {
-                    Ok(true) => self.complete_host_effect(ticket).map_err(|refusal| {
-                        self.retain_driver_refusal(
-                            refusal.ticket,
-                            ContextDriverError::Driver(refusal.error),
-                        )
-                    }),
+                    Ok(true) => {
+                        let reason = *reason;
+                        self.handoff_context_admission_close(ticket, reason, tasks)
+                            .map_err(|refusal| {
+                                let error = ContextDriverError::Task(refusal.error);
+                                match refusal.ticket {
+                                    Some(ticket) => self.retain_driver_refusal(ticket, error),
+                                    None => error,
+                                }
+                            })
+                    }
                     result => {
                         assert!(self.resources.pending_host_jobs.driver_close.is_none());
                         self.resources.pending_host_jobs.driver_close = Some(ticket);
@@ -353,6 +374,8 @@ impl ContextHostRecord {
         if !handles.accepts_owner(jobs) {
             return Err(ContextDriverError::WrongOwner);
         }
+        jobs.bind_execution_host(tasks.execution.as_ref())
+            .map_err(ContextDriverError::Host)?;
         if let Some(original) = self.resources.pending_host_jobs.driver_close.take() {
             self.handoff_driver_effect(original, tasks)?;
         }

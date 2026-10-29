@@ -60,16 +60,17 @@ use std::{
     any::Any,
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 type PanicPayload = ManuallyDrop<Box<dyn Any + Send>>;
+const HOLDER_PANIC_SLOTS: usize = 10;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ContextHostReturned {
     Materialized(Result<ContextMaterialized, AdmissionRefusal>),
     MaterializationWithdrawn,
-    Released,
+    Released { normal_close: bool },
     Disposed,
     StartRefused(ExitRoleError),
     Panicked,
@@ -162,8 +163,10 @@ struct Rich {
     credential: Option<ManuallyDrop<CredentialUpdate>>,
     rejection: Option<ManuallyDrop<HostRejection>>,
     evidence: Option<ManuallyDrop<ReleasedContextEvidence>>,
-    panics: [Option<PanicPayload>; 9],
+    panics: [Option<PanicPayload>; HOLDER_PANIC_SLOTS],
     roots: Option<super::context_host::root_read::RootReadDisposal>,
+    // One original Node execution owner is retained across physical R and H.
+    execution: Option<ManuallyDrop<Arc<dyn crate::TaskExecutionHost>>>,
 }
 struct State {
     m: Call,
@@ -174,6 +177,8 @@ struct State {
     r_issued: bool,
     h_issued: bool,
     release_requested: bool,
+    execution_bound: bool,
+    execution_identity: Option<Weak<dyn crate::TaskExecutionHost>>,
     domain_borrowers: usize,
     credential_resource: Option<u64>,
     // Positive outcome of the actual M boundary, not absence in a directory.
@@ -248,7 +253,10 @@ impl std::fmt::Debug for MaterializationCaptureRefusal {
 }
 enum Operation {
     Materialize(ValidatedMaterializationSource),
-    Release(Option<ManuallyDrop<Arc<dyn QueryContextHostInstance>>>),
+    Release(
+        Option<ManuallyDrop<Arc<dyn QueryContextHostInstance>>>,
+        Option<ManuallyDrop<Arc<dyn crate::TaskExecutionHost>>>,
+    ),
     Dispose(Rich),
 }
 #[must_use = "Return the same original host job on physical queue refusal"]
@@ -316,6 +324,8 @@ impl ContextHostJobs {
                 r_issued: false,
                 h_issued: false,
                 release_requested: false,
+                execution_bound: false,
+                execution_identity: None,
                 domain_borrowers: 0,
                 credential_resource: None,
                 no_instance_created: false,
@@ -564,6 +574,51 @@ impl ContextHostJobs {
         c.retired = true;
         Ok(true)
     }
+    /// Bind the same Node composition once, before R or H can capture it. None
+    /// explicitly denotes a cold Node with Task intake unavailable, never a
+    /// missing Task or an inferred normal-close result.
+    pub(crate) fn bind_execution_host(
+        &self,
+        host: Option<&Arc<dyn crate::TaskExecutionHost>>,
+    ) -> Result<(), ContextHostJobError> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .expect("original Context execution binding");
+        if state.execution_bound {
+            let same = match (state.execution_identity.as_ref(), host) {
+                (Some(original), Some(host)) => Weak::ptr_eq(original, &Arc::downgrade(host)),
+                (None, None) => true,
+                _ => false,
+            };
+            return if same {
+                Ok(())
+            } else {
+                Err(ContextHostJobError::WrongOwner)
+            };
+        }
+        if state.r_issued || state.h_issued {
+            return Err(ContextHostJobError::WrongPhase);
+        }
+        state.execution_identity = host.map(Arc::downgrade);
+        state.rich.execution = host.map(|host| ManuallyDrop::new(Arc::clone(host)));
+        state.execution_bound = true;
+        Ok(())
+    }
+    /// Only this original physical R return can supply a retention observation.
+    /// Neither a missing host address nor a protocol reply supplies false.
+    pub(crate) fn normal_close_observation(&self) -> Option<bool> {
+        let state = self
+            .0
+            .state
+            .lock()
+            .expect("original Context retention observation");
+        match state.r.returned {
+            Some(ContextHostReturned::Released { normal_close }) => Some(normal_close),
+            _ => None,
+        }
+    }
     /// R can be requested before factory publication. Only the original
     /// pending bit is set; no worker is occupied waiting for a resource.
     pub(super) fn request_release(
@@ -591,6 +646,9 @@ impl ContextHostJobs {
         if !state.release_requested || state.r_issued || state.domain_borrowers != 0 {
             return Ok(None);
         }
+        if !state.execution_bound {
+            return Err(ContextHostJobError::WrongPhase);
+        }
         let instance = state
             .rich
             .instance
@@ -611,7 +669,14 @@ impl ContextHostJobs {
             index: 1,
             authority: Some(authority),
             sender: Some(sender),
-            operation: Some(Operation::Release(instance)),
+            operation: Some(Operation::Release(
+                instance,
+                state
+                    .rich
+                    .execution
+                    .as_ref()
+                    .map(|host| ManuallyDrop::new(Arc::clone(host))),
+            )),
         }))
     }
     /// Borrow the original materialized instance before any foreign domain call.
@@ -729,7 +794,7 @@ impl ContextHostJobs {
                 ContextHostReturned::MaterializationWithdrawn => {
                     Some(ContextInput::MaterializationWithdrawn)
                 }
-                ContextHostReturned::Released => Some(ContextInput::HostReleased),
+                ContextHostReturned::Released { .. } => Some(ContextInput::HostReleased),
                 ContextHostReturned::Disposed => None,
                 fault => {
                     state.fault = Some(fault);
@@ -983,6 +1048,7 @@ impl ContextHostJob {
     fn release(
         &self,
         instance: &Option<ManuallyDrop<Arc<dyn QueryContextHostInstance>>>,
+        execution: &Option<ManuallyDrop<Arc<dyn crate::TaskExecutionHost>>>,
     ) -> ContextHostReturned {
         let evidence = instance
             .as_ref()
@@ -994,9 +1060,36 @@ impl ContextHostJob {
             .expect("Context original release evidence")
             .rich
             .evidence = Some(ManuallyDrop::new(evidence));
-        ContextHostReturned::Released
+        // The same physical invocation observes the original capability bank
+        // only after all Task retirement operations and this real Release.
+        let normal_close = execution
+            .as_ref()
+            .is_some_and(|host| host.retains_normal_close(self.owner.0.context));
+        ContextHostReturned::Released { normal_close }
     }
-    fn dispose(&self, rich: Rich) -> ContextHostReturned {
+    fn dispose(&self, mut rich: Rich) -> ContextHostReturned {
+        // H can only be issued after the actual Root RemoveHost authorization.
+        // Forget precedes every holder destructor and HostRemoved. A foreign
+        // panic keeps the whole original capture and H Unknown, never Disposed.
+        if let Some(host) = &rich.execution
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                host.forget_context_admission(self.owner.0.context);
+            }))
+        {
+            let slot = rich
+                .panics
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .expect("original H has a fixed panic retention position");
+            *slot = Some(ManuallyDrop::new(payload));
+            self.owner
+                .0
+                .state
+                .lock()
+                .expect("original failed Context forget")
+                .rich = rich;
+            return ContextHostReturned::Panicked;
+        }
         let Rich {
             factory,
             instance,
@@ -1005,8 +1098,9 @@ impl ContextHostJob {
             evidence,
             panics,
             roots,
+            execution,
         } = rich;
-        let mut failures: [Option<PanicPayload>; 9] = Default::default();
+        let mut failures: [Option<PanicPayload>; HOLDER_PANIC_SLOTS] = Default::default();
         let mut next = 0;
         let mut observe = |result: std::thread::Result<()>| {
             if let Err(p) = result {
@@ -1033,6 +1127,9 @@ impl ContextHostJob {
             if let Some(roots) = roots {
                 roots.dispose();
             }
+        })));
+        observe(catch_unwind(AssertUnwindSafe(|| {
+            drop(execution.map(ManuallyDrop::into_inner))
         })));
         for p in panics.into_iter().flatten() {
             observe(catch_unwind(AssertUnwindSafe(|| {
@@ -1110,7 +1207,7 @@ impl ContextHostJob {
                 }
                 Ok(()) => catch_unwind(AssertUnwindSafe(|| match &operation {
                     Operation::Materialize(source) => self.materialize(source),
-                    Operation::Release(instance) => self.release(instance),
+                    Operation::Release(instance, execution) => self.release(instance, execution),
                     Operation::Dispose(_) => {
                         unreachable!("holder disposal moves its original fields")
                     }
@@ -1163,7 +1260,10 @@ impl ContextHostJob {
     }
     fn return_captures(operation: Operation) {
         match operation {
-            Operation::Release(instance) => drop(instance.map(ManuallyDrop::into_inner)),
+            Operation::Release(instance, execution) => {
+                drop(instance.map(ManuallyDrop::into_inner));
+                drop(execution.map(ManuallyDrop::into_inner));
+            }
             Operation::Materialize(source) => drop(source),
             Operation::Dispose(_) => unreachable!("holder captures use their own cleanup boundary"),
         }

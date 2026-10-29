@@ -660,7 +660,15 @@ impl ContextHostRecord {
         let Some(lifecycle) = &mut self.resources.lifecycle else {
             return Err((ContextHostJobError::WrongPhase, ticket));
         };
-        if let Err(error) = lifecycle.forward_retained(&ticket) {
+        let Some(normal_close) = self
+            .resources
+            .host_jobs
+            .as_ref()
+            .and_then(ContextHostJobs::normal_close_observation)
+        else {
+            return Err((ContextHostJobError::WrongPhase, ticket));
+        };
+        if let Err(error) = lifecycle.forward_retained(&ticket, normal_close) {
             return Err((error, ticket));
         }
         let reference = EffectRef {

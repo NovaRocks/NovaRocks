@@ -762,6 +762,7 @@ impl TaskExecutionHost for CompiledTaskHost {
                                     RootProducerState::ContextHeld
                                 ))),
                             },
+                            normal_close_validated: false,
                             output_released: false,
                             final_statistics,
                         })

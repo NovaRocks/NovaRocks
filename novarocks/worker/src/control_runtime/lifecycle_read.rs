@@ -95,6 +95,11 @@ impl TaskLifetime {
     pub(crate) fn observation(&self) -> Arc<TaskReadBinding> {
         self.read.clone()
     }
+    pub(crate) fn retirement_observer(
+        &self,
+    ) -> novarocks_control_runtime::lease::WorkRetirementObserver {
+        self.work.retirement_observer()
+    }
     pub(crate) const fn id(&self) -> WorkId {
         self.work.id()
     }

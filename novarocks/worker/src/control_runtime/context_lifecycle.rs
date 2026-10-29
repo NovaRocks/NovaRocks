@@ -127,6 +127,7 @@ impl ContextLifecycle {
     pub(crate) fn forward_retained(
         &mut self,
         ticket: &EffectTicket<WorkerAction>,
+        normal_close: bool,
     ) -> Result<(), ContextHostJobError> {
         self.runtime.validate_effect_ticket(ticket)?;
         if ticket.actor != self.actor
@@ -152,6 +153,7 @@ impl ContextLifecycle {
                     request: None,
                     command: ControlInput::Retained {
                         context: self.context,
+                        normal_close,
                     },
                 }),
             )

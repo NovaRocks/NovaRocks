@@ -29,19 +29,18 @@ pub(crate) fn measure(
     input: &TaskCreationInput,
     ingress_retained_bytes: usize,
 ) -> Result<CreationCost, AdmissionRefusal> {
-    let inbound_bytes = novarocks_worker_protocol::inbound_cost::record_bytes(request.descriptor())
-        .ok_or_else(|| {
-            AdmissionRefusal::Domain(
-                DomainFailureOutcome::ResourceExhausted,
-                OperationDomainFailure::new(
-                    FailureFact::new(
-                        FailureClass::Resource,
-                        crate::failure_reason::WorkerFailureReason::InboundRecordSize.reason(),
-                    ),
-                    SafeDetail::truncating("inbound normal-close record size overflowed"),
+    let inbound_bytes = inbound_record_bytes(request.descriptor()).ok_or_else(|| {
+        AdmissionRefusal::Domain(
+            DomainFailureOutcome::ResourceExhausted,
+            OperationDomainFailure::new(
+                FailureFact::new(
+                    FailureClass::Resource,
+                    crate::failure_reason::WorkerFailureReason::InboundRecordSize.reason(),
                 ),
-            )
-        })?;
+                SafeDetail::truncating("inbound normal-close record size overflowed"),
+            ),
+        )
+    })?;
     Ok(CreationCost {
         input_retained_bytes: input.retained_bytes() as u64,
         ingress_retained_bytes: ingress_retained_bytes as u64,
@@ -49,6 +48,17 @@ pub(crate) fn measure(
         inbound_records: u64::from(inbound_bytes != 0),
         inbound_bytes: inbound_bytes as u64,
     })
+}
+
+/// The pure author receives the actual inline owner layout. The live permit
+/// and its original reservation remain outside the protocol core.
+pub(crate) fn inbound_record_bytes(
+    descriptor: &novarocks_execution_contract::TaskDescriptor,
+) -> Option<usize> {
+    novarocks_worker_protocol::inbound_cost::record_bytes(
+        descriptor,
+        std::mem::size_of::<Option<crate::TaskInboundPermit>>(),
+    )
 }
 
 pub(crate) fn structural_bytes(request: &CreateTask) -> usize {

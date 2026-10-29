@@ -41,6 +41,8 @@ pub struct BackendMetricsRegistry {
     worker_node: Option<novarocks_worker::WorkerTaskControl>,
     worker_node_gauges: IntGaugeVec,
     worker_node_snapshot_available: IntGauge,
+    preparation_gauges: IntGaugeVec,
+    preparation_snapshot_available: IntGauge,
     process_memory: Option<(ProcessMemoryObservation, ProcessMemoryGauges)>,
     scrape_lock: std::sync::Mutex<()>,
 }
@@ -417,6 +419,19 @@ impl BackendMetricsRegistry {
         registry
             .register(Box::new(worker_node_snapshot_available.clone()))
             .map_err(|error| format!("register Worker Node snapshot availability: {error}"))?;
+        let preparation_gauges = IntGaugeVec::new(
+            Opts::new("novarocks_backend_task_preparation", "Actual preparation charges and independently sampled original physical fair-queue occupancy. Charges include retained/exiting holders; queue/worker counts do not prove whole exit."),
+            &["resource", "dimension"],
+        ).map_err(|error| format!("construct preparation owner metrics: {error}"))?;
+        registry
+            .register(Box::new(preparation_gauges.clone()))
+            .map_err(|error| format!("register preparation owner metrics: {error}"))?;
+        let preparation_snapshot_available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_task_preparation_snapshot_available", "Whether both original preparation owners supplied a current nonblocking sample. Busy snapshots omit usage and limits; no zero or cached observation is substituted.",
+        )).map_err(|error| format!("construct preparation owner availability: {error}"))?;
+        registry
+            .register(Box::new(preparation_snapshot_available.clone()))
+            .map_err(|error| format!("register preparation owner availability: {error}"))?;
         let collectors = [
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone())
                 as Box<dyn prometheus::core::Collector>,
@@ -472,6 +487,8 @@ impl BackendMetricsRegistry {
             worker_node: None,
             worker_node_gauges,
             worker_node_snapshot_available,
+            preparation_gauges,
+            preparation_snapshot_available,
             process_memory: None,
             scrape_lock: std::sync::Mutex::new(()),
         })
@@ -587,6 +604,37 @@ impl BackendMetricsRegistry {
                     .set(gauge_value(used));
             }
         }
+        let preparation = match &self.worker_node {
+            Some(owner) => owner
+                .try_preparation_snapshot()
+                .map_err(|error| format!("observe original preparation ownership: {error:?}"))?,
+            None => None,
+        };
+        self.preparation_snapshot_available
+            .set(i64::from(preparation.is_some()));
+        if let Some(snapshot) = preparation {
+            for (resource, used, limit) in [
+                ("positions", snapshot.positions, snapshot.position_limit),
+                (
+                    "context_positions",
+                    snapshot.context_positions,
+                    snapshot.context_position_limit,
+                ),
+                (
+                    "queued_positions",
+                    snapshot.queued_positions,
+                    snapshot.position_limit,
+                ),
+                ("workers", snapshot.workers, snapshot.worker_limit),
+                ("bytes", snapshot.bytes, snapshot.byte_limit),
+            ] {
+                for (dimension, value) in [("used", used), ("limit", limit)] {
+                    self.preparation_gauges
+                        .with_label_values(&[resource, dimension])
+                        .set(gauge_value(value));
+                }
+            }
+        }
         let _query_resource_scrape_guard = self.native_query_resources.as_ref().map(|_| {
             NATIVE_QUERY_RESOURCE_SCRAPE_LOCK
                 .lock()
@@ -618,6 +666,9 @@ impl BackendMetricsRegistry {
         if node.is_none() {
             families
                 .retain(|family| family.get_name() != "novarocks_backend_worker_node_resources");
+        }
+        if preparation.is_none() {
+            families.retain(|family| family.get_name() != "novarocks_backend_task_preparation");
         }
         Ok(families)
     }
