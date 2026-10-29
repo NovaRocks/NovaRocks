@@ -285,14 +285,10 @@ fn emit(
                 cause,
             ));
         }
-        TaskProtocolEvent::TaskTerminalRetained {
-            identity,
-            state,
-            bytes,
-        } => {
+        TaskProtocolEvent::TaskTerminalRetained { identity, state } => {
             let execution = identity.query_execution_id();
             observer.observe(&format!(
-                "NOVAROCKS_TASK_TERMINAL_RETAINED execution_id={}:{}:{} stage={} task={} backend={} state={state} bytes={bytes}",
+                "NOVAROCKS_TASK_TERMINAL_RETAINED execution_id={}:{}:{} stage={} task={} backend={} state={state}",
                 execution.query_id().high(),
                 execution.query_id().low(),
                 execution.attempt_id().get(),

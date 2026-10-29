@@ -1688,7 +1688,7 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         &self,
         execution: QueryExecutionId,
         carrier: TaskIdentity,
-        reporter: &TaskStatusReporter,
+        producer: novarocks_worker::TaskDynamicFilterWriter,
     ) -> bool {
         let Some(context) = self.context_for_execution(execution) else {
             return false;
@@ -1722,7 +1722,7 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         let Some(participant) = facts.participant.clone() else {
             return false;
         };
-        let sink = TaskRuntimeFilterFeedbackEgress::new(carrier, reporter.clone());
+        let sink = TaskRuntimeFilterFeedbackEgress::new(carrier, producer);
         #[cfg(novarocks_dev_controls)]
         let sink = {
             let sink = if let Some(controls) = self.test_controls.clone() {

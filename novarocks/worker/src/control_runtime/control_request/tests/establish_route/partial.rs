@@ -288,10 +288,10 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
     let retired = f.f.root.reap_ready_requests(32).unwrap();
     f.finish_model_refusal();
 
-    assert_eq!(
+    assert!(matches!(
         result,
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
-    );
+        EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict
+    ));
     assert!(!first);
     assert!(escrow_held);
     assert!(second);

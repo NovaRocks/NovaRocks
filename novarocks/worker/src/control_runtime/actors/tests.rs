@@ -1150,7 +1150,12 @@ fn causal_loader_partial_source_refusal_returns_unread_input_and_reaps_only_unus
         statistics,
         open_summary,
         mut causal,
+        production,
     } = host.into_resources();
+    assert!(
+        production.is_none(),
+        "component fixture never created a production runtime/root owner"
+    );
     assert_eq!(
         active.resources().unwrap(),
         policy
@@ -1592,11 +1597,16 @@ fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generati
     assert_eq!(close.get(), 2);
     let outputs = f.run(ContextInput::NextInternal, None);
     assert!(outputs.iter().any(|action| matches!(action,
-        WorkerAction::Context(ContextEffect::ApplyTaskClose { task, generation }) if *task == identity && *generation == close)));
+        WorkerAction::Context(ContextEffect::ApplyTaskClose { task, generation,
+..
+}) if *task == identity && *generation == close)));
     let outputs = f.run(
         ContextInput::ApplyTaskClose {
             task: identity,
             generation: close,
+            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                novarocks_execution_contract::AbortCause::QueryFailed,
+            ),
         },
         None,
     );
@@ -1691,6 +1701,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
             ticket: empty(),
         },
         roles[1].0.id(),
+        roles[0].0.id(),
     );
     let target = ActorId::new(2).unwrap();
     f.runtime
@@ -1701,10 +1712,12 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
             ActorConfig {
                 mailbox: [8, 8, 8, 1],
                 max_batches: 25,
-                max_effects_per_step: ControlCore::MAX_STEP_WORK,
-                max_dependencies_per_effect: ControlCore::MAX_STEP_WORK,
-                turn_budget: 64,
-                max_step_work: ControlCore::MAX_STEP_WORK,
+                max_effects_per_step:
+                    crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                max_dependencies_per_effect:
+                    crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                turn_budget: crate::control_runtime::actors::ControlActor::TURN_BUDGET,
+                max_step_work: crate::control_runtime::actors::ControlActor::MAX_STEP_WORK,
             },
             &roles[0].0,
         )
@@ -1815,6 +1828,25 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
             decision: novarocks_worker_protocol::context::ContextEstablishmentDecision {
                 state: novarocks_execution_contract::QueryContextState::Active,
                 outcome: Ok(OperationOutcome::Accepted),
+                acknowledgement: Some(novarocks_worker_protocol::context::ContextAcknowledgement {
+                    outcome: OperationOutcome::Accepted,
+                    receipt: std::sync::Arc::new(
+                        novarocks_execution_contract::QueryContextReceipt::new(
+                            next,
+                            novarocks_execution_contract::QueryContextState::Active,
+                        )
+                        .with_lease(
+                            novarocks_worker_protocol::lease::InstalledLease::install_initial(
+                                semantics.initial_lease_valid_for,
+                                novarocks_worker_protocol::lease::LeaseBounds::DEFAULT,
+                                MonotonicInstant::ORIGIN,
+                            )
+                            .receipt(),
+                        ),
+                    ),
+                    termination_cause: None,
+                }),
+                decided_at: MonotonicInstant::ORIGIN,
             },
         },
         None,
@@ -3124,7 +3156,12 @@ fn exercise_fragment_roles_with_preparation(
         statistics,
         open_summary,
         causal,
+        production,
     } = host.into_resources();
+    assert!(
+        production.is_none(),
+        "component fixture never created a production runtime/root owner"
+    );
     assert!(
         loading_events.is_none(),
         "this fixture used the loader component directly"
@@ -3547,7 +3584,17 @@ fn lifecycle_event_report_cannot_use_its_prefix_as_its_own_core_receipt() {
     let admission = h.admission();
     let (cut, sender) = h
         .inbox
-        .admit_input(work, 1, std::sync::Arc::new(CausalPending), admission)
+        .admit_input(
+            &h.fixture
+                .roles
+                .iter()
+                .find(|(original, _)| original.id() == work)
+                .expect("the same actual author")
+                .0,
+            1,
+            std::sync::Arc::new(CausalPending),
+            admission,
+        )
         .unwrap();
     drop(h.ingress.submit(TaskConclusionProposal::Canceled(
         CancelReason::UpstreamNoLongerNeeded,
@@ -3663,18 +3710,28 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
     let next = closing
         .iter()
         .find_map(|effect| match effect {
-            WorkerAction::Context(ContextEffect::ApplyTaskClose { task, generation })
-                if *task == h.task =>
-            {
-                Some(*generation)
-            }
+            WorkerAction::Context(ContextEffect::ApplyTaskClose {
+                task, generation, ..
+            }) if *task == h.task => Some(*generation),
             _ => None,
         })
         .expect("the pure close owner emits this Task's finite causal role");
     assert_ne!(next, generation());
     let (close_cut, close) = h
         .inbox
-        .admit_close(next, work, 1, std::sync::Arc::new(CausalPending), admission)
+        .admit_close(
+            next,
+            novarocks_worker_protocol::context::TaskCloseIntent::Abort(AbortCause::PeerTaskFailed),
+            &h.fixture
+                .roles
+                .iter()
+                .find(|(original, _)| original.id() == work)
+                .expect("the same actual close author")
+                .0,
+            1,
+            std::sync::Arc::new(CausalPending),
+            admission,
+        )
         .unwrap();
     h.ingress
         .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));

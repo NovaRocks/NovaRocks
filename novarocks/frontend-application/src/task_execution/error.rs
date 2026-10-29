@@ -985,8 +985,8 @@ mod canonical_input_tests {
     }
     #[test]
     fn owner_failure_is_an_invariant_with_no_process_recovery_qualification() {
+        use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_query_application::api::NativeAttemptTopologyRequirement;
-        use novarocks_query_application::coordination::AttemptFailureClass;
         let input = TaskExecutionError::OperationFailed {
             context: context(),
             operation_id: TaskOperationId::new_v7(),

@@ -249,6 +249,16 @@ impl Fixture {
                 decision: ContextEstablishmentDecision {
                     state,
                     outcome: Ok(outcome),
+                    acknowledgement: Some(novarocks_worker_protocol::context::ContextAcknowledgement {
+                        outcome,
+                        receipt: std::sync::Arc::new(novarocks_execution_contract::QueryContextReceipt::new(
+                            context(1), state,
+                        ).with_lease(novarocks_worker_protocol::lease::InstalledLease::install_initial(
+                            semantics().initial_lease_valid_for, novarocks_worker_protocol::lease::LeaseBounds::DEFAULT, at(0),
+                        ).receipt())),
+                        termination_cause: None,
+                    }),
+                    decided_at: at(now),
                 },
             },
         )
@@ -266,6 +276,7 @@ impl Fixture {
                 context: context(1),
                 request,
                 result,
+                acknowledgement: None,
                 decided_at: at(decided_at),
             },
         )
@@ -359,6 +370,7 @@ fn wrong_route_correlation_or_decision_time_cannot_consume_the_original_pending_
                     context: target,
                     request: candidate,
                     result,
+                    acknowledgement: None,
                     decided_at,
                 },
                 &mut f.capacity,

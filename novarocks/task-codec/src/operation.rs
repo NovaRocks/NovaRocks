@@ -206,6 +206,11 @@ pub struct DecodedUpdateTask {
 }
 
 impl DecodedUpdateTask {
+    /// Move the original neutral request and its rich domain handles to the
+    /// admitted Worker owner without cloning the domain vector.
+    pub fn into_request(self) -> UpdateTask {
+        self.request
+    }
     pub const fn request(&self) -> &UpdateTask {
         &self.request
     }
@@ -1645,27 +1650,87 @@ pub fn encode_credential_receipt(
     }
 }
 
-/// Encodes a release acknowledgement.
-///
-/// `runtime_filter` is the releasing backend's own sealed runtime-filter
-/// observation. It is passed already-validated rather than assembled here:
-/// the projection belongs to the participant's owner, and this codec's job is
-/// to carry the value it produced without inventing an empty one for a
-/// release that had nothing to seal.
-pub fn encode_quiesce_ack(
+/// The shared fixed scalar header for a Quiesce acknowledgement or fact.
+/// Membership is encoded only by the external wire projection below.
+fn encode_quiesce_scalar(
     value: &QuiesceQueryContextReceipt,
 ) -> Option<novarocks::QuiesceQueryContextAck> {
     Some(novarocks::QuiesceQueryContextAck {
         query_context: Some(encode_query_context_ref(value.context())),
         fence_version: value.fence_version(),
-        accepted_tasks: value
-            .accepted_tasks()
-            .iter()
-            .copied()
-            .map(encode_task_identity)
-            .collect(),
+        accepted_tasks: Vec::new(),
         state: encode_context_state(value.state())?,
     })
+}
+
+pub fn encode_quiesce_ack(
+    value: &QuiesceQueryContextReceipt,
+) -> Option<novarocks::QuiesceQueryContextAck> {
+    let mut wire = encode_quiesce_scalar(value)?;
+    wire.accepted_tasks = value
+        .accepted_tasks()
+        .iter()
+        .copied()
+        .map(encode_task_identity)
+        .collect();
+    Some(wire)
+}
+
+/// Constant-time conservative encoded size of a live covered Quiesce fact.
+/// This never clones or traverses accepted_tasks. It bounds every legal typed
+/// identity, including foreign-context members; membership validation remains
+/// with the actual encoder/decoder and the original Core author.
+pub fn covered_quiesce_fact_size_bound(value: &QuiesceQueryContextReceipt) -> Option<usize> {
+    use novarocks_execution_contract::QueryContextState;
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use prost::encoding::{encoded_len_varint, key_len};
+
+    if value.fence_version() == 0
+        || value.accepted_tasks().len() > TransportBudget::DEFAULT.max_tasks_per_context()
+        || !matches!(
+            value.state(),
+            QueryContextState::Quiescing
+                | QueryContextState::Releasing
+                | QueryContextState::Aborting
+                | QueryContextState::TerminalRetained
+        )
+    {
+        return None;
+    }
+    // int64 uses ten bytes for negative values, more than positive i64::MAX.
+    // Attempt/Stage/Task use their actual maximum legal unsigned widths. The
+    // fixed UUID is a valid non-nil v7, and every UUID encodes sixteen bytes.
+    let mut uuid = [u8::MAX; 16];
+    uuid[6] = 0x7f;
+    uuid[8] = 0xbf;
+    let maximum = TaskIdentity::new(
+        QueryExecutionId::new(
+            QueryId::new(i64::MIN, i64::MIN),
+            AttemptId::new(u64::MAX).ok()?,
+        )
+        .ok()?,
+        StageId::new(u32::MAX).ok()?,
+        TaskId::new(u32::MAX).ok()?,
+        BackendProcessId::try_from_bytes(uuid).ok()?,
+    );
+    let identity_bytes = encode_task_identity(maximum).encoded_len();
+    // Quiesce Ack and Observation share scalar tags 1/2/4 and repeated Task
+    // tag3. Header encoding comes from the same scalar projection as the wire.
+    let per_member = key_len(3)
+        .checked_add(encoded_len_varint(u64::try_from(identity_bytes).ok()?))?
+        .checked_add(identity_bytes)?;
+    let payload = encode_quiesce_scalar(value)?
+        .encoded_len()
+        .checked_add(value.accepted_tasks().len().checked_mul(per_member)?)?;
+    // TaskStatusStreamEvent oneof Quiesce is field5. Optional live revision
+    // field11 is present, at its largest actual uint64 value (not guessed).
+    key_len(5)
+        .checked_add(encoded_len_varint(u64::try_from(payload).ok()?))?
+        .checked_add(payload)?
+        .checked_add(key_len(11))?
+        .checked_add(encoded_len_varint(u64::MAX))
 }
 
 pub fn decode_quiesce_ack(

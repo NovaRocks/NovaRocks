@@ -159,7 +159,7 @@ fn probe(
     assert_eq!(result.records_visited, 1);
     assert!(result.requests.is_empty());
     assert_eq!(result.effects.len(), 1);
-    match result.effects[0] {
+    match result.effects.into_iter().next().unwrap() {
         ContextEffect::EstablishProbed {
             context: actual,
             request: correlated,
@@ -274,9 +274,8 @@ fn materialization_installs_the_initial_domains_only_after_real_success() {
     }
     // This explicit symbolic fact says the canonical owner compared the
     // candidate material against precisely resource 700 at epoch FIRST.
-    assert_eq!(
-        probe(&mut core, 1, request(), comparison(initial, true)),
-        EstablishReplayResult::Decided(OperationOutcome::Idempotent)
+    assert!(
+        matches!(probe(&mut core, 1, request(), comparison(initial, true)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::Idempotent)
     );
     assert_eq!(core.establishment(), original());
 }
@@ -301,22 +300,19 @@ fn every_immutable_establish_field_conflicts_but_a_new_carrier_is_valid() {
             }
             _ => unreachable!(),
         }
-        assert_eq!(
-            probe(&mut core, 1, candidate, comparison(current, true)),
-            EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+        assert!(
+            matches!(probe(&mut core, 1, candidate, comparison(current, true)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
         );
     }
     for payload in [PayloadId(900), PayloadId(901), original().payload] {
         let mut candidate = request();
         candidate.payload = payload;
-        assert_eq!(
-            probe(&mut core, 1, candidate, comparison(current, true)),
-            EstablishReplayResult::Decided(OperationOutcome::Idempotent)
+        assert!(
+            matches!(probe(&mut core, 1, candidate, comparison(current, true)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::Idempotent)
         );
     }
-    assert_eq!(
-        probe(&mut core, 1, request(), comparison(current, false)),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    assert!(
+        matches!(probe(&mut core, 1, request(), comparison(current, false)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
 }
 
@@ -334,9 +330,8 @@ fn an_initial_probe_waits_without_accepting_uninstalled_comparison_facts() {
     );
     let mut changed = request();
     changed.ticket = AdmissionTicketId::try_from_bytes([21; 16]).unwrap();
-    assert_eq!(
-        probe(&mut core, 1, changed, None),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    assert!(
+        matches!(probe(&mut core, 1, changed, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
     assert_eq!(core.state(), QueryContextState::Establishing);
 }
@@ -375,9 +370,8 @@ fn credential_rotation_requires_a_current_comparison_and_repeated_materializatio
         EstablishReplayResult::CompareCredential { expected: current }
     );
     // Even equal material cannot make the old initial epoch current again.
-    assert_eq!(
-        probe(&mut core, 1, request(), comparison(current, true)),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    assert!(
+        matches!(probe(&mut core, 1, request(), comparison(current, true)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
     assert_eq!(core.establishment(), original());
 }
@@ -419,9 +413,8 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
         command_step(&mut core, 1, 10002, operation(60), ContextCommand::Quiesce);
         materialize(&mut core, 999, 1);
         assert_eq!(core.state(), QueryContextState::Quiescing);
-        assert_eq!(
-            probe(&mut core, 1, mismatched, None),
-            EstablishReplayResult::Decided(OperationOutcome::ContextTerminalReceipt)
+        assert!(
+            matches!(probe(&mut core, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextTerminalReceipt)
         );
     }
     let mut unmaterialized = core();
@@ -435,16 +428,14 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
         },
     );
     materialize(&mut unmaterialized, 999, 1);
-    assert_eq!(
-        probe(&mut unmaterialized, 1, mismatched, None),
-        EstablishReplayResult::Decided(OperationOutcome::InvalidStateOrRequest)
+    assert!(
+        matches!(probe(&mut unmaterialized, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::InvalidStateOrRequest)
     );
     let mut core = active(700);
     step(&mut core, 30, ContextInput::Tick);
     assert_eq!(core.state(), QueryContextState::Aborting);
-    assert_eq!(
-        probe(&mut core, 30, mismatched, None),
-        EstablishReplayResult::Decided(OperationOutcome::InvalidStateOrRequest)
+    assert!(
+        matches!(probe(&mut core, 30, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::InvalidStateOrRequest)
     );
     // Normal release reaches Releasing through the actual Quiesce protocol,
     // independently of the Aborting state above.
@@ -453,16 +444,14 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
     step(&mut core, 1, ContextInput::ContinueQuiesce);
     command_step(&mut core, 1, 10005, operation(61), ContextCommand::Release);
     assert_eq!(core.state(), QueryContextState::Releasing);
-    assert_eq!(
-        probe(&mut core, 1, mismatched, None),
-        EstablishReplayResult::Decided(OperationOutcome::InvalidStateOrRequest)
+    assert!(
+        matches!(probe(&mut core, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::InvalidStateOrRequest)
     );
     step(&mut core, 1, ContextInput::HostReleased);
     assert_eq!(core.state(), QueryContextState::TerminalRetained);
     materialize(&mut core, 999, 1);
-    assert_eq!(
-        probe(&mut core, 1, mismatched, None),
-        EstablishReplayResult::Decided(OperationOutcome::ContextTerminalReceipt)
+    assert!(
+        matches!(probe(&mut core, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextTerminalReceipt)
     );
 }
 

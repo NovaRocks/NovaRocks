@@ -1410,6 +1410,13 @@ impl<A: Actor> ActorRuntime<A> {
         let inbox = node.inbox.lock().expect("actor inbox lock");
         Ok(Self::timer_state(&inbox))
     }
+    /// Observe the unique builtin Tick's original input address. This grants
+    /// no retirement authority; its real batch still gates retire_input.
+    pub fn pending_timer_input(&self, actor: ActorId) -> Result<Option<InputId>, DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        Ok(inbox.timer_input)
+    }
     fn timer_state(inbox: &Inbox<A>) -> TimerSourceState {
         if !inbox.timer_closed {
             TimerSourceState::Open
@@ -3081,10 +3088,16 @@ impl<A: Actor> PollerPool<A> {
                             let now = worker_clock.now();
                             worker_runtime
                                 .advance_time(now, 64)
-                                .unwrap_or_else(|_| std::process::abort());
+                                .unwrap_or_else(|error| {
+                                    eprintln!("Control poller timer advance failed: {error:?}");
+                                    std::process::abort();
+                                });
                             let core_progressed = worker_runtime
                                 .poll_one_with_clock(worker_clock.as_ref())
-                                .unwrap_or_else(|_| std::process::abort());
+                                .unwrap_or_else(|error| {
+                                    eprintln!("Control poller Core turn failed: {error:?}");
+                                    std::process::abort();
+                                });
                             // A continuously ready protocol actor must not starve
                             // host handoffs or retirement. Each queue gets one
                             // finite opportunity before another turn begins.
@@ -3111,6 +3124,7 @@ impl<A: Actor> PollerPool<A> {
                     // Protocol-core panic is isolated inside poll_one. Reaching this boundary
                     // means the shared driver or its fixed failure projection lost an invariant.
                     if result.is_err() {
+                        eprintln!("Control poller shared driver panicked");
                         std::process::abort();
                     }
                 });

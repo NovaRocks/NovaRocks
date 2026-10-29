@@ -131,6 +131,97 @@ impl ControlRequestCustody {
         }
         Ok(dispatched)
     }
+    fn dispatch_notification(
+        &mut self,
+        handles: &EstablishExecutorHandles,
+    ) -> Result<usize, RequestIoError> {
+        if self.pending_notification.is_none() {
+            self.pending_notification = self.notification.take_job().map(|job| {
+                super::super::request_endpoint::RequestNotificationJob {
+                    original: job,
+                    notice: super::super::request_endpoint::RequestNotice(
+                        self.endpoint.external.slot().clone(),
+                    ),
+                }
+            });
+        }
+        let Some(job) = self.pending_notification.take() else {
+            return Ok(0);
+        };
+        let before = self.endpoint.ready.source_capacity_revision();
+        match handles.try_submit_notification(job) {
+            Ok(()) => {
+                self.endpoint
+                    .ready
+                    .clear_capacity_wait(self.endpoint.external.slot())?;
+                Ok(1)
+            }
+            Err((error, job)) => {
+                self.pending_notification = Some(job);
+                match error {
+                    EstablishSubmitError::Host(error)
+                        if crate::control_runtime::request_endpoint::notification_submit_busy(
+                            &error,
+                        ) =>
+                    {
+                        self.endpoint
+                            .ready
+                            .park_capacity(self.endpoint.external.slot(), before)?;
+                        Ok(0)
+                    }
+                    error => Err(RequestIoError::Submit(error)),
+                }
+            }
+        }
+    }
+    pub(in crate::control_runtime) fn advance_protocol_observation(
+        &mut self,
+        handles: &EstablishExecutorHandles,
+        ports: Option<&crate::TaskExecutionPorts>,
+    ) -> Result<usize, RequestIoError> {
+        if self.protocol_observation.failed() {
+            return Err(ControlRequestError::SubmissionUnresolved.into());
+        }
+        if self.pending_protocol_observation.is_none() && self.protocol_observation.has_pending() {
+            let ports = ports.ok_or(ControlRequestError::MissingObservationPort)?;
+            self.pending_protocol_observation = self.protocol_observation.take_job(
+                ports,
+                self.scope.id(),
+                self.work,
+                super::super::request_endpoint::RequestNotice(
+                    self.endpoint.external.slot().clone(),
+                ),
+            );
+        }
+        let Some(job) = self.pending_protocol_observation.take() else {
+            return Ok(0);
+        };
+        let before = self.endpoint.ready.source_capacity_revision();
+        match handles.try_submit_observation(job) {
+            Ok(()) => {
+                self.endpoint
+                    .ready
+                    .clear_capacity_wait(self.endpoint.external.slot())?;
+                Ok(1)
+            }
+            Err((error, original)) => {
+                self.pending_protocol_observation = Some(original);
+                match error {
+                    EstablishSubmitError::Host(error)
+                        if crate::control_runtime::request_endpoint::notification_submit_busy(
+                            &error,
+                        ) =>
+                    {
+                        self.endpoint
+                            .ready
+                            .park_capacity(self.endpoint.external.slot(), before)?;
+                        Ok(0)
+                    }
+                    error => Err(RequestIoError::Submit(error)),
+                }
+            }
+        }
+    }
     pub(in crate::control_runtime) fn advance_source_io(
         &mut self,
         handles: &EstablishExecutorHandles,
@@ -148,7 +239,7 @@ impl ControlRequestCustody {
         }
         let mut progress = RequestIoProgress {
             visited: 1,
-            dispatched: self.dispatch_sources(handles)?,
+            dispatched: self.dispatch_sources(handles)? + self.dispatch_notification(handles)?,
             ..Default::default()
         };
         if self.ingress_issued && !self.submitted && !self.withdrawal {

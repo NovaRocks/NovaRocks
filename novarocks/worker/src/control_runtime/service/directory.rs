@@ -50,6 +50,11 @@ impl DerefMut for ContextHostGuard<'_> {
     }
 }
 impl ContextHostGuard<'_> {
+    /// Keep this same cell locked until its original parent owner has moved
+    /// to Root. A concurrent Root lookup then sees either owner, never a gap.
+    pub(in crate::control_runtime) fn take_for_parent(&mut self) -> ContextHostRecord {
+        self.0.take().expect("same original Context parent owner")
+    }
     pub(super) fn take_original(mut self) -> ContextHostRecord {
         self.0.take().expect("same original Context removal owner")
     }
@@ -89,17 +94,36 @@ impl ContextHostAddress {
 pub(super) struct DirectoryState {
     pub contexts: BTreeMap<QueryContextRef, ContextHostAddress>,
     pub actors: BTreeMap<ActorId, QueryContextRef>,
+    pub executions: BTreeMap<novarocks_types::QueryExecutionId, QueryContextRef>,
 }
 /// Clone this handle before a host turn; lookup releases the short directory
 /// lock before any caller locks the addressed Context's original inventory.
 #[derive(Clone, Default)]
 pub(crate) struct ContextDirectory(Arc<Mutex<DirectoryState>>);
 impl ContextDirectory {
+    /// Both sparse indices must be empty before the process owner can retire.
+    /// This observes actual address inventory, never a Context's exit fact.
+    pub(crate) fn is_empty(&self) -> bool {
+        let state = self.state();
+        state.contexts.is_empty() && state.actors.is_empty() && state.executions.is_empty()
+    }
     pub(super) fn state(&self) -> MutexGuard<'_, DirectoryState> {
         self.0.lock().expect("Context address directory lock")
     }
     pub(crate) fn context(&self, context: QueryContextRef) -> Option<ContextHostAddress> {
         self.state().contexts.get(&context).cloned()
+    }
+    /// Task wire identities omit the Frontend process. Resolve that component
+    /// only from this exact held execution's original Context, never by scan or
+    /// by inventing a Frontend identity from the Task.
+    pub(crate) fn task_context(
+        &self,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> Option<QueryContextRef> {
+        let state = self.state();
+        let context = *state.executions.get(&task.query_execution_id())?;
+        task.verify_query_context(context).ok()?;
+        Some(context)
     }
     /// The Root dispatcher can release its own inventory lock before this
     /// target handoff. The caller retains its original effect ticket, and a
@@ -133,7 +157,7 @@ impl ContextDirectory {
             .filter(|address| turn.matches_registration(&address.0.registration))
             .cloned()
     }
-    pub(super) fn remove_original(&self, address: &ContextHostAddress) {
+    pub(in crate::control_runtime) fn remove_original(&self, address: &ContextHostAddress) {
         let mut state = self.state();
         let context = address.context();
         assert!(
@@ -144,6 +168,7 @@ impl ContextDirectory {
             "only the same physically removed Context can leave its directory"
         );
         state.contexts.remove(&context);
+        assert_eq!(state.executions.remove(&context.query_execution_id()), Some(context));
         assert_eq!(
             state.actors.remove(&address.0.registration.actor()),
             Some(context)

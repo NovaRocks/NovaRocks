@@ -134,6 +134,10 @@ impl WorkerService {
     pub(super) fn ledger(&self) -> &RuntimeLedger {
         &self.ledger
     }
+    /// The actual directory bound frozen by the original Control Core.
+    pub(super) fn directory_capacity(&self) -> NonZeroUsize {
+        self.max_contexts
+    }
     pub(crate) fn runtime(&self) -> &ActorRuntime<WorkerActor> {
         &self.runtime
     }
@@ -177,7 +181,9 @@ impl WorkerService {
         // poller cannot resolve the newly registered actor before its original
         // Context cell has been published here.
         let mut directory = self.directory.state();
-        if directory.contexts.contains_key(&context) {
+        if directory.contexts.contains_key(&context)
+            || directory.executions.contains_key(&context.query_execution_id())
+        {
             return Err(ServiceHostError::ContextAlreadyOwned);
         }
         if directory.actors.contains_key(&binding.actor) || binding.actor == self.control {
@@ -203,6 +209,7 @@ impl WorkerService {
             }));
         }
         assert_eq!(host.identity(), context);
+        assert!(directory.executions.insert(context.query_execution_id(), context).is_none());
         assert!(directory.actors.insert(host.actor(), context).is_none());
         assert!(
             directory

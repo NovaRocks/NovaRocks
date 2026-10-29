@@ -186,7 +186,7 @@ pub trait TaskQueryContextFacts: Send + Sync {
         &self,
         execution: QueryExecutionId,
         carrier: TaskIdentity,
-        reporter: &TaskStatusReporter,
+        producer: novarocks_worker::TaskDynamicFilterWriter,
     ) -> bool;
 
     /// Delivers one task-scoped dynamic filter the frontend pushed down.
@@ -290,6 +290,7 @@ struct TaskRuntime {
     /// Terminal sealing withdraws its owner; concurrent samples keep only
     /// their original producer loan until that actual call exits.
     operator_statistics: Arc<TaskOperatorStatisticsSink>,
+    dynamic_filters: novarocks_worker::TaskDynamicFilterProducer,
 }
 
 /// The same original receiver captures, moved under the inbound writer fence.
@@ -913,6 +914,7 @@ impl NativeTaskExecutionHost {
             start,
             terminal,
             statistics,
+            dynamic_filters,
             final_statistics,
             completion_exit,
         } = preparation_scope.take_roles().map_err(host_failure)?;
@@ -1095,6 +1097,7 @@ impl NativeTaskExecutionHost {
                 replay_gate: Mutex::new(None),
                 read_context,
                 operator_statistics,
+                dynamic_filters,
                 root_channel,
             }),
         );
@@ -1605,10 +1608,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // status owner only once it is being submitted. Before the worker
         // starts, because a producer can close its channel almost immediately
         // after the drivers begin.
-        if self
-            .context_facts
-            .bind_runtime_filter_feedback(execution, identity, &reporter)
-        {
+        if self.context_facts.bind_runtime_filter_feedback(
+            execution,
+            identity,
+            runtime.dynamic_filters.writer(),
+        ) {
             debug!("task {identity} carries its query context's dynamic filter feedback");
         }
 
@@ -2118,6 +2122,9 @@ impl NativeRunnableTask {
                 });
                 current.termination().is_some() || current.is_terminal()
             });
+        tracing::debug!(pid = std::process::id(), task = ?self.identity,
+            stopped_before_start, latched_stop,
+            "Original dormant Native start entered its committed physical path");
         let PreparedNativeStart {
             kernel,
             completion,

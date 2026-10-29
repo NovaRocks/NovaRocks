@@ -72,7 +72,7 @@ fn probe_in_handoff_order(f: &mut RouteFixture, input: InputId) -> EstablishRepl
             let result = match &probe.effect {
                 WorkerAction::Context(ContextEffect::EstablishProbed {
                     request, result, ..
-                }) if request.token == input => *result,
+                }) if request.token == input => result.clone(),
                 _ => panic!("the actual Context probe follows route handoff order"),
             };
             host.handoff_establish_probe(probe).unwrap();
@@ -192,9 +192,8 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
     // not fabricate a getter, a Context decision or a Source exit from counts.
     drop(handles);
     pools.join();
-    assert_eq!(
-        probe_in_handoff_order(&mut f, first),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    assert!(
+        matches!(probe_in_handoff_order(&mut f, first), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
     assert!(
         f.f.root
@@ -207,9 +206,8 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
             .unwrap()
     );
     finish_conflict_return(&mut f, first, first_handle, first_getters, first_drops);
-    assert_eq!(
-        probe_in_handoff_order(&mut f, second),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    assert!(
+        matches!(probe_in_handoff_order(&mut f, second), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
     assert!(
         f.f.root
@@ -310,9 +308,8 @@ fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_
         .into_owner();
     drop(handles);
     pools.join();
-    assert_eq!(
-        probe_in_handoff_order(&mut f, input),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    assert!(
+        matches!(probe_in_handoff_order(&mut f, input), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
     assert!(
         address

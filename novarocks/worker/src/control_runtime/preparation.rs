@@ -345,8 +345,24 @@ impl PreparationCustody {
         state.task_source_storage_transferred = true;
         Ok(storage)
     }
-    fn key(&self) -> Key {
+    pub(crate) fn key(&self) -> Key {
         (self.0.parent.scope.id(), self.0.parent.work)
+    }
+    /// These flags are set only by this original custodian after a
+    /// successful retirement of the corresponding actual report slot.
+    pub(crate) fn body_report_retired(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .expect("original body report retirement")
+            .body_report_retired
+    }
+    pub(crate) fn exit_report_retired(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .expect("original whole report retirement")
+            .exit_report_retired
     }
     pub(crate) fn body_report(&self) -> &ReportSlot {
         &self.0.body_report
@@ -481,6 +497,10 @@ impl PreparationCustody {
         }
         drop(state);
         self.0.pending.pending();
+    }
+    pub(crate) fn body_and_captures_exited(&self) -> bool {
+        let state = self.0.state.lock().expect("original preparation body exit");
+        !state.unresolved && state.body_exited && state.captures_exited
     }
     /// Only the actual preparation call, its captures and its registered
     /// provider-host holders. This read cannot invoke a provider or publish an

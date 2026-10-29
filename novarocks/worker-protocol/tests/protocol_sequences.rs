@@ -534,6 +534,9 @@ fn abort_predecessor_is_applied_before_a_late_loader_result() {
         ContextInput::ApplyTaskClose {
             task: task(1),
             generation: Generation::new(2).unwrap(),
+            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                novarocks_execution_contract::AbortCause::QueryFailed,
+            ),
         },
         ContextInput::Physical {
             task: task(1),
@@ -1426,6 +1429,7 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
             ContextEffect::ApplyTaskClose {
                 task: target,
                 generation,
+                ..
             } if *target == task(1) => Some(*generation),
             _ => None,
         })
@@ -1453,6 +1457,9 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
             ContextInput::ApplyTaskClose {
                 task: task(1),
                 generation: close_generation,
+                intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                    novarocks_execution_contract::AbortCause::QueryFailed,
+                ),
             },
             &mut port,
         )
@@ -1653,6 +1660,7 @@ fn finish_routed_establish(
                 context,
                 request: request.request,
                 result,
+                acknowledgement: None,
                 decided_at: at(decided_at),
             },
             port,
@@ -2295,11 +2303,46 @@ fn establishment_decision(step: &ContextStep) -> (Generation, ContextEstablishme
     decisions[0].clone()
 }
 
-fn active_establishment_decision() -> ContextEstablishmentDecision {
-    ContextEstablishmentDecision {
-        state: QueryContextState::Active,
-        outcome: Ok(OperationOutcome::Accepted),
+trait EstablishmentContract {
+    type Shape: std::fmt::Debug + PartialEq;
+    fn contract(self) -> Self::Shape;
+}
+impl EstablishmentContract for ContextEstablishmentDecision {
+    type Shape = (
+        QueryContextState,
+        Result<OperationOutcome, novarocks_worker_protocol::context::DomainRefusal>,
+    );
+    fn contract(self) -> Self::Shape {
+        (self.state, self.outcome)
     }
+}
+impl EstablishmentContract for (Generation, ContextEstablishmentDecision) {
+    type Shape = (
+        Generation,
+        <ContextEstablishmentDecision as EstablishmentContract>::Shape,
+    );
+    fn contract(self) -> Self::Shape {
+        (self.0, self.1.contract())
+    }
+}
+fn assert_establishment_contract<T: EstablishmentContract>(actual: T, expected: T) {
+    assert_eq!(actual.contract(), expected.contract());
+}
+
+fn active_establishment_decision() -> ContextEstablishmentDecision {
+    let mut original = core(1, 1);
+    let step = original
+        .handle(
+            at(0),
+            ContextInput::MaterializationFinished {
+                result: Ok(ContextMaterialized {
+                    initial_credential_resource: 101,
+                }),
+            },
+            &mut Port::default(),
+        )
+        .unwrap();
+    establishment_decision(&step).1
 }
 fn closed_establishment_decision(
     state: QueryContextState,
@@ -2308,6 +2351,8 @@ fn closed_establishment_decision(
     ContextEstablishmentDecision {
         state,
         outcome: Ok(outcome),
+        acknowledgement: None,
+        decided_at: at(0),
     }
 }
 
@@ -2485,9 +2530,9 @@ fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease
             &mut port,
         )
         .unwrap();
-    assert_eq!(
+    assert_establishment_contract(
         establishment_decision(&established),
-        (Generation::new(1).unwrap(), active_establishment_decision())
+        (Generation::new(1).unwrap(), active_establishment_decision()),
     );
     assert_eq!(context_core.next_deadline(), Some(at(32)));
     let duplicate = context_core
@@ -2517,15 +2562,15 @@ fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease
             &mut port,
         )
         .unwrap();
-    assert_eq!(
+    assert_establishment_contract(
         establishment_decision(&expired),
         (
             Generation::new(2).unwrap(),
             closed_establishment_decision(
                 QueryContextState::Aborting,
-                OperationOutcome::LeaseExpired
-            )
-        )
+                OperationOutcome::LeaseExpired,
+            ),
+        ),
     );
     assert_eq!(context_core.state(), QueryContextState::Aborting);
     assert!(
@@ -2562,15 +2607,15 @@ fn a_late_first_establishment_reports_expiry_and_cannot_reopen_on_repetition() {
                 &mut port,
             )
             .unwrap();
-        assert_eq!(
+        assert_establishment_contract(
             establishment_decision(&closed),
             (
                 Generation::new(2).unwrap(),
                 closed_establishment_decision(
                     QueryContextState::Aborting,
-                    OperationOutcome::LeaseExpired
-                )
-            )
+                    OperationOutcome::LeaseExpired,
+                ),
+            ),
         );
         assert_eq!(context_core.state(), QueryContextState::Aborting);
     }
@@ -2606,15 +2651,15 @@ fn an_abort_before_establishment_keeps_its_original_closed_outcome() {
                 &mut port,
             )
             .unwrap();
-        assert_eq!(
+        assert_establishment_contract(
             establishment_decision(&closed),
             (
                 Generation::new(2).unwrap(),
                 closed_establishment_decision(
                     QueryContextState::Aborting,
-                    OperationOutcome::ContextTerminalReceipt
-                )
-            )
+                    OperationOutcome::ContextTerminalReceipt,
+                ),
+            ),
         );
         assert_eq!(context_core.state(), QueryContextState::Aborting);
     }
@@ -2663,15 +2708,15 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
                 &mut port,
             )
             .unwrap();
-        assert_eq!(
+        assert_establishment_contract(
             establishment_decision(&late),
             (
                 Generation::new(1).unwrap(),
                 closed_establishment_decision(
                     QueryContextState::Quiescing,
-                    OperationOutcome::ContextTerminalReceipt
-                )
-            )
+                    OperationOutcome::ContextTerminalReceipt,
+                ),
+            ),
         );
         assert!(
             !late
@@ -2803,8 +2848,8 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
             )
             .unwrap();
         let (_, verdict) = establishment_decision(&decided);
-        assert_eq!(
-            verdict,
+        assert_establishment_contract(
+            verdict.clone(),
             if close_first {
                 closed_establishment_decision(
                     QueryContextState::Aborting,
@@ -2812,7 +2857,7 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
                 )
             } else {
                 active_establishment_decision()
-            }
+            },
         );
         if !close_first {
             context_core
@@ -3133,7 +3178,10 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             .unwrap();
         assert!(a.effects.contains(&ContextEffect::ApplyTaskClose {
             task: task(1),
-            generation: Generation::new(2).unwrap()
+            generation: Generation::new(2).unwrap(),
+            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                novarocks_execution_contract::AbortCause::QueryFailed
+            ),
         }));
         assert_eq!(
             core.task(task(1)).unwrap().applied_close_generation.get(),
@@ -3142,7 +3190,10 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
         let b = core.handle(at(0), ContextInput::Tick, &mut port).unwrap();
         assert!(b.effects.contains(&ContextEffect::ApplyTaskClose {
             task: task(2),
-            generation: Generation::new(2).unwrap()
+            generation: Generation::new(2).unwrap(),
+            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                novarocks_execution_contract::AbortCause::QueryFailed
+            ),
         }));
         let another_abort = core
             .apply_fixture(
@@ -3163,6 +3214,9 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
                 ContextInput::ApplyTaskClose {
                     task: task(2),
                     generation: Generation::new(2).unwrap(),
+                    intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                        novarocks_execution_contract::AbortCause::QueryFailed,
+                    ),
                 },
                 &mut port,
             )
@@ -3205,6 +3259,9 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
                 ContextInput::ApplyTaskClose {
                     task: task(1),
                     generation: Generation::new(2).unwrap(),
+                    intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                        novarocks_execution_contract::AbortCause::QueryFailed,
+                    ),
                 },
                 &mut port,
             )
@@ -3322,6 +3379,9 @@ fn a_preparation_failure_before_its_ordered_close_is_not_preempted_by_context_ab
         ContextInput::ApplyTaskClose {
             task: task(1),
             generation: Generation::new(2).unwrap(),
+            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                novarocks_execution_contract::AbortCause::QueryFailed,
+            ),
         },
         &mut port,
     )
@@ -3386,6 +3446,9 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
             ContextInput::ApplyTaskClose {
                 task: task(1),
                 generation: Generation::new(2).unwrap(),
+                intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                    novarocks_execution_contract::AbortCause::QueryFailed,
+                ),
             },
             &mut port,
         )
@@ -3486,6 +3549,9 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
             ContextInput::ApplyTaskClose {
                 task: task(1),
                 generation: Generation::new(2).unwrap(),
+                intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                    novarocks_execution_contract::AbortCause::QueryFailed,
+                ),
             },
             &mut port,
         )
@@ -4514,10 +4580,16 @@ fn physically_retained_context_returns_the_active_ticket_before_metadata_evictio
         .unwrap();
     assert_eq!(
         removed.effects,
-        vec![ControlEffect::RetireReservation(
-            ReservationId::new(2).unwrap()
-        )]
+        vec![
+            ControlEffect::Route {
+                context: c,
+                state: QueryContextState::Gone,
+                generation: Generation::new(1).unwrap(),
+            },
+            ControlEffect::RetireReservation(ReservationId::new(2).unwrap()),
+        ]
     );
+    assert_eq!(control.route(c), QueryContextState::Gone);
 }
 
 #[test]
@@ -5327,6 +5399,9 @@ fn task_close_retries_a_stopped_pending_success_as_the_existing_abort() {
         ContextInput::ApplyTaskClose {
             task: task(1),
             generation: Generation::new(2).unwrap(),
+            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                novarocks_execution_contract::AbortCause::PeerTaskFailed,
+            ),
         },
     );
     let record = core.task(task(1)).unwrap();
@@ -6730,7 +6805,12 @@ fn materialization_decisions_reject_impossible_shapes_and_unknown_contexts() {
                     at(0),
                     ControlInput::EstablishmentDecided {
                         context: context(),
-                        decision: ContextEstablishmentDecision { state, outcome },
+                        decision: ContextEstablishmentDecision {
+                            state,
+                            outcome,
+                            acknowledgement: None,
+                            decided_at: at(0)
+                        },
                     },
                     &mut f.port
                 )
@@ -6865,6 +6945,8 @@ fn terminal_typed_establishment_decision() -> ContextEstablishmentDecision {
     ContextEstablishmentDecision {
         state: QueryContextState::TerminalRetained,
         outcome: Err(DomainRefusal { outcome, failure }),
+        acknowledgement: None,
+        decided_at: at(0),
     }
 }
 

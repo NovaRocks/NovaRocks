@@ -65,9 +65,9 @@ use crate::static_package_admission::StaticPackageAdmission;
 #[cfg(novarocks_dev_controls)]
 use crate::task_protocol_fault;
 use novarocks_worker::{
-    AdmissionTicketObservation, CoveredObservationFact, CoveredObservationFrame,
-    CoveredSubscription, DynamicFilterReadOutcome, FinalTaskInfoOutcome, HostRejection,
-    OperationReceipt, TaskDynamicFilterRead, TaskStatusSource,
+    CoveredObservationFact, CoveredObservationFrame, CoveredSubscription, DynamicFilterReadOutcome,
+    FinalTaskInfoOutcome, HostRejection, NodeAdmissionTicketObservation, OperationReceipt,
+    TaskDynamicFilterRead, TaskStatusSource,
 };
 
 /// The Tower-owned request clock carried into task operation dispatch.
@@ -224,33 +224,39 @@ pub trait TaskStatusSubscriptionReader: Send + Sync {
 
 /// Role-local authority that linearly applies one already decoded task
 /// operation. It never receives a raw Native request.
+#[tonic::async_trait]
 pub trait TaskOperationBatchApplier: Send + Sync {
     /// Applies one domain operation and returns its role-owned receipt.
     ///
     /// The operation is handed over by value because a create carries a
     /// short-lived creation input that is moved, never cloned, to whichever
     /// owner wins that identity's creation, and is otherwise dropped unread.
-    fn apply_task_operation(
+    /// `deadline` is the original ingress deadline, never a fresh wait granted
+    /// when this future eventually gets polled.
+    async fn apply_task_operation(
         &self,
         operation: DecodedOperation,
-        local_wait_cap: Duration,
+        deadline: Instant,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status>;
 
     /// The Worker owner's context-bound, read-only ticket observation.
-    fn observe_admission_ticket(
+    async fn observe_admission_ticket(
         &self,
+        operation: TaskOperationId,
         ticket_id: AdmissionTicketId,
         context: QueryContextRef,
-    ) -> AdmissionTicketObservation;
+        deadline: Instant,
+    ) -> Result<NodeAdmissionTicketObservation, tonic::Status>;
 
     /// A narrow Worker-authored refusal only when an absent context would
     /// reach expiry redemption next. All ambiguous states return None.
-    fn preflight_expired_establish_ticket(
+    async fn preflight_expired_establish_ticket(
         &self,
         operation_id: TaskOperationId,
         ticket_id: AdmissionTicketId,
         context: QueryContextRef,
         native_compatibility_id: Option<&proto::NativeCompatibilityId>,
+        deadline: Instant,
     ) -> Result<Option<proto::TaskOperationReceipt>, tonic::Status>;
 
     /// The compiled-package resource gate this process composed. A plan-tree
@@ -267,14 +273,14 @@ pub trait TaskOperationBatchApplier: Send + Sync {
 /// because vended material crossed here and was legal only on an encrypted
 /// transport; material no longer crosses at all, so the gate had nothing left
 /// to guard (CAD-1 D1).
-pub fn apply_task_operations(
+pub async fn apply_task_operations(
     applier: &dyn TaskOperationBatchApplier,
     request: proto::ApplyTaskOperationsRequest,
 ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
-    apply_task_operations_at(applier, request, TaskIngressTiming::starting_now())
+    apply_task_operations_at(applier, request, TaskIngressTiming::starting_now()).await
 }
 
-pub fn apply_task_operations_at(
+pub async fn apply_task_operations_at(
     applier: &dyn TaskOperationBatchApplier,
     request: proto::ApplyTaskOperationsRequest,
     timing: TaskIngressTiming,
@@ -343,29 +349,43 @@ pub fn apply_task_operations_at(
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let ticket_id = decode_admission_ticket_id(ticket_id, path.field("admission_ticket_id"))
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        ticket_preflight.push(match applier.observe_admission_ticket(ticket_id, context) {
-            AdmissionTicketObservation::Issued { remaining } => {
-                Some((ticket_id, context, Instant::now() + remaining))
-            }
-            AdmissionTicketObservation::Expired
-                if index == 0
-                    && Instant::now()
-                        < timing.operation_deadline(envelopes[index].max_wait().get()) =>
-            {
-                // The Worker supplies the only early verdict. The codec still
-                // validates every other item before any item is applied.
-                if let Some(receipt) = applier.preflight_expired_establish_ticket(
+        ticket_preflight.push(
+            match applier
+                .observe_admission_ticket(
                     envelopes[index].operation_id(),
                     ticket_id,
                     context,
-                    establish.native_compatibility_id.as_ref(),
-                )? {
-                    early_receipts[index] = Some(receipt);
+                    timing.operation_deadline(envelopes[index].max_wait().get()),
+                )
+                .await?
+            {
+                NodeAdmissionTicketObservation::Issued { remaining } => {
+                    Some((ticket_id, context, Instant::now() + remaining))
                 }
-                None
-            }
-            _ => None,
-        });
+                NodeAdmissionTicketObservation::Expired
+                    if index == 0
+                        && Instant::now()
+                            < timing.operation_deadline(envelopes[index].max_wait().get()) =>
+                {
+                    // The Worker supplies the only early verdict. The codec still
+                    // validates every other item before any item is applied.
+                    if let Some(receipt) = applier
+                        .preflight_expired_establish_ticket(
+                            envelopes[index].operation_id(),
+                            ticket_id,
+                            context,
+                            establish.native_compatibility_id.as_ref(),
+                            timing.operation_deadline(envelopes[index].max_wait().get()),
+                        )
+                        .await?
+                    {
+                        early_receipts[index] = Some(receipt);
+                    }
+                    None
+                }
+                _ => None,
+            },
+        );
     }
     // Every non-skipped item is fully decoded and method-classified before
     // any operation is applied. Skipped Establish items have Worker receipts.
@@ -411,18 +431,19 @@ pub fn apply_task_operations_at(
         &ticket_preflight,
         timing,
     )
+    .await
 }
 
-/// Applies only the four closed control shapes through the existing owner.
-/// The dedicated execution capacity for this method is installed later.
-pub fn apply_task_control_operations(
+/// Validates the closed control schema and awaits each original owner in order.
+/// Its Native ingress class remains independently admitted.
+pub async fn apply_task_control_operations(
     applier: &dyn TaskOperationBatchApplier,
     request: proto::ApplyTaskControlOperationsRequest,
 ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
-    apply_task_control_operations_at(applier, request, TaskIngressTiming::starting_now())
+    apply_task_control_operations_at(applier, request, TaskIngressTiming::starting_now()).await
 }
 
-pub fn apply_task_control_operations_at(
+pub async fn apply_task_control_operations_at(
     applier: &dyn TaskOperationBatchApplier,
     request: proto::ApplyTaskControlOperationsRequest,
     timing: TaskIngressTiming,
@@ -447,7 +468,7 @@ pub fn apply_task_control_operations_at(
         .collect::<Vec<_>>();
     let operations = operations.into_iter().map(Some).collect::<Vec<_>>();
     let early_receipts = vec![None; operations.len()];
-    apply_decoded_operations(applier, operations, &early_receipts, &waits, &[], timing)
+    apply_decoded_operations(applier, operations, &early_receipts, &waits, &[], timing).await
 }
 
 /// Applies each decoded item in request order.
@@ -456,7 +477,7 @@ pub fn apply_task_control_operations_at(
 /// value. An item that is refused here, before the applier, drops whatever it
 /// carried unread -- including a create's input -- exactly as an item the
 /// Worker answers from an existing identity does.
-fn apply_decoded_operations(
+async fn apply_decoded_operations(
     applier: &dyn TaskOperationBatchApplier,
     operations: Vec<Option<DecodedOperation>>,
     early_receipts: &[Option<proto::TaskOperationReceipt>],
@@ -490,19 +511,25 @@ fn apply_decoded_operations(
             ));
             continue;
         }
-        let mut remaining = operation_deadline.duration_since(now);
+        let mut deadline = operation_deadline;
         if let Some((ticket_id, context, first_deadline)) =
             ticket_preflight.get(index).copied().flatten()
-            && let AdmissionTicketObservation::Issued {
+            && let NodeAdmissionTicketObservation::Issued {
                 remaining: ticket_remaining,
-            } = applier.observe_admission_ticket(ticket_id, context)
+            } = applier
+                .observe_admission_ticket(
+                    operation.envelope().operation_id(),
+                    ticket_id,
+                    context,
+                    operation_deadline,
+                )
+                .await?
         {
             // The Worker owns the current state. Once redeemed, the original
             // issuance deadline no longer limits exact Establish replay.
-            remaining = remaining.min(ticket_remaining);
-            remaining = remaining.min(first_deadline.saturating_duration_since(now));
+            deadline = deadline.min(now + ticket_remaining).min(first_deadline);
         }
-        receipts.push(applier.apply_task_operation(operation, remaining)?);
+        receipts.push(applier.apply_task_operation(operation, deadline).await?);
     }
     Ok(proto::ApplyTaskOperationsResponse { receipts })
 }
@@ -1021,12 +1048,12 @@ pub trait TaskExecutionIngress: Send + Sync {
     ///
     /// A batch gives its items no atomicity and no shared verdict: a partial
     /// failure leaves every other item exactly as its own receipt reports.
-    fn apply_task_operations(
+    async fn apply_task_operations(
         &self,
         request: proto::ApplyTaskOperationsRequest,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status>;
 
-    fn apply_task_operations_at(
+    async fn apply_task_operations_at(
         &self,
         request: proto::ApplyTaskOperationsRequest,
         timing: TaskIngressTiming,
@@ -1034,12 +1061,12 @@ pub trait TaskExecutionIngress: Send + Sync {
 
     /// Applies the closed, bounded control operation schema using the same
     /// per-item role owner and receipt semantics as the ordinary method.
-    fn apply_task_control_operations(
+    async fn apply_task_control_operations(
         &self,
         request: proto::ApplyTaskControlOperationsRequest,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status>;
 
-    fn apply_task_control_operations_at(
+    async fn apply_task_control_operations_at(
         &self,
         request: proto::ApplyTaskControlOperationsRequest,
         timing: TaskIngressTiming,
@@ -1053,16 +1080,20 @@ pub trait TaskExecutionIngress: Send + Sync {
     fn subscribe_task_status(
         &self,
         request: proto::SubscribeTaskStatusRequest,
+        deadline: Instant,
+        ownership: Arc<NativeIngressOwnership>,
     ) -> Result<TaskStatusEventStream, tonic::Status>;
 
-    fn fetch_task_dynamic_filters(
+    async fn fetch_task_dynamic_filters(
         &self,
         request: proto::FetchTaskDynamicFiltersRequest,
+        deadline: Instant,
     ) -> Result<proto::FetchTaskDynamicFiltersResponse, tonic::Status>;
 
-    fn get_final_task_info(
+    async fn get_final_task_info(
         &self,
         request: proto::GetFinalTaskInfoRequest,
+        deadline: Instant,
     ) -> Result<proto::GetFinalTaskInfoResponse, tonic::Status>;
 
     /// Polls the root task's result stream.

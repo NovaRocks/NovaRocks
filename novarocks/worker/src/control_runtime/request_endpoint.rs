@@ -18,10 +18,19 @@
 //! The original request's endpoint and unique external delivery leg. These
 //! containers grant no Work, capacity, publication or retirement authority.
 
+use super::actors::WorkerActor;
 use super::request_ready::{ControlRequestReady, RequestExternalLeg, RequestReadySlot};
-use novarocks_control_runtime::publication::PublishedReply;
+use novarocks_control_runtime::{
+    publication::PublishedReply,
+    reply_notification::{ReplyNotificationError, ReplyNotificationJob, ReplyObserver},
+};
 use novarocks_worker_protocol::creation::RequestContext;
-use std::sync::Arc;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 /// Constructed only by the original admission owner after its actual slot and
 /// role exist. The PublishedReply belongs to that caller's actual Scope; this
@@ -48,6 +57,7 @@ impl<B, H: Copy> RequestEndpoint<B, H> {
 pub(crate) struct RequestHandle<B, H: Copy = RequestContext> {
     pub(super) endpoint: Arc<RequestEndpoint<B, H>>,
     pub(super) active: bool,
+    pub(super) observer: Option<ReplyObserver<WorkerActor>>,
 }
 impl<B, H: Copy> RequestHandle<B, H> {
     pub(crate) fn request(&self) -> H {
@@ -62,12 +72,14 @@ impl<B, H: Copy> RequestHandle<B, H> {
         Some(RequestDelivery {
             endpoint: self.endpoint.clone(),
             body: Some(body),
+            observer: self.observer.take(),
         })
     }
 }
 impl<B, H: Copy> Drop for RequestHandle<B, H> {
     fn drop(&mut self) {
         if self.active {
+            drop(self.observer.take());
             RequestEndpoint::end_external(&self.endpoint);
         }
     }
@@ -79,10 +91,17 @@ impl<B, H: Copy> Drop for RequestHandle<B, H> {
 pub(crate) struct RequestDelivery<B, H: Copy = RequestContext> {
     endpoint: Arc<RequestEndpoint<B, H>>,
     body: Option<Arc<B>>,
+    observer: Option<ReplyObserver<WorkerActor>>,
 }
 impl<B, H: Copy> RequestDelivery<B, H> {
     pub(crate) fn request(&self) -> H {
         self.endpoint.request
+    }
+    pub(crate) fn take_observer(&mut self) -> Option<ReplyObserver<WorkerActor>> {
+        self.observer.take()
+    }
+    pub(crate) fn notify_original(&self) {
+        self.endpoint.external.notify();
     }
     pub(crate) fn body(&self) -> &B {
         self.body.as_deref().expect("live original reply delivery")
@@ -93,7 +112,71 @@ impl<B, H: Copy> Drop for RequestDelivery<B, H> {
         // A foreign body destructor runs outside all endpoint/phase locks. If
         // it panics, do not invent an Ended fact while unwinding that body.
         drop(self.body.take());
+        drop(self.observer.take());
         RequestEndpoint::end_external(&self.endpoint);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestAwaitError {
+    AlreadyTaken,
+    Notification(ReplyNotificationError),
+}
+impl<B, H: Copy> Future for RequestHandle<B, H> {
+    type Output = Result<RequestDelivery<B, H>, RequestAwaitError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if !this.active {
+            return Poll::Ready(Err(RequestAwaitError::AlreadyTaken));
+        }
+        if let Some(delivery) = this.try_take() {
+            return Poll::Ready(Ok(delivery));
+        }
+        let observer = this.observer.as_mut().expect("same original R observer");
+        match observer.arm(cx.waker().clone()) {
+            Ok(armed) if !armed.failed => {}
+            Ok(_) => {
+                return Poll::Ready(Err(RequestAwaitError::Notification(
+                    ReplyNotificationError::Failed,
+                )));
+            }
+            Err(refusal) => {
+                // This polling thread still owns a refused, never-retained Waker.
+                let error = refusal.error;
+                drop(refusal.waker);
+                return Poll::Ready(Err(RequestAwaitError::Notification(error)));
+            }
+        }
+        this.endpoint.external.notify();
+        if let Some(delivery) = this.try_take() {
+            return Poll::Ready(Ok(delivery));
+        }
+        Poll::Pending
+    }
+}
+
+/// One physical notification capture of the same original R. Common owns
+/// the callback mechanics; this wrapper only marks its exact ready position.
+#[must_use = "Preserve the same original notification job on queue refusal"]
+pub(crate) struct RequestNotificationJob {
+    pub(super) original: ReplyNotificationJob<WorkerActor>,
+    pub(super) notice: RequestNotice,
+}
+impl RequestNotificationJob {
+    pub(crate) fn queue_key(
+        &self,
+    ) -> (
+        novarocks_control_runtime_core::identity::ScopeId,
+        novarocks_control_runtime_core::identity::WorkId,
+    ) {
+        self.original.queue_key()
+    }
+    pub(crate) fn belongs_to(&self, ready: &ControlRequestReady) -> bool {
+        self.notice.belongs_to(ready)
+    }
+    pub(crate) fn run(self) {
+        self.original.run();
+        self.notice.notify();
     }
 }
 
@@ -108,4 +191,18 @@ impl RequestNotice {
     pub(super) fn notify(&self) {
         self.0.notify();
     }
+}
+
+/// Physical capacity refusal is distinct from queue corruption or shutdown.
+pub(crate) fn notification_submit_busy(error: &super::host_executor::HostSubmitError) -> bool {
+    use novarocks_control_runtime_core::fair_queue::FairQueueError;
+    matches!(
+        error,
+        super::host_executor::HostSubmitError::Queue(
+            FairQueueError::Full
+                | FairQueueError::ContextFull
+                | FairQueueError::ContextCapacity
+                | FairQueueError::DuplicateWork
+        )
+    )
 }

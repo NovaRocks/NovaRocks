@@ -61,12 +61,21 @@ impl ProcessControlOwner {
     pub(crate) fn advance_ready_requests(
         &mut self,
         handles: &EstablishExecutorHandles,
+        ports: Option<&crate::TaskExecutionPorts>,
         budget: usize,
     ) -> Result<RequestIoProgress, RootRequestAdvanceError> {
         // Check the actual Root namespace before consuming any ready address.
         if !handles.belongs_to(&self.resources.request_ready) {
             return Err(RootRequestAdvanceError::WrongOwner);
         }
+        self.resources
+            .request_ready
+            .retry_capacity(
+                self.registration(),
+                self.resources.request_ready.source_capacity_revision(),
+                budget,
+            )
+            .map_err(RootRequestAdvanceError::Control)?;
         let generation = self
             .resources
             .scope
@@ -86,6 +95,9 @@ impl ProcessControlOwner {
                 .requests
                 .get_mut(&input)
                 .expect("ready address retains its original R");
+            progress.dispatched += custody
+                .advance_protocol_observation(handles, ports)
+                .map_err(|error| RootRequestAdvanceError::Request { input, error })?;
             let advanced = custody
                 .advance_source_io(handles, generation, failure_work)
                 .map_err(|error| RootRequestAdvanceError::Request { input, error })?;

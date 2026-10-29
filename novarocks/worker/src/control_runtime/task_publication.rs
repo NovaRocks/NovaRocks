@@ -607,7 +607,12 @@ mod tests {
                 statistics,
                 open_summary,
                 causal,
+                production,
             } = self.host.take().unwrap().into_resources();
+            assert!(
+                production.is_none(),
+                "component fixture never created a production runtime/root owner"
+            );
             assert!(loader.is_none());
             assert!(loading_events.is_none());
             assert!(loading_return.is_none());

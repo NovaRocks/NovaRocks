@@ -33,9 +33,9 @@ use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::status::TerminationDetail;
 
 use crate::task_execution::operation::OperationDispatchResult;
-use novarocks_execution::task_execution::OperationKind;
 use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
+use novarocks_execution::task_execution::{OperationKind, OperationOutcome};
 use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
 use novarocks_query_application::coordination::{
     AcceptedAttemptFailure, AcceptedRootStatusSender, AcceptedRootStatusSource,
@@ -1150,6 +1150,55 @@ impl TaskRound {
         acknowledgement: &OperationAcknowledgement,
     ) -> Result<bool, TaskExecutionError> {
         let operation_id = acknowledgement.operation_id();
+
+        if acknowledgement.kind() == OperationKind::AbortQueryContext
+            && acknowledgement.worker_outcome() == Some(OperationOutcome::OwnerFailed)
+        {
+            let active_context = self
+                .abort_effects
+                .get(&operation_id)
+                .filter(|effect| effect.intent().operation_id() == operation_id)
+                .map(|effect| actor_abort_context(effect.intent()));
+            let context = match active_context {
+                Some(context) => {
+                    let context = context?;
+                    let settled = match self.execution.actor_abort_dispatch_state(operation_id) {
+                        Ok(ActorAbortDispatchState::Queued) => {
+                            self.execution.cancel_queued_actor_abort(operation_id)
+                        }
+                        Ok(ActorAbortDispatchState::InFlight) => {
+                            self.execution.acknowledge(acknowledgement)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = settled {
+                        self.fail_closed_abort_operation(operation_id)?;
+                        return Err(error);
+                    }
+                    Some(context)
+                }
+                None => self
+                    .late_abort_settlements
+                    .get(&operation_id)
+                    .and_then(|late| late.first())
+                    .filter(|late| late.identity().operation_id() == operation_id)
+                    .map(|late| late.identity().context()),
+            };
+            if let Some(context) = context {
+                // This exact negative Worker fact settles only dispatch. The
+                // original actor/residual owner still needs real convergence;
+                // neither a closure receipt nor a replay may be manufactured.
+                self.fail_closed_abort_operation(operation_id)?;
+                return Err(TaskExecutionError::OperationFailed {
+                    context,
+                    operation_id,
+                    kind: acknowledgement.kind(),
+                    rejection: acknowledgement
+                        .worker_header()
+                        .expect("OwnerFailed retains its exact Worker verdict"),
+                });
+            }
+        }
 
         if acknowledgement.dispatch_result() == OperationDispatchResult::NonWorkerRejected
             && acknowledgement.governance_failure().is_some()

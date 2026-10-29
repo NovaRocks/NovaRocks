@@ -21,14 +21,39 @@
 use super::{DomainRefusal, RequestResult, RequestSettlement, RootDrainVerdict};
 use crate::creation::{PayloadId, RequestContext};
 use novarocks_execution_contract::{
-    DomainVersion, FinalTaskInfo, OperationOutcome, QueryContextDomainReceipt,
-    QuiesceQueryContextReceipt, TaskDomainReceipt, TaskIdentity,
+    AbortCause, CreateTaskReceipt, DomainVersion, FinalTaskInfo, OperationOutcome,
+    QueryContextDomainReceipt, QueryContextReceipt, QueryContextRef, QueryContextState,
+    QuiesceQueryContextReceipt, ReleaseOutcome, TaskDomainReceipt, TaskIdentity, TaskStatus,
 };
 use std::sync::Arc;
+
+/// One actual Context decision, including its original installed lease and
+/// first-wins termination cause. It is never reconstructed from a host view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextAcknowledgement {
+    pub outcome: OperationOutcome,
+    pub receipt: Arc<QueryContextReceipt>,
+    pub termination_cause: Option<AbortCause>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextReplyBody {
     Verdict(RequestResult),
+    Create {
+        outcome: OperationOutcome,
+        receipt: Arc<CreateTaskReceipt>,
+    },
+    Task {
+        outcome: OperationOutcome,
+        status: Arc<TaskStatus>,
+    },
+    Context(ContextAcknowledgement),
+    Release {
+        context: QueryContextRef,
+        release: ReleaseOutcome,
+        state: QueryContextState,
+        termination_cause: Option<AbortCause>,
+    },
     FinalInfo(Arc<FinalTaskInfo>),
     RootDrain(RootDrainVerdict),
     TaskDomain {
@@ -38,6 +63,7 @@ pub enum ContextReplyBody {
     ContextDomain {
         outcome: OperationOutcome,
         receipt: QueryContextDomainReceipt,
+        acknowledgement: ContextAcknowledgement,
     },
     Domain(DomainRefusal),
     ReadPayload {
@@ -54,9 +80,18 @@ impl ContextReplyBody {
     pub fn matches(&self, result: RequestResult) -> bool {
         self.result() == result
     }
-    pub(super) fn result(&self) -> RequestResult {
+    pub(crate) fn result(&self) -> RequestResult {
         match self {
             Self::Verdict(result) => *result,
+            Self::Create { outcome, .. } | Self::Task { outcome, .. } => {
+                RequestResult::Outcome(*outcome)
+            }
+            Self::Context(ack) => RequestResult::Outcome(ack.outcome),
+            Self::Release { release, .. } => RequestResult::Outcome(match release {
+                ReleaseOutcome::Released => OperationOutcome::Accepted,
+                ReleaseOutcome::NotReady => OperationOutcome::ReleaseNotReady,
+                ReleaseOutcome::AlreadyTerminal => OperationOutcome::ContextTerminalReceipt,
+            }),
             Self::FinalInfo(_) => RequestResult::Outcome(OperationOutcome::Accepted),
             Self::RootDrain(verdict) => RequestResult::Outcome(match verdict {
                 RootDrainVerdict::Published(_) | RootDrainVerdict::AlreadyTerminal(_) => {

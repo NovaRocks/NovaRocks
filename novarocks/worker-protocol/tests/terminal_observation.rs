@@ -553,6 +553,9 @@ fn the_last_retirement_requests_host_release_without_inventing_exit_in_the_group
     model.apply(ContextInput::ApplyTaskClose {
         task: task(),
         generation,
+        intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+            novarocks_execution_contract::AbortCause::PeerTaskFailed,
+        ),
     });
     model.other_physical_gates();
     model.physical(PhysicalFact::ActualStopped);

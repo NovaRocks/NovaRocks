@@ -11994,3 +11994,5 @@ pub(crate) fn manifest_original_gated_round_fixture(
     round.seal_pumps();
     (round, owner, acks, status, clock)
 }
+
+mod owner_failed_actor_abort;

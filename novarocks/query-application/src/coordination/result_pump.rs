@@ -1262,7 +1262,7 @@ async fn run_root_relay_core(
                 // The final ACK-only read is optional and never awaited here.
                 let read = frontier.next_read().unwrap_or(super::RootRelayRead {
                     wanted: None,
-                    consumed: frontier.consumed_through(),
+                    consumed: end.sequence.get(),
                 });
                 break RelayExit::EndConsumed(read, end);
             }
@@ -1390,8 +1390,8 @@ async fn run_root_relay_core(
             return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
         }
     };
-    // Optional early retirement of the consumed prefix on the Backend. It is
-    // neither a seal precondition nor awaited for success.
+    // Acknowledge the consumed End on the Backend through the original tail.
+    // The stable tail owns its actual completion independently of this pump.
     if final_read.wanted.is_none()
         && let Ok(request) = RootResultRead::try_new(
             root,
@@ -3352,7 +3352,7 @@ mod tests {
         );
         let requests = port.requests();
         assert_eq!(requests[0], (Some(1), 0));
-        assert!(requests[1..].iter().all(|request| *request == (None, 0)));
+        assert!(requests[1..].iter().all(|request| *request == (None, 1)));
         drop((stream, actor, owner, window));
     }
 

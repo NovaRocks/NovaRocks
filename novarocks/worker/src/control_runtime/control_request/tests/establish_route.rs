@@ -390,7 +390,7 @@ impl RouteFixture {
                         self.removed
                             .as_mut()
                             .unwrap()
-                            .retire_active_context(&ticket)
+                            .authorize_parent_retirement(&ticket)
                             .unwrap();
                     } else {
                         assert!(self.f.root.retire_ticket(&ticket).unwrap());
@@ -518,7 +518,7 @@ impl RouteFixture {
         let result = match &probe.effect {
             WorkerAction::Context(ContextEffect::EstablishProbed {
                 request, result, ..
-            }) if request.token == input => *result,
+            }) if request.token == input => result.clone(),
             _ => panic!("actual Context owner probe"),
         };
         host.handoff_establish_probe(probe).unwrap();
@@ -679,10 +679,10 @@ impl RouteFixture {
 fn the_context_leg_retires_before_root_consumes_its_original_routed_reply() {
     let mut f = RouteFixture::new();
     let (input, mut handle, getters, drops) = f.begin_route(op(12), 100, None);
-    assert_eq!(
+    assert!(matches!(
         f.probe(input),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
-    );
+        EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict
+    ));
     assert!(
         f.f.root
             .service()

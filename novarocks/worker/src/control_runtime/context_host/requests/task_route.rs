@@ -41,7 +41,6 @@ pub(super) struct TaskRequestRoute {
     retired: Option<RetiredCut>,
     sources_exited: bool,
     reaped: [Option<ReapedPosition>; 2],
-    prefix_reaped: [Option<ReapedPosition>; 2],
     sources_released: bool,
     detached: Option<[crate::control_runtime::source_positions::DetachedSourceSlotStorage; 2]>,
 }
@@ -65,7 +64,6 @@ impl TaskRequestRoute {
             retired: None,
             sources_exited: false,
             reaped: [None, None],
-            prefix_reaped: [None, None],
             sources_released: false,
             detached: None,
         }
@@ -110,15 +108,17 @@ impl TaskRequestRoute {
         {
             return Err(reject(ContextRequestError::WrongRequest, command));
         }
-        if let Err(error) = original
-            .authority
-            .as_mut()
-            .expect("original Task R authority")
-            .start()
-        {
-            return Err(reject(ContextRequestError::Exit(error), command));
+        if !original.started {
+            if let Err(error) = original
+                .authority
+                .as_mut()
+                .expect("original Task R authority")
+                .start()
+            {
+                return Err(reject(ContextRequestError::Exit(error), command));
+            }
+            original.started = true;
         }
-        original.started = true;
         let result = self
             .sender
             .take()
@@ -171,6 +171,15 @@ impl TaskRequestRoute {
                     operation: metadata.operation,
                     deadline: metadata.deadline,
                 });
+                if let Some(domain) = original
+                    .domain
+                    .as_ref()
+                    .and_then(|domain| domain.custody.as_ref())
+                {
+                    domain
+                        .bind_request(delivery.event)
+                        .map_err(ContextRequestError::Domain)?;
+                }
                 self.delivery = Some(delivery);
             }
         }
@@ -254,53 +263,41 @@ impl TaskRequestRoute {
                     | CausalError::Source(
                         SourcePositionError::NotAvailable | SourcePositionError::SourceStillHeld,
                     ) => {
-                        // A real candidate source is independent of main-R
-                        // exit. Only its original holder/report/reap facts can
-                        // retire this prefix. Never turn a claim into unused.
-                        let ingress = task.port().ingress().clone();
-                        let route = crate::task_proposal_ingress::PairRoute::Cut(self.cut);
-                        for source in ingress
-                            .pair_inventory(route)
-                            .map_err(|error| ContextRequestError::Causal(error.into()))?
-                        {
-                            if !source
-                                .custody
-                                .try_retire()
-                                .map_err(ContextRequestError::Exit)?
-                            {
-                                return Ok(false);
+                        let progress = task
+                            .causal()
+                            .advance_source_pair_retirement(
+                                self.cut,
+                                &original.ledger,
+                                &original.scope,
+                            )
+                            .map_err(ContextRequestError::Causal)?;
+                        let Some(reaped) = progress.reaped else {
+                            if progress.progressed {
+                                original.endpoint.external().notify();
                             }
-                        }
-                        original
-                            .ledger
-                            .reap_scope_ready(original.scope.id(), 1)
-                            .map_err(ContextRequestError::Runtime)?;
-                        let probes = ingress
-                            .prepare_pair_reap(route)
-                            .map_err(|error| ContextRequestError::Causal(error.into()))?;
-                        for (saved, probe) in self.prefix_reaped.iter_mut().zip(probes) {
-                            if saved.is_none() {
-                                *saved = probe.observe_reaped().ok();
-                            }
-                        }
-                        if self.prefix_reaped.iter().any(Option::is_none) {
-                            original.endpoint.external().notify();
                             return Ok(false);
-                        }
-                        let reaped = self.prefix_reaped.each_mut().map(|saved| {
-                            saved.take().expect("both actual prefix source witnesses")
-                        });
+                        };
                         match task
                             .causal()
                             .retire_after_exit(self.cut, CausalSourceRetirement::Reaped(reaped))
                         {
                             Ok(retired) => self.retired = Some(retired),
-                            Err(refusal) => {
-                                if let CausalSourceRetirement::Reaped(reaped) = refusal.retirement {
-                                    self.prefix_reaped = reaped.map(Some);
+                            Err(refusal) => match refusal.error {
+                                CausalError::Driver(DriverError::RoleBusy)
+                                | CausalError::Cut(
+                                    novarocks_worker_protocol::proposal_summary::CutError::ExitUnobserved
+                                    | novarocks_worker_protocol::proposal_summary::CutError::NotReady
+                                    | novarocks_worker_protocol::proposal_summary::CutError::Consuming,
+                                ) => {
+                                    // These witnesses observe the same resident
+                                    // originals and can be read again next turn.
+                                    if progress.progressed {
+                                        original.endpoint.external().notify();
+                                    }
+                                    return Ok(false);
                                 }
-                                return Err(ContextRequestError::Causal(refusal.error));
-                            }
+                                error => return Err(ContextRequestError::Causal(error)),
+                            },
                         }
                     }
                     CausalError::Cut(
@@ -388,7 +385,7 @@ impl TaskRequestRoute {
 }
 
 impl ContextRequestPartial {
-    fn from_task_funding(
+    pub(super) fn from_task_funding(
         funding: super::task_funding::TaskRequestFunding,
         ledger: RuntimeLedger,
     ) -> Self {
@@ -437,6 +434,16 @@ impl ContextHostRecord {
         if self.resources.failure.is_some() {
             return Err(no_partial(ContextRequestError::OwnerFailed));
         }
+        let snapshot = self
+            .control_runtime
+            .snapshot(self.actor)
+            .map_err(|error| no_partial(ContextRequestError::Driver(error)))?;
+        if snapshot.sealed
+            || self.resources.control_admission_closed
+            || (class == InputClass::Ordinary && !snapshot.external_open)
+        {
+            return Err(no_partial(ContextRequestError::AdmissionClosed));
+        }
         match self.tasks.get(&task) {
             Some(super::super::TaskHostOwner::Ready(host)) if host.request_admission_open() => {}
             Some(super::super::TaskHostOwner::Ready(_)) => {
@@ -470,6 +477,13 @@ impl ContextHostRecord {
             operation,
             deadline,
         };
+        let (notification, observer) =
+            novarocks_control_runtime::reply_notification::ReplyNotification::for_admitted_work(
+                &self.control_runtime,
+                self.registration(),
+                &funding.author.work,
+            )
+            .unwrap_or_else(|_| std::process::abort());
         let admitted = match self.tasks.get_mut(&task) {
             Some(super::super::TaskHostOwner::Ready(host)) => host.bind_request_author(
                 funding.author,
@@ -550,6 +564,7 @@ impl ContextHostRecord {
         let handle = RequestHandle {
             endpoint: endpoint.clone(),
             active: true,
+            observer: Some(observer),
         };
         let cut = admitted.cut;
         let custody = ContextRequestCustody {
@@ -561,6 +576,7 @@ impl ContextHostRecord {
             work,
             endpoint: ContextRequestEndpoint::Task(endpoint),
             request: None,
+            domain: None,
             task_route: Some(TaskRequestRoute::new(
                 task,
                 cut,
@@ -568,7 +584,7 @@ impl ContextHostRecord {
                 funding.outer,
             )),
             permit: None,
-            role: admitted.role,
+            role: Some(admitted.role),
             authority: Some(admitted.authority),
             report,
             work_retirement,
@@ -584,6 +600,16 @@ impl ContextHostRecord {
             core_acknowledged: false,
             external_acknowledged: false,
             unresolved_revocation: false,
+            create: None,
+            retired_task_read: None,
+            deferred_root: None,
+            observation: None,
+            notification,
+            pending_notification: None,
+            protocol_observation: Default::default(),
+            pending_protocol_observation: None,
+            protocol_observation_kind: Default::default(),
+            release_observation: None,
         };
         assert!(self.resources.requests.insert(work, custody).is_none());
         assert!(self.task_request_cuts.insert((task, cut), work).is_none());
@@ -624,6 +650,15 @@ impl ContextHostRecord {
             let input = original.request().token;
             assert_eq!(input, delivery.event);
             assert!(self.request_inputs.insert(input, *work).is_none());
+        }
+        if let Some(delivery) = delivery {
+            if let Some(&work) = self
+                .task_driver
+                .domain_feedback_cuts
+                .get(&(task, delivery.cut))
+            {
+                self.remember_domain_feedback_delivery(work, delivery);
+            }
         }
         Ok(delivery)
     }

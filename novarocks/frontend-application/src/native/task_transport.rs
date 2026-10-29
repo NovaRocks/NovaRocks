@@ -8498,7 +8498,7 @@ mod tests {
                 None,
             )]));
         submit_batch(
-            &fixture.sink,
+            &fixture,
             released_batch(backend, vec![abort_intent(context(backend))]),
         );
         let acks = settled(&fixture.acks, 1).await;

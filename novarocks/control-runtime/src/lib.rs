@@ -29,6 +29,7 @@ pub mod notify;
 pub mod owned_return;
 pub mod read_resource;
 pub mod reported_work;
+pub mod reply_notification;
 pub mod resource;
 pub mod shutdown;
 pub mod sync;

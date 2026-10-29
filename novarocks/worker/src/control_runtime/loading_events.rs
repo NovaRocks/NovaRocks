@@ -326,6 +326,25 @@ impl LoadingEvents {
     }
     fn outcome(&self, outcome: LoaderOutcome) -> LoadingEventOutcome {
         match outcome {
+            LoaderOutcome::Loaded {
+                result,
+                shape,
+                initial_domains,
+            } => {
+                if self.send(
+                    LOADED,
+                    ContextInput::LoadedTask {
+                        task: self.0.task,
+                        result,
+                        shape,
+                        initial_domains,
+                    },
+                ) {
+                    LoadingEventOutcome::Loaded
+                } else {
+                    LoadingEventOutcome::Rejected
+                }
+            }
             LoaderOutcome::Measured(result) => {
                 if self.send(
                     LOADED,
@@ -838,6 +857,9 @@ mod tests {
             ContextInput::ApplyTaskClose {
                 task: host.port().identity(),
                 generation: epoch,
+                intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                    novarocks_execution_contract::AbortCause::LeaseExpired,
+                ),
             },
         );
         assert!(outputs.iter().any(|effect| matches!(

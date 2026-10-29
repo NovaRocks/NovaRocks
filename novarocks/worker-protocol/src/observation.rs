@@ -219,11 +219,12 @@ pub struct CoveredSubscriptionRequest {
 }
 #[derive(Debug)]
 struct InitialCatchUp {
-    cursors: VecDeque<TaskStatusCursor>,
+    position: Arc<CoveredSubscriptionRequest>,
+    status_index: usize,
+    convergence_index: usize,
+    required_index: usize,
     requested: BTreeSet<TaskIdentity>,
-    convergence: VecDeque<TaskConvergenceCursor>,
     convergence_requested: BTreeSet<TaskIdentity>,
-    required: VecDeque<TaskIdentity>,
     context_cursor: Option<QueryContextConvergenceCursor>,
     context_observed: Option<novarocks_execution_contract::QueryContextConvergenceVersion>,
     quiesce_cursor: Option<QuiesceObservationCursor>,
@@ -233,6 +234,27 @@ struct InitialCatchUp {
     // Copy-on-change preserves the initial cut while source updates continue.
     // Each source key consumes at most one override for this subscriber.
     overrides: BTreeMap<ObservationKey, Option<StoredFact>>,
+}
+impl InitialCatchUp {
+    fn next_status(&mut self) -> Option<TaskStatusCursor> {
+        let value = self.position.status.get(self.status_index).copied()?;
+        self.status_index += 1;
+        Some(value)
+    }
+    fn next_convergence(&mut self) -> Option<TaskConvergenceCursor> {
+        let value = self
+            .position
+            .convergence
+            .get(self.convergence_index)
+            .copied()?;
+        self.convergence_index += 1;
+        Some(value)
+    }
+    fn next_required(&mut self) -> Option<TaskIdentity> {
+        let value = self.position.required.get(self.required_index).copied()?;
+        self.required_index += 1;
+        Some(value)
+    }
 }
 #[derive(Debug)]
 struct Publication {
@@ -505,6 +527,17 @@ impl ObservationSource {
         generation: u64,
         request: CoveredSubscriptionRequest,
     ) -> Result<u64, CoveredSubscriptionError> {
+        self.begin_shared_covered_subscription(id, generation, Arc::new(request))
+    }
+    /// Shares the same already-owned neutral request. Each continuation reads
+    /// one cursor directly; neither effect handoff nor initialization clones
+    /// or scans the complete input vectors.
+    pub fn begin_shared_covered_subscription(
+        &mut self,
+        id: SubscriptionId,
+        generation: u64,
+        request: Arc<CoveredSubscriptionRequest>,
+    ) -> Result<u64, CoveredSubscriptionError> {
         if generation == 0 {
             return Err(CoveredSubscriptionError::InvalidGeneration);
         }
@@ -534,13 +567,14 @@ impl ObservationSource {
                 noted_cut: self.revision,
                 retiring: false,
                 initialization: Some(InitialCatchUp {
-                    cursors: request.status.into(),
-                    convergence: request.convergence.into(),
+                    status_index: 0,
+                    convergence_index: 0,
+                    required_index: 0,
                     convergence_requested: BTreeSet::new(),
-                    required: request.required.into(),
                     context_observed: request.context.and_then(|cursor| cursor.current_version()),
                     context_cursor: request.context,
                     quiesce_cursor: request.quiesce,
+                    position: request,
                     requested: BTreeSet::new(),
                     scan_after: None,
                     bytes: 0,
@@ -621,7 +655,7 @@ impl ObservationSource {
                 complete = true;
                 break;
             }
-            if let Some(cursor) = initial.cursors.pop_front() {
+            if let Some(cursor) = initial.next_status() {
                 work += 1;
                 let identity = cursor.identity();
                 if identity.verify_query_context(self.context).is_err() {
@@ -668,7 +702,7 @@ impl ObservationSource {
                 };
                 initial.bytes = initial.bytes.saturating_add(bytes);
                 subscriber.initial.push_back(fact);
-            } else if let Some(cursor) = initial.convergence.pop_front() {
+            } else if let Some(cursor) = initial.next_convergence() {
                 work += 1;
                 let identity = cursor.identity();
                 if identity.verify_query_context(self.context).is_err() {
@@ -721,7 +755,7 @@ impl ObservationSource {
                     }
                     None => {}
                 }
-            } else if let Some(identity) = initial.required.pop_front() {
+            } else if let Some(identity) = initial.next_required() {
                 work += 1;
                 if identity.verify_query_context(self.context).is_err() {
                     return Err(CoveredSubscriptionError::MismatchedContext);
@@ -858,10 +892,8 @@ impl ObservationSource {
                 if initial.convergence_requested.pop_first().is_some() {
                     continue;
                 }
-                // These remaining cursor vectors contain only Copy value IDs.
-                initial.cursors.clear();
-                initial.convergence.clear();
-                initial.required.clear();
+                // The immutable original contains only Copy value IDs. Drop
+                // its shared reference after retiring the indexed metadata.
                 subscriber.initialization = None;
                 continue;
             }
@@ -1005,5 +1037,31 @@ impl ObservationSource {
             covered_prefix: s.covered_prefix(s.noted_cut),
             source_cut: s.noted_cut,
         })
+    }
+    /// Dispose only original neutral metadata, after all actual subscription
+    /// owners have left. Each charged unit drops at most one source record.
+    pub fn drain_unsubscribed(&mut self, budget: usize) -> ObservationProgress {
+        if !self.subscribers.is_empty() || self.publication.is_some() {
+            return ObservationProgress {
+                work: 0,
+                complete: false,
+            };
+        }
+        let mut work = 0;
+        while work < budget {
+            if self.facts.pop_first().is_some() {
+                work += 1;
+                continue;
+            }
+            if self.targets.pop_first().is_some() {
+                work += 1;
+                continue;
+            }
+            break;
+        }
+        ObservationProgress {
+            work,
+            complete: self.facts.is_empty() && self.targets.is_empty(),
+        }
     }
 }

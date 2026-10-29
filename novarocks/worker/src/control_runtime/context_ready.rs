@@ -25,7 +25,10 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::identity::ScopeId;
 use novarocks_execution_contract::QueryContextRef;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContextReadyError {
@@ -38,6 +41,7 @@ struct Endpoint {
     context: QueryContextRef,
     scope: ScopeHandle,
     registration: ActorRegistration,
+    version: AtomicU64,
 }
 /// Clones retain only the original address. They grant no Work, capacity,
 /// publication, physical exit, or a second host dispatch claim.
@@ -63,6 +67,7 @@ impl ContextReadyNotice {
             context,
             scope: scope.clone(),
             registration: registration.clone(),
+            version: AtomicU64::new(0),
         })))
     }
     pub(crate) fn same_origin(&self, other: &Self) -> bool {
@@ -74,7 +79,18 @@ impl ContextReadyNotice {
     pub(crate) fn scope(&self) -> ScopeId {
         self.0.scope.id()
     }
+    /// Wake ordering only. Neither this revision nor a comparison authorizes
+    /// admission, a callback, publication, or any resource exit.
+    pub(super) fn version(&self) -> u64 {
+        self.0.version.load(Ordering::Acquire)
+    }
     pub(super) fn notify(&self) {
+        self.0
+            .version
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |version| {
+                version.checked_add(1)
+            })
+            .unwrap_or_else(|_| std::process::abort());
         match self.0.runtime.notify_host_actor(&self.0.registration) {
             Ok(()) | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {}
             Err(_) => std::process::abort(),

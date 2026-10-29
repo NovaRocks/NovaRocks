@@ -191,6 +191,25 @@ impl Fixture {
             decision: ContextEstablishmentDecision {
                 state: QueryContextState::Active,
                 outcome: Ok(OperationOutcome::Accepted),
+                acknowledgement: Some(crate::context::ContextAcknowledgement {
+                    outcome: OperationOutcome::Accepted,
+                    receipt: std::sync::Arc::new(
+                        novarocks_execution_contract::QueryContextReceipt::new(
+                            context,
+                            QueryContextState::Active,
+                        )
+                        .with_lease(
+                            crate::lease::InstalledLease::install_initial(
+                                semantics().initial_lease_valid_for,
+                                crate::lease::LeaseBounds::DEFAULT,
+                                at(self.now),
+                            )
+                            .receipt(),
+                        ),
+                    ),
+                    termination_cause: None,
+                }),
+                decided_at: at(self.now),
             },
         });
         assert_eq!(decided.requests.len(), 1);

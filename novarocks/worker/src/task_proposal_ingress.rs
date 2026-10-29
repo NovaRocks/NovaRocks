@@ -40,7 +40,7 @@ use novarocks_execution_contract::{
     RetainedTaskSource, TaskConclusionProposal, TaskFailurePhase, TaskIdentity, TaskOperationId,
 };
 use novarocks_worker_protocol::{
-    context::{ContextCommand, ContextInput},
+    context::{ContextCommand, ContextInput, TaskCloseIntent},
     lease::MonotonicInstant,
     proposal_summary::{CausalSegments, CutError, CutId, Diagnostic, ProposalSummary, SourceId},
 };
@@ -145,7 +145,7 @@ pub(crate) struct RequestMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CausalEventKind {
     Settlement,
-    ApplyClose(Generation),
+    ApplyClose(Generation, TaskCloseIntent),
     Input,
     Request(RequestMetadata),
 }
@@ -591,6 +591,37 @@ impl TaskProposalIngress {
             .phase = EventPhase::Registered;
         Ok(())
     }
+    /// The same admitted Close author publishes only its already-bound
+    /// generation. No caller-provided payload can replace that event.
+    pub(crate) fn register_close_event(
+        &self,
+        cut: CutId,
+        generation: Generation,
+        intent: TaskCloseIntent,
+    ) -> Result<(), IngressError> {
+        let mut state = self.state.lock().expect("original Task close handoff");
+        let event = state
+            .cuts
+            .get(&cut)
+            .and_then(|cell| cell.event.as_ref())
+            .ok_or(CutError::Unknown)?;
+        if !matches!(event.kind,CausalEventKind::ApplyClose(bound, original) if bound==generation && original==intent)
+            || event.phase != EventPhase::Reserved
+            || event.work.is_none()
+        {
+            return Err(CutError::NotReserved.into());
+        }
+        state.seal(cut)?;
+        state
+            .cuts
+            .get_mut(&cut)
+            .expect("same original close cut")
+            .event
+            .as_mut()
+            .expect("same original close event")
+            .phase = EventPhase::Registered;
+        Ok(())
+    }
     pub(crate) fn register_input_event(
         &self,
         cut: CutId,
@@ -614,6 +645,8 @@ impl TaskProposalIngress {
             (
                 CausalEventKind::Input,
                 ContextInput::Loaded { task, .. }
+                | ContextInput::LoadedTask { task, .. }
+                | ContextInput::InstalledTask { task, .. }
                 | ContextInput::Running { task }
                 | ContextInput::Flushing { task }
                 | ContextInput::CompletionIntent { task, .. }
@@ -625,6 +658,7 @@ impl TaskProposalIngress {
                 | ContextInput::OperatorStatistics { task, .. }
                 | ContextInput::DynamicFilterPublished { task, .. },
             ) => Some(*task),
+            (CausalEventKind::Input, ContextInput::TaskUpdateApplied { task, .. }) => Some(*task),
             _ => None,
         };
         if event.phase != EventPhase::Reserved
@@ -699,7 +733,7 @@ impl TaskProposalIngress {
         if event.task != task {
             return Err(IngressError::WrongTask);
         }
-        if !event.kind.has_input()
+        if !(event.kind.has_input() || matches!(event.kind, CausalEventKind::ApplyClose(_, _)))
             || event.phase != EventPhase::Reserved
             || event.work != Some(work)
             || event.input.is_some()
@@ -725,7 +759,9 @@ impl TaskProposalIngress {
         if event.task != task {
             return Err(IngressError::WrongTask);
         }
-        if !event.kind.has_input() || event.work != Some(work) {
+        if !(event.kind.has_input() || matches!(event.kind, CausalEventKind::ApplyClose(_, _)))
+            || event.work != Some(work)
+        {
             return Err(CutError::NotReserved.into());
         }
         Ok(())
@@ -772,9 +808,11 @@ impl TaskProposalIngress {
         event.phase = EventPhase::Taken;
         let input = match kind {
             CausalEventKind::Settlement => ContextInput::Settle { task, work },
-            CausalEventKind::ApplyClose(generation) => {
-                ContextInput::ApplyTaskClose { task, generation }
-            }
+            CausalEventKind::ApplyClose(generation, intent) => ContextInput::ApplyTaskClose {
+                task,
+                generation,
+                intent,
+            },
             CausalEventKind::Input | CausalEventKind::Request(_) => {
                 event.input.take().expect("registered input")
             }

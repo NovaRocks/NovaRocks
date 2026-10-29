@@ -206,6 +206,33 @@ impl TaskCompletionRoles {
     ) -> Result<(), crate::settlement::SettlementDispatchError> {
         self.settlement.commit_barrier(runtime, ticket, port)
     }
+    pub(crate) fn handoff_settlement_effect(
+        &self,
+        runtime: &novarocks_control_runtime::driver::ActorRuntime<
+            crate::control_runtime::actors::WorkerActor,
+        >,
+        dispatch: &mut crate::control_runtime::effect_dispatch::EffectDispatch,
+        ticket: novarocks_control_runtime::driver::EffectTicket<
+            crate::control_runtime::actors::WorkerAction,
+        >,
+        port: &crate::task_port::TaskRuntimePort,
+    ) -> Result<
+        (),
+        (
+            crate::settlement::SettlementDispatchError,
+            novarocks_control_runtime::driver::EffectTicket<
+                crate::control_runtime::actors::WorkerAction,
+            >,
+        ),
+    > {
+        self.settlement
+            .handoff_original_barrier(runtime, dispatch, ticket, port)
+    }
+    pub(crate) fn finish_settlement_effect(
+        &self,
+    ) -> Result<(), crate::settlement::SettlementDispatchError> {
+        self.settlement.complete_original_barrier()
+    }
     pub(crate) fn settlement_barrier_committed(&self) -> bool {
         self.settlement.barrier_committed()
     }
@@ -256,6 +283,11 @@ impl TaskCompletionRoles {
         {
             self.settlement.unused_role_exited();
         }
+    }
+    /// The same original settlement callback and captures returned; report
+    /// consumers and header reaping are independent of this positive fact.
+    pub(crate) fn settlement_call_exited(&self) -> bool {
+        self.settlement.actual_call_exited()
     }
     /// Read the real fixed execution-call holders, without consuming reports
     /// or waiting for causal inputs, sources or child-header reaping. In

@@ -331,6 +331,7 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
             WorkerAction::Context(ContextEffect::ApplyTaskClose {
                 task: id,
                 generation,
+                ..
             }) if *id == task => Some(*generation),
             _ => None,
         })
@@ -339,6 +340,9 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
         ContextInput::ApplyTaskClose {
             task,
             generation: close_generation,
+            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                novarocks_execution_contract::AbortCause::LeaseExpired,
+            ),
         },
         None,
     );

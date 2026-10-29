@@ -31,7 +31,7 @@ fn probe_in_handoff_order(f: &mut RouteFixture, input: InputId) -> EstablishRepl
             let result = match &probe.effect {
                 WorkerAction::Context(ContextEffect::EstablishProbed {
                     request, result, ..
-                }) if request.token == input => *result,
+                }) if request.token == input => result.clone(),
                 _ => panic!("the next actual Context probe follows route handoff order"),
             };
             host.handoff_establish_probe(probe).unwrap();
@@ -115,10 +115,10 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
         assert!(routes.contains_key(&input));
     }
     assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 0);
-    assert_eq!(
+    assert!(matches!(
         f.probe(input),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
-    );
+        EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict
+    ));
     assert!(
         f.f.root
             .service()
@@ -341,9 +341,8 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
         assert!(routes.contains_key(&earlier_token));
     }
     assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 0);
-    assert_eq!(
-        probe_in_handoff_order(&mut f, later_token),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    assert!(
+        matches!(probe_in_handoff_order(&mut f, later_token), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
     assert!(
         f.f.root
@@ -355,9 +354,8 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
             .advance_establish_route(later_token)
             .unwrap()
     );
-    assert_eq!(
-        probe_in_handoff_order(&mut f, earlier_token),
-        EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+    assert!(
+        matches!(probe_in_handoff_order(&mut f, earlier_token), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
     assert!(
         f.f.root

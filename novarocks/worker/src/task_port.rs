@@ -208,6 +208,7 @@ impl TaskProjection {
         if (self.convergence.conclusion_stable() && !next.conclusion_stable())
             || (self.convergence.actual_stopped() && !next.actual_stopped())
             || (self.convergence.output_released() && !next.output_released())
+            || (self.convergence.output_transferred() && !next.output_transferred())
             || (self.convergence.resources_converged() && !next.resources_converged())
             || (self.convergence.retired() && !next.retired())
         {

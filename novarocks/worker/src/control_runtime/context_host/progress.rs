@@ -34,6 +34,24 @@ pub(super) struct PendingHostJobs {
     jobs: [Option<ContextHostJob>; 3],
     materialization_submitted: bool,
     materialization_cancel_checked: bool,
+    // The same original claimed ticket stays in its owner across refusal.
+    // This is not a copy of runtime obligations or a second work queue.
+    pub(super) driver_effect: Option<EffectTicket<WorkerAction>>,
+    // Exactly the two original close actions can await their real host jobs
+    // without blocking unrelated stop/release effects in the same batch.
+    pub(super) driver_close: Option<EffectTicket<WorkerAction>>,
+    pub(super) driver_seal: Option<EffectTicket<WorkerAction>>,
+    // The one original Release effect waits on Context-owned Root aliases.
+    pub(super) driver_release: Option<EffectTicket<WorkerAction>>,
+    pub(super) root_release_after: Option<novarocks_execution_contract::TaskIdentity>,
+    pub(super) root_release_finished: bool,
+    pub(super) effect_scan_remaining: usize,
+    pub(super) effect_scan_version: Option<u64>,
+    pub(super) failure_after: Option<novarocks_control_runtime_core::identity::BatchId>,
+    pub(super) route_sweep_version: Option<u64>,
+    pub(super) route_sweep_complete: bool,
+    pub(super) route_after: Option<novarocks_control_runtime_core::identity::InputId>,
+    pub(super) route_until: Option<novarocks_control_runtime_core::identity::InputId>,
 }
 
 #[derive(Debug)]
@@ -74,8 +92,19 @@ impl ContextHostRecord {
                 ticket,
             });
         };
+        let input = ticket.input;
         self.control_runtime
             .effect_completed_for(registration, ticket)?;
+        // A late close/seal body can outlive its already delivered reply.
+        // Wake that exact original R when its own batch changes; waking only
+        // the Context would leave its drained ready slot parked indefinitely.
+        if let Some(request) = self
+            .request_inputs
+            .get(&input)
+            .and_then(|work| self.resources.requests.get(work))
+        {
+            request.note_input_progress();
+        }
         self.notify_host_progress();
         Ok(())
     }
@@ -167,8 +196,16 @@ impl ContextHostRecord {
         if pending.jobs[1].is_none() {
             pending.jobs[1] = jobs.take_release_job()?;
         }
-        if pending.jobs[2].is_none() {
-            pending.jobs[2] = jobs.take_holder_disposal()?;
+        if pending.jobs[2].is_none()
+            && pending.driver_seal.is_none()
+            && pending.driver_release.is_none()
+            && self.tasks.is_empty()
+            && self.task_driver.is_idle()
+            && self.resources.requests.is_empty()
+            && self.resources.request_partials.is_empty()
+        {
+            pending.jobs[2] =
+                jobs.take_holder_disposal_with_roots(&mut self.resources.root_reads)?;
         }
         for (index, slot) in pending.jobs.iter_mut().enumerate() {
             let Some(original) = slot.take() else {

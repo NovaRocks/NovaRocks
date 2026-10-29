@@ -35,7 +35,7 @@ const AUTHOR_STORAGE: StorageNeed = StorageNeed {
     cuts: 0,
     replies: 0,
     completions: 1,
-    captures: 1,
+    captures: 4,
     work: 1,
 };
 
@@ -57,20 +57,23 @@ impl ContextHostRecord {
     pub(crate) fn reserve_task_request_funding(
         &mut self,
     ) -> Result<TaskRequestFunding, ContextRequestAdmissionRefusal> {
-        match self.try_reserve_task_request_funding() {
+        match self.try_reserve_task_request_funding(true) {
             Ok(funding) => Ok(funding),
             Err((error, partial)) => Err(self.retain_request_partial(error, partial)),
         }
     }
-    fn try_reserve_task_request_funding(
+    pub(super) fn try_reserve_task_request_funding(
         &self,
+        reply: bool,
     ) -> Result<TaskRequestFunding, (ContextRequestError, Option<ContextRequestPartial>)> {
-        let full = StorageNeed::role(true);
+        let full = StorageNeed::role(reply);
+        let mut author_storage = AUTHOR_STORAGE;
+        author_storage.captures = if reply { 4 } else { 1 };
         let resources = full
             .resources()
             .map_err(|e| (ContextRequestError::Policy(e), None))?;
         let outer = full
-            .checked_sub(AUTHOR_STORAGE)
+            .checked_sub(author_storage)
             .and_then(StorageNeed::resources)
             .map_err(|e| (ContextRequestError::Policy(e), None))?;
         let scope = self.scope();

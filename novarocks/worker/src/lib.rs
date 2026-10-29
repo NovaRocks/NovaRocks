@@ -89,6 +89,7 @@ mod task_protocol_event;
 pub use task_preparation::{
     TaskPreparationChild, TaskPreparationChildExit, TaskPreparationChildRegistrationFailure,
 };
+#[cfg(test)]
 mod task_registry;
 mod task_registry_config;
 mod task_registry_entry;
@@ -132,7 +133,24 @@ pub use catalog_manager::{
 };
 pub use catalog_manager_config::{CatalogManagerConfig, DEFAULT_MAX_RETAINED_CATALOGS};
 pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
+pub use control_runtime::context_host::observation::{
+    ObservationProjection, ObservationProjectionError,
+};
 pub use control_runtime::lifecycle_read::TaskReadError;
+pub use control_runtime::node_api::{
+    WorkerContextDelivery, WorkerContextReplyBody, WorkerControlDelivery, WorkerControlReplyBody,
+    WorkerCreateDelivery, WorkerCreateReply,
+    WorkerMonotonicInstant, WorkerRequestError, WorkerRequestRefusal, WorkerRequestResult,
+    WorkerRootDelivery, WorkerRootRead, WorkerRootReadError, WorkerRootReadErrorKind,
+    WorkerTaskControl, WorkerTaskDelivery,
+};
+pub use control_runtime::node_bootstrap::{
+    NODE_CONTEXT_STEP_BUDGET, NODE_CONTROL_STEP_BUDGET, NodeAdmissionTicketConfig,
+    NodeContextCoreConfig, NodeControlConfig, NodeWorkers, WorkerNodeConfig, WorkerNodeRuntime,
+    WorkerNodeShutdownError, WorkerNodeStartRefusal,
+};
+pub use control_runtime::node_geometry::{NodeGeometry, NodeGeometryError, NodeGeometryInputs};
+pub use control_runtime::node_metrics::WorkerNodeMetricsSnapshot;
 pub use control_runtime::operator_statistics::{
     StatisticsSubmission, TaskStatisticsFinalizer, TaskStatisticsProducer,
 };
@@ -165,9 +183,16 @@ pub use lifecycle::{
     classify_operation_admission, classify_root_drain, classify_task_transition,
 };
 pub use novarocks_execution_contract::AdmissionEpochCapability;
+pub use novarocks_worker_protocol::admission::AdmissionTicketObservation as NodeAdmissionTicketObservation;
 pub use novarocks_worker_protocol::context::{
     TerminalIntent as TaskTerminalIntent, TerminalObservation as TaskTerminalObservation,
     TerminalStatistics as TaskTerminalStatistics,
+};
+pub use novarocks_worker_protocol::observation::{
+    CoveredObservationBookmark as NodeCoveredObservationBookmark,
+    CoveredObservationFact as NodeCoveredObservationFact,
+    CoveredObservationFrame as NodeCoveredObservationFrame,
+    CoveredSubscriptionRequest as NodeCoveredSubscriptionRequest,
 };
 pub use observation::{
     ContextConvergenceCursorError, CoveredObservationBookmark, CoveredObservationFact,
@@ -214,6 +239,7 @@ pub use task_lifecycle::{
     TaskStartPermit, TaskStartRefusal, TaskStopIntent, TaskTerminalPermit,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
+#[cfg(test)]
 pub use task_registry::{
     DeadlineSweep, RegistryCounters, RegistryLockObservation, RegistryLockSnapshot,
     TaskExecutionRegistry, TaskPreparationSnapshot, TaskPreparationSnapshotError,
@@ -341,3 +367,20 @@ mod result_policy_failure_tests {
         assert_eq!((valid.per_root().get(), valid.per_process().get()), (8, 16));
     }
 }
+
+pub use control_runtime::node_api::{
+    WorkerObservationError, WorkerObservationErrorKind, WorkerObservationFrameDelivery,
+    WorkerObservationStream,
+};
+
+pub use novarocks_worker_protocol::observation::{
+    CoveredSubscriptionError as NodeCoveredSubscriptionError,
+    QuiesceObservationCursor as NodeQuiesceObservationCursor,
+};
+
+pub use control_runtime::node_api::WorkerTaskReadDelivery;
+
+pub use control_runtime::dynamic_filters::{
+    DynamicFilterSubmission, TaskDynamicFilterCommittedNotice, TaskDynamicFilterProducer,
+    TaskDynamicFilterWriter,
+};

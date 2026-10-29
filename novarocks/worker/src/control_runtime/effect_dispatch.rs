@@ -170,7 +170,8 @@ impl EffectDispatch {
                         | ControlEffect::RetireReservation(_),
                     ..
                 }
-                | WorkerAction::ControlReply(_) => Release::Completed,
+                | WorkerAction::ControlReply(_)
+                | WorkerAction::AdmissionEpoch(_) => Release::Completed,
                 WorkerAction::Control { .. } => Release::Started,
                 _ => return None,
             };
@@ -189,6 +190,7 @@ impl EffectDispatch {
                 | ContextEffect::SummaryConsumed { task, .. }
                 | ContextEffect::PublishConclusion { task, .. }
                 | ContextEffect::RetireTask { task, .. }
+                | ContextEffect::FinalizeTaskExecution { task }
                 | ContextEffect::SettlementBarrier { task, .. },
             ) => Some((LaneKey::Task(*task), Release::Published)),
             WorkerAction::Context(ContextEffect::PrepareReadPayload { task, .. }) => {
@@ -196,9 +198,13 @@ impl EffectDispatch {
             }
             // Only the preceding publications gate dispatch. The original
             // started stop job retains its own actual exit/capture liability.
-            WorkerAction::Context(ContextEffect::StopTask { task, .. }) => {
-                Some((LaneKey::Task(*task), Release::Started))
-            }
+            WorkerAction::Context(
+                ContextEffect::StopTask { task, .. }
+                | ContextEffect::DisposeSource { task, .. }
+                | ContextEffect::EnqueuePreparation { task, .. }
+                | ContextEffect::InitialPreparationReady { task, .. }
+                | ContextEffect::ApplyTaskClose { task, .. },
+            ) => Some((LaneKey::Task(*task), Release::Started)),
             // A later RPC reply observes the same Task publication order.
             // Starting its original delivery releases only this ordering
             // position; the actual reply body and wire holder exit separately.
@@ -451,6 +457,20 @@ impl EffectDispatch {
         }
         self.pop_lane(key, effect);
         Ok(())
+    }
+    /// Waiting lanes retain custody but do not make a host turn runnable.
+    pub(crate) fn has_unindexed(
+        &self,
+        runtime: &ActorRuntime<WorkerActor>,
+    ) -> Result<bool, DispatchError> {
+        Ok(!runtime
+            .committed_batches(self.actor, self.after, 1)?
+            .is_empty())
+    }
+    /// Count current routing markers for one bounded readiness scan. This is
+    /// not evidence that a dependency or physical action has completed.
+    pub(crate) fn ready_positions(&self) -> usize {
+        self.ready.len()
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.indexed == 0

@@ -392,6 +392,7 @@ fn close_parks_until_its_real_task_fact_then_drains_abort_waiters() {
             ContextEffect::ApplyTaskClose {
                 task: id,
                 generation,
+                ..
             } if *id == task(1) => Some(*generation),
             _ => None,
         })
@@ -406,6 +407,7 @@ fn close_parks_until_its_real_task_fact_then_drains_abort_waiters() {
     let applied = m.fact(ContextInput::ApplyTaskClose {
         task: task(1),
         generation,
+        intent: TaskCloseIntent::Abort(novarocks_execution_contract::AbortCause::QueryFailed),
     });
     assert!(applied.requests.is_empty());
     assert!(m.core.has_internal_work());

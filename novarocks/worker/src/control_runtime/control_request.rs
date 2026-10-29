@@ -77,7 +77,7 @@ pub(crate) const CONTROL_REQUEST_STORAGE: StorageNeed = StorageNeed {
     cuts: 0,
     replies: 1,
     completions: 1,
-    captures: 1,
+    captures: 4 + super::request_observation::REQUEST_OBSERVATION_CAPTURES,
     work: 1,
 };
 /// The same RPC position pays for its source child, one Context probe and
@@ -95,7 +95,7 @@ pub(crate) const ESTABLISH_REQUEST_STORAGE: StorageNeed = StorageNeed {
         + ROOT_ROUTE_RETURN_STORAGE.effects,
     work: 3 + CONTEXT_ROUTE_ESCROW_STORAGE.work,
     completions: 2 + CONTEXT_ROUTE_ESCROW_STORAGE.completions,
-    captures: 2 + CONTEXT_ROUTE_ESCROW_STORAGE.captures,
+    captures: CONTROL_REQUEST_STORAGE.captures + 1 + CONTEXT_ROUTE_ESCROW_STORAGE.captures,
     ..CONTROL_REQUEST_STORAGE
 };
 fn core_consumer() -> ConsumerId {
@@ -121,6 +121,7 @@ pub(crate) enum ControlRequestError {
     WrongEffect,
     WrongPhase,
     MissingBody,
+    MissingObservationPort,
     BodyResultMismatch,
     AdmissionReceiptMismatch,
     SubmissionUnresolved,
@@ -232,6 +233,8 @@ impl std::fmt::Debug for EstablishIngressBeginRefusal {
 }
 #[derive(Clone, Copy)]
 enum RequestKind {
+    ObserveTicket,
+    CreateWithoutContext,
     Acquire {
         context: QueryContextRef,
         valid_for: LeaseValidFor,
@@ -275,6 +278,10 @@ pub(crate) struct ControlRequestCustody {
     work: WorkId,
     work_retirement: WorkRetirementObserver,
     endpoint: Arc<Endpoint>,
+    notification: novarocks_control_runtime::reply_notification::ReplyNotification<WorkerActor>,
+    pending_notification: Option<super::request_endpoint::RequestNotificationJob>,
+    protocol_observation: super::request_observation::RequestObservation,
+    pending_protocol_observation: Option<super::request_observation::RequestObservationJob>,
     permit: Option<InputPermit<WorkerActor>>,
     role: ExitRole,
     authority: Option<ExitAuthority>,
@@ -307,6 +314,56 @@ pub(crate) struct ControlRequestCustody {
     withdrawal: bool,
 }
 impl ControlRequestCustody {
+    /// Observe the original pure ticket owner through this same admitted R.
+    /// This read neither enters the operation replay table nor redeems a grant.
+    pub(crate) fn submit_ticket_observation(
+        &mut self,
+        ticket: novarocks_execution_contract::AdmissionTicketId,
+        context: QueryContextRef,
+        preflight: bool,
+    ) -> Result<(), ControlRequestError> {
+        if self.submitted || self.started || self.ingress_enabled || self.permit.is_none() {
+            return Err(ControlRequestError::WrongPhase);
+        }
+        self.authority
+            .as_mut()
+            .expect("original observation R authority")
+            .start()
+            .map_err(ControlRequestError::Exit)?;
+        self.started = true;
+        self.permit
+            .as_ref()
+            .expect("original observation R input")
+            .bind()
+            .map_err(ControlRequestError::Driver)?;
+        self.kind = Some(RequestKind::ObserveTicket);
+        let message = WorkerMessage::Control(ControlMessage::ObserveTicket {
+            work: self.work,
+            request: RequestMetadata {
+                operation: self.request().operation,
+                deadline: self.request().deadline,
+            },
+            ticket,
+            context,
+            preflight,
+        });
+        match self
+            .permit
+            .take()
+            .expect("same original observation input")
+            .fill(message)
+        {
+            Ok(input) => {
+                assert_eq!(input, self.input_id());
+                self.submitted = true;
+                Ok(())
+            }
+            Err((error, original)) => {
+                self.failed_submission = Some(original);
+                Err(ControlRequestError::Driver(error))
+            }
+        }
+    }
     pub(crate) fn admit(
         root: &ProcessControlOwner,
         source: ActorId,
@@ -468,6 +525,13 @@ impl ControlRequestCustody {
                 });
             }
         };
+        let (notification, observer) =
+            novarocks_control_runtime::reply_notification::ReplyNotification::for_admitted_work(
+                root.runtime(),
+                root.registration(),
+                reported.work(),
+            )
+            .unwrap_or_else(|_| std::process::abort());
         let endpoint = Arc::new(Endpoint {
             request,
             ready: root.request_ready().clone(),
@@ -484,6 +548,10 @@ impl ControlRequestCustody {
                 work: work_id,
                 work_retirement,
                 endpoint: endpoint.clone(),
+                notification,
+                pending_notification: None,
+                protocol_observation: Default::default(),
+                pending_protocol_observation: None,
                 permit: Some(permit),
                 role,
                 authority: Some(authority),
@@ -518,6 +586,7 @@ impl ControlRequestCustody {
             ControlRequestHandle {
                 endpoint,
                 active: true,
+                observer: Some(observer),
             },
         ))
     }
@@ -752,7 +821,7 @@ impl ControlRequestCustody {
                 ControlEffect::Materialize {
                     context,
                     establishment,
-                    generation,
+                    generation: _,
                     reservation,
                 },
             admitted: Some(original),
@@ -775,13 +844,7 @@ impl ControlRequestCustody {
             || p.ticket != establishment.ticket
             || p.payload != establishment.payload
             || p.semantics != establishment.semantics
-            || !jobs.matches_owner(
-                &self.runtime,
-                self.actor,
-                *context,
-                *generation,
-                *establishment,
-            )
+            || !jobs.matches_materialization(&self.runtime, ticket)
         {
             return Err(ControlRequestError::WrongRequest);
         }
@@ -1141,6 +1204,7 @@ impl ControlRequestCustody {
             ControlInput::Establish { request, .. } if *request == self.request().operation => {
                 RequestKind::Establish
             }
+            ControlInput::CreateWithoutContextAddress { .. } => RequestKind::CreateWithoutContext,
             _ => return Err(reject(ControlRequestError::WrongOperation, command)),
         };
         if !self.started {
@@ -1235,6 +1299,17 @@ impl ControlRequestCustody {
             }
             match (self.kind, &decided_body) {
                 (
+                    Some(RequestKind::CreateWithoutContext),
+                    ControlReplyBody::CreateContext(_)
+                    | ControlReplyBody::Verdict(RequestResult::Outcome(
+                        OperationOutcome::OwnerFailed,
+                    )),
+                ) => {}
+                (Some(RequestKind::CreateWithoutContext), _)
+                | (_, ControlReplyBody::CreateContext(_)) => {
+                    return Err(reject(ControlRequestError::WrongEffect, ticket));
+                }
+                (
                     Some(RequestKind::Acquire { context, valid_for }),
                     ControlReplyBody::Admission(Ok(receipt)),
                 ) if receipt.context() != context || receipt.valid_for() != valid_for => {
@@ -1254,6 +1329,11 @@ impl ControlRequestCustody {
                 }
                 _ => {}
             }
+            let event = if matches!(self.kind, Some(RequestKind::Establish)) {
+                super::request_observation::establish_event(self.request().operation, &decided_body)
+            } else {
+                None
+            };
             let body = Arc::new(decided_body);
             if let Err((error, body)) =
                 self.runtime
@@ -1265,11 +1345,14 @@ impl ControlRequestCustody {
                     body,
                 });
             }
+            self.protocol_observation.stage(event);
             self.published = Some(key);
+            self.notification.published();
         }
         match self.runtime.effect_completed(ticket) {
             Ok(()) => {
                 self.reply_completed = true;
+                self.notification.published();
                 self.endpoint.external.notify();
                 Ok(())
             }
@@ -1285,6 +1368,9 @@ impl ControlRequestCustody {
         if self.retired {
             return Ok(true);
         }
+        if self.protocol_observation.failed() || self.notification.snapshot().failure.is_some() {
+            return Err(ControlRequestError::SubmissionUnresolved);
+        }
         if self.failed_submission.is_some() {
             return Err(ControlRequestError::SubmissionUnresolved);
         }
@@ -1292,7 +1378,11 @@ impl ControlRequestCustody {
             return Ok(false);
         }
         if self.withdrawal {
-            if !self.endpoint.external_ended() || !self.close_ingress()? || !self.close_route()? {
+            if !self.endpoint.external_ended()
+                || !self.notification.is_idle()
+                || !self.close_ingress()?
+                || !self.close_route()?
+            {
                 return Ok(false);
             }
             if !self.initial_retired {
@@ -1337,7 +1427,11 @@ impl ControlRequestCustody {
                 Err(error) => return Err(ControlRequestError::Driver(error)),
             }
         }
-        if !self.reply_completed || !self.endpoint.external_ended() {
+        if !self.reply_completed
+            || !self.endpoint.external_ended()
+            || !self.notification.is_idle()
+            || !self.protocol_observation.is_idle()
+        {
             return Ok(false);
         }
         if !self.close_ingress()? || !self.close_route()? {
@@ -1550,10 +1644,12 @@ mod tests {
                     actor_config: ActorConfig {
                         mailbox: [4, 4, 4, 1],
                         max_batches: 8,
-                        max_effects_per_step: ControlCore::MAX_STEP_WORK,
-                        max_dependencies_per_effect: ControlCore::MAX_STEP_WORK,
-                        turn_budget: 64,
-                        max_step_work: ControlCore::MAX_STEP_WORK,
+                        max_effects_per_step:
+                            crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                        max_dependencies_per_effect:
+                            crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                        turn_budget: crate::control_runtime::actors::ControlActor::TURN_BUDGET,
+                        max_step_work: crate::control_runtime::actors::ControlActor::MAX_STEP_WORK,
                     },
                     admission_storage,
                 },
@@ -2266,6 +2362,7 @@ mod tests {
                 context: f.context,
                 request: routed_request,
                 result: Ok(OperationOutcome::InvalidStateOrRequest),
+                acknowledgement: None,
                 decided_at: MonotonicInstant::from_origin(Duration::from_nanos(3)),
             },
             host_storage,

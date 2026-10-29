@@ -272,6 +272,11 @@ impl ContextHostRecord {
         ticket: &EffectTicket<WorkerAction>,
     ) -> Result<(), DriverError> {
         self.resources.owner_control.authorize_removal(ticket)?;
-        self.resources.internal.authorize_removal(ticket)
+        self.resources.internal.authorize_removal(ticket)?;
+        // Quiesce closes business intake, while Release and other admitted
+        // control operations must still converge. Root's actual RemoveHost
+        // handoff is the final gate for newly issued control requests.
+        self.resources.control_admission_closed = true;
+        Ok(())
     }
 }

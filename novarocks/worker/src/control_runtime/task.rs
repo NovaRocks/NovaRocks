@@ -19,6 +19,8 @@
 //! lifecycle; this record holds its original reservations, published port and
 //! one finite set of original fragment capabilities outside the actor.
 
+mod domain_return;
+
 use super::{
     actors::{WorkerAction, WorkerActor},
     admitted_role::{adopt_reported_work, dispose_unused_completion, reserve_reported_role},
@@ -101,6 +103,7 @@ pub(crate) enum TaskHostError {
     SourceInventoryPending,
     HostCall(TaskHostCallError),
     OwnerFailed,
+    OpenSummary(super::open_summary::OpenSummaryError),
     WrongEffect,
     WrongTaskOrPayload,
     InvalidGeometry,
@@ -119,6 +122,11 @@ pub(crate) enum TaskHostError {
     CompletionAction(CausalInputError),
     Preparation(PreparationAdoptionError),
 }
+impl From<CausalError> for TaskHostError {
+    fn from(error: CausalError) -> Self {
+        Self::Causal(error)
+    }
+}
 impl From<RuntimeError> for TaskHostError {
     fn from(error: RuntimeError) -> Self {
         Self::Runtime(error)
@@ -133,6 +141,9 @@ impl std::fmt::Display for TaskHostError {
             }
             Self::HostCall(error) => {
                 write!(f, "original Task host-call admission failed: {error:?}")
+            }
+            Self::OpenSummary(error) => {
+                write!(f, "original open summary retirement failed: {error:?}")
             }
             Self::OwnerFailed => f.write_str("the Task owner failed before new business capture"),
             Self::SourceInventoryPending => {
@@ -289,16 +300,27 @@ pub(crate) struct TaskHostResources {
     pub completion_action: Option<CompletionActionCustody>,
     pub lifecycle_inputs: BTreeMap<TaskLifecycleRole, CausalInputCustody>,
     pub statistics: Option<TaskStatisticsInbox>,
+    pub dynamic_filters: Option<super::dynamic_filters::TaskDynamicFilterInbox>,
     pub open_summary: Option<TaskOpenSummaryInbox>,
     pub causal: TaskCausalInbox,
+    pub production: Option<Arc<ProductionPreparation>>,
 }
 impl TaskHostResources {
+    fn resources_dynamic_filter_pending(&self) -> bool {
+        self.dynamic_filters
+            .as_ref()
+            .is_some_and(|source| !source.is_retired())
+    }
     /// The custodian has disposed actual payloads and retired each independent
     /// report/input position. Transfer read authority only from that inventory;
     /// a Task terminal or a stopped execution borrow gate is insufficient.
     pub(crate) fn seal_read_observation(&self) -> Result<Arc<TaskReadSnapshot>, TaskReadError> {
         use novarocks_control_runtime::exit_role::ExitRolePhase;
-        if self.host_calls.iter().any(|call| !call.is_retired())
+        if self
+            .production
+            .as_ref()
+            .is_some_and(|owner| !owner.is_retired())
+            || self.host_calls.iter().any(|call| !call.is_retired())
             || self
                 .source_partials
                 .iter()
@@ -309,6 +331,7 @@ impl TaskHostResources {
                 .statistics
                 .as_ref()
                 .is_some_and(|statistics| !statistics.is_retired())
+            || self.resources_dynamic_filter_pending()
             || self.pending_loading.is_some()
             || self
                 .open_summary
@@ -503,6 +526,18 @@ pub(crate) struct TaskHostRecord {
     #[cfg(test)]
     source_storage_model: bool,
     lifecycle_issued: [bool; TaskLifecycleRole::COUNT],
+    normal_source_detached: [bool; 2],
+    normal_lifetime_ended: bool,
+    completion_core_observed: bool,
+    production_settlement_cut: Option<(
+        novarocks_worker_protocol::proposal_summary::CutId,
+        novarocks_control_runtime_core::identity::WorkId,
+    )>,
+    host_cut_cursor: Option<novarocks_worker_protocol::proposal_summary::CutId>,
+    host_retired_pairs: BTreeMap<
+        novarocks_worker_protocol::proposal_summary::CutId,
+        crate::task_proposal_ingress::RetiredCut,
+    >,
 }
 /// A borrowed proof from the original failed Task inventory. Its producer
 /// facts are monotonic and its business issuers are already fenced by the
@@ -517,6 +552,9 @@ impl TaskExecutionBorrowersExited<'_> {
 }
 
 impl TaskHostRecord {
+    pub(super) fn source_address(&self) -> ActorId {
+        self.task_source
+    }
     /// Electing the Task and paying its active/loading storage happened in
     /// the Core step. This takes the same guard once; it reserves no new quota.
     pub(crate) fn adopt_loading(
@@ -723,7 +761,9 @@ impl TaskHostRecord {
                 completion_action: None,
                 lifecycle_inputs: BTreeMap::new(),
                 statistics: None,
+                dynamic_filters: None,
                 open_summary: None,
+                production: None,
                 causal: TaskCausalInbox::new(
                     runtime.clone(),
                     ticket.actor,
@@ -742,6 +782,12 @@ impl TaskHostRecord {
             #[cfg(test)]
             source_storage_model: binding.source_storage_model,
             lifecycle_issued: [false; TaskLifecycleRole::COUNT],
+            normal_source_detached: [false; 2],
+            normal_lifetime_ended: false,
+            completion_core_observed: false,
+            production_settlement_cut: None,
+            host_cut_cursor: None,
+            host_retired_pairs: BTreeMap::new(),
         })
     }
     /// Address the original preadmitted role. Cloning its observer handle
@@ -1118,7 +1164,7 @@ impl TaskHostRecord {
                 self.resources
                     .causal
                     .admit_input(
-                        loader.work.id(),
+                        &loader.work,
                         1,
                         self.pending.clone(),
                         CutSourceAdmission::Fresh(sources),
@@ -1234,7 +1280,14 @@ impl TaskHostRecord {
     }
     pub(crate) fn observe_loading_exit_report(&mut self) -> Result<bool, LoadingEventError> {
         match self.resources.loading_events.as_ref() {
-            Some(events) => events.observe_exit_report(&mut self.resources.causal),
+            Some(events) => {
+                let before = events.is_retired();
+                let retired = events.observe_exit_report(&mut self.resources.causal)?;
+                if !before && events.is_retired() {
+                    self.pending.pending();
+                }
+                Ok(retired)
+            }
             None => Ok(false),
         }
     }
@@ -1264,7 +1317,7 @@ impl TaskHostRecord {
             return Err(TaskHostError::DuplicatePreparation);
         }
         let accepted_slots = TaskLifecycleRole::COUNT
-            .checked_sub(2)
+            .checked_sub(TaskLifecycleRole::LOADING.len())
             .and_then(|roles| roles.checked_mul(2))
             .ok_or(TaskHostError::InvalidGeometry)?;
         let source_storage = SOURCE_SLOT_STORAGE
@@ -1420,11 +1473,38 @@ impl TaskHostRecord {
         self.issue_lifecycle_author(TaskLifecycleRole::TerminalObservation)
             .map(crate::TaskTerminalPermit::from_admitted_author)
     }
+    pub(crate) fn publish_context_close(
+        &mut self,
+        generation: Generation,
+        intent: novarocks_worker_protocol::context::TaskCloseIntent,
+    ) -> Result<(), TaskHostError> {
+        let kind = match intent {
+            novarocks_worker_protocol::context::TaskCloseIntent::Quiesce => {
+                TaskLifecycleRole::QuiesceClose
+            }
+            novarocks_worker_protocol::context::TaskCloseIntent::Abort(_) => {
+                TaskLifecycleRole::ContextClose
+            }
+        };
+        self.issue_lifecycle_author_bound(kind, Some((generation, intent)))?
+            .publish_close(generation, intent)
+            .map_err(TaskHostError::CompletionAction)
+    }
     fn issue_lifecycle_author(
         &mut self,
         kind: TaskLifecycleRole,
     ) -> Result<InputAuthor, TaskHostError> {
-        if self.resources.preparation.is_none() {
+        self.issue_lifecycle_author_bound(kind, None)
+    }
+    fn issue_lifecycle_author_bound(
+        &mut self,
+        kind: TaskLifecycleRole,
+        close: Option<(
+            Generation,
+            novarocks_worker_protocol::context::TaskCloseIntent,
+        )>,
+    ) -> Result<InputAuthor, TaskHostError> {
+        if self.resources.preparation.is_none() && !kind.is_context_close() {
             return Err(TaskHostError::CompletionBeforeAccepted);
         }
         if std::mem::replace(&mut self.lifecycle_issued[kind as usize], true) {
@@ -1440,19 +1520,31 @@ impl TaskHostRecord {
             },
             Some(self.core_generation),
         )?;
-        let sources = match self.reserve_source_slots::<2>(false) {
+        let sources = match self.reserve_source_slots::<2>(kind.is_context_close()) {
             Ok(sources) => sources,
             Err(error) => {
                 dispose_unused_completion(role);
                 return Err(error);
             }
         };
-        let (cut, sender) = match self.resources.causal.admit_input(
-            role.work.id(),
-            1,
-            self.pending.clone(),
-            CutSourceAdmission::Fresh(sources),
-        ) {
+        let admitted = if let Some((generation, intent)) = close {
+            self.resources.causal.admit_close(
+                generation,
+                intent,
+                &role.work,
+                1,
+                self.pending.clone(),
+                CutSourceAdmission::Fresh(sources),
+            )
+        } else {
+            self.resources.causal.admit_input(
+                &role.work,
+                1,
+                self.pending.clone(),
+                CutSourceAdmission::Fresh(sources),
+            )
+        };
+        let (cut, sender) = match admitted {
             Ok(admitted) => admitted,
             Err(refusal) => {
                 let error = self.retain_source_refusal(refusal);
@@ -1488,9 +1580,15 @@ impl TaskHostRecord {
     pub(crate) fn observe_lifecycle_inputs(&mut self) -> Result<bool, TaskHostError> {
         let mut retired = true;
         for input in self.resources.lifecycle_inputs.values() {
+            let before = input.phase();
             retired &= input
                 .observe_consumers(&mut self.resources.causal)
                 .map_err(TaskHostError::CompletionAction)?;
+            if before != novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+                && input.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+            {
+                self.pending.pending();
+            }
         }
         Ok(retired)
     }
@@ -1587,7 +1685,7 @@ impl TaskHostRecord {
             }
         };
         let (cut, sender) = match self.resources.causal.admit_input(
-            role.work.id(),
+            &role.work,
             1,
             self.pending.clone(),
             CutSourceAdmission::Fresh(sources),
@@ -1621,9 +1719,16 @@ impl TaskHostRecord {
         let Some(action) = self.resources.completion_action.as_ref() else {
             return Ok(true);
         };
-        action
+        let before = action.phase();
+        let retired = action
             .observe_consumers(&mut self.resources.causal)
-            .map_err(TaskHostError::CompletionAction)
+            .map_err(TaskHostError::CompletionAction)?;
+        if before != novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+            && action.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+        {
+            self.pending.pending();
+        }
+        Ok(retired)
     }
     /// Bind before giving the original job to its actual fair host queue. The
     /// preparation custodian, rather than a detached runtime alias, retains
@@ -1779,5 +1884,1204 @@ mod tests {
         capacity.release(&resources).unwrap();
         ledger.remove_scope(scope.id()).unwrap();
         assert!(ledger.is_empty());
+    }
+}
+
+/// Actual captures produced by the original preparation. Metadata readers
+/// cannot destroy the dormant runtime or its exact Root channel.
+#[derive(Default)]
+struct ProductionPreparedState {
+    host_install_attempted: bool,
+    installation_observed: bool,
+    installation_failed: bool,
+    root_closed: bool,
+    root_close_reason: Option<novarocks_execution_contract::root_lifetime::RootRetentionClose>,
+    root_ownership_reported: bool,
+    root_idle_author: Option<InputAuthor>,
+    root: Option<std::sync::Weak<RootRetentionCustody>>,
+    root_handoff: Option<RootContextRetention>,
+    runnable: Option<std::mem::ManuallyDrop<Arc<dyn crate::RunnableTask>>>,
+    descriptor: Option<novarocks_execution_contract::TaskDescriptor>,
+    refusal: Option<HostPreparationRefusal>,
+    activated: bool,
+    activation_queued: bool,
+    retired: bool,
+    retirement_panic: Option<std::mem::ManuallyDrop<Box<dyn std::any::Any + Send>>>,
+    terminal_return: Option<Arc<crate::task_lifecycle::PreparationTerminalReturn>>,
+    rollback_job_active: bool,
+    rollback_finished: bool,
+}
+#[derive(Default)]
+pub(crate) struct ProductionPreparation {
+    root_wake: Option<Arc<super::context_host::task_driver::TaskRootWake>>,
+    root_binding: Option<(TaskIdentity, QueryContextRef, ScopeHandle)>,
+    state: std::sync::Mutex<ProductionPreparedState>,
+}
+impl ProductionPreparation {
+    pub(crate) fn is_retired(&self) -> bool {
+        self.state
+            .lock()
+            .expect("original production captures")
+            .retired
+    }
+    pub(crate) fn installation_observed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("original production captures")
+            .installation_observed
+    }
+}
+impl TaskHostRecord {
+    pub(crate) fn trace_draining_originals(&self) {
+        let status = self.resources.port.current();
+        let production = self.resources.production.as_ref().map(|owner| {
+            let state = owner.state.lock().expect("original Task drain observation");
+            (
+                state.host_install_attempted,
+                state.installation_observed,
+                state.installation_failed,
+                state.activated,
+                state.retired,
+                state.rollback_job_active,
+                state.rollback_finished,
+                state.root.is_some(),
+            )
+        });
+        let inputs = self
+            .resources
+            .lifecycle_inputs
+            .iter()
+            .map(|(kind, input)| (*kind, input.cut(), input.phase(), input.actual_exit_ready()))
+            .collect::<Vec<_>>();
+        let cuts = self
+            .resources
+            .causal
+            .cut_inventory(None, 8)
+            .into_iter()
+            .map(|cut| (cut, self.resources.port.ingress().cut_consumption(cut)))
+            .collect::<Vec<_>>();
+        let calls = self
+            .resources
+            .host_calls
+            .iter()
+            .map(|call| (call.kind(), call.actual_call_exited(), call.is_retired()))
+            .collect::<Vec<_>>();
+        tracing::debug!(pid = std::process::id(), task = ?self.task,
+            state = ?status.state(), installed = status.installed(), terminating = status.termination().is_some(),
+            loader = ?self.resources.loader.as_ref().map(|loader| loader.phase()),
+            preparation_body = self.resources.preparation.as_ref().map(|p| p.body_and_captures_exited()),
+            preparation_report = self.resources.preparation.as_ref().map(|p| p.exit_report_retired()),
+            remainder = self.resources.preparation_remainder.is_some(), ?production, ?inputs, ?cuts, ?calls,
+            "Worker original Task inventory at process drain");
+        self.resources.causal.trace_drain_inventory(8);
+    }
+    /// Retry only this original preparation's provider rollback on a physical
+    /// worker. The already admitted preparation row retains its whole liability.
+    pub(crate) fn take_preparation_rollback_job(
+        &self,
+        host: Arc<dyn crate::TaskExecutionHost>,
+    ) -> Option<super::context_host::task_driver::TaskDriverHostJob> {
+        let preparation = self.resources.preparation.as_ref()?;
+        if !preparation.body_and_captures_exited() {
+            return None;
+        }
+        let owner = self.resources.production.as_ref()?;
+        let mut state = owner.state.lock().expect("original preparation rollback");
+        if state.rollback_job_active
+            || state.rollback_finished
+            || state.terminal_return.is_none()
+            // A submitted runnable owns the original dormant kernel and its
+            // completion authorities. Its existing activation drains a stopped
+            // kernel through real cleanup; never-adopted rollback must not
+            // race that handoff and strand those same authorities.
+            || state.runnable.is_some()
+            || (!state.installation_failed
+                && (state.activated || !self.resources.port.is_stopped()))
+        {
+            return None;
+        }
+        state.rollback_job_active = true;
+        Some(
+            super::context_host::task_driver::TaskDriverHostJob::RollbackPreparation {
+                preparation: preparation.clone(),
+                owner: owner.clone(),
+                host,
+                pending: self.pending.clone(),
+            },
+        )
+    }
+}
+impl ProductionPreparation {
+    pub(crate) fn rollback_on_host(
+        &self,
+        preparation: &PreparationCustody,
+        host: &dyn crate::TaskExecutionHost,
+        pending: &dyn TaskPendingNotice,
+    ) {
+        let (descriptor, returned, no_host_call) = {
+            let state = self.state.lock().expect("original rollback captures");
+            (
+                state.descriptor.clone(),
+                state.terminal_return.clone(),
+                !state.host_install_attempted,
+            )
+        };
+        let mut finished = preparation.rollback_host_runtime(
+            || {
+                if let Some(descriptor) = &descriptor {
+                    host.remove_inbound_capability(descriptor);
+                }
+            },
+            || {
+                if let Some(descriptor) = &descriptor {
+                    host.remove_receiver(descriptor);
+                }
+            },
+        );
+        if finished {
+            if let (Some(children), Some(returned)) = (preparation.host_children(), returned) {
+                if let Some(proof) = children.never_adopted_rollback_exit() {
+                    // Provider rollback and return of both original callback
+                    // authorities are independent. A later real return wakes
+                    // this same owner; do not seal it while one is still held.
+                    finished = false;
+                    match returned.take_after_rollback(&proof) {
+                        Ok(Some((mut terminal, mut exit))) => {
+                            terminal.bind();
+                            exit.bind();
+                            // Failure/control proposals precede this original
+                            // role in the same causal FIFO. No replacement
+                            // terminal or physical-exit authority is minted.
+                            let _ = terminal.handoff(crate::TaskTerminalObservation {
+                                intent: crate::TaskTerminalIntent::FinishExistingTermination {
+                                    output: None,
+                                },
+                                // Root work requires the original whole child
+                                // registration before creation. A sealed, fully
+                                // exited scope that never registered a child
+                                // proves no output was created, including an
+                                // early stop inside the host entry checkpoint.
+                                output_released: no_host_call || proof.never_registered_child(),
+                                final_statistics: None,
+                            });
+                            exit.completed();
+                            finished = true;
+                        }
+                        Ok(None) => {}
+                        Err(
+                            crate::task_lifecycle::PreparationTerminalReturnError::AlreadyTaken,
+                        ) => {
+                            finished = true;
+                        }
+                        Err(error) => {
+                            tracing::error!(?error, "Original preparation terminal return failed");
+                        }
+                    }
+                }
+            }
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("actual preparation rollback return");
+        state.rollback_job_active = false;
+        state.rollback_finished = finished;
+        drop(state);
+        if finished {
+            pending.pending();
+        }
+    }
+}
+impl TaskHostRecord {
+    pub(crate) fn issue_installed_author(&mut self) -> Result<InputAuthor, TaskHostError> {
+        self.issue_lifecycle_author(TaskLifecycleRole::Installed)
+    }
+    pub(crate) fn bind_production_preparation(
+        &mut self,
+        root_wake: Arc<super::context_host::task_driver::TaskRootWake>,
+    ) -> Result<Arc<ProductionPreparation>, TaskHostError> {
+        if self.resources.production.is_some() {
+            return Err(TaskHostError::DuplicatePreparation);
+        }
+        let owner = Arc::new(ProductionPreparation {
+            root_wake: Some(root_wake),
+            root_binding: Some((self.task, self.context, self.scope.clone())),
+            ..ProductionPreparation::default()
+        });
+        self.resources.production = Some(owner.clone());
+        let root_idle = self.issue_lifecycle_author(TaskLifecycleRole::RootIdle)?;
+        owner
+            .state
+            .lock()
+            .expect("original Root idle author")
+            .root_idle_author = Some(root_idle);
+        Ok(owner)
+    }
+    pub(crate) fn preparation_roles(
+        &mut self,
+    ) -> Result<crate::TaskPreparationRoles, TaskHostError> {
+        let (settlement_cut, registration) = self.admit_settlement_notice(1)?;
+        let fragments = match self.issue_completion_roles(registration) {
+            Ok(fragments) => fragments,
+            Err((error, registration)) => {
+                std::mem::forget(registration);
+                return Err(error);
+            }
+        };
+        // Registration bound this exact cut to the same original settlement
+        // Work before any callback escaped. Keep its address until that real
+        // callback/capture exit can reach the causal owner.
+        let settlement_work = self
+            .resources
+            .completion
+            .as_ref()
+            .expect("original completion roles")
+            .settlement_work();
+        self.production_settlement_cut = Some((settlement_cut, settlement_work));
+        let start = self.issue_start_permit()?;
+        let terminal = self.issue_terminal_permit()?;
+        let (statistics, final_statistics) = self.issue_statistics_producer()?;
+        let dynamic_filters = self.issue_dynamic_filter_producer()?;
+        let completion_exit = self.issue_completion_exit_notice()?;
+        Ok(crate::TaskPreparationRoles {
+            fragments,
+            start,
+            terminal,
+            statistics,
+            dynamic_filters,
+            final_statistics,
+            completion_exit,
+        })
+    }
+}
+impl TaskPreparationJob {
+    pub(crate) fn install_complete(
+        mut self,
+        host: Arc<dyn crate::TaskExecutionHost>,
+        reporter: crate::TaskStatusReporter,
+        progressions: Arc<Vec<novarocks_execution_contract::DomainProgression>>,
+        initial_refusal: Option<novarocks_execution_contract::DomainConflict>,
+        installed: InputAuthor,
+        owner: Arc<ProductionPreparation>,
+    ) -> PreparationOutcome<()> {
+        let diagnostic_task = self
+            .request
+            .as_ref()
+            .expect("original preparation request")
+            .identity();
+        let diagnostic_key = self.job.as_ref().expect("original preparation body").key();
+        let installed_cut = installed.custody().cut();
+        let mut binding = self.host.take().expect("original host preparation binding");
+        let children = binding.children.clone();
+        let pending = binding.pending.clone();
+        let terminal_return = crate::task_lifecycle::PreparationTerminalReturn::new(
+            children.clone(),
+            pending.clone(),
+        );
+        terminal_return
+            .bind_original(
+                &mut binding.roles.terminal,
+                &mut binding.roles.completion_exit,
+            )
+            .expect("same original preparation terminal roles");
+        owner
+            .state
+            .lock()
+            .expect("original preparation terminal return")
+            .terminal_return = Some(terminal_return);
+        owner
+            .state
+            .lock()
+            .expect("original preparation descriptor")
+            .descriptor = self
+            .request
+            .as_ref()
+            .map(|request| request.descriptor().clone());
+        let author = Arc::new(std::sync::Mutex::new(Some(installed)));
+        let sent = author.clone();
+        let exited_owner = owner.clone();
+        let outcome = self.run(move |request, input, parent| {
+            let refusal = match RefusalPosition::reserve(&parent) {
+                Ok(position) => position,
+                Err(_) => {
+                    drop(input);
+                    return;
+                }
+            };
+            if owner
+                .state
+                .lock()
+                .expect("original Root issuance fence")
+                .root_closed
+            {
+                drop(input);
+                owner
+                    .state
+                    .lock()
+                    .expect("original rejected installation")
+                    .installation_failed = true;
+                return;
+            }
+            let preparation = crate::TaskPreparationContext::from_admitted(
+                binding.port.execution_port(),
+                &binding.children,
+                binding.cadence,
+                binding.roles,
+            )
+            .expect("same original preparation roles");
+            let prepared = (|| {
+                // This pure journal refusal belongs to the original already
+                // Accepted preparation. Its payload, unused roles and failure
+                // publication exit through this real physical invocation.
+                if let Some(conflict) = initial_refusal {
+                    tracing::debug!(pid = std::process::id(), task = ?diagnostic_task,
+                        work = ?diagnostic_key, installed_cut = ?installed_cut, ?conflict,
+                        "Original initial preparation refusal entered physical body");
+                    return Err(crate::HostRejection::from_domain(
+                        novarocks_execution_contract::TaskFailureCategory::Protocol,
+                        conflict,
+                    ));
+                }
+                owner
+                    .state
+                    .lock()
+                    .expect("original host installation call")
+                    .host_install_attempted = true;
+                let installation =
+                    host.install_receiver(request.descriptor(), input, preparation)?;
+                installation.validate_task(request.descriptor())?;
+                let (_, root) = installation.into_parts();
+                {
+                    let mut state = owner.state.lock().expect("original production captures");
+                    state.installation_observed = true;
+                    if let Some(root) = root.as_ref() {
+                        let (task, context, scope) = owner
+                            .root_binding
+                            .as_ref()
+                            .expect("original installed Root binding");
+                        let token = RootContextRetention::from_installed(
+                            *task,
+                            *context,
+                            scope.clone(),
+                            owner
+                                .root_wake
+                                .as_ref()
+                                .expect("original Root wake")
+                                .clone(),
+                            root.clone(),
+                        );
+                        state.root = Some(token.downgrade());
+                        state.root_handoff = Some(token);
+                    }
+                    state.descriptor = Some(request.descriptor().clone());
+                }
+                if let Some(root) = root {
+                    let waker = std::task::Waker::from(
+                        owner
+                            .root_wake
+                            .as_ref()
+                            .expect("original Root wake owner")
+                            .clone(),
+                    );
+                    if let Err(original) = root.bind_exit_waker(waker) {
+                        std::mem::forget(original);
+                        std::process::abort();
+                    }
+                    // The Task temporarily holds only the unique handoff.
+                    // The original Context metadata turn adopts the unique
+                    // token before Installed can activate this producer.
+                }
+                if owner
+                    .state
+                    .lock()
+                    .expect("original Root issuance fence")
+                    .root_closed
+                {
+                    let sealing = {
+                        let state = owner.state.lock().expect("same original Root");
+                        state.root_handoff.as_ref().map(|token| {
+                            token.prepare_seal_for_context(
+                                state
+                                    .root_close_reason
+                                    .expect("original Context Root close reason"),
+                            )
+                        })
+                    };
+                    match sealing {
+                        Some(Ok(RetainedRootSealPreparation::Job(job))) => {
+                            if job.finish_on_host().is_err() {
+                                std::panic::panic_any(
+                                    crate::root_result_channel::RootChannelError::Producer,
+                                );
+                            }
+                        }
+                        Some(Err(_)) => std::panic::panic_any(
+                            crate::root_result_channel::RootChannelError::Producer,
+                        ),
+                        Some(Ok(
+                            RetainedRootSealPreparation::Ready
+                            | RetainedRootSealPreparation::Pending,
+                        ))
+                        | None => {}
+                    }
+                    binding.children.request_rollback();
+                    binding
+                        .children
+                        .cleanup(crate::task_preparation::PreparationCleanup::Inbound, || {
+                            host.remove_inbound_capability(request.descriptor())
+                        });
+                    binding.children.cleanup(
+                        crate::task_preparation::PreparationCleanup::Receiver,
+                        || host.remove_receiver(request.descriptor()),
+                    );
+                    return Ok(());
+                }
+                host.install_inbound_capability(request.descriptor())?;
+                let queued = crate::task_domain_execution::apply_planned_task_domain_updates(
+                    host.as_ref(),
+                    request.descriptor(),
+                    request.initial_domains(),
+                    &progressions,
+                    request.envelope().operation_id(),
+                )
+                .map_err(|error| error.into_host())?;
+                let runnable = host.submit_runnable(request.descriptor(), reporter.clone())?;
+                owner
+                    .state
+                    .lock()
+                    .expect("original production captures")
+                    .runnable = Some(std::mem::ManuallyDrop::new(runnable));
+                let input = novarocks_worker_protocol::context::ContextInput::InstalledTask {
+                    task: request.identity(),
+                    initial_queued: queued,
+                };
+                let author = sent
+                    .lock()
+                    .expect("original Installed author")
+                    .take()
+                    .expect("single Installed fact");
+                // Rejection retains this same input in its original custody.
+                let _ = author.publish(input);
+                Ok::<(), crate::HostRejection>(())
+            })();
+            if let Err(rejection) = prepared {
+                {
+                    let mut state = owner.state.lock().expect("original preparation result");
+                    if !state.installation_observed {
+                        state.installation_failed = true;
+                    }
+                }
+                tracing::debug!(pid = std::process::id(), task = ?diagnostic_task,
+                    work = ?diagnostic_key, installed_cut = ?installed_cut,
+                    fact = ?rejection.operation_failure().fact(),
+                    "Original preparation submitted its actual failure proposal");
+                let failure = refusal
+                    .retain(
+                        rejection,
+                        request.identity(),
+                        binding.pending,
+                        binding.health,
+                    )
+                    .into_retained_source();
+                reporter.failing(
+                    failure,
+                    novarocks_execution_contract::TaskFailurePhase::Preparation,
+                );
+                binding.children.request_rollback();
+                binding
+                    .children
+                    .cleanup(crate::task_preparation::PreparationCleanup::Inbound, || {
+                        host.remove_inbound_capability(request.descriptor())
+                    });
+                binding.children.cleanup(
+                    crate::task_preparation::PreparationCleanup::Receiver,
+                    || host.remove_receiver(request.descriptor()),
+                );
+            }
+        });
+        if matches!(
+            outcome,
+            PreparationOutcome::TaskStopped | PreparationOutcome::StartRefused(_)
+        ) {
+            // This actual physical invocation disposed its never-run closure
+            // and input. No receiver/Root could have been installed by it.
+            tracing::debug!(pid = std::process::id(), task = ?diagnostic_task,
+                work = ?diagnostic_key, installed_cut = ?installed_cut,
+                start_refused = matches!(outcome, PreparationOutcome::StartRefused(_)),
+                "Original preparation physically disposed its unstarted invocation");
+            exited_owner
+                .state
+                .lock()
+                .expect("unstarted preparation exit")
+                .installation_failed = true;
+        }
+        if initial_refusal.is_some() {
+            let outcome_kind = match &outcome {
+                PreparationOutcome::Returned(_) => "Returned",
+                PreparationOutcome::TaskStopped => "TaskStopped",
+                PreparationOutcome::StartRefused(_) => "StartRefused",
+                PreparationOutcome::Unresolved => "Unresolved",
+            };
+            tracing::debug!(pid = std::process::id(), task = ?diagnostic_task,
+                work = ?diagnostic_key, installed_cut = ?installed_cut, outcome_kind,
+                "Original initial-refusal preparation invocation returned");
+        }
+        children.body_exited();
+        pending.pending();
+        if let Some(author) = author.lock().expect("original Installed author").take() {
+            let _ = author.withdraw();
+        }
+        outcome
+    }
+}
+
+impl ProductionPreparation {
+    /// Called only by the physical host runner after the real Installed
+    /// snapshot has committed. The queued capture itself grants no start.
+    pub(crate) fn activate(&self, preparation: &PreparationCustody) -> bool {
+        let runnable = {
+            let state = self.state.lock().expect("original production captures");
+            if state.activated {
+                return true;
+            }
+            state.runnable.as_ref().map(|runnable| Arc::clone(runnable))
+        };
+        let Some(runnable) = runnable else {
+            return false;
+        };
+        match preparation.adopt_host_runtime(move || runnable.commit_creation()) {
+            Ok(true) => {
+                tracing::debug!(pid = std::process::id(), key = ?preparation.key(),
+                    "Original production activation and preparation adoption exited");
+                self.state
+                    .lock()
+                    .expect("original production captures")
+                    .activated = true;
+                true
+            }
+            Ok(false) => {
+                tracing::debug!(pid = std::process::id(), key = ?preparation.key(),
+                    "Original production activation returned before complete adoption exit");
+                false
+            }
+            Err(original) => {
+                tracing::debug!(pid = std::process::id(), key = ?preparation.key(),
+                    "Original preparation refused its never-invoked activation capture");
+                drop(original);
+                false
+            }
+        }
+    }
+}
+
+impl TaskHostRecord {
+    pub(crate) fn retain_preparation_job(&mut self, job: TaskPreparationJob) {
+        assert!(self.resources.pending_preparation_adoption.is_none());
+        self.resources.pending_preparation_adoption = Some(job);
+    }
+}
+
+impl TaskHostRecord {
+    /// Only an actually committed Installed projection can expose this
+    /// original activation capture to the physical executor.
+    pub(crate) fn take_production_activation(
+        &self,
+    ) -> Option<super::context_host::task_driver::TaskDriverHostJob> {
+        if !self.resources.port.current().installed() {
+            return None;
+        }
+        let owner = self.resources.production.as_ref()?;
+        let preparation = self.resources.preparation.as_ref()?;
+        let mut state = owner.state.lock().expect("original production captures");
+        if state.activation_queued || state.activated || state.runnable.is_none() {
+            return None;
+        }
+        state.activation_queued = true;
+        Some(
+            super::context_host::task_driver::TaskDriverHostJob::Activate {
+                key: preparation.key(),
+                preparation: preparation.clone(),
+                owner: owner.clone(),
+                pending: self.pending.clone(),
+            },
+        )
+    }
+}
+
+impl TaskHostRecord {
+    /// Each fact is issued by its original finite lifecycle role. Report
+    /// consumers remain independent of those positive physical observations.
+    pub(crate) fn advance_production_facts(&mut self) -> Result<bool, TaskHostError> {
+        use novarocks_control_runtime_core::{completion::Consumption, identity::ConsumerId};
+        use novarocks_worker_protocol::context::{ContextInput, PhysicalFact};
+        let Some(preparation) = self.resources.preparation.clone() else {
+            return Ok(false);
+        };
+        let mut progressed = false;
+        if let Some(roles) = &self.resources.completion {
+            let before = roles.settlement_phase();
+            // An uninvoked finisher's real holder may already have returned
+            // from failed preparation. Observe that original body/capture
+            // evidence; revocation alone does not supply an exit fact.
+            roles.observe_unused_settlement();
+            if before != roles.settlement_phase() {
+                progressed = true;
+                self.pending.pending();
+            }
+        }
+        if self.resources.preparation_remainder.is_some() {
+            if progressed {
+                self.trace_preparation_failure_progress();
+            }
+            return self
+                .resources
+                .production
+                .as_ref()
+                .map_or(Ok(false), |owner| owner.publish_root_ownership_if_ready())
+                .map(|root_progress| progressed || root_progress);
+        }
+        let body = preparation.body_and_captures_exited();
+        let whole = preparation.publish_whole_exit()?;
+        for (kind, fact, ready, report, retired) in [
+            (
+                TaskLifecycleRole::PreparationBodyExited,
+                PhysicalFact::PreparationBodyExited,
+                body,
+                preparation.body_report(),
+                preparation.body_report_retired(),
+            ),
+            (
+                TaskLifecycleRole::PreparationExited,
+                PhysicalFact::PreparationExited,
+                whole,
+                preparation.exit_report(),
+                preparation.exit_report_retired(),
+            ),
+        ] {
+            if retired {
+                continue;
+            }
+            if ready {
+                let observer = ConsumerId::new(2).expect("fixed observer");
+                if report.consumption(observer)? == Consumption::Pending {
+                    report.consume(observer)?;
+                    progressed = true;
+                }
+                if !self.lifecycle_issued[kind as usize] {
+                    let author = self.issue_lifecycle_author(kind)?;
+                    author
+                        .publish(ContextInput::Physical {
+                            task: self.task,
+                            fact,
+                        })
+                        .map_err(TaskHostError::CompletionAction)?;
+                    progressed = true;
+                }
+            }
+            if self
+                .resources
+                .lifecycle_inputs
+                .get(&kind)
+                .is_some_and(|input| {
+                    input.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+                })
+            {
+                let core = ConsumerId::new(1).expect("fixed Core");
+                if report.consumption(core)? == Consumption::Pending {
+                    report.consume(core)?;
+                    progressed = true;
+                }
+            }
+        }
+        if let Some(owner) = &self.resources.production {
+            if owner.publish_root_ownership_if_ready()? {
+                progressed = true;
+            }
+        }
+        self.observe_lifecycle_inputs()?;
+        if whole {
+            progressed |= self.collect_preparation_remainder()?;
+        }
+        if progressed {
+            self.trace_preparation_failure_progress();
+        }
+        Ok(progressed)
+    }
+    /// Failure-path diagnostics only: bounded neutral original inventory.
+    /// A log line grants no start, consumption, publication, or exit authority.
+    fn trace_preparation_failure_progress(&self) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let Some(owner) = &self.resources.production else {
+            return;
+        };
+        let (failed, installed, root_idle) = {
+            let state = owner.state.lock().expect("original preparation diagnostic");
+            (
+                state.installation_failed,
+                state.installation_observed,
+                state.root_ownership_reported,
+            )
+        };
+        if !failed {
+            return;
+        }
+        let preparation = self.resources.preparation.as_ref();
+        let roles = self.resources.completion.as_ref();
+        let cut = self
+            .resources
+            .causal
+            .cut_inventory(None, 1)
+            .into_iter()
+            .next();
+        let cut_consumption = cut.map(|cut| self.resources.port.ingress().cut_consumption(cut));
+        let input_roles = self
+            .resources
+            .lifecycle_inputs
+            .iter()
+            .map(|(kind, input)| (*kind, input.cut(), input.phase(), input.actual_exit_ready()))
+            .collect::<Vec<_>>();
+        tracing::debug!(pid = std::process::id(), task = ?self.task, actor = ?self.actor,
+            installation_failed = failed, installation_observed = installed, root_ownership_reported = root_idle,
+            preparation_work = ?preparation.map(|p| p.key()),
+            body_captures_exited = preparation.is_some_and(|p| p.body_and_captures_exited()),
+            body_report_retired = preparation.is_some_and(|p| p.body_report_retired()),
+            whole_report_retired = preparation.is_some_and(|p| p.exit_report_retired()),
+            remainder = self.resources.preparation_remainder.is_some(),
+            finisher = ?roles.map(|r| r.phase(TaskLifecycleRole::Finisher)),
+            wall = ?roles.map(|r| r.phase(TaskLifecycleRole::WallTime)),
+            publisher = ?roles.map(|r| r.phase(TaskLifecycleRole::TerminalPublisher)),
+            settlement = ?roles.map(|r| r.settlement_phase()),
+            execution_calls_exited = roles.is_some_and(|r| r.execution_calls_exited()),
+            completion_action = ?self.resources.completion_action.as_ref().map(|a| a.phase()),
+            oldest_cut = ?cut, ?cut_consumption, host_cut_cursor = ?self.host_cut_cursor,
+            retired_pairs = self.host_retired_pairs.len(), ?input_roles,
+            "Original preparation failure made actual metadata progress");
+    }
+    pub(crate) fn pending_notice(&self) -> Arc<dyn TaskPendingNotice> {
+        self.pending.clone()
+    }
+}
+
+impl TaskHostRecord {
+    /// One original host-owned cut per metadata slice. Task RPC cuts remain
+    /// exclusively with their original R custody. No absent input proves a
+    /// receipt: the causal owner saves actual commits before header retirement.
+    pub(crate) fn advance_production_cut(
+        &mut self,
+        ledger: &novarocks_control_runtime::transaction::RuntimeLedger,
+    ) -> Result<bool, TaskHostError> {
+        use super::causal::CausalSourceRetirement;
+        if let Some((&cut, _)) = self.host_retired_pairs.first_key_value() {
+            let pair = &self.host_retired_pairs[&cut].pair;
+            let ingress = self.resources.port.ingress();
+            for holder in ingress
+                .take_unused_owned_pair(pair)
+                .map_err(|error| TaskHostError::Causal(error.into()))?
+                .into_iter()
+                .flatten()
+            {
+                holder.exit();
+            }
+            for position in ingress
+                .owned_pair_inventory(pair)
+                .map_err(|error| TaskHostError::Causal(error.into()))?
+            {
+                if !position
+                    .custody
+                    .try_retire()
+                    .map_err(|error| TaskHostError::Causal(CausalError::Role(error)))?
+                {
+                    return Ok(false);
+                }
+            }
+            let reaped_count = ledger.reap_scope_ready(self.scope.id(), 1)?;
+            let probes = ingress
+                .prepare_owned_pair_reap(pair)
+                .map_err(|error| TaskHostError::Causal(error.into()))?;
+            let [a, b] = probes.map(|probe| probe.observe_reaped());
+            let (Ok(a), Ok(b)) = (a, b) else {
+                if reaped_count > 0 {
+                    self.pending.pending();
+                }
+                return Ok(false);
+            };
+            let mut detached = ingress
+                .release_owned_pair(pair, [a, b])
+                .map_err(|(error, _)| TaskHostError::Causal(error.into()))?;
+            for storage in &mut detached {
+                storage.release()?;
+            }
+            self.host_retired_pairs.remove(&cut);
+            return Ok(true);
+        }
+        let cut = self
+            .resources
+            .causal
+            .cut_inventory(self.host_cut_cursor, 1)
+            .into_iter()
+            .next()
+            .or_else(|| {
+                self.resources
+                    .causal
+                    .cut_inventory(None, 1)
+                    .into_iter()
+                    .next()
+            });
+        let Some(cut) = cut else {
+            return Ok(false);
+        };
+        self.host_cut_cursor = Some(cut);
+        if self.resources.causal.rpc_cut(cut)? {
+            return Ok(false);
+        }
+        self.observe_lifecycle_inputs()?;
+        self.observe_completion_action()?;
+        if let Some((original_cut, original_work)) = self.production_settlement_cut {
+            if original_cut == cut
+                && self.resources.completion.as_ref().is_some_and(|roles| {
+                    roles.settlement_work() == original_work && roles.settlement_call_exited()
+                })
+            {
+                self.resources
+                    .port
+                    .ingress()
+                    .observe_cut_exit(cut, true, false)
+                    .map_err(|error| TaskHostError::Causal(error.into()))?;
+            }
+        }
+        if !self.resources.causal.retire_host_headers(cut)? {
+            return Ok(false);
+        }
+        match self
+            .resources
+            .causal
+            .retire_after_exit(cut, CausalSourceRetirement::Unclaimed)
+        {
+            Ok(retired) => {
+                self.host_retired_pairs.insert(cut, retired);
+                Ok(true)
+            }
+            Err(refusal) => match refusal.error {
+                CausalError::Cut(
+                    novarocks_worker_protocol::proposal_summary::CutError::ExitUnobserved,
+                )
+                | CausalError::Source(
+                    super::source_positions::SourcePositionError::NotAvailable
+                    | super::source_positions::SourcePositionError::SourceStillHeld,
+                ) => {
+                    let progress = self.resources.causal.advance_source_pair_retirement(
+                        cut,
+                        ledger,
+                        &self.scope,
+                    )?;
+                    let Some(reaped) = progress.reaped else {
+                        return Ok(progress.progressed);
+                    };
+                    match self.resources.causal.retire_after_exit(
+                        cut, CausalSourceRetirement::Reaped(reaped),
+                    ) {
+                        Ok(retired) => {
+                            self.host_retired_pairs.insert(cut, retired);
+                            Ok(true)
+                        }
+                        Err(refusal) => match refusal.error {
+                            CausalError::Driver(DriverError::RoleBusy)
+                            | CausalError::Cut(
+                                novarocks_worker_protocol::proposal_summary::CutError::ExitUnobserved
+                                | novarocks_worker_protocol::proposal_summary::CutError::NotReady
+                                | novarocks_worker_protocol::proposal_summary::CutError::Consuming,
+                            ) => Ok(progress.progressed),
+                            error => Err(TaskHostError::Causal(error)),
+                        },
+                    }
+                }
+                CausalError::Driver(DriverError::RoleBusy)
+                | CausalError::Cut(
+                    novarocks_worker_protocol::proposal_summary::CutError::NotReady
+                    | novarocks_worker_protocol::proposal_summary::CutError::Consuming,
+                ) => Ok(false),
+                error => Err(TaskHostError::Causal(error)),
+            },
+        }
+    }
+}
+
+impl ProductionPreparation {
+    fn publish_root_ownership_if_ready(&self) -> Result<bool, TaskHostError> {
+        use novarocks_worker_protocol::context::{ContextInput, PhysicalFact};
+        let (author, fact) = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("original Root transfer observation");
+            if state.root_ownership_reported
+                || (!state.installation_observed && !state.installation_failed)
+            {
+                return Ok(false);
+            }
+            let fact = match &state.root {
+                Some(root) => {
+                    let root = root.upgrade().ok_or(TaskHostError::InputNotReady)?;
+                    if !root.producer_relinquished() {
+                        return Ok(false);
+                    }
+                    PhysicalFact::RootTransferredToContext
+                }
+                None => PhysicalFact::RootIdle,
+            };
+            let Some(author) = state.root_idle_author.take() else {
+                return Ok(false);
+            };
+            state.root_ownership_reported = true;
+            (author, fact)
+        };
+        let task = author.task();
+        author
+            .publish(ContextInput::Physical { task, fact })
+            .map_err(TaskHostError::CompletionAction)?;
+        Ok(true)
+    }
+}
+impl ProductionPreparation {
+    pub(crate) fn close_root_issuance(
+        &self,
+        reason: novarocks_execution_contract::root_lifetime::RootRetentionClose,
+    ) -> bool {
+        let mut state = self.state.lock().expect("original Root issuance fence");
+        state.root_closed = true;
+        state.root_close_reason.get_or_insert(reason);
+        state.installation_observed || state.installation_failed
+    }
+}
+impl TaskHostRecord {
+    pub(crate) fn close_root_issuance(
+        &self,
+        reason: novarocks_execution_contract::root_lifetime::RootRetentionClose,
+    ) -> bool {
+        self.resources
+            .production
+            .as_ref()
+            .is_none_or(|owner| owner.close_root_issuance(reason))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TaskRootReadError {
+    NotInstalled,
+    NoRoot,
+    OwnerNotReady,
+    Channel(crate::root_result_channel::RootChannelError),
+}
+impl ProductionPreparation {
+    fn begin_original_root_read(
+        &self,
+        read: &novarocks_execution_contract::root_result::RootResultRead,
+    ) -> Result<crate::root_result_channel::RootChannelRead, TaskRootReadError> {
+        let state = self.state.lock().expect("original admitted Root read");
+        if !state.installation_observed {
+            return Err(TaskRootReadError::OwnerNotReady);
+        }
+        let root = state
+            .root
+            .as_ref()
+            .ok_or(TaskRootReadError::NoRoot)?
+            .upgrade()
+            .ok_or(TaskRootReadError::OwnerNotReady)?;
+        root.begin_original_root_read(read)
+    }
+}
+impl TaskHostRecord {
+    /// Only the private Context R issuer calls this after original funding.
+    /// An admitted read pins the actual channel; a numeric TaskId grants no
+    /// Root, input, capacity or foreign execution capability by itself.
+    pub(crate) fn begin_original_root_read(
+        &self,
+        read: &novarocks_execution_contract::root_result::RootResultRead,
+    ) -> Result<crate::root_result_channel::RootChannelRead, TaskRootReadError> {
+        if !self.resources.port.current().installed() {
+            return Err(TaskRootReadError::NotInstalled);
+        }
+        self.resources
+            .production
+            .as_ref()
+            .ok_or(TaskRootReadError::OwnerNotReady)?
+            .begin_original_root_read(read)
+    }
+}
+
+impl TaskHostRecord {
+    /// Move only the installed Root token; executable Task ownership remains here.
+    pub(crate) fn take_root_context_retention(
+        &mut self,
+    ) -> Result<Option<RootContextRetention>, TaskHostError> {
+        Ok(self.resources.production.as_ref().and_then(|owner| {
+            owner
+                .state
+                .lock()
+                .expect("original installed Root handoff")
+                .root_handoff
+                .take()
+        }))
+    }
+}
+
+#[cfg(test)]
+impl TaskHostRecord {
+    /// Failure diagnostics only: original identities, phases and counters.
+    /// No opaque input, error source, callback or protocol payload is Debugged.
+    pub(crate) fn print_neutral_production_inventory(&self) {
+        self.print_neutral_retirement_inventory();
+        let runtime = self.resources.causal.runtime();
+        eprintln!(
+            "Task metadata task={:?} health={:?} host_cut_cursor={:?} retired_pairs={} input_inventory={:?}",
+            self.task,
+            self.health.failure(),
+            self.host_cut_cursor,
+            self.host_retired_pairs.len(),
+            runtime.input_inventory(self.actor, None, 64)
+        );
+        if let Ok(batches) = runtime.committed_batches(self.actor, None, 64) {
+            for (batch, input) in batches {
+                if let Ok(effects) = runtime.effect_inventory(
+                    self.actor,
+                    input,
+                    None,
+                    super::actors::ContextActor::MAX_STEP_ACTIONS,
+                ) {
+                    for (effect, state) in effects {
+                        let kind = runtime
+                            .pending_effect_metadata(self.actor, input, effect.id)
+                            .ok()
+                            .flatten()
+                            .map(|effect| match effect {
+                                WorkerAction::Context(effect) => {
+                                    format!("Context {:?}", std::mem::discriminant(&effect))
+                                }
+                                WorkerAction::Reply(_) => "Reply".to_owned(),
+                                _ => "Other".to_owned(),
+                            });
+                        eprintln!(
+                            "Task original batch={batch:?} input={input:?} action={:?} work={:?} state={state:?} kind={kind:?}",
+                            effect.id, effect.work
+                        );
+                    }
+                }
+            }
+        }
+        self.resources.causal.print_neutral_inventory();
+        if let Some(preparation) = &self.resources.preparation {
+            eprintln!(
+                "Task preparation body_caps={} body_report_retired={} whole_report_retired={} remainder={}",
+                preparation.body_and_captures_exited(),
+                preparation.body_report_retired(),
+                preparation.exit_report_retired(),
+                self.resources.preparation_remainder.is_some()
+            );
+        }
+        if let Some(roles) = &self.resources.completion {
+            eprintln!(
+                "Task execution roles finisher={:?} wall={:?} publisher={:?} settlement={:?} actual_calls_exited={}",
+                roles.phase(TaskLifecycleRole::Finisher),
+                roles.phase(TaskLifecycleRole::WallTime),
+                roles.phase(TaskLifecycleRole::TerminalPublisher),
+                roles.settlement_phase(),
+                roles.execution_calls_exited()
+            );
+        }
+    }
+}
+
+impl TaskHostRecord {
+    pub(crate) fn restore_root_context_retention(
+        &mut self,
+        root: RootContextRetention,
+    ) -> Result<(), RootContextRetention> {
+        if root.identity() != self.task
+            || root.context() != self.context
+            || !root.matches_scope(&self.scope)
+        {
+            return Err(root);
+        }
+        let Some(owner) = &self.resources.production else {
+            return Err(root);
+        };
+        let mut state = owner.state.lock().expect("original refused Root handoff");
+        if state.root_handoff.is_some() {
+            return Err(root);
+        }
+        state.root_handoff = Some(root);
+        Ok(())
+    }
+}
+
+mod retirement;
+pub(crate) use retirement::RetiredTaskDisposal;
+mod root_retention;
+pub(crate) use root_retention::{
+    RetainedRootSeal, RetainedRootSealError, RetainedRootSealPreparation, RootContextRetention,
+    RootRetentionCustody,
+};
+
+impl TaskHostRecord {
+    pub(crate) fn issue_dynamic_filter_producer(
+        &mut self,
+    ) -> Result<crate::TaskDynamicFilterProducer, TaskHostError> {
+        if self.scope.gates()?.failed {
+            return Err(TaskHostError::OwnerFailed);
+        }
+        if self.resources.preparation.is_none() {
+            return Err(TaskHostError::CompletionBeforeAccepted);
+        }
+        let kind = TaskLifecycleRole::DynamicFilters;
+        if std::mem::replace(&mut self.lifecycle_issued[kind as usize], true) {
+            return Err(TaskHostError::LifecycleAlreadyIssued(kind));
+        }
+        let role = reserve_reported_role(
+            &self.scope,
+            self.resources.active.id(),
+            WorkKind::Cleanup,
+            Some(self.core_generation),
+        )?;
+        let runtime = self.resources.causal.runtime().clone();
+        let permit = match runtime.reserve_input(
+            self.actor,
+            self.task_source,
+            novarocks_control_runtime_core::mailbox::InputClass::Ordinary,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                dispose_unused_completion(role);
+                return Err(TaskHostError::Driver(error));
+            }
+        };
+        let input = match permit.into_role() {
+            Ok(input) => input,
+            Err((error, permit)) => {
+                permit.revoke_unused().expect("unexposed RF input");
+                dispose_unused_completion(role);
+                return Err(TaskHostError::Driver(error));
+            }
+        };
+        let (inbox, producer) = super::dynamic_filters::TaskDynamicFilterInbox::from_admitted(
+            role,
+            input,
+            super::dynamic_filters::DynamicFilterBinding {
+                task: self.task,
+                scope: self.scope.clone(),
+                generation: self.core_generation,
+                runtime,
+                actor: self.actor,
+                pending: self.pending.clone(),
+            },
+        );
+        self.resources.dynamic_filters = Some(inbox);
+        Ok(producer)
+    }
+    pub(crate) fn dynamic_filters(
+        &mut self,
+    ) -> Option<&mut super::dynamic_filters::TaskDynamicFilterInbox> {
+        self.resources.dynamic_filters.as_mut()
     }
 }

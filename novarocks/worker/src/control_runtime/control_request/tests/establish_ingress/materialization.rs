@@ -17,6 +17,8 @@
 
 //! Actual original M/R calls on a symbolic host instance. These tests do not
 //! claim Native materialization, and only Core decides the establishment reply.
+mod node_flow;
+mod node_task_flow;
 
 use super::source_pools::SourcePoolGuard;
 use super::*;
@@ -301,7 +303,19 @@ impl MaterializationFixture {
             .unwrap()
             .prepare_host_jobs()
             .unwrap();
-        f.root.bind_materialization_return(&materialize).unwrap();
+        let original_jobs = f
+            .root
+            .service()
+            .context(f.context)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .host_jobs()
+            .unwrap()
+            .clone();
+        f.root
+            .bind_materialization_return(&materialize, original_jobs)
+            .unwrap();
         let source = f.root.take_materialization_source(&materialize).unwrap();
         let owner_address = f.root.service().context(f.context).unwrap();
         let owner = owner_address.lock().unwrap();
@@ -1325,7 +1339,7 @@ fn the_same_published_instance_releases_while_materialization_is_blocked_and_cor
             && capacity.resources().unwrap().get(Dimension::Work.id()) > 0
             && capacity.resources().unwrap().get(Dimension::Inputs.id()) >= 2
     };
-    host.retire_active_context(&retirement).unwrap();
+    host.authorize_parent_retirement(&retirement).unwrap();
     complete_root(&mut f, retirement);
     let lifecycle_retired = host.retire_lifecycle().unwrap();
     let (mut resources, tasks) = host.into_resources();
@@ -1651,7 +1665,7 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
             && capacity.resources().unwrap().get(Dimension::Work.id()) > 0
             && capacity.resources().unwrap().get(Dimension::Inputs.id()) >= 2
     };
-    host.retire_active_context(&retirement).unwrap();
+    host.authorize_parent_retirement(&retirement).unwrap();
     complete_root(&mut f, retirement);
     let lifecycle_retired = host.retire_lifecycle().unwrap();
     let (mut resources, tasks) = host.into_resources();
@@ -1675,11 +1689,10 @@ fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_cred
     assert!(source_consumed && disposed_source);
     assert!(!before_m_effect && !after_m_effect_before_r);
     assert_eq!(
-        actual_decision,
-        Some(ContextEstablishmentDecision {
-            state: QueryContextState::Active,
-            outcome: Ok(OperationOutcome::Accepted),
-        })
+        actual_decision
+            .as_ref()
+            .map(|decision| (decision.state, decision.outcome.clone())),
+        Some((QueryContextState::Active, Ok(OperationOutcome::Accepted)))
     );
     assert!(accepted_reply && delivered_accepted);
     assert_eq!(active_route, QueryContextState::Active);
@@ -2035,7 +2048,7 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
             && capacity.resources().unwrap().get(Dimension::Work.id()) > 0
             && capacity.resources().unwrap().get(Dimension::Inputs.id()) >= 2
     };
-    host.retire_active_context(&retirement).unwrap();
+    host.authorize_parent_retirement(&retirement).unwrap();
     complete_root(&mut f, retirement);
     let lifecycle_retired = host.retire_lifecycle().unwrap();
     let (mut resources, tasks) = host.into_resources();
@@ -2086,11 +2099,13 @@ fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_
     assert!(source_after_m && raw_dispatched && raw_disposed);
     assert!(!before_m_effect && !m_retired_but_r_not_issued);
     assert_eq!(
-        actual_decision,
-        Some(ContextEstablishmentDecision {
-            state: QueryContextState::Aborting,
-            outcome: Ok(OperationOutcome::LeaseExpired),
-        })
+        actual_decision
+            .as_ref()
+            .map(|decision| (decision.state, decision.outcome.clone())),
+        Some((
+            QueryContextState::Aborting,
+            Ok(OperationOutcome::LeaseExpired)
+        ))
     );
     assert!(lease_reply && delivered_lease);
     assert_eq!(raw_drops_before_r, 4);

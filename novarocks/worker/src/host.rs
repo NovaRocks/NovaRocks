@@ -46,6 +46,7 @@ pub struct TaskPreparationRoles {
     pub start: crate::TaskStartPermit,
     pub terminal: crate::TaskTerminalPermit,
     pub statistics: crate::TaskStatisticsProducer,
+    pub dynamic_filters: crate::TaskDynamicFilterProducer,
     pub final_statistics: crate::TaskStatisticsFinalizer,
     pub completion_exit: crate::CompletionExitNotice,
 }
@@ -55,6 +56,7 @@ impl TaskPreparationRoles {
             && self.start.identity() == identity
             && self.terminal.identity() == identity
             && self.statistics.identity() == identity
+            && self.dynamic_filters.identity() == identity
             && self.final_statistics.identity() == identity
             && self.completion_exit.identity() == identity
     }
@@ -265,6 +267,7 @@ impl TestPreparationControl {
     pub fn stop_view(&self) -> crate::TaskPreparationView {
         self.view.clone()
     }
+    #[cfg(test)]
     pub fn scope(&self) -> TaskPreparationContext<'_> {
         TaskPreparationContext::new(&self.status, self.view.control().1)
     }

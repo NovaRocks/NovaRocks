@@ -34,6 +34,7 @@ use novarocks_execution::runtime::fragment::io::{
 use novarocks_execution::runtime::observable::{
     BoundedNotification, Observable, ObserverSubscription,
 };
+use novarocks_execution_contract::TaskIdentity;
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::ordered_retained_stream::{
     OfferOutcome, OrderedRetainedStream, RetainedItemKind, RetainedStreamItem,
@@ -609,6 +610,8 @@ struct PhysicalOwners {
     notification_pending: AtomicBool,
     metadata_notification_held: AtomicBool,
     notification_exited: RuntimeNotify,
+    // One fixed driver I/O wake; it owns no Root read or physical-exit proof.
+    exit_waker: OnceLock<std::task::Waker>,
     segments: AtomicUsize,
     deliveries: AtomicUsize,
     retained_reservations: RootReservationPositions,
@@ -707,6 +710,9 @@ impl PhysicalOwners {
                 // retired and the holder has been cleared. This concrete
                 // metadata wake cannot call a host or start another batch.
                 self.notification_exited.notify();
+                if let Some(waker) = self.exit_waker.get() {
+                    waker.wake_by_ref();
+                }
             }
             self.notifying.store(false, Ordering::Release);
             if failed
@@ -956,9 +962,18 @@ impl RootResultChannel {
         // Construct only the same callback value on the stack. This preflight
         // does not allocate or upgrade its empty Weak metadata capability.
         let budget_wake = Self::budget_wake_callback(Weak::new());
+        #[cfg(target_vendor = "apple")]
+        let context_custody_lock_bytes = Layout::new::<(isize, [u8; 56])>().size();
+        #[cfg(not(target_vendor = "apple"))]
+        let context_custody_lock_bytes = 0;
         let parts = [
+            context_custody_lock_bytes,
             Layout::new::<RootArcAllocation<Self>>().size(),
             Layout::new::<RootArcAllocation<PhysicalOwners>>().size(),
+            // The unique installed Context custody replaces Task execution
+            // ownership without adding a second Root data credit or Work.
+            Layout::new::<RootArcAllocation<crate::control_runtime::task::RootRetentionCustody>>()
+                .size(),
             Layout::new::<RootArcAllocation<novarocks_result_contract::RootOutputContract>>()
                 .size(),
             Layout::new::<RootArcAllocation<Observable>>().size(),
@@ -1074,6 +1089,7 @@ impl RootResultChannel {
             notification_pending: AtomicBool::new(false),
             metadata_notification_held: AtomicBool::new(false),
             notification_exited: RuntimeNotify::default(),
+            exit_waker: OnceLock::new(),
             segments: AtomicUsize::new(0),
             deliveries: AtomicUsize::new(0),
             retained_reservations: RootReservationPositions::new(),
@@ -1510,6 +1526,16 @@ impl RootResultChannel {
             metadata_bytes: self.physical.fixed_metadata_bytes.load(Ordering::Acquire),
         }))
     }
+    /// Task execution may relinquish this Root without consuming its End or
+    /// destroying Context-retained buffers. Producer exit remains independent.
+    pub(crate) fn producer_retirement_ready(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("original Root producer retirement");
+        (!state.producer_started || state.producer_exited)
+            && state.lifetime.validate_task_retirement().is_ok()
+    }
     pub fn physical_idle(&self) -> bool {
         let state = self.state.lock().unwrap();
         (!state.producer_started || state.producer_exited)
@@ -1525,6 +1551,24 @@ impl RootResultChannel {
     /// The host reaper must multiplex this readiness source with its other
     /// admitted duties, including after Core failure. Obtain the version,
     /// check physical_idle, then wait only if the predicate is still false.
+    /// Bind once to the original metadata driver. Registration precedes its
+    /// physical-idle observation, so a last-alias exit cannot be lost. Waking
+    /// is an I/O primitive and is performed after all Root locks/callbacks.
+    pub(crate) fn bind_exit_waker(&self, waker: std::task::Waker) -> Result<(), std::task::Waker> {
+        match self.physical.exit_waker.set(waker) {
+            Ok(()) => Ok(()),
+            Err(waker)
+                if self
+                    .physical
+                    .exit_waker
+                    .get()
+                    .is_some_and(|original| original.will_wake(&waker)) =>
+            {
+                Ok(())
+            }
+            Err(waker) => Err(waker),
+        }
+    }
     pub fn notification_exit_notice(&self) -> RootNotificationExitNotice<'_> {
         RootNotificationExitNotice {
             ready: &self.physical.notification_exited,
@@ -1581,6 +1625,7 @@ impl RootResultChannel {
         let guard = RootDeliveryOwner {
             position: Some(Arc::new(RootDeliveryPosition {
                 physical: Arc::clone(&self.physical),
+                request_body: std::sync::OnceLock::new(),
             })),
         };
         Ok(RootChannelRead {
@@ -1606,6 +1651,7 @@ impl RootResultChannel {
                 Ok(RootResultDelivery {
                     reply: self.reply(consumed, RootReadOutcome::AwaitTerminalControl),
                     guard: RootDeliveryOwner { position: None },
+                    acknowledged_end: None,
                 })
             }
             Err(error) => Err(error),
@@ -1621,14 +1667,22 @@ impl RootResultChannel {
             let notified = self.physical.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let reply = self.read_once(read, &guard)?;
+            let (reply, acknowledged_end) = self.read_once_with_ack(read, &guard)?;
             if !matches!(reply.outcome, RootReadOutcome::NotReady)
                 || tokio::time::Instant::now() >= deadline
             {
-                return Ok(RootResultDelivery { reply, guard });
+                return Ok(RootResultDelivery {
+                    reply,
+                    guard,
+                    acknowledged_end,
+                });
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return Ok(RootResultDelivery { reply, guard });
+                return Ok(RootResultDelivery {
+                    reply,
+                    guard,
+                    acknowledged_end,
+                });
             }
         }
     }
@@ -1637,18 +1691,39 @@ impl RootResultChannel {
         read: &RootResultRead,
         guard: &RootDeliveryOwner,
     ) -> Result<RootResultReply, RootChannelError> {
+        self.read_once_with_ack(read, guard)
+            .map(|(reply, _proof)| reply)
+    }
+    fn read_once_with_ack(
+        &self,
+        read: &RootResultRead,
+        guard: &RootDeliveryOwner,
+    ) -> Result<(RootResultReply, Option<RootEndAcknowledged>), RootChannelError> {
         let (reply, retired) = {
             let mut state = self.state.lock().unwrap();
             if !state.context_owned {
                 return Err(RootChannelError::Identity);
             }
             if !state.lifetime.allows_read() {
-                return Ok(self.reply(
-                    state.stream.snapshot().consumed_through,
-                    RootReadOutcome::AwaitTerminalControl,
+                return Ok((
+                    self.reply(
+                        state.stream.snapshot().consumed_through,
+                        RootReadOutcome::AwaitTerminalControl,
+                    ),
+                    None,
                 ));
             }
             let (accepted, retired) = state.acknowledge_and_retire(read.consumed())?;
+            let acknowledged_end = state
+                .lifetime
+                .end()
+                .filter(|end| {
+                    read.consumed() >= end.sequence.get() && accepted >= end.sequence.get()
+                })
+                .map(|_| RootEndAcknowledged {
+                    task: self.spec.task,
+                    _position: guard.clone(),
+                });
             let outcome = (|| {
                 Ok(match read.wanted() {
                     None => RootReadOutcome::AckOnly,
@@ -1687,7 +1762,7 @@ impl RootResultChannel {
                 })
             })();
             (
-                outcome.map(|outcome| self.reply(accepted, outcome)),
+                outcome.map(|outcome| (self.reply(accepted, outcome), acknowledged_end)),
                 retired,
             )
         };
@@ -1784,8 +1859,14 @@ impl RootProducerExit {
 pub struct RootDeliveryOwner {
     position: Option<Arc<RootDeliveryPosition>>,
 }
+/// A lifetime-only attachment to an already admitted read position. It has
+/// no operations, resource factories or publication/exit authority.
+pub(crate) trait RootDeliveryAttachment: Send + Sync {}
 struct RootDeliveryPosition {
     physical: Arc<PhysicalOwners>,
+    // The real read R follows the same position already carried by every
+    // returned Bytes clone/slice, rather than only the response wrapper.
+    request_body: std::sync::OnceLock<Arc<dyn RootDeliveryAttachment>>,
 }
 impl RootDeliveryOwner {
     fn backing_metadata_bytes() -> usize {
@@ -1823,7 +1904,30 @@ pub struct RootChannelRead {
     request: RootResultRead,
     guard: RootDeliveryOwner,
 }
+/// Private proof from this actual request's channel-lock ACK transaction.
+/// Offered End, another reader's frontier, and a naked sequence cannot mint it.
+pub(crate) struct RootEndAcknowledged {
+    task: TaskIdentity,
+    _position: RootDeliveryOwner,
+}
+impl RootEndAcknowledged {
+    pub(crate) fn identity(&self) -> TaskIdentity {
+        self.task
+    }
+}
 impl RootChannelRead {
+    pub(crate) fn attach_delivery_lifetime(
+        &mut self,
+        holder: Arc<dyn RootDeliveryAttachment>,
+    ) -> Result<(), Arc<dyn RootDeliveryAttachment>> {
+        // The once-only attachment cell is the authority for this original
+        // position. Existing lifetime aliases do not grant another attachment
+        // or require replacing the original delivery owner.
+        let Some(position) = self.guard.position.as_ref() else {
+            return Err(holder);
+        };
+        position.request_body.set(holder)
+    }
     /// Apply this original admission's ACK before reserving native copy space.
     /// This neither offers a payload nor creates another read holder. A repeat
     /// by `read()` is idempotent; seal winning this cut refuses the late ACK.
@@ -1880,8 +1984,12 @@ impl RootChannelRead {
 pub struct RootResultDelivery {
     reply: RootResultReply,
     guard: RootDeliveryOwner,
+    acknowledged_end: Option<RootEndAcknowledged>,
 }
 impl RootResultDelivery {
+    pub(crate) fn take_acknowledged_end(&mut self) -> Option<RootEndAcknowledged> {
+        self.acknowledged_end.take()
+    }
     pub fn reply(&self) -> &RootResultReply {
         &self.reply
     }

@@ -109,7 +109,7 @@ impl From<ExitRoleError> for EstablishRouteError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ProbePhase {
     Constructing,
     InFlight,
@@ -422,11 +422,17 @@ impl EstablishRouteCustody {
             .context_leg
             .lock()
             .expect("original Context route")
-            .phase
+            .phase.clone()
         {
             ProbePhase::Waiting(result) => Some(result),
             _ => None,
         }
+    }
+    /// Only local cleanup metadata is runnable. A live probe still awaiting
+    /// its original Core decision must park rather than spin a host poller.
+    pub(crate) fn context_cleanup_ready(&self) -> bool {
+        let leg = self.context_leg.lock().expect("original Context route");
+        leg.retired || leg.cancelled || matches!(leg.phase, ProbePhase::Finished)
     }
     /// The Context metadata lane calls this before completing its original
     /// effect. Successful fill transfers only neutral responsibility to Root;
@@ -480,7 +486,8 @@ impl EstablishRouteCustody {
                         command: ControlInput::RoutedEstablishFinished {
                             context: self.context,
                             request: self.request.request,
-                            result: Ok(*outcome),
+                            result: Ok(outcome.outcome),
+                            acknowledgement: Some(outcome.clone()),
                             decided_at: *decided_at,
                         },
                     }),
@@ -488,7 +495,7 @@ impl EstablishRouteCustody {
                 .map_err(|(error, _neutral)| EstablishRouteError::Driver(error))?;
             ProbePhase::Finished
         } else {
-            ProbePhase::Waiting(*result)
+            ProbePhase::Waiting(result.clone())
         };
         leg.handoff = Some(key);
         Ok(())
@@ -626,6 +633,9 @@ impl EstablishRouteCustody {
             .is_some_and(|observer| !observer.is_retired())
         {
             self.notice.notify();
+            self.runtime
+                .notify_host_actor(&self.registration)
+                .unwrap_or_else(|_| std::process::abort());
             return Ok(false);
         }
         if let Some(role) = &leg.role

@@ -34,24 +34,33 @@ use std::num::NonZeroUsize;
 enum Queued {
     Getter(EstablishIngressJob),
     Disposal(EstablishDisposalJob),
+    ReplyNotification(super::request_endpoint::RequestNotificationJob),
+    RequestObservation(super::request_observation::RequestObservationJob),
 }
 impl QueuedPreparation for Queued {
     fn queue_key(&self) -> (ScopeId, WorkId) {
         match self {
             Self::Getter(job) => job.queue_key(),
             Self::Disposal(job) => job.queue_key(),
+            Self::ReplyNotification(job) => job.queue_key(),
+            Self::RequestObservation(job) => job.queue_key(),
         }
     }
     fn fairness_group(&self, scope: ScopeId) -> HostFairnessGroup {
         match self {
             Self::Getter(job) => job.fairness_group(scope),
             Self::Disposal(job) => job.fairness_group(scope),
+            Self::ReplyNotification(_) | Self::RequestObservation(_) => {
+                HostFairnessGroup::Scope(scope)
+            }
         }
     }
 }
 fn run(original: Queued) {
     match original {
         Queued::Getter(job) => job.run(),
+        Queued::ReplyNotification(job) => job.run(),
+        Queued::RequestObservation(job) => job.run(),
         Queued::Disposal(job) => {
             // A false result leaves the original Source role Unresolved and
             // marks its original R. Root's ready consumer reports that fault;
@@ -60,11 +69,20 @@ fn run(original: Queued) {
         }
     }
 }
-fn limits(requests: NonZeroUsize, workers: NonZeroUsize) -> Option<HostExecutorLimits> {
+fn limits(
+    requests: NonZeroUsize,
+    workers: NonZeroUsize,
+    jobs_per_request: usize,
+) -> Option<HostExecutorLimits> {
     // At most one job per admitted R in each pool, plus N physical tails that
     // can outlive logical retirement. All R may name one Context, so neither
     // context count nor cumulative Task T is a valid per-group bound here.
-    let bound = NonZeroUsize::new(requests.get().checked_add(workers.get())?)?;
+    let bound = NonZeroUsize::new(
+        requests
+            .get()
+            .checked_mul(jobs_per_request)?
+            .checked_add(workers.get())?,
+    )?;
     Some(HostExecutorLimits {
         contexts: bound,
         jobs: bound,
@@ -110,15 +128,22 @@ impl EstablishExecutors {
         cleanup_workers: NonZeroUsize,
     ) -> Result<Self, EstablishExecutorStartRefusal> {
         let (Some(getters), Some(cleanup)) = (
-            limits(ready.limit(), getter_workers),
-            limits(ready.limit(), cleanup_workers),
+            limits(ready.limit(), getter_workers, 1),
+            // Original source disposal, reply notification and one protocol
+            // observation may overlap; each is captured by that same paid R.
+            limits(ready.limit(), cleanup_workers, 3),
         ) else {
             return Err(EstablishExecutorStartRefusal {
                 error: EstablishExecutorStartError::GeometryOverflow,
                 owner: None,
             });
         };
-        match HostExecutorPair::start(getters, cleanup, run) {
+        match HostExecutorPair::start_with_waker(
+            getters,
+            cleanup,
+            run,
+            ready.source_capacity_waker(),
+        ) {
             Ok(pools) => Ok(Self { ready, pools }),
             Err((error, pools)) => Err(EstablishExecutorStartRefusal {
                 error: EstablishExecutorStartError::Spawn(error),
@@ -163,6 +188,50 @@ impl EstablishExecutorHandles {
             .map_err(|(error, original)| {
                 let Queued::Getter(original) = original else {
                     unreachable!("getter submission preserves its variant")
+                };
+                (EstablishSubmitError::Host(error), original)
+            })
+    }
+    pub(crate) fn try_submit_notification(
+        &self,
+        original: super::request_endpoint::RequestNotificationJob,
+    ) -> Result<
+        (),
+        (
+            EstablishSubmitError,
+            super::request_endpoint::RequestNotificationJob,
+        ),
+    > {
+        if !original.belongs_to(&self.ready) {
+            return Err((EstablishSubmitError::WrongOwner, original));
+        }
+        self.cleanup
+            .try_submit(Queued::ReplyNotification(original))
+            .map_err(|(error, original)| {
+                let Queued::ReplyNotification(original) = original else {
+                    unreachable!("same original reply notification");
+                };
+                (EstablishSubmitError::Host(error), original)
+            })
+    }
+    pub(crate) fn try_submit_observation(
+        &self,
+        original: super::request_observation::RequestObservationJob,
+    ) -> Result<
+        (),
+        (
+            EstablishSubmitError,
+            super::request_observation::RequestObservationJob,
+        ),
+    > {
+        if !original.belongs_to(&self.ready) {
+            return Err((EstablishSubmitError::WrongOwner, original));
+        }
+        self.cleanup
+            .try_submit(Queued::RequestObservation(original))
+            .map_err(|(error, original)| {
+                let Queued::RequestObservation(original) = original else {
+                    unreachable!("same original protocol observation");
                 };
                 (EstablishSubmitError::Host(error), original)
             })

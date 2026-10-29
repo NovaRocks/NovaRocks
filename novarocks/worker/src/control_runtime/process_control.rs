@@ -22,15 +22,21 @@
 
 mod host_cell;
 mod ready_routes;
+mod request_partial;
+pub(crate) use request_partial::RootRequestPartialProgress;
 mod source_io;
-pub(crate) use host_cell::{RootHostCell, RootHostProgress};
+mod teardown;
+pub(crate) use host_cell::{
+    RootHostCell, RootHostProgress, RootMaterializationError, RootMaterializationRefusal,
+};
 use ready_routes::ReadyRoutes;
 pub(crate) use source_io::RootRequestAdvanceError;
+pub(crate) use teardown::{RootDrainError, RootDrainProgress, RootDrainRefusal};
 
 use super::{
     actors::{ControlActor, WorkerActor},
     context_host::{ContextHostBinding, ContextMetadataRole},
-    context_host_jobs::ContextHostJobError,
+    context_host_jobs::{ContextHostJobError, ContextHostJobs},
     context_lifecycle::CONTEXT_LIFECYCLE_INPUTS,
     control_internal::{
         ControlInternal, ControlInternalError, ControlInternalPartial, InternalAdvance,
@@ -79,7 +85,7 @@ pub(crate) const PROCESS_CONTROL_BOOTSTRAP_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
     inputs: 1,
     batches: 1,
-    effects: ControlCore::MAX_STEP_WORK,
+    effects: ControlActor::MAX_STEP_ACTIONS,
     cuts: 0,
     replies: 0,
     completions: 0,
@@ -137,15 +143,21 @@ pub(crate) enum ControlContextHandoffRefusal {
 /// scope. No original role or paid bundle is dropped as an unused reservation.
 #[must_use = "Retain the process root until every original owner actually exits"]
 pub(crate) struct ProcessControlResources {
+    pub admission_epoch: novarocks_control_runtime::publication::PublishedSnapshot<
+        novarocks_execution_contract::AdmissionEpochCapability,
+    >,
     pub scope: ScopeHandle,
     pub roles: Vec<ContextMetadataRole>,
     pub registered: bool,
     pub request_ready: ControlRequestReady,
     pub requests: BTreeMap<InputId, ControlRequestCustody>,
+    request_partials: request_partial::RootRequestPartials,
     pub tickets: ControlTicketInventory,
     pub dispatch: EffectDispatch,
     pub internal: Option<ControlInternal>,
     pub internal_partial: Option<ControlInternalPartial>,
+    teardown: teardown::ProcessControlTeardown,
+    task_capacity: Option<super::task_capacity::TaskCapacitySignal>,
     // Addresses of the original R owners, never decisions or obligations.
     // Keys follow actual metadata handoff order, not request token order.
     route_waiters: BTreeMap<QueryContextRef, BTreeMap<u64, InputId>>,
@@ -223,9 +235,9 @@ impl ProcessControlOwner {
         };
         if binding.max_work < KINDS.len()
             || binding.max_slots == 0
-            || binding.actor_config.max_step_work != ControlCore::MAX_STEP_WORK
-            || binding.actor_config.max_effects_per_step != ControlCore::MAX_STEP_WORK
-            || binding.actor_config.max_dependencies_per_effect < ControlCore::MAX_STEP_WORK
+            || binding.actor_config.max_step_work < ControlActor::MAX_STEP_WORK
+            || binding.actor_config.max_effects_per_step < ControlActor::MAX_STEP_ACTIONS
+            || binding.actor_config.max_dependencies_per_effect < ControlActor::MAX_STEP_ACTIONS
             || binding.actor_config.validate().is_err()
         {
             return Err(invalid());
@@ -268,15 +280,22 @@ impl ProcessControlOwner {
                 resources: None,
             })?;
         let mut resources = ProcessControlResources {
+            admission_epoch: novarocks_control_runtime::publication::PublishedSnapshot::new(
+                &scope,
+                std::sync::Arc::new(core.admission().capability()),
+            ),
             scope: scope.clone(),
             roles: Vec::with_capacity(KINDS.len()),
             registered: false,
             request_ready: ControlRequestReady::new(binding.request_positions, runtime.clone()),
             requests: BTreeMap::new(),
+            request_partials: request_partial::RootRequestPartials::default(),
             tickets: ControlTicketInventory::new(),
             dispatch: EffectDispatch::control(runtime.clone(), binding.actor, effect_positions),
             internal: None,
             internal_partial: None,
+            teardown: teardown::ProcessControlTeardown::default(),
+            task_capacity: None,
             route_waiters: BTreeMap::new(),
             ready_routes: ReadyRoutes::new(binding.request_positions),
             next_route_order: 0,
@@ -326,6 +345,7 @@ impl ProcessControlOwner {
                 scope.clone(),
                 binding.admission_storage,
                 resources.roles[TIMER].work.id(),
+                resources.roles[LIFETIME].work.id(),
             );
             let registration = runtime
                 .register_supervised_bound_with_policy(
@@ -362,6 +382,23 @@ impl ProcessControlOwner {
             resources,
             source_executors_started: false,
         })
+    }
+    /// One process composition shares this same signal between physical Task
+    /// pools and the original Root turn. Its size is the real directory C.
+    pub(crate) fn task_capacity_signal(
+        &mut self,
+    ) -> Result<super::task_capacity::TaskCapacitySignal, super::task_capacity::TaskCapacityError>
+    {
+        if let Some(original) = &self.resources.task_capacity {
+            return Ok(original.clone());
+        }
+        let original = super::task_capacity::TaskCapacitySignal::new(
+            self.runtime().clone(),
+            self.registration.clone(),
+            self.service.directory_capacity().get(),
+        )?;
+        self.resources.task_capacity = Some(original.clone());
+        Ok(original)
     }
     pub(crate) fn registration(&self) -> &ActorRegistration {
         &self.registration
@@ -465,6 +502,9 @@ impl ProcessControlOwner {
         Ok(())
     }
     pub(crate) fn advance_internal(&mut self) -> Result<InternalAdvance, ControlInternalError> {
+        if self.resources.teardown.internal_closed {
+            return Ok(InternalAdvance::Idle);
+        }
         self.resources
             .internal
             .as_mut()
@@ -480,7 +520,11 @@ impl ProcessControlOwner {
         operation: TaskOperationId,
         deadline: MonotonicInstant,
     ) -> Result<(InputId, ControlRequestHandle), ControlRequestAdmissionRefusal> {
-        let (custody, handle) = ControlRequestCustody::admit(self, source, operation, deadline)?;
+        let (custody, handle) =
+            match ControlRequestCustody::admit(self, source, operation, deadline) {
+                Ok(original) => original,
+                Err(refusal) => return Err(self.retain_request_partial(refusal)),
+            };
         let input = custody.input_id();
         if self.resources.requests.contains_key(&input) {
             // A duplicate actual input identity is a shared runtime invariant.
@@ -490,6 +534,19 @@ impl ProcessControlOwner {
         self.resources.requests.insert(input, custody);
         Ok((input, handle))
     }
+    pub(crate) fn submit_ticket_observation(
+        &mut self,
+        input: InputId,
+        ticket: novarocks_execution_contract::AdmissionTicketId,
+        context: QueryContextRef,
+        preflight: bool,
+    ) -> Result<(), ControlRequestError> {
+        self.resources
+            .requests
+            .get_mut(&input)
+            .ok_or(ControlRequestError::WrongRequest)?
+            .submit_ticket_observation(ticket, context, preflight)
+    }
     pub(crate) fn admit_establish_request(
         &mut self,
         source: ActorId,
@@ -497,7 +554,10 @@ impl ProcessControlOwner {
         deadline: MonotonicInstant,
     ) -> Result<(InputId, ControlRequestHandle), ControlRequestAdmissionRefusal> {
         let (custody, handle) =
-            ControlRequestCustody::admit_establish(self, source, operation, deadline)?;
+            match ControlRequestCustody::admit_establish(self, source, operation, deadline) {
+                Ok(original) => original,
+                Err(refusal) => return Err(self.retain_request_partial(refusal)),
+            };
         let input = custody.input_id();
         if self.resources.requests.insert(input, custody).is_some() {
             std::process::abort();
@@ -542,22 +602,13 @@ impl ProcessControlOwner {
             .ok_or(ControlRequestError::WrongRequest)?
             .begin_unsubmitted_withdrawal()
     }
+    /// Bind the original Root return without borrowing the Context owner.
+    /// The caller prepared these same Jobs under its separate Context cell.
     pub(crate) fn bind_materialization_return(
         &mut self,
         ticket: &EffectTicket<super::actors::WorkerAction>,
+        jobs: ContextHostJobs,
     ) -> Result<(), ControlRequestError> {
-        let super::actors::WorkerAction::Control {
-            effect: novarocks_worker_protocol::control::ControlEffect::Materialize { context, .. },
-            ..
-        } = &ticket.effect
-        else {
-            return Err(ControlRequestError::WrongEffect);
-        };
-        let jobs = self
-            .service
-            .context(*context)
-            .and_then(|address| address.lock().and_then(|host| host.host_jobs().cloned()))
-            .ok_or(ControlRequestError::WrongPhase)?;
         let custody = self
             .resources
             .requests
@@ -1055,10 +1106,12 @@ mod tests {
             actor_config: ActorConfig {
                 mailbox: [1; 4],
                 max_batches: 4,
-                max_effects_per_step: ControlCore::MAX_STEP_WORK,
-                max_dependencies_per_effect: ControlCore::MAX_STEP_WORK,
-                turn_budget: 64,
-                max_step_work: ControlCore::MAX_STEP_WORK,
+                max_effects_per_step:
+                    crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                max_dependencies_per_effect:
+                    crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                turn_budget: crate::control_runtime::actors::ControlActor::TURN_BUDGET,
+                max_step_work: crate::control_runtime::actors::ControlActor::MAX_STEP_WORK,
             },
             // This bootstrap submits no request, ticket or Context effect.
             // It cannot claim any such unpaid capability from these vectors.

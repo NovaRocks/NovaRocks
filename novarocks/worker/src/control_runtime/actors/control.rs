@@ -42,6 +42,13 @@ use std::{collections::BTreeMap, time::Duration};
 )]
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
+    ObserveTicket {
+        work: WorkId,
+        request: RequestMetadata,
+        ticket: novarocks_execution_contract::AdmissionTicketId,
+        context: novarocks_execution_contract::QueryContextRef,
+        preflight: bool,
+    },
     Command {
         work: WorkId,
         request: Option<RequestMetadata>,
@@ -56,13 +63,18 @@ pub(crate) struct ControlActor {
     runtime_generation: Generation,
     storage: AdmissionStorage,
     timer_work: WorkId,
+    lifetime_work: WorkId,
 }
 impl ControlActor {
+    pub(crate) const MAX_STEP_ACTIONS: usize = ControlCore::MAX_STEP_WORK + 2;
+    pub(crate) const MAX_STEP_WORK: usize = ControlCore::MAX_STEP_WORK + 2;
+    pub(crate) const TURN_BUDGET: usize = 4 * (Self::MAX_STEP_WORK + 1);
     pub(crate) fn new(
         core: ControlCore,
         scope: ScopeHandle,
         storage: AdmissionStorage,
         timer_work: WorkId,
+        lifetime_work: WorkId,
     ) -> Self {
         let runtime_generation = scope
             .gates()
@@ -74,6 +86,7 @@ impl ControlActor {
             runtime_generation,
             storage,
             timer_work,
+            lifetime_work,
         }
     }
 }
@@ -98,6 +111,63 @@ impl Actor for ControlActor {
                 command,
             } => (work, request, command),
             ControlMessage::Timer => (self.timer_work, None, ControlInput::Tick),
+            ControlMessage::ObserveTicket {
+                work,
+                request,
+                ticket,
+                context,
+                preflight,
+            } => {
+                use novarocks_worker_protocol::{
+                    context::{RequestResult, RequestSettlement},
+                    control::{ControlReplyBody, ControlRequestSettlement},
+                };
+                let (result, body) = if now.has_reached(request.deadline) {
+                    let result = RequestResult::Outcome(
+                        novarocks_execution_contract::OperationOutcome::OperationTimedOut,
+                    );
+                    (result, ControlReplyBody::Verdict(result))
+                } else {
+                    (
+                        RequestResult::Outcome(
+                            novarocks_execution_contract::OperationOutcome::Accepted,
+                        ),
+                        if preflight {
+                            ControlReplyBody::PreflightExpired(
+                                self.core.preflight_expired_establish(context, ticket, now),
+                            )
+                        } else {
+                            ControlReplyBody::TicketObservation(
+                                self.core.admission().observe(ticket, context, now),
+                            )
+                        },
+                    )
+                };
+                assert!(step.charge(1), "one original ticket observation");
+                step.effect(
+                    EffectDescriptor {
+                        id: ActionId::new(1).expect("original read reply action"),
+                        work,
+                        kind: EffectKind::Reply,
+                        dependencies: Vec::new(),
+                    },
+                    WorkerAction::ControlReply(ControlRequestSettlement {
+                        settlement: RequestSettlement {
+                            request: RequestContext {
+                                token: envelope.input,
+                                operation: request.operation,
+                                deadline: request.deadline,
+                            },
+                            result,
+                        },
+                        body,
+                    }),
+                )
+                .unwrap_or_else(|(error, _)| {
+                    panic!("bounded original ticket observation reply: {error:?}")
+                });
+                return;
+            }
         };
         let acquiring = matches!(&command, ControlInput::Acquire { .. });
         let mut admission = ScopeAdmissionPort::new(
@@ -105,7 +175,9 @@ impl Actor for ControlActor {
             self.runtime_generation,
             None,
             self.storage.clone(),
-        );
+        )
+        .with_parent(self.lifetime_work);
+        let previous_epoch = self.core.admission().capability();
         let result = match request {
             Some(request) => self.core.handle_request(
                 now,
@@ -142,6 +214,24 @@ impl Actor for ControlActor {
             .flatten();
         let mut adopted_ticket = false;
         let mut next = 0u64;
+        let epoch = self.core.admission().capability();
+        let epoch_publication = if epoch != previous_epoch {
+            next += 1;
+            let id = ActionId::new(next).expect("first epoch projection action");
+            step.effect(
+                EffectDescriptor {
+                    id,
+                    work,
+                    kind: EffectKind::Publication,
+                    dependencies: Vec::new(),
+                },
+                WorkerAction::AdmissionEpoch(epoch),
+            )
+            .unwrap_or_else(|(error, _)| panic!("bounded admission epoch projection: {error:?}"));
+            Some(id)
+        } else {
+            None
+        };
         let mut reply_bodies = BTreeMap::<TaskOperationId, ActionId>::new();
         let mut released_admission = Vec::new();
         let mut route_publications = Vec::new();
@@ -158,7 +248,7 @@ impl Actor for ControlActor {
             ) {
                 continue;
             }
-            let mut dependencies = Vec::new();
+            let mut dependencies: Vec<_> = epoch_publication.into_iter().collect();
             let admitted = match &effect {
                 ControlEffect::Materialize { reservation, .. } => Some(*reservation),
                 ControlEffect::AdmissionReply { result: Ok(_), .. } => {

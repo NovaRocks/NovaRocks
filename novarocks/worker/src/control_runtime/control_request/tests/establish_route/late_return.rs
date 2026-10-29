@@ -38,7 +38,7 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
         &probe.effect,
         WorkerAction::Context(ContextEffect::EstablishProbed { request, result, .. })
             if request.token == input
-                && *result == EstablishReplayResult::Decided(OperationOutcome::ContextConflict)
+                && matches!(result, EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
     );
     let timer_selected = runtime.advance_time(Tick(10), 2).unwrap();
     runtime.poll_one(Tick(10)).unwrap();

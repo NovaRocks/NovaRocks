@@ -47,8 +47,12 @@ use novarocks_execution_contract::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+mod initial_creation;
+pub(crate) use initial_creation::InitialCreation;
+
+mod domain_waiters;
 mod reply;
-pub use reply::{ContextReplyBody, ContextRequestSettlement};
+pub use reply::{ContextAcknowledgement, ContextReplyBody, ContextRequestSettlement};
 
 mod terminal;
 pub use terminal::{TerminalIntent, TerminalObservation, TerminalStatistics};
@@ -63,6 +67,14 @@ pub struct ContextEstablishment {
     pub semantics: EstablishSemanticFacts,
     /// The Root's actual election time is also the initial lease origin.
     pub elected_at: MonotonicInstant,
+}
+
+/// A finite original Context-close decision, frozen before its Task prefix is sealed.
+/// Normal quiescence leaves the Context's abort cause and protocol epoch unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskCloseIntent {
+    Quiesce,
+    Abort(AbortCause),
 }
 
 /// Actual neutral facts supplied by the successful materialization owner.
@@ -87,11 +99,11 @@ pub struct EstablishCredentialComparison {
     pub same_material: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EstablishReplayResult {
     AwaitMaterialization,
     CompareCredential { expected: CredentialState },
-    Decided(OperationOutcome),
+    Decided(ContextAcknowledgement),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,6 +148,12 @@ pub enum PhysicalFact {
     OutputReleased,
     ResourcesConverged,
     RootIdle,
+    /// The original Context owns this exact Root after real encoder exit.
+    /// Retained data and read aliases remain funded there; this is not an ACK.
+    RootTransferredToContext,
+    /// The same real Root has closed issuance, disposed retiring output and
+    /// reached complete physical idle. This also releases its output custody.
+    RootRetentionReleased,
 }
 #[derive(Clone, Debug, Default)]
 pub struct TaskShape {
@@ -151,10 +169,12 @@ struct PendingTaskUpdate {
     host_started: bool,
     completing: bool,
     refusal: Option<DomainRefusal>,
+    blocked: Option<OperationOutcome>,
 }
 #[derive(Debug)]
 struct PendingContextUpdate {
     request: InputId,
+    payload: PayloadId,
     domains: QueryContextDomains,
     update: ContextDomainInput,
     progression: DomainProgression,
@@ -231,6 +251,11 @@ pub enum ContextCommand {
         task: TaskIdentity,
         payload: PayloadId,
     },
+    /// Read the original entity/rejection after business intake has closed.
+    /// This cannot elect a Task, capture its input, or reserve preparation.
+    InspectCreation {
+        task: TaskIdentity,
+    },
     Renew {
         sequence: LeaseSequence,
         valid_for: LeaseValidFor,
@@ -245,6 +270,7 @@ impl ContextCommand {
     pub fn task(&self) -> Option<TaskIdentity> {
         match self {
             Self::Create { task, .. }
+            | Self::InspectCreation { task }
             | Self::Cancel { task, .. }
             | Self::UpdateTask { task, .. }
             | Self::RootDrained { task }
@@ -273,9 +299,16 @@ pub enum ContextInput {
     ApplyTaskClose {
         task: TaskIdentity,
         generation: Generation,
+        intent: TaskCloseIntent,
     },
     ContinueTaskDomain {
         task: TaskIdentity,
+    },
+    ContinueContextDomain,
+    ContextCredentialCompared {
+        request: InputId,
+        expected: CredentialState,
+        result: Result<bool, DomainRefusal>,
     },
     ContinueRequestReplies {
         operation: InputId,
@@ -370,11 +403,24 @@ pub enum ContextInput {
         task: TaskIdentity,
         result: Result<CreationCost, AdmissionRefusal>,
     },
+    /// The same original Loader reports its complete frozen neutral shape and
+    /// initial domains. No independent host-side domain authority is created.
+    LoadedTask {
+        task: TaskIdentity,
+        result: Result<CreationCost, AdmissionRefusal>,
+        shape: TaskShape,
+        initial_domains: Vec<TaskDomainInput>,
+    },
     ContinueReplies {
         task: TaskIdentity,
     },
     Installed {
         task: TaskIdentity,
+    },
+    /// Real queued depths from applying the Core's original initial plan.
+    InstalledTask {
+        task: TaskIdentity,
+        initial_queued: Vec<Option<u64>>,
     },
     Running {
         task: TaskIdentity,
@@ -437,6 +483,7 @@ pub enum ContextEffect {
     ApplyTaskClose {
         task: TaskIdentity,
         generation: Generation,
+        intent: TaskCloseIntent,
     },
     CancelLoader {
         task: TaskIdentity,
@@ -459,6 +506,9 @@ pub enum ContextEffect {
         cut: Option<CutId>,
         diagnostics: crate::proposal_summary::Diagnostics,
     },
+    PublishContextConvergence {
+        receipt: novarocks_execution_contract::QueryContextConvergenceReceipt,
+    },
     PublishTaskConvergence {
         task: TaskIdentity,
         version: u64,
@@ -474,7 +524,6 @@ pub enum ContextEffect {
         request: InputId,
         task: TaskIdentity,
         payload: PayloadId,
-        updates: Vec<TaskDomainInput>,
     },
     WakeTaskDomains {
         task: TaskIdentity,
@@ -487,9 +536,18 @@ pub enum ContextEffect {
     WaitContextDomain {
         request: InputId,
         payload: PayloadId,
-        update: ContextDomainInput,
     },
     WakeContextDomains,
+    RecompareContextCredential {
+        request: InputId,
+        payload: PayloadId,
+        expected: CredentialState,
+    },
+    DomainRequestCompleted {
+        request: InputId,
+        payload: PayloadId,
+        task: Option<TaskIdentity>,
+    },
     /// Pin the selected version through the original request's paid read role.
     /// This is synchronous metadata preparation, never a getter or wire action.
     PrepareReadPayload {
@@ -519,6 +577,15 @@ pub enum ContextEffect {
         task: TaskIdentity,
         payload: PayloadId,
         reservation: ReservationId,
+        initial_progressions: Arc<Vec<DomainProgression>>,
+        initial_pending: bool,
+    },
+    /// Complete the original Accepted preparation's neutral initial plan.
+    /// This grants no second Work, reservation, or Task acceptance.
+    InitialPreparationReady {
+        task: TaskIdentity,
+        progressions: Arc<Vec<DomainProgression>>,
+        refusal: Option<novarocks_execution_contract::DomainConflict>,
     },
     PublishTask {
         task: TaskIdentity,
@@ -542,6 +609,12 @@ pub enum ContextEffect {
         task: TaskIdentity,
         source: SourceId,
     },
+    /// The logical conclusion is sealed. Close actual execution borrowers and
+    /// finalize rich local sources before waiting for whole preparation exit.
+    /// This grants no physical convergence or capacity-release fact.
+    FinalizeTaskExecution {
+        task: TaskIdentity,
+    },
     StopTask {
         task: TaskIdentity,
         generation: Generation,
@@ -549,6 +622,7 @@ pub enum ContextEffect {
     SealRoot {
         context: QueryContextRef,
         generation: Generation,
+        reason: novarocks_execution_contract::root_lifetime::RootRetentionClose,
     },
     CloseExternalAdmission {
         context: QueryContextRef,
@@ -566,6 +640,7 @@ pub enum ContextEffect {
     },
     RetireTask {
         task: TaskIdentity,
+        state: TaskState,
         active: ReservationId,
         preparation: Option<ReservationId>,
         convergence: crate::convergence::TaskConvergenceSnapshot,
@@ -614,6 +689,8 @@ pub enum RequestResult {
 pub struct ContextEstablishmentDecision {
     pub state: QueryContextState,
     pub outcome: Result<OperationOutcome, DomainRefusal>,
+    pub acknowledgement: Option<ContextAcknowledgement>,
+    pub decided_at: MonotonicInstant,
 }
 #[derive(Clone, Debug)]
 struct PendingReply {
@@ -675,6 +752,7 @@ pub struct ContextCore {
     unretired_tasks: usize,
     closing: Option<Closing>,
     close_applied: bool,
+    close_decision: Option<(ContextAcknowledgement, MonotonicInstant)>,
     scheduled_closes: usize,
     abort_waiters: BTreeSet<InputId>,
     host_releasing: bool,
@@ -683,6 +761,11 @@ pub struct ContextCore {
     pending_task_updates: BTreeMap<TaskIdentity, PendingTaskUpdate>,
     context_domains: QueryContextDomains,
     pending_context_update: Option<PendingContextUpdate>,
+    task_domain_waiters:
+        BTreeMap<TaskIdentity, std::collections::VecDeque<domain_waiters::TaskDomainWaiter>>,
+    context_domain_waiters: std::collections::VecDeque<domain_waiters::ContextDomainWaiter>,
+    context_domain_comparison: Option<domain_waiters::ContextDomainComparison>,
+    prefer_context_domain: bool,
     dynamic_filters: BTreeMap<TaskIdentity, (DomainVersion, PayloadId)>,
     final_info: BTreeMap<TaskIdentity, Arc<FinalTaskInfo>>,
     metrics: BTreeMap<TaskIdentity, TaskResourceFacts>,
@@ -756,6 +839,7 @@ impl ContextCore {
             unretired_tasks: 0,
             closing: None,
             close_applied: false,
+            close_decision: None,
             scheduled_closes: 0,
             abort_waiters: BTreeSet::new(),
             host_releasing: false,
@@ -764,6 +848,10 @@ impl ContextCore {
             pending_task_updates: BTreeMap::new(),
             context_domains: QueryContextDomains::default(),
             pending_context_update: None,
+            task_domain_waiters: BTreeMap::new(),
+            context_domain_waiters: std::collections::VecDeque::new(),
+            context_domain_comparison: None,
+            prefer_context_domain: false,
             dynamic_filters: BTreeMap::new(),
             final_info: BTreeMap::new(),
             metrics: BTreeMap::new(),
@@ -831,7 +919,8 @@ impl ContextCore {
     /// Pure readiness, not permission to start a host job or to consume a reply.
     /// Future deadlines and owners awaiting a host return do not cause a wake.
     pub fn has_internal_work(&self) -> bool {
-        !self.runnable_task_domains.is_empty()
+        self.context_domain_runnable()
+            || !self.runnable_task_domains.is_empty()
             || !self.pending_replies.is_empty()
             || !self.creation_reply_tasks.is_empty()
             || self.pending_quiesce.is_some()
@@ -847,15 +936,26 @@ impl ContextCore {
             let class =
                 InternalClass::ALL[(self.internal_cursor + offset) % Self::INTERNAL_CLASSES];
             let input = match class {
-                InternalClass::TaskDomain => self
-                    .domain_cursor
-                    .and_then(|cursor| {
-                        self.runnable_task_domains
-                            .range((Excluded(cursor), Unbounded))
-                            .next()
-                    })
-                    .or_else(|| self.runnable_task_domains.first())
-                    .map(|&task| ContextInput::ContinueTaskDomain { task }),
+                InternalClass::TaskDomain => {
+                    let task = self
+                        .domain_cursor
+                        .and_then(|cursor| {
+                            self.runnable_task_domains
+                                .range((Excluded(cursor), Unbounded))
+                                .next()
+                        })
+                        .or_else(|| self.runnable_task_domains.first())
+                        .copied();
+                    if self.context_domain_runnable()
+                        && (self.prefer_context_domain || task.is_none())
+                    {
+                        self.prefer_context_domain = false;
+                        Some(ContextInput::ContinueContextDomain)
+                    } else {
+                        self.prefer_context_domain = true;
+                        task.map(|task| ContextInput::ContinueTaskDomain { task })
+                    }
+                }
                 // Original tokens, not wire operation IDs. Always select the
                 // lowest ready token; higher-token churn cannot pass it.
                 InternalClass::RequestReplies => self
@@ -917,28 +1017,47 @@ impl ContextCore {
         }
         self.now = now;
         let task = command.task();
+        let refused_domain = match &command {
+            ContextCommand::UpdateTask { task, payload, .. } => {
+                Some(ContextEffect::DomainRequestCompleted {
+                    request: request.token,
+                    payload: *payload,
+                    task: Some(*task),
+                })
+            }
+            ContextCommand::UpdateContext { payload, .. } => {
+                Some(ContextEffect::DomainRequestCompleted {
+                    request: request.token,
+                    payload: *payload,
+                    task: None,
+                })
+            }
+            _ => None,
+        };
         if now.has_reached(request.deadline) {
             let body = match &command {
-                ContextCommand::Create { task, .. } => match self.tasks.get(task) {
-                    Some(record) => match &record.creation_refusal {
-                        Some(AdmissionRefusal::Domain(outcome, failure)) => {
-                            ContextReplyBody::Domain(DomainRefusal {
-                                outcome: *outcome,
-                                failure: failure.clone(),
-                            })
-                        }
-                        _ => ContextReplyBody::Verdict(match record.pending_reply_outcome {
-                            Some(OperationOutcome::Accepted) => {
-                                RequestResult::Outcome(OperationOutcome::Idempotent)
+                ContextCommand::Create { task, .. } | ContextCommand::InspectCreation { task } => {
+                    match self.tasks.get(task) {
+                        Some(record) => match &record.creation_refusal {
+                            Some(AdmissionRefusal::Domain(outcome, failure)) => {
+                                ContextReplyBody::Domain(DomainRefusal {
+                                    outcome: *outcome,
+                                    failure: failure.clone(),
+                                })
                             }
-                            Some(outcome) => RequestResult::Outcome(outcome),
-                            None => RequestResult::TimeoutWhileAccepted,
-                        }),
-                    },
-                    None => ContextReplyBody::Verdict(RequestResult::Outcome(
-                        OperationOutcome::OperationTimedOut,
-                    )),
-                },
+                            _ => ContextReplyBody::Verdict(match record.pending_reply_outcome {
+                                Some(OperationOutcome::Accepted) => {
+                                    RequestResult::Outcome(OperationOutcome::Idempotent)
+                                }
+                                Some(outcome) => RequestResult::Outcome(outcome),
+                                None => RequestResult::TimeoutWhileAccepted,
+                            }),
+                        },
+                        None => ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::OperationTimedOut,
+                        )),
+                    }
+                }
                 _ => ContextReplyBody::Verdict(RequestResult::Outcome(
                     OperationOutcome::OperationTimedOut,
                 )),
@@ -946,6 +1065,7 @@ impl ContextCore {
             return Ok(ContextStep {
                 records_visited: 1,
                 requests: vec![ContextRequestSettlement::new(request, task, Arc::new(body))],
+                effects: refused_domain.into_iter().collect(),
                 ..ContextStep::default()
             });
         }
@@ -957,6 +1077,7 @@ impl ContextCore {
                     task,
                     RequestResult::Outcome(OperationOutcome::ResourceExhausted),
                 )],
+                effects: refused_domain.into_iter().collect(),
                 ..ContextStep::default()
             });
         }
@@ -1041,21 +1162,48 @@ impl ContextCore {
             ContextInput::OwnerFenced => {
                 self.begin_abort(None, AbortCause::QueryFailed, &mut step)?;
             }
-            ContextInput::ApplyTaskClose { task, generation } => {
-                if generation != self.generation {
-                    return Err(CoreError::WrongIdentity);
-                }
+            ContextInput::ApplyTaskClose {
+                task,
+                generation,
+                intent,
+            } => {
                 let record = self.tasks.get(&task).ok_or(CoreError::UnknownTask)?;
-                if record.scheduled_close_generation != Some(generation)
-                    && record.applied_close_generation != generation
-                {
-                    return Err(CoreError::IllegalFact);
+                match intent {
+                    TaskCloseIntent::Quiesce => {
+                        if record.scheduled_quiesce_generation != Some(generation)
+                            && record.applied_quiesce_generation != Some(generation)
+                        {
+                            return Err(CoreError::IllegalFact);
+                        }
+                    }
+                    TaskCloseIntent::Abort(cause) => {
+                        if generation != self.generation
+                            || self.closing.is_none_or(|closing| closing.cause != cause)
+                        {
+                            return Err(CoreError::WrongIdentity);
+                        }
+                        if record.scheduled_close_generation != Some(generation)
+                            && record.applied_close_generation != generation
+                        {
+                            return Err(CoreError::IllegalFact);
+                        }
+                    }
                 }
-                self.apply_close_to(task, &mut step)?;
+                self.apply_close_to(task, generation, intent, &mut step)?;
                 self.try_finish_completion_intent(task, &mut step)?;
+                // Both original close inputs remain independent retirement gates.
+                self.retire_if_ready(task, &mut step)?;
             }
             ContextInput::ContinueTaskDomain { task } => {
-                self.advance_task_domain(task, &mut step)?
+                self.advance_task_domain(task, capacity, &mut step)?
+            }
+            ContextInput::ContinueContextDomain => self.advance_context_domain_waiter(&mut step)?,
+            ContextInput::ContextCredentialCompared {
+                request,
+                expected,
+                result,
+            } => {
+                self.context_credential_compared(request, expected, result, &mut step)?;
             }
             ContextInput::RequestCompleted { operation, outcome } => {
                 self.complete_request(
@@ -1190,7 +1338,10 @@ impl ContextCore {
             }
             ContextInput::BindTaskShape { task, shape } => {
                 let record = self.tasks.get(&task).ok_or(CoreError::UnknownTask)?;
-                if record.phase != CreationPhase::Loading || self.task_domains.contains_key(&task) {
+                if record.phase != CreationPhase::Loading
+                    || self.task_domains.contains_key(&task)
+                    || record.initial_creation.is_some()
+                {
                     return Err(CoreError::IllegalFact);
                 }
                 self.task_domains.insert(
@@ -1219,22 +1370,45 @@ impl ContextCore {
                 match result {
                     Ok(()) => {
                         self.context_domains = pending.domains;
+                        let outcome = if pending.progression == DomainProgression::Apply {
+                            OperationOutcome::Accepted
+                        } else {
+                            OperationOutcome::Idempotent
+                        };
+                        let receipt = self
+                            .context_domains
+                            .receipt(pending.update, pending.progression);
+                        let mut acknowledgement = self.context_acknowledgement(outcome);
+                        acknowledgement.receipt = Arc::new(
+                            acknowledgement
+                                .receipt
+                                .as_ref()
+                                .clone()
+                                .with_domains(vec![receipt.clone()]),
+                        );
                         step.reply(
                             request,
                             ContextReplyBody::ContextDomain {
-                                outcome: if pending.progression == DomainProgression::Apply {
-                                    OperationOutcome::Accepted
-                                } else {
-                                    OperationOutcome::Idempotent
-                                },
-                                receipt: self
-                                    .context_domains
-                                    .receipt(pending.update, pending.progression),
+                                outcome,
+                                receipt,
+                                acknowledgement,
                             },
                         );
                     }
-                    Err(failure) => step.reply(request, ContextReplyBody::Domain(failure)),
+                    Err(failure) => {
+                        // A host refusal cannot prove that its shared-domain
+                        // call had no external prefix. Fence this Context
+                        // before returning the original refusal; never keep
+                        // using a host whose state may have advanced.
+                        self.begin_abort(None, AbortCause::QueryFailed, &mut step)?;
+                        step.reply(request, ContextReplyBody::Domain(failure));
+                    }
                 }
+                step.effects.push(ContextEffect::DomainRequestCompleted {
+                    request,
+                    payload: pending.payload,
+                    task: None,
+                });
                 step.effects.push(ContextEffect::WakeContextDomains);
             }
             ContextInput::DynamicFilterPublished {
@@ -1244,16 +1418,16 @@ impl ContextCore {
                 domain_count,
             } => {
                 self.flush(task, &mut step)?;
-                if self
-                    .dynamic_filters
-                    .get(&task)
-                    .is_some_and(|(accepted, _)| *accepted > version)
-                {
-                    return Err(CoreError::IllegalFact);
-                }
-                self.dynamic_filters.insert(task, (version, payload));
                 let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
                 if !record.state.is_terminal() {
+                    if self
+                        .dynamic_filters
+                        .get(&task)
+                        .is_some_and(|(accepted, _)| *accepted > version)
+                    {
+                        return Err(CoreError::IllegalFact);
+                    }
+                    self.dynamic_filters.insert(task, (version, payload));
                     record.filter_advertisement =
                         Some(DynamicFilterAdvertisement::new(version, domain_count));
                     record.bump_version();
@@ -1329,6 +1503,10 @@ impl ContextCore {
                     decision: ContextEstablishmentDecision {
                         state: self.state,
                         outcome: Ok(self.closed_outcome()),
+                        acknowledgement: Some(
+                            self.establishment_acknowledgement(self.closed_outcome()),
+                        ),
+                        decided_at: self.now,
                     },
                 });
             }
@@ -1385,7 +1563,12 @@ impl ContextCore {
                     close_epoch: self.generation,
                     decision: ContextEstablishmentDecision {
                         state: self.state,
+                        acknowledgement: outcome
+                            .as_ref()
+                            .ok()
+                            .map(|outcome| self.establishment_acknowledgement(*outcome)),
                         outcome,
+                        decided_at: self.now,
                     },
                 });
             }
@@ -1403,29 +1586,43 @@ impl ContextCore {
                 });
             }
             ContextInput::Loaded { task, result } => {
-                self.loaded(task, result, capacity, &mut step)?
+                if self
+                    .tasks
+                    .get(&task)
+                    .is_some_and(|record| record.initial_creation.is_some())
+                {
+                    return Err(CoreError::IllegalFact);
+                }
+                self.loaded(task, result, Arc::new(Vec::new()), capacity, &mut step)?
+            }
+            ContextInput::LoadedTask {
+                task,
+                result,
+                shape,
+                initial_domains,
+            } => {
+                self.loaded_task(task, result, shape, initial_domains, capacity, &mut step)?;
             }
             ContextInput::ContinueReplies { task } => {
                 self.reply_creation(task, &mut step)?;
                 self.retire_if_ready(task, &mut step)?;
             }
             ContextInput::Installed { task } => {
-                self.flush(task, &mut step)?;
-                let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
-                if t.phase != CreationPhase::Accepted {
+                if self
+                    .tasks
+                    .get(&task)
+                    .is_some_and(|record| record.initial_creation.is_some())
+                {
                     return Err(CoreError::IllegalFact);
                 }
-                if !t.installed {
-                    if t.state.is_terminal()
-                        || matches!(t.conclusion.accepted.as_ref(),Some(TaskConclusion::Terminated(TerminationDetail::Failed(failure))) if failure.phase()==novarocks_execution_contract::TaskFailurePhase::Preparation)
-                    {
-                        return Err(CoreError::IllegalFact);
-                    }
-                    t.installed = true;
-                    t.bump_version();
-                    Self::publish(t, &mut step)?;
-                }
-                self.try_finish_completion_intent(task, &mut step)?;
+                self.validate_installation(task, &mut step)?;
+                self.publish_installation(task, &mut step)?;
+            }
+            ContextInput::InstalledTask {
+                task,
+                initial_queued,
+            } => {
+                self.installed_task(task, initial_queued, &mut step)?;
             }
             ContextInput::Running { task } | ContextInput::Flushing { task } => {
                 let target = if matches!(input, ContextInput::Running { .. }) {
@@ -1519,13 +1716,27 @@ impl ContextCore {
                         t.runtime_resources_converged_received = true;
                     }
                     PhysicalFact::RootIdle => t.root_idle = true,
+                    PhysicalFact::RootTransferredToContext => {
+                        t.root_transferred = true;
+                        t.convergence
+                            .note_output_transferred()
+                            .map_err(|_| CoreError::IllegalFact)?;
+                    }
+                    PhysicalFact::RootRetentionReleased => {
+                        t.root_idle = true;
+                        t.convergence
+                            .note_output_released()
+                            .map_err(|_| CoreError::IllegalFact)?;
+                        t.output_released = true;
+                    }
                 }
                 Self::apply_runtime_exit_receipts(t, before, &mut step)?;
+                self.resume_initial_after_preparation_exit(task, &mut step)?;
                 self.try_finish_completion_intent(task, &mut step)?;
                 self.retire_if_ready(task, &mut step)?;
             }
             ContextInput::HostReleased => {
-                if !self.host_releasing {
+                if !self.host_releasing || self.unretired_tasks != 0 {
                     return Err(CoreError::IllegalFact);
                 }
                 self.host_releasing = false;
@@ -1533,13 +1744,20 @@ impl ContextCore {
                 if let Some(request) = self.release_request.take() {
                     step.reply(
                         request,
-                        ContextReplyBody::Verdict(RequestResult::Outcome(
-                            OperationOutcome::Accepted,
-                        )),
+                        self.release_reply(novarocks_execution_contract::ReleaseOutcome::Released),
                     );
                 }
                 step.effects.push(ContextEffect::RetainContext {
                     context: self.identity,
+                });
+                // The original HostReleased fact follows actual Task/host
+                // retirement and the same Context admission fence.
+                step.effects.push(ContextEffect::PublishContextConvergence {
+                    receipt: novarocks_execution_contract::QueryContextConvergenceReceipt::new(
+                        self.identity,
+                        novarocks_execution_contract::QueryContextConvergenceVersion::FIRST,
+                        novarocks_execution_contract::QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                    ),
                 });
             }
             ContextInput::ContinueClose => self.advance_close(&mut step)?,
@@ -1587,6 +1805,9 @@ impl ContextCore {
             && self.close_applied
             && self.unretired_tasks == 0
             && !self.host_releasing
+            && self.pending_context_update.is_none()
+            && self.context_domain_comparison.is_none()
+            && self.context_domain_waiters.is_empty()
         {
             self.host_releasing = true;
             step.effects.push(ContextEffect::ReleaseHost {
@@ -1625,9 +1846,10 @@ impl ContextCore {
                     }
                     step.reply(
                         request,
-                        ContextReplyBody::Verdict(RequestResult::Outcome(
-                            OperationOutcome::Accepted,
-                        )),
+                        ContextReplyBody::Task {
+                            outcome: OperationOutcome::Accepted,
+                            status: Arc::new(Self::compose(&self.tasks[&task])?),
+                        },
                     );
                 }
             }
@@ -1721,10 +1943,21 @@ impl ContextCore {
                         generation,
                         position: Arc::new(position),
                     });
+                    // Intake commits only this original R. Catch-up coverage
+                    // and cursor validation belong to ObservationSource.
+                    step.reply(
+                        request,
+                        ContextReplyBody::Verdict(RequestResult::Outcome(
+                            OperationOutcome::Accepted,
+                        )),
+                    );
                 }
             }
             ContextCommand::Create { task, payload } => {
                 self.create(request, task, payload, capacity, step)?
+            }
+            ContextCommand::InspectCreation { task } => {
+                self.inspect_creation(request, task, step)?
             }
             ContextCommand::Renew {
                 sequence,
@@ -1756,11 +1989,23 @@ impl ContextCore {
                 };
                 step.reply(
                     request,
-                    ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+                    ContextReplyBody::Context(self.context_acknowledgement(outcome)),
                 );
             }
             ContextCommand::Quiesce => {
-                if !matches!(
+                if self.state == QueryContextState::TerminalRetained
+                    && let Some(decision) = self.quiesce_decision.as_ref()
+                {
+                    // Release retains the exact previously committed fence;
+                    // replay grants no new admission or close authority.
+                    step.reply(
+                        request,
+                        ContextReplyBody::Quiesce {
+                            outcome: OperationOutcome::ContextTerminalReceipt,
+                            receipt: decision.receipt.clone(),
+                        },
+                    );
+                } else if !matches!(
                     self.state,
                     QueryContextState::Establishing
                         | QueryContextState::Active
@@ -1808,9 +2053,9 @@ impl ContextCore {
                 if self.state == QueryContextState::TerminalRetained {
                     step.reply(
                         request,
-                        ContextReplyBody::Verdict(RequestResult::Outcome(
-                            OperationOutcome::ContextTerminalReceipt,
-                        )),
+                        self.release_reply(
+                            novarocks_execution_contract::ReleaseOutcome::AlreadyTerminal,
+                        ),
                     );
                 } else if self.state != QueryContextState::Quiescing
                     || self.closing.is_some()
@@ -1819,17 +2064,22 @@ impl ContextCore {
                     || self.unretired_tasks != 0
                     || !self.pending_task_updates.is_empty()
                     || self.pending_context_update.is_some()
+                    || self.context_domain_comparison.is_some()
+                    || !self.context_domain_waiters.is_empty()
                 {
                     step.reply(
                         request,
-                        ContextReplyBody::Verdict(RequestResult::Outcome(
-                            OperationOutcome::ReleaseNotReady,
-                        )),
+                        self.release_reply(novarocks_execution_contract::ReleaseOutcome::NotReady),
                     );
                 } else {
                     self.state = QueryContextState::Releasing;
                     self.release_request = Some(request);
                     self.host_releasing = true;
+                    step.effects.push(ContextEffect::SealRoot {
+                        context: self.identity,
+                        generation: self.generation,
+                        reason: novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextReleased,
+                    });
                     step.effects.push(ContextEffect::ReleaseHost {
                         context: self.identity,
                         generation: self.generation,
@@ -1878,6 +2128,67 @@ impl ContextCore {
         });
         Ok(())
     }
+    fn context_acknowledgement(&self, outcome: OperationOutcome) -> ContextAcknowledgement {
+        ContextAcknowledgement {
+            outcome,
+            receipt: Arc::new(
+                novarocks_execution_contract::QueryContextReceipt::new(self.identity, self.state)
+                    .with_lease(self.lease.receipt()),
+            ),
+            termination_cause: self.closing.map(|closing| closing.cause),
+        }
+    }
+    fn establishment_acknowledgement(&self, outcome: OperationOutcome) -> ContextAcknowledgement {
+        let mut ack = self.context_acknowledgement(outcome);
+        if let Some(current) = self.context_domains.credential() {
+            let initial = self.establishment.semantics;
+            let catalog = ContextDomainInput::Catalog {
+                version: DomainVersion::FIRST,
+                fingerprint: initial.catalog,
+            };
+            let filter = ContextDomainInput::Filter {
+                version: DomainVersion::FIRST,
+                fingerprint: initial.shared_filter,
+            };
+            let credential = ContextDomainInput::Credential(crate::domain::CredentialInput {
+                lease: current.lease,
+                epoch: current.epoch,
+                current_resource: current.resource,
+                replacement_resource: current.resource,
+                same_material: true,
+            });
+            let progression = |input| {
+                if outcome == OperationOutcome::Accepted {
+                    DomainProgression::Apply
+                } else {
+                    self.context_domains.classify(input)
+                }
+            };
+            let domains = vec![
+                self.context_domains.receipt(catalog, progression(catalog)),
+                self.context_domains.receipt(filter, progression(filter)),
+                self.context_domains
+                    .receipt(credential, progression(credential)),
+            ];
+            ack.receipt = Arc::new(
+                novarocks_execution_contract::QueryContextReceipt::new(self.identity, self.state)
+                    .with_lease(self.lease.receipt())
+                    .with_domains(domains),
+            );
+        }
+        ack
+    }
+    fn release_reply(
+        &self,
+        release: novarocks_execution_contract::ReleaseOutcome,
+    ) -> ContextReplyBody {
+        ContextReplyBody::Release {
+            context: self.identity,
+            release,
+            state: self.state,
+            termination_cause: self.closing.map(|closing| closing.cause),
+        }
+    }
     fn closed_outcome(&self) -> OperationOutcome {
         if self
             .closing
@@ -1888,14 +2199,14 @@ impl ContextCore {
             OperationOutcome::ContextTerminalReceipt
         }
     }
-    fn create(
+    /// Preserve Create's exact identity/entity priority for the business and
+    /// read-only entries. A closed Context still owes existing Task replays.
+    fn replay_creation(
         &mut self,
         request: InputId,
         task: TaskIdentity,
-        payload: PayloadId,
-        capacity: &mut impl AdmissionPort,
         step: &mut ContextStep,
-    ) -> Result<(), CoreError> {
+    ) -> Result<bool, CoreError> {
         if task.verify_query_context(self.identity).is_err() {
             step.reply(
                 request,
@@ -1903,12 +2214,12 @@ impl ContextCore {
                     OperationOutcome::IdentityMismatch,
                 )),
             );
-            return Ok(());
+            return Ok(true);
         }
         if let Some(t) = self.tasks.get_mut(&task) {
             if t.phase == CreationPhase::Loading {
                 if t.waiting_replies.contains(&request) {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if t.waiting_replies.len() >= self.config.max_creation_waiters {
                     step.reply(
@@ -1923,20 +2234,61 @@ impl ContextCore {
             } else if let Some(refusal) = &t.creation_refusal {
                 Self::refusal_reply(request, refusal.clone(), step);
             } else {
-                step.reply(
-                    request,
-                    ContextReplyBody::Verdict(RequestResult::Outcome(
-                        if t.pending_reply_outcome
-                            .is_some_and(|outcome| outcome != OperationOutcome::Accepted)
-                        {
-                            t.pending_reply_outcome
-                                .expect("retained creation verdict exists")
-                        } else {
-                            OperationOutcome::Idempotent
-                        },
-                    )),
-                );
+                let body = if t
+                    .pending_reply_outcome
+                    .is_some_and(|outcome| outcome != OperationOutcome::Accepted)
+                {
+                    Self::creation_reply_body(t)
+                } else {
+                    ContextReplyBody::Create {
+                        outcome: OperationOutcome::Idempotent,
+                        receipt: Arc::new(
+                            novarocks_execution_contract::CreateTaskReceipt::from_shared(
+                                t.identity,
+                                t.initial_domain_receipts.clone(),
+                                Self::compose(t)?,
+                            ),
+                        ),
+                    }
+                };
+                step.reply(request, body);
             }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    fn inspect_creation(
+        &mut self,
+        request: InputId,
+        task: TaskIdentity,
+        step: &mut ContextStep,
+    ) -> Result<(), CoreError> {
+        if self.replay_creation(request, task, step)? {
+            return Ok(());
+        }
+        let outcome = if matches!(
+            self.state,
+            QueryContextState::Active | QueryContextState::Establishing
+        ) {
+            OperationOutcome::NotReady
+        } else {
+            self.closed_outcome()
+        };
+        step.reply(
+            request,
+            ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+        );
+        Ok(())
+    }
+    fn create(
+        &mut self,
+        request: InputId,
+        task: TaskIdentity,
+        payload: PayloadId,
+        capacity: &mut impl AdmissionPort,
+        step: &mut ContextStep,
+    ) -> Result<(), CoreError> {
+        if self.replay_creation(request, task, step)? {
             return Ok(());
         }
         let rejection = if self.state != QueryContextState::Active {
@@ -1983,6 +2335,7 @@ impl ContextCore {
         &mut self,
         task: TaskIdentity,
         result: Result<CreationCost, AdmissionRefusal>,
+        initial_progressions: Arc<Vec<DomainProgression>>,
         capacity: &mut impl AdmissionPort,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
@@ -2062,14 +2415,38 @@ impl ContextCore {
             Self::publish(t, step)?;
             // The runtime must bind this action's started dependency to the
             // preceding publication's actual commit/completion evidence.
+            // The same batch transfers its actual Accepted reservation.
+            // Initial-domain classification may finish later; the original
+            // queued holder parks until that neutral plan is ready.
             step.effects.push(ContextEffect::EnqueuePreparation {
                 task,
                 payload: t.payload,
                 reservation: t
                     .preparation_reservation
                     .expect("accepted preparation reservation"),
+                initial_progressions,
+                initial_pending: t.initial_creation.is_some(),
             });
         }
+        t.creation_reply = Some(Arc::new(match &t.creation_refusal {
+            Some(AdmissionRefusal::Domain(outcome, failure)) => {
+                ContextReplyBody::Domain(DomainRefusal {
+                    outcome: *outcome,
+                    failure: failure.clone(),
+                })
+            }
+            _ if outcome == OperationOutcome::Accepted => ContextReplyBody::Create {
+                outcome,
+                receipt: Arc::new(
+                    novarocks_execution_contract::CreateTaskReceipt::from_shared(
+                        t.identity,
+                        t.initial_domain_receipts.clone(),
+                        Self::compose(t)?,
+                    ),
+                ),
+            },
+            _ => ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+        }));
         self.reply_creation(task, step)?;
         self.retire_if_ready(task, step)?;
         Ok(())
@@ -2110,18 +2487,10 @@ impl ContextCore {
         Ok(())
     }
     fn creation_reply_body(task: &TaskRecord) -> ContextReplyBody {
-        match &task.creation_refusal {
-            Some(AdmissionRefusal::Domain(outcome, failure)) => {
-                ContextReplyBody::Domain(DomainRefusal {
-                    outcome: *outcome,
-                    failure: failure.clone(),
-                })
-            }
-            _ => ContextReplyBody::Verdict(RequestResult::Outcome(
-                task.pending_reply_outcome
-                    .expect("creation reply has an entity decision"),
-            )),
-        }
+        task.creation_reply
+            .as_deref()
+            .expect("original complete entity Create decision")
+            .clone()
     }
     fn retire_if_ready(
         &mut self,
@@ -2132,12 +2501,17 @@ impl ContextCore {
         if t.phase != CreationPhase::Retained
             && t.retirement_ready()
             && !self.pending_task_updates.contains_key(&task)
+            && !self.task_domain_waiters.contains_key(&task)
+            && t.initial_creation.is_none()
+            && t.scheduled_close_generation.is_none()
+            && t.scheduled_quiesce_generation.is_none()
         {
             t.convergence.retire().map_err(|_| CoreError::IllegalFact)?;
             t.phase = CreationPhase::Retained;
             self.unretired_tasks -= 1;
             step.effects.push(ContextEffect::RetireTask {
                 task,
+                state: t.state,
                 active: t.active_reservation,
                 preparation: t.preparation_reservation,
                 convergence: t.convergence.snapshot(),
@@ -2208,6 +2582,8 @@ impl ContextCore {
                 .map_err(|_| CoreError::IllegalFact)?;
             record.bump_version();
             Self::publish(record, step)?;
+            step.effects
+                .push(ContextEffect::FinalizeTaskExecution { task });
             self.final_info.insert(
                 task,
                 Arc::new(
@@ -2296,9 +2672,9 @@ impl ContextCore {
             if let Some(request) = request {
                 step.reply(
                     request,
-                    ContextReplyBody::Verdict(RequestResult::Outcome(
-                        OperationOutcome::ContextTerminalReceipt,
-                    )),
+                    ContextReplyBody::Context(
+                        self.context_acknowledgement(OperationOutcome::ContextTerminalReceipt),
+                    ),
                 );
             }
             return Ok(());
@@ -2308,9 +2684,9 @@ impl ContextCore {
                 if self.close_applied {
                     step.reply(
                         request,
-                        ContextReplyBody::Verdict(RequestResult::Outcome(
-                            OperationOutcome::Idempotent,
-                        )),
+                        ContextReplyBody::Context(
+                            self.context_acknowledgement(OperationOutcome::Idempotent),
+                        ),
                     );
                 } else if closing.request != Some(request) && !self.abort_waiters.contains(&request)
                 {
@@ -2341,6 +2717,11 @@ impl ContextCore {
         step.effects.push(ContextEffect::SealRoot {
             context: self.identity,
             generation: self.generation,
+            reason: if cause == AbortCause::LeaseExpired {
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::LeaseExpired
+            } else {
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted
+            },
         });
         step.effects.push(ContextEffect::ContinueClose {
             generation: self.generation,
@@ -2350,47 +2731,60 @@ impl ContextCore {
     fn apply_close_to(
         &mut self,
         task: TaskIdentity,
+        generation: Generation,
+        intent: TaskCloseIntent,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
-        let Some(closing) = self.closing else {
-            return Err(CoreError::IllegalFact);
-        };
         let t = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
-        if let Some(scheduled) = t.scheduled_close_generation.take() {
-            if scheduled != self.generation {
-                return Err(CoreError::WrongIdentity);
-            }
-            self.scheduled_closes = self
-                .scheduled_closes
-                .checked_sub(1)
-                .ok_or(CoreError::IllegalFact)?;
-        }
-        if t.applied_close_generation != self.generation {
-            t.applied_close_generation = self.generation;
-            if !t.accepted() {
-                // Creating never entered the public Task protocol. Only its
-                // input role is cancelled; original captures still owe exit.
-                if !t.loader_exited {
-                    step.effects.push(ContextEffect::CancelLoader {
-                        task,
-                        generation: self.generation,
-                    });
+        let conclusion = match intent {
+            TaskCloseIntent::Quiesce => {
+                if t.applied_quiesce_generation == Some(generation) {
+                    return Ok(());
                 }
-            } else {
-                let proposal = Proposal {
-                    conclusion: TaskConclusion::Terminated(TerminationDetail::Aborted(
-                        closing.cause,
-                    )),
-                    evidence: None,
-                    source: None,
-                    diagnostic: None,
-                };
-                if let Some(source) = t.proposals.push(proposal) {
-                    step.effects
-                        .push(ContextEffect::DisposeSource { task, source });
+                if t.scheduled_quiesce_generation.take() != Some(generation) {
+                    return Err(CoreError::IllegalFact);
                 }
-                self.flush(task, step)?;
+                t.applied_quiesce_generation = Some(generation);
+                TaskConclusion::Terminated(TerminationDetail::Canceled(
+                    CancelReason::UpstreamNoLongerNeeded,
+                ))
             }
+            TaskCloseIntent::Abort(cause) => {
+                if let Some(scheduled) = t.scheduled_close_generation.take() {
+                    if scheduled != generation {
+                        return Err(CoreError::WrongIdentity);
+                    }
+                    self.scheduled_closes = self
+                        .scheduled_closes
+                        .checked_sub(1)
+                        .ok_or(CoreError::IllegalFact)?;
+                }
+                if t.applied_close_generation == generation {
+                    self.finish_close_if_ready(step);
+                    return Ok(());
+                }
+                t.applied_close_generation = generation;
+                TaskConclusion::Terminated(TerminationDetail::Aborted(cause))
+            }
+        };
+        if !t.accepted() {
+            // Unaccepted loading owns no public Task conclusion or runtime exit.
+            if !t.loader_exited {
+                step.effects
+                    .push(ContextEffect::CancelLoader { task, generation });
+            }
+        } else {
+            let proposal = Proposal {
+                conclusion,
+                evidence: None,
+                source: None,
+                diagnostic: None,
+            };
+            if let Some(source) = t.proposals.push(proposal) {
+                step.effects
+                    .push(ContextEffect::DisposeSource { task, source });
+            }
+            self.flush(task, step)?;
         }
         self.finish_close_if_ready(step);
         Ok(())
@@ -2403,10 +2797,15 @@ impl ContextCore {
             return;
         }
         self.close_applied = true;
-        if let Some(request) = closing.request.take() {
-            step.reply(
+        let request = closing.request.take();
+        let acknowledgement = self.context_acknowledgement(OperationOutcome::Accepted);
+        self.close_decision = Some((acknowledgement.clone(), self.now));
+        if let Some(request) = request {
+            self.complete_request_at(
                 request,
-                ContextReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::Accepted)),
+                Arc::new(ContextReplyBody::Context(acknowledgement)),
+                self.now,
+                step,
             );
         }
         if !self.abort_waiters.is_empty() {
@@ -2445,7 +2844,17 @@ impl ContextCore {
         .next();
         if let Some((task, record)) = next {
             closing.cursor = Some(*task);
-            if record.applied_close_generation != self.generation
+            if (record.state.is_terminal()
+                || (record.phase == CreationPhase::Retained
+                    && record.convergence.snapshot().retired()))
+                && record.scheduled_close_generation.is_none()
+            {
+                // Its conclusion is already sealed. The Context fence closes
+                // new business, while original Task summaries and cleanup keep
+                // their actual causal generation until consumed. Do not revive
+                // an exited Task Work or pretend a new close prefix applied.
+                // Context-retained Root closure is its separate host duty.
+            } else if record.applied_close_generation != self.generation
                 && record.scheduled_close_generation.is_none()
             {
                 record.scheduled_close_generation = Some(self.generation);
@@ -2453,6 +2862,7 @@ impl ContextCore {
                 step.effects.push(ContextEffect::ApplyTaskClose {
                     task: *task,
                     generation: self.generation,
+                    intent: TaskCloseIntent::Abort(closing.cause),
                 });
             }
         }
@@ -2520,9 +2930,19 @@ impl ContextCore {
                 request,
                 ContextReplyBody::Verdict(RequestResult::Outcome(self.closed_outcome())),
             );
+            step.effects.push(ContextEffect::DomainRequestCompleted {
+                request,
+                payload,
+                task: Some(task),
+            });
             return Ok(());
         }
         if !self.task_request_cut(request, task, step)? {
+            step.effects.push(ContextEffect::DomainRequestCompleted {
+                request,
+                payload,
+                task: Some(task),
+            });
             return Ok(());
         }
         self.try_finish_completion_intent(task, step)?;
@@ -2533,17 +2953,42 @@ impl ContextCore {
                     OperationOutcome::TerminalRejected,
                 )),
             );
+            step.effects.push(ContextEffect::DomainRequestCompleted {
+                request,
+                payload,
+                task: Some(task),
+            });
             return Ok(());
         }
-        if self.pending_task_updates.contains_key(&task) {
+        if self.pending_task_updates.contains_key(&task)
+            || self.tasks[&task].initial_creation.is_some()
+            || self.task_domain_waiters.contains_key(&task)
+        {
+            self.task_domain_waiters.entry(task).or_default().push_back(
+                domain_waiters::TaskDomainWaiter::Request {
+                    request,
+                    payload,
+                    updates,
+                },
+            );
             step.effects.push(ContextEffect::WaitTaskDomain {
                 request,
                 task,
                 payload,
-                updates,
             });
+            self.refresh_task_domain_waiter(task);
             return Ok(());
         }
+        self.start_task_domain(request, task, payload, updates, step)
+    }
+    fn start_task_domain(
+        &mut self,
+        request: InputId,
+        task: TaskIdentity,
+        payload: PayloadId,
+        updates: Vec<TaskDomainInput>,
+        step: &mut ContextStep,
+    ) -> Result<(), CoreError> {
         let Some(domains) = self.task_domains.remove(&task) else {
             step.reply(
                 request,
@@ -2551,6 +2996,11 @@ impl ContextCore {
                     OperationOutcome::InvalidStateOrRequest,
                 )),
             );
+            step.effects.push(ContextEffect::DomainRequestCompleted {
+                request,
+                payload,
+                task: Some(task),
+            });
             return Ok(());
         };
         self.runnable_task_domains.insert(task);
@@ -2563,6 +3013,7 @@ impl ContextCore {
                 host_started: false,
                 completing: false,
                 refusal: None,
+                blocked: None,
             },
         );
         step.effects
@@ -2609,8 +3060,21 @@ impl ContextCore {
     fn advance_task_domain(
         &mut self,
         task: TaskIdentity,
+        capacity: &mut impl AdmissionPort,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
+        if self
+            .tasks
+            .get(&task)
+            .is_some_and(|record| record.initial_creation.is_some())
+        {
+            self.advance_initial_creation(task, capacity, step)?;
+            self.refresh_task_domain_waiter(task);
+            return Ok(());
+        }
+        if !self.pending_task_updates.contains_key(&task) {
+            return self.advance_task_domain_waiter(task, step);
+        }
         use crate::domain::TaskDomainTransactionProgress as P;
         self.flush(task, step)?;
         self.try_finish_completion_intent(task, step)?;
@@ -2623,6 +3087,27 @@ impl ContextCore {
             return Err(CoreError::IllegalFact);
         }
         self.runnable_task_domains.remove(&task);
+        if !pending.host_started
+            && pending.blocked.is_none()
+            && (!matches!(
+                self.state,
+                QueryContextState::Active | QueryContextState::Quiescing
+            ) || self.tasks[&task].state.is_terminal()
+                || self.tasks[&task].conclusion.accepted.is_some())
+        {
+            pending.blocked = Some(
+                if self.tasks[&task].state.is_terminal()
+                    || self.tasks[&task].conclusion.accepted.is_some()
+                {
+                    OperationOutcome::TerminalRejected
+                } else {
+                    self.closed_outcome()
+                },
+            );
+            pending
+                .transaction
+                .rollback(novarocks_execution_contract::DomainConflict::NotMonotonic);
+        }
         match pending.transaction.advance() {
             P::Pending => {
                 self.runnable_task_domains.insert(task);
@@ -2643,14 +3128,16 @@ impl ContextCore {
             P::RolledBack(conflict) => {
                 let (domains, _, _) = pending.transaction.into_result();
                 self.task_domains.insert(task, domains);
-                step.reply(
-                    pending.request,
-                    ContextReplyBody::Domain(
+                let body = match pending.blocked {
+                    Some(outcome) => ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+                    None => ContextReplyBody::Domain(
                         pending
                             .refusal
                             .unwrap_or_else(|| DomainRefusal::policy(conflict)),
                     ),
-                );
+                };
+                step.reply(pending.request, body);
+                self.complete_task_domain_source(task, pending.request, pending.payload);
                 step.effects.push(ContextEffect::WakeTaskDomains { task });
             }
             P::Complete => {
@@ -2667,6 +3154,7 @@ impl ContextCore {
                         receipts: Arc::new(receipts),
                     },
                 );
+                self.complete_task_domain_source(task, pending.request, pending.payload);
                 step.effects.push(ContextEffect::WakeTaskDomains { task });
             }
         }
@@ -2680,12 +3168,12 @@ impl ContextCore {
         match self.state {
             QueryContextState::Quiescing | QueryContextState::TerminalRetained => {
                 return Ok(EstablishReplayResult::Decided(
-                    OperationOutcome::ContextTerminalReceipt,
+                    self.establishment_acknowledgement(OperationOutcome::ContextTerminalReceipt),
                 ));
             }
             QueryContextState::Aborting | QueryContextState::Releasing => {
                 return Ok(EstablishReplayResult::Decided(
-                    OperationOutcome::InvalidStateOrRequest,
+                    self.establishment_acknowledgement(OperationOutcome::InvalidStateOrRequest),
                 ));
             }
             QueryContextState::Establishing | QueryContextState::Active => {}
@@ -2696,7 +3184,7 @@ impl ContextCore {
             || candidate.semantics != self.establishment.semantics
         {
             return Ok(EstablishReplayResult::Decided(
-                OperationOutcome::ContextConflict,
+                self.establishment_acknowledgement(OperationOutcome::ContextConflict),
             ));
         }
         // A new carrier's payload identity is not part of entity equality.
@@ -2711,14 +3199,16 @@ impl ContextCore {
             return Ok(EstablishReplayResult::CompareCredential { expected: current });
         };
         Ok(EstablishReplayResult::Decided(
-            if candidate.semantics.credential_lease == current.lease
-                && candidate.semantics.credential_epoch == current.epoch
-                && comparison.same_material
-            {
-                OperationOutcome::Idempotent
-            } else {
-                OperationOutcome::ContextConflict
-            },
+            self.establishment_acknowledgement(
+                if candidate.semantics.credential_lease == current.lease
+                    && candidate.semantics.credential_epoch == current.epoch
+                    && comparison.same_material
+                {
+                    OperationOutcome::Idempotent
+                } else {
+                    OperationOutcome::ContextConflict
+                },
+            ),
         ))
     }
     fn update_context(
@@ -2736,14 +3226,37 @@ impl ContextCore {
                 request,
                 ContextReplyBody::Verdict(RequestResult::Outcome(self.closed_outcome())),
             );
-            return Ok(());
-        }
-        if self.pending_context_update.is_some() {
-            step.effects.push(ContextEffect::WaitContextDomain {
+            step.effects.push(ContextEffect::DomainRequestCompleted {
                 request,
                 payload,
-                update,
+                task: None,
             });
+            return Ok(());
+        }
+        if self.pending_context_update.is_some()
+            || self.context_domain_comparison.is_some()
+            || !self.context_domain_waiters.is_empty()
+        {
+            self.context_domain_waiters
+                .push_back(domain_waiters::ContextDomainWaiter {
+                    request,
+                    payload,
+                    update,
+                });
+            step.effects
+                .push(ContextEffect::WaitContextDomain { request, payload });
+            return Ok(());
+        }
+        self.start_context_domain(request, payload, update, step)
+    }
+    fn start_context_domain(
+        &mut self,
+        request: InputId,
+        payload: PayloadId,
+        update: ContextDomainInput,
+        step: &mut ContextStep,
+    ) -> Result<(), CoreError> {
+        if self.recompare_context_credential(request, payload, update, step)? {
             return Ok(());
         }
         let mut domains = self.context_domains.clone();
@@ -2754,11 +3267,17 @@ impl ContextCore {
                     request,
                     ContextReplyBody::Domain(DomainRefusal::policy(conflict)),
                 );
+                step.effects.push(ContextEffect::DomainRequestCompleted {
+                    request,
+                    payload,
+                    task: None,
+                });
                 return Ok(());
             }
         };
         self.pending_context_update = Some(PendingContextUpdate {
             request,
+            payload,
             domains,
             update,
             progression,
@@ -2865,13 +3384,28 @@ impl ContextCore {
             return Ok(());
         };
         let records = match pending.cursor {
-            Some(cursor) => self.tasks.range((Excluded(cursor), Unbounded)),
-            None => self.tasks.range(..),
+            Some(cursor) => self.tasks.range_mut((Excluded(cursor), Unbounded)),
+            None => self.tasks.range_mut(..),
         };
         for (identity, record) in records.take(1) {
             pending.cursor = Some(*identity);
             if record.pending_reply_outcome == Some(OperationOutcome::Accepted) {
                 pending.accepted.push(*identity);
+                // This scan freezes membership and requests one causal cancellation;
+                // only the returned original close input may adjudicate the Task.
+                if self.closing.is_none()
+                    && !record.state.is_terminal()
+                    && record.phase != CreationPhase::Retained
+                    && record.scheduled_quiesce_generation.is_none()
+                    && record.applied_quiesce_generation.is_none()
+                {
+                    record.scheduled_quiesce_generation = Some(self.generation);
+                    step.effects.push(ContextEffect::ApplyTaskClose {
+                        task: *identity,
+                        generation: self.generation,
+                        intent: TaskCloseIntent::Quiesce,
+                    });
+                }
             }
         }
         let more = pending.cursor.is_some_and(|cursor| {
@@ -3020,7 +3554,19 @@ impl ContextCore {
                 decision.decided_at,
             ))
         };
-        if let Some((body, decided_at)) = creation.or_else(quiesce) {
+        let aborted = || {
+            if !self.abort_waiters.contains(&token) {
+                return None;
+            }
+            let (acknowledgement, decided_at) = self
+                .close_decision
+                .as_ref()
+                .filter(|(_, decided_at)| *decided_at < at)?;
+            let mut acknowledgement = acknowledgement.clone();
+            acknowledgement.outcome = OperationOutcome::Idempotent;
+            Some((ContextReplyBody::Context(acknowledgement), *decided_at))
+        };
+        if let Some((body, decided_at)) = creation.or_else(quiesce).or_else(aborted) {
             self.complete_request_at(token, Arc::new(body), decided_at, step);
             return;
         }

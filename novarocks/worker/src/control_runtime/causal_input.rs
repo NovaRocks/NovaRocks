@@ -125,6 +125,9 @@ impl CausalInputCustody {
         };
         (owner, author)
     }
+    pub(crate) fn work_id(&self) -> novarocks_control_runtime_core::identity::WorkId {
+        self.0.binding.work_id()
+    }
     pub(crate) fn cut(&self) -> CutId {
         self.0.cut
     }
@@ -272,6 +275,30 @@ impl InputAuthor {
             drop(self.authority.take());
             self.custody.unresolved();
             return Err(CausalInputError::HandoffRejected);
+        }
+        self.finish_exit()
+    }
+    /// A fixed Close author has no arbitrary payload: its admitted event
+    /// already binds the original Task and protocol-close generation.
+    pub(crate) fn publish_close(
+        mut self,
+        generation: novarocks_control_runtime_core::identity::Generation,
+        intent: novarocks_worker_protocol::context::TaskCloseIntent,
+    ) -> Result<(), CausalInputError> {
+        if let Err(error) = self.take_sender().send_close(generation, intent) {
+            *self
+                .custody
+                .0
+                .rejected
+                .lock()
+                .expect("original rejected close event") = Some(ContextInput::ApplyTaskClose {
+                task: self.task(),
+                generation,
+                intent,
+            });
+            drop(self.authority.take());
+            self.custody.unresolved();
+            return Err(CausalInputError::Causal(error));
         }
         self.finish_exit()
     }
@@ -791,7 +818,7 @@ mod tests {
         );
         let (cut, sender) = inbox
             .admit_input(
-                work.id(),
+                &work,
                 1,
                 pending.clone(),
                 CutSourceAdmission::Fresh(source_roles(&runtime.scope, parent)),

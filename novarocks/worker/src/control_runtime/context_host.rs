@@ -19,7 +19,18 @@
 //! only transfers the existing guard and establishes finite metadata roles;
 //! it does not run materialization, publish Active, or infer any host exit.
 
+mod driver;
 pub(super) mod failure;
+pub(crate) mod observation;
+pub(crate) use driver::{ContextDriverError, ContextDriverProgress};
+pub(crate) mod root_read;
+pub(crate) use root_read::{NodeRootDelivery, NodeRootRead, RootReadError};
+pub(super) mod task_driver;
+pub(crate) use task_driver::{
+    TaskDriverError, TaskDriverPorts, TaskDriverProgress, TaskDriverRefusal,
+};
+mod teardown;
+pub(crate) use teardown::ContextTeardownRefusal;
 mod internal;
 mod owner_control;
 pub(crate) use internal::ContextInternalAdvance;
@@ -126,6 +137,7 @@ pub(crate) enum ContextHostError {
     Io(ContextIoError),
     HostJob(ContextHostJobError),
     Ready(ContextReadyError),
+    RootRead(root_read::RootReadError),
 }
 
 pub(crate) struct ContextMetadataRole {
@@ -138,6 +150,12 @@ pub(crate) struct ContextMetadataRole {
 /// or reports a half-registered Context as successfully materialized.
 #[must_use = "The host must retain the original Context payer and every admitted role"]
 pub(crate) struct ContextHostResources {
+    pub(super) observation: Option<observation::ContextObservation>,
+    pub(super) observation_positions: usize,
+    pub(super) observation_projection: Option<observation::ObservationProjection>,
+    pub(in crate::control_runtime) root_reads: root_read::RootReadState,
+    pub(super) teardown: teardown::ContextTeardownState,
+    pub(super) control_admission_closed: bool,
     pub admission: ContextMetadataRole,
     pub scope: Option<ScopeHandle>,
     pub roles: Vec<ContextMetadataRole>,
@@ -188,7 +206,11 @@ pub(crate) struct ContextHostRecord {
     initial_generation: novarocks_control_runtime_core::identity::Generation,
     resources: ContextHostResources,
     tasks: BTreeMap<TaskIdentity, TaskHostOwner>,
+    retired_task_reads: BTreeMap<TaskIdentity, Arc<super::lifecycle_read::TaskReadSnapshot>>,
+    pub(super) task_driver: task_driver::TaskDriverState,
+    root_issuance_sealed: bool,
     max_live_tasks: usize,
+    max_live_roots: usize,
     max_routes: usize,
     pub dispatch: EffectDispatch,
     request_inputs: BTreeMap<InputId, novarocks_control_runtime_core::identity::WorkId>,
@@ -327,6 +349,15 @@ impl ContextHostRecord {
             .bind(WorkKind::Business)
             .map_err(|error| no_owner(ContextHostError::AdmissionBindInvariant(error)))?;
         let mut resources = ContextHostResources {
+            observation: None,
+            observation_positions: binding.policy.request_pool.requests,
+            observation_projection: None,
+            root_reads: root_read::RootReadState::new(
+                binding.max_live_roots,
+                binding.policy.ingress.root_read_holders,
+            ),
+            teardown: Default::default(),
+            control_admission_closed: false,
             failure: None,
             admission: ContextMetadataRole { work, capacity },
             scope: None,
@@ -449,7 +480,11 @@ impl ContextHostRecord {
             initial_generation: generation,
             resources,
             tasks: BTreeMap::new(),
+            retired_task_reads: BTreeMap::new(),
+            task_driver: task_driver::TaskDriverState::default(),
+            root_issuance_sealed: false,
             max_live_tasks: binding.max_live_tasks,
+            max_live_roots: binding.max_live_roots,
             max_routes,
             dispatch: EffectDispatch::context(runtime.clone(), binding.actor, effect_limit),
             request_inputs: BTreeMap::new(),
@@ -559,6 +594,8 @@ impl ContextHostRecord {
                 context: self.identity,
                 generation: self.initial_generation,
                 establishment: self.establishment,
+                admission: self.resources.admission.capacity.id(),
+                admission_work: self.resources.admission.work.id(),
                 notice,
             },
             parts,
@@ -698,7 +735,9 @@ impl ContextHostRecord {
         // A captured address is not a lifecycle pin. A sealed/removed actor
         // cannot admit a new Context leg after its metadata sources exit.
         match self.control_runtime.snapshot(self.actor) {
-            Ok(snapshot) if snapshot.sealed => return Err(EstablishRouteError::TargetRemoved),
+            Ok(snapshot) if snapshot.sealed || self.resources.control_admission_closed => {
+                return Err(EstablishRouteError::TargetRemoved);
+            }
             Ok(_) => {}
             Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {
                 return Err(EstablishRouteError::TargetRemoved);
@@ -767,10 +806,9 @@ impl ContextHostRecord {
         self.resources.routes.get(&request)
     }
 
-    /// Logical active-context retirement releases only that dimension. The
-    /// same original payer keeps bootstrap metadata charged until real host,
-    /// input, actor and child-scope retirement, independently of retention ACK.
-    pub(crate) fn retire_active_context(
+    /// The original Root decision authorizes parent teardown. Keep both its
+    /// Context slot and metadata payment until the parent records really exit.
+    pub(crate) fn authorize_parent_retirement(
         &mut self,
         ticket: &EffectTicket<WorkerAction>,
     ) -> Result<(), ContextHostError> {
@@ -784,20 +822,7 @@ impl ContextHostRecord {
         {
             return Err(ContextHostError::WrongEffect);
         }
-        let capacity = &mut self.resources.admission.capacity;
-        if capacity
-            .resources()
-            .map_err(ContextHostError::Runtime)?
-            .get(Dimension::Contexts.id())
-            != 0
-        {
-            capacity
-                .release(
-                    &ResourceVector::new([(Dimension::Contexts.id(), 1)])
-                        .expect("one original active Context unit"),
-                )
-                .map_err(ContextHostError::Runtime)?;
-        }
+        self.resources.teardown.parent_retire_authorized = true;
         Ok(())
     }
     pub(crate) fn adopt_task(
@@ -815,12 +840,18 @@ impl ContextHostRecord {
             ) if ticket.actor == self.actor && binding.context == self.identity => *task,
             _ => return Err(ContextHostError::WrongEffect),
         };
-        if self.tasks.contains_key(&task) {
+        if self.tasks.contains_key(&task) || self.retired_task_reads.contains_key(&task) {
             return Err(ContextHostError::TaskAlreadyOwned);
         }
-        if self.tasks.len() == self.max_live_tasks {
+        if self
+            .tasks
+            .len()
+            .saturating_add(self.retired_task_reads.len())
+            >= self.max_live_tasks
+        {
             return Err(ContextHostError::TaskTableFull);
         }
+        let source = binding.task_source;
         let mut host = match TaskHostRecord::adopt_loading(runtime, ticket, binding) {
             Ok(host) => host,
             Err(refusal) => {
@@ -837,6 +868,7 @@ impl ContextHostRecord {
         // Retain the original elected Task even if its paid notification
         // position cannot transfer. No host port/job is published on refusal;
         // the actual failure owner still has this complete bound inventory.
+        assert!(self.task_driver.sources.insert(source, task).is_none());
         let result = host.admit_open_summary(runtime);
         let owner = if result.is_ok() {
             TaskHostOwner::Ready(Box::new(host))
@@ -869,15 +901,44 @@ impl ContextHostRecord {
             return Err(ContextHostError::TaskStillOwned);
         }
         self.ensure_task_unrouted(task)?;
-        match self.tasks.get(&task) {
-            Some(TaskHostOwner::Ready(host) | TaskHostOwner::Initializing(host)) => {
-                host.resources_for_retirement()
-                    .seal_read_observation()
-                    .map_err(|_| ContextHostError::TaskStillOwned)?;
-            }
-            _ => return Err(ContextHostError::TaskStillOwned),
+        if self.retired_task_reads.len() >= self.max_live_tasks
+            && !self.retired_task_reads.contains_key(&task)
+        {
+            return Err(ContextHostError::TaskTableFull);
         }
-        Ok(self.tasks.remove(&task).expect("same closed original Task"))
+        let sealed_read = match self.tasks.get(&task) {
+            Some(TaskHostOwner::Ready(host) | TaskHostOwner::Initializing(host)) => host
+                .resources_for_retirement()
+                .seal_read_observation()
+                .map_err(|_| ContextHostError::TaskStillOwned)?,
+            _ => return Err(ContextHostError::TaskStillOwned),
+        };
+        if sealed_read.status.identity() != task {
+            return Err(ContextHostError::WrongContext);
+        }
+        // The installed Root was already moved into this Context's original
+        // slot. Only this real closed Task prefix permits direct RootDrained.
+        self.resources.root_reads.mark_task_retired(task);
+        assert!(
+            self.retired_task_reads.insert(task, sealed_read).is_none(),
+            "one actual sealed read handoff per original Task"
+        );
+        Ok(self.remove_task_owner(task))
+    }
+    pub(crate) fn has_retired_task_read(&self, task: TaskIdentity) -> bool {
+        self.retired_task_reads
+            .get(&task)
+            .is_some_and(|original| original.status.identity() == task)
+    }
+    fn remove_task_owner(&mut self, task: TaskIdentity) -> TaskHostOwner {
+        let owner = self.tasks.remove(&task).expect("same original Task");
+        if let TaskHostOwner::Ready(host) | TaskHostOwner::Initializing(host) = &owner {
+            assert_eq!(
+                self.task_driver.sources.remove(&host.source_address()),
+                Some(task)
+            );
+        }
+        owner
     }
     fn ensure_task_unrouted(&mut self, task: TaskIdentity) -> Result<(), ContextHostError> {
         if self
@@ -916,10 +977,7 @@ impl ContextHostRecord {
         task: TaskIdentity,
     ) -> Result<TaskHostOwner, ContextHostError> {
         self.ensure_task_unrouted(task)?;
-        Ok(self
-            .tasks
-            .remove(&task)
-            .expect("same original component Task"))
+        Ok(self.remove_task_owner(task))
     }
     pub(crate) fn into_resources(
         self,
@@ -928,10 +986,11 @@ impl ContextHostRecord {
     }
 }
 
-mod requests;
+pub(crate) mod requests;
 pub(crate) use requests::{
-    ContextRequestAdmissionRefusal, ContextRequestError, ContextRequestHandle,
-    ContextRequestPublishRefusal, ContextRequestSubmitRefusal, TaskContextRequestHandle,
+    CONTEXT_REQUEST_STORAGE, ContextRequestAdmissionRefusal, ContextRequestError,
+    ContextRequestHandle, ContextRequestPublishRefusal, ContextRequestSubmitRefusal,
+    TaskContextRequestHandle,
 };
 
 #[cfg(test)]
@@ -1184,7 +1243,13 @@ mod tests {
             )
             .unwrap();
             let capability = core.admission().capability();
-            let actor = ControlActor::new(core, scope.clone(), storage.clone(), roles[1].work.id());
+            let actor = ControlActor::new(
+                core,
+                scope.clone(),
+                storage.clone(),
+                roles[1].work.id(),
+                roles[0].work.id(),
+            );
             let runtime = ActorRuntime::new(2);
             runtime
                 .register_supervised_next(
@@ -1194,10 +1259,12 @@ mod tests {
                     ActorConfig {
                         mailbox: [1, 1, 1, 1],
                         max_batches: 4,
-                        max_effects_per_step: ControlCore::MAX_STEP_WORK,
-                        max_dependencies_per_effect: ControlCore::MAX_STEP_WORK,
-                        turn_budget: 64,
-                        max_step_work: ControlCore::MAX_STEP_WORK,
+                        max_effects_per_step:
+                            crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                        max_dependencies_per_effect:
+                            crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                        turn_budget: crate::control_runtime::actors::ControlActor::TURN_BUDGET,
+                        max_step_work: crate::control_runtime::actors::ControlActor::MAX_STEP_WORK,
                     },
                     &roles[0].work,
                 )
@@ -1649,7 +1716,7 @@ mod tests {
             mut host: ContextHostRecord,
             retirement: EffectTicket<WorkerAction>,
         ) {
-            host.retire_active_context(&retirement).unwrap();
+            host.authorize_parent_retirement(&retirement).unwrap();
             self.complete_control_effect(retirement);
             let (resources, tasks) = host.into_resources();
             assert!(tasks.is_empty());
@@ -1817,7 +1884,7 @@ mod tests {
             .resources()
             .unwrap();
         let scope_work = second.scope.snapshot().unwrap().work;
-        let result = second_host.retire_active_context(&first_retirement);
+        let result = second_host.authorize_parent_retirement(&first_retirement);
         let after = second_host
             .resources
             .admission

@@ -44,19 +44,43 @@ impl<J: QueuedPreparation> HostExecutorPair<J> {
         cleanup: HostExecutorLimits,
         run: fn(J),
     ) -> Result<Self, (std::io::Error, Self)> {
+        Self::start_inner(ordinary, cleanup, run, None)
+    }
+    pub(crate) fn start_with_waker(
+        ordinary: HostExecutorLimits,
+        cleanup: HostExecutorLimits,
+        run: fn(J),
+        waker: std::task::Waker,
+    ) -> Result<Self, (std::io::Error, Self)> {
+        Self::start_inner(ordinary, cleanup, run, Some(waker))
+    }
+    fn start_inner(
+        ordinary: HostExecutorLimits,
+        cleanup: HostExecutorLimits,
+        run: fn(J),
+        waker: Option<std::task::Waker>,
+    ) -> Result<Self, (std::io::Error, Self)> {
         let mut owner = Self {
             ordinary: None,
             cleanup: None,
             startup_complete: false,
         };
-        match HostExecutor::start(ordinary, run) {
+        let started = match waker.as_ref() {
+            Some(waker) => HostExecutor::start_with_waker(ordinary, run, waker.clone()),
+            None => HostExecutor::start(ordinary, run),
+        };
+        match started {
             Ok(pool) => owner.ordinary = Some(pool),
             Err((error, pool)) => {
                 owner.ordinary = Some(pool);
                 return Err((error, owner));
             }
         }
-        match HostExecutor::start(cleanup, run) {
+        let started = match waker {
+            Some(waker) => HostExecutor::start_with_waker(cleanup, run, waker),
+            None => HostExecutor::start(cleanup, run),
+        };
+        match started {
             Ok(pool) => owner.cleanup = Some(pool),
             Err((error, pool)) => {
                 owner.cleanup = Some(pool);

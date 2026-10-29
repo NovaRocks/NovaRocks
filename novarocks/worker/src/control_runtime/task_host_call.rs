@@ -202,6 +202,7 @@ struct State {
     observer_consumed: bool,
     payment: Option<CapacityBundle>,
     retired: bool,
+    effect: Option<EffectTicket<WorkerAction>>,
 }
 struct Custody {
     kind: TaskHostCallKind,
@@ -394,6 +395,7 @@ impl TaskHostCall {
                 observer_consumed: false,
                 payment,
                 retired: false,
+                effect: None,
             }),
             retained: Mutex::new(None),
         });
@@ -486,6 +488,39 @@ impl TaskHostCall {
         }
         drained.validate(&self.0.runtime, self.0.actor)?;
         self.take_job(StartPermission::FailurePublicationsDrained)
+    }
+    /// The original normal retirement effect and the original Task's positive
+    /// borrower inventory authorize this once-only execution-port close. The
+    /// effect remains with the Task owner until its physical cleanup commits.
+    pub(super) fn take_retire_effect_job(
+        &self,
+        ticket: &EffectTicket<WorkerAction>,
+        exited: &super::task::TaskExecutionBorrowersExited<'_>,
+    ) -> Result<TaskHostCallJob, TaskHostCallError> {
+        if self.0.kind != TaskHostCallKind::RetireBorrowing
+            || ticket.actor != self.0.actor
+            || !matches!(&ticket.effect, WorkerAction::Context(ContextEffect::RetireTask {task,..} | ContextEffect::FinalizeTaskExecution {task}) if *task==self.0.task)
+            || !exited.matches(self.0.task, &self.0.scope)
+        {
+            return Err(TaskHostCallError::WrongTask);
+        }
+        self.0.runtime.validate_effect_ticket(ticket)?;
+        self.take_job(StartPermission::Normal(ticket.generation))
+    }
+    /// The actual once-only call owns the original effect as well as its
+    /// preadmitted callback/report. Refusal returns the same exclusive ticket.
+    pub(crate) fn handoff_stop_effect(
+        &self,
+        ticket: EffectTicket<WorkerAction>,
+    ) -> Result<TaskHostCallJob, (TaskHostCallError, EffectTicket<WorkerAction>)> {
+        let job = match self.take_stop_effect_job(&ticket) {
+            Ok(job) => job,
+            Err(error) => return Err((error, ticket)),
+        };
+        let mut state = self.0.state.lock().expect("original Task host effect");
+        assert!(state.effect.is_none(), "one original Stop effect");
+        state.effect = Some(ticket);
+        Ok(job)
     }
     pub(crate) fn take_stop_effect_job(
         &self,
@@ -742,6 +777,11 @@ impl TaskHostCallJob {
         };
         if exited {
             if let Err(error) = authority.exited() {
+                tracing::error!(
+                    pid = std::process::id(),
+                    ?error,
+                    "Original host call exit failed"
+                );
                 std::mem::forget((error, self.sender.take()));
                 std::process::abort();
             }
@@ -751,8 +791,31 @@ impl TaskHostCallJob {
         }
         let sender = self.sender.take().expect("original host return sender");
         if let Err(refusal) = sender.publish(outcome) {
+            tracing::error!(pid = std::process::id(), error = ?refusal.error,
+                "Original host call return publication failed");
             std::mem::forget(refusal);
             std::process::abort();
+        }
+        if exited {
+            let ticket = self
+                .owner
+                .0
+                .state
+                .lock()
+                .expect("original completed host effect")
+                .effect
+                .take();
+            if let Some(ticket) = ticket {
+                if let Err(refusal) = self.owner.0.runtime.effect_completed(ticket) {
+                    self.owner
+                        .0
+                        .state
+                        .lock()
+                        .expect("refused original host effect")
+                        .effect = Some(refusal.ticket);
+                    self.owner.unresolved();
+                }
+            }
         }
         self.owner.0.pending.pending();
     }

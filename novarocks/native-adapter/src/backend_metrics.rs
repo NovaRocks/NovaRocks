@@ -38,17 +38,10 @@ pub struct BackendMetricsRegistry {
     registry: Registry,
     native_query_resources:
         Option<std::sync::Arc<dyn Fn() -> NativeQueryExecutionResourceSnapshot + Send + Sync>>,
-    worker_reservations: Option<(
-        std::sync::Arc<novarocks_worker::AdmissionReservationObservation>,
-        usize,
-    )>,
-    worker_registry_lock: Option<std::sync::Arc<novarocks_worker::RegistryLockObservation>>,
+    worker_node: Option<novarocks_worker::WorkerTaskControl>,
+    worker_node_gauges: IntGaugeVec,
+    worker_node_snapshot_available: IntGauge,
     process_memory: Option<(ProcessMemoryObservation, ProcessMemoryGauges)>,
-    task_preparation: Option<std::sync::Arc<novarocks_worker::TaskExecutionRegistry>>,
-    task_preparation_gauges: IntGaugeVec,
-    preparation_snapshot_available: IntGauge,
-    root_ownership_gauges: IntGaugeVec,
-    root_snapshot_available: IntGauge,
     scrape_lock: std::sync::Mutex<()>,
 }
 
@@ -407,35 +400,23 @@ pub(crate) static NATIVE_QUERY_RESOURCE_SCRAPE_LOCK: Mutex<()> = Mutex::new(());
 impl BackendMetricsRegistry {
     pub fn new() -> Result<Self, String> {
         let registry = Registry::new();
-        let task_preparation_gauges = IntGaugeVec::new(
-            Opts::new("novarocks_backend_task_preparation", "Temporary preparation ownership and configured limits from the Worker charge ledger."),
-            &["resource", "dimension"],
-        ).map_err(|error| format!("construct task preparation metrics: {error}"))?;
-        registry
-            .register(Box::new(task_preparation_gauges.clone()))
-            .map_err(|error| format!("register task preparation metrics: {error}"))?;
-        let preparation_snapshot_available = IntGauge::with_opts(Opts::new(
-            "novarocks_backend_task_preparation_snapshot_available",
-            "Whether this scrape obtained the exact Worker preparation charge ledger.",
-        ))
-        .map_err(|error| format!("construct preparation snapshot availability: {error}"))?;
-        registry
-            .register(Box::new(preparation_snapshot_available.clone()))
-            .map_err(|error| format!("register preparation snapshot availability: {error}"))?;
-        let root_ownership_gauges = IntGaugeVec::new(
-            Opts::new("novarocks_backend_root_ownership", "Bounded census of context-owned root channels. Logical state is lock-consistent per channel; physical owner counters are independent samples. Released channels and other Arc tails are excluded; zero is not a last-owner exit receipt."),
+        let worker_node_gauges = IntGaugeVec::new(
+            Opts::new(
+                "novarocks_backend_worker_node_resources",
+                "Actual charged units independently sampled from the original Worker Node ledger. Includes retained/exiting holders; not coherent cross-dimension totals, queue/running counts or exit receipts.",
+            ),
             &["resource"],
-        ).map_err(|error| format!("construct root ownership metrics: {error}"))?;
+        ).map_err(|error| format!("construct Worker Node resource metrics: {error}"))?;
         registry
-            .register(Box::new(root_ownership_gauges.clone()))
-            .map_err(|error| format!("register root ownership metrics: {error}"))?;
-        let root_snapshot_available = IntGauge::with_opts(Opts::new(
-            "novarocks_backend_root_ownership_snapshot_available",
-            "Whether this scrape completed the bounded nonblocking Worker root census. Busy locks or insufficient scan coverage are unavailable, never zero usage.",
-        )).map_err(|error| format!("construct root snapshot availability: {error}"))?;
+            .register(Box::new(worker_node_gauges.clone()))
+            .map_err(|error| format!("register Worker Node resource metrics: {error}"))?;
+        let worker_node_snapshot_available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_worker_node_snapshot_available",
+            "Whether this scrape has the actual Worker Node charged-resource observation owner. Unavailable resource observations are omitted, never reported as zero usage.",
+        )).map_err(|error| format!("construct Worker Node snapshot availability: {error}"))?;
         registry
-            .register(Box::new(root_snapshot_available.clone()))
-            .map_err(|error| format!("register root snapshot availability: {error}"))?;
+            .register(Box::new(worker_node_snapshot_available.clone()))
+            .map_err(|error| format!("register Worker Node snapshot availability: {error}"))?;
         let collectors = [
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone())
                 as Box<dyn prometheus::core::Collector>,
@@ -462,10 +443,6 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_NATIVE_CONTROL_QUEUE_WAIT).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_BLOCKING_QUEUE_WAIT).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_ASYNC_FIRST_POLL_LAG).clone()),
-            Box::new(Lazy::force(&BACKEND_WORKER_CONTEXT_RESERVATIONS).clone()),
-            Box::new(Lazy::force(&BACKEND_WORKER_RESERVATION_LAST_PUBLISHED).clone()),
-            Box::new(Lazy::force(&BACKEND_WORKER_REGISTRY_LOCK).clone()),
-            Box::new(Lazy::force(&BACKEND_WORKER_REGISTRY_LOCK_SAMPLE_AGE).clone()),
             Box::new(Lazy::force(&BACKEND_SATURATION_SOURCE_AVAILABLE).clone()),
         ];
         for collector in collectors {
@@ -492,14 +469,10 @@ impl BackendMetricsRegistry {
         Ok(Self {
             registry,
             native_query_resources: None,
-            worker_reservations: None,
-            worker_registry_lock: None,
+            worker_node: None,
+            worker_node_gauges,
+            worker_node_snapshot_available,
             process_memory: None,
-            task_preparation: None,
-            task_preparation_gauges,
-            preparation_snapshot_available,
-            root_ownership_gauges,
-            root_snapshot_available,
             scrape_lock: std::sync::Mutex::new(()),
         })
     }
@@ -586,95 +559,32 @@ impl BackendMetricsRegistry {
         self
     }
 
-    pub fn with_worker_reservations(
-        mut self,
-        observation: std::sync::Arc<novarocks_worker::AdmissionReservationObservation>,
-        limit: usize,
-    ) -> Self {
-        self.worker_reservations = Some((observation, limit));
-        self
-    }
-
-    pub fn with_worker_registry_lock(
-        mut self,
-        observation: std::sync::Arc<novarocks_worker::RegistryLockObservation>,
-    ) -> Self {
-        self.worker_registry_lock = Some(observation);
-        self
-    }
-
-    pub fn with_task_preparation(
-        mut self,
-        owner: std::sync::Arc<novarocks_worker::TaskExecutionRegistry>,
-    ) -> Self {
-        self.task_preparation = Some(owner);
+    pub fn with_worker_node(mut self, control: novarocks_worker::WorkerTaskControl) -> Self {
+        self.worker_node = Some(control);
         self
     }
 
     fn gather(&self) -> Result<Vec<prometheus::proto::MetricFamily>, String> {
         // Keep owner sampling, gauge projection and collection in one scrape order.
         let _scrape = self.scrape_lock.lock().expect("backend metric scrape lock");
-        let preparation = self
-            .task_preparation
+        let node = self
+            .worker_node
             .as_ref()
-            .map(|owner| owner.try_preparation_snapshot())
-            .transpose()
-            .map_err(|error| format!("sample Worker preparation charge ledger: {error}"))?
-            .flatten();
-        self.preparation_snapshot_available
-            .set(i64::from(preparation.is_some()));
-        if let Some(snapshot) = preparation {
-            for (resource, used, limit) in [
-                ("positions", snapshot.positions, snapshot.position_limit),
-                (
-                    "context_positions",
-                    snapshot.context_positions,
-                    snapshot.context_position_limit,
-                ),
-                (
-                    "queued_positions",
-                    snapshot.queued_positions,
-                    snapshot.position_limit,
-                ),
-                ("workers", snapshot.workers, snapshot.worker_limit),
-                ("bytes", snapshot.bytes, snapshot.byte_limit),
-            ] {
-                self.task_preparation_gauges
-                    .with_label_values(&[resource, "used"])
-                    .set(i64::try_from(used).unwrap_or(i64::MAX));
-                self.task_preparation_gauges
-                    .with_label_values(&[resource, "limit"])
-                    .set(i64::try_from(limit).unwrap_or(i64::MAX));
-            }
-        }
-        let roots = self
-            .task_preparation
-            .as_ref()
-            .map(|owner| owner.try_root_ownership_snapshot())
-            .transpose()
-            .map_err(|error| format!("sample Worker root ownership: {error}"))?
-            .flatten();
-        self.root_snapshot_available.set(i64::from(roots.is_some()));
-        if let Some(snapshot) = roots {
+            .map(|owner| owner.metrics_snapshot());
+        self.worker_node_snapshot_available
+            .set(i64::from(node.is_some()));
+        if let Some(snapshot) = node {
             for (resource, used) in [
-                ("channels", snapshot.channels),
-                ("terminal_task_records", snapshot.terminal_task_records),
-                ("producers_running", snapshot.producers_running),
-                ("producers_exited", snapshot.producers_exited),
-                ("ends_published", snapshot.ends_published),
-                ("ends_acknowledged", snapshot.ends_acknowledged),
-                ("sealed", snapshot.sealed),
-                ("data_positions", snapshot.data_positions),
-                ("payload_bytes", snapshot.payload_bytes),
-                ("segments", snapshot.segments),
-                ("deliveries", snapshot.deliveries),
-                ("retained_reservations", snapshot.retained_reservations),
-                ("metadata_holders", snapshot.metadata_holders),
-                ("metadata_bytes", snapshot.metadata_bytes),
+                ("active_tasks", snapshot.active_tasks),
+                ("preparing_tasks", snapshot.preparing_tasks),
+                ("preparing_bytes", snapshot.preparing_bytes),
+                ("requests", snapshot.requests),
+                ("tickets", snapshot.tickets),
+                ("contexts", snapshot.contexts),
             ] {
-                self.root_ownership_gauges
+                self.worker_node_gauges
                     .with_label_values(&[resource])
-                    .set(i64::try_from(used).unwrap_or(i64::MAX));
+                    .set(gauge_value(used));
             }
         }
         let _query_resource_scrape_guard = self.native_query_resources.as_ref().map(|_| {
@@ -704,24 +614,10 @@ impl BackendMetricsRegistry {
                 snapshot.active_fragments,
             );
         }
-        if let Some((observation, limit)) = &self.worker_reservations {
-            publish_worker_context_reservation(
-                observation.used(),
-                *limit,
-                observation.last_published_unix_seconds(),
-            );
-        }
-        if let Some(observation) = &self.worker_registry_lock {
-            publish_worker_registry_lock(observation.snapshot());
-        }
         let mut families = self.registry.gather();
-        if preparation.is_none() {
-            // This scrape has no exact ledger. Previously sampled values must
-            // not appear as current values, and unavailable is not zero usage.
-            families.retain(|family| family.get_name() != "novarocks_backend_task_preparation");
-        }
-        if roots.is_none() {
-            families.retain(|family| family.get_name() != "novarocks_backend_root_ownership");
+        if node.is_none() {
+            families
+                .retain(|family| family.get_name() != "novarocks_backend_worker_node_resources");
         }
         Ok(families)
     }
@@ -961,40 +857,6 @@ static BACKEND_NATIVE_ASYNC_FIRST_POLL_LAG: Lazy<HistogramVec> = Lazy::new(|| {
         &["class"],
     )
     .expect("construct Native async first-poll lag histogram")
-});
-
-static BACKEND_WORKER_CONTEXT_RESERVATIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new("novarocks_backend_worker_context_reservations", "Worker-owned context reservations: atomic observation projection and configured limit."),
-        &["dimension"],
-    ).expect("construct Worker context reservation gauge")
-});
-
-static BACKEND_WORKER_RESERVATION_LAST_PUBLISHED: Lazy<prometheus::IntGauge> = Lazy::new(|| {
-    prometheus::IntGauge::with_opts(Opts::new(
-        "novarocks_backend_worker_reservation_last_published_unixtime_seconds",
-        "Last Worker context-reservation observation publication, or zero if unavailable.",
-    ))
-    .expect("construct Worker reservation freshness gauge")
-});
-
-static BACKEND_WORKER_REGISTRY_LOCK: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new(
-            "novarocks_backend_worker_registry_lock_observation",
-            "Actual Worker registry mutex wait/hold samples, cumulative nanoseconds, and maximum nanoseconds. Intentional condition waits are excluded.",
-        ),
-        &["phase", "statistic"],
-    )
-    .expect("construct Worker registry lock gauge")
-});
-
-static BACKEND_WORKER_REGISTRY_LOCK_SAMPLE_AGE: Lazy<prometheus::IntGauge> = Lazy::new(|| {
-    prometheus::IntGauge::with_opts(Opts::new(
-        "novarocks_backend_worker_registry_lock_last_sample_age_nanoseconds",
-        "Age of the last actual Worker registry lock sample, or -1 before any sample.",
-    ))
-    .expect("construct Worker registry lock freshness gauge")
 });
 
 static BACKEND_SATURATION_SOURCE_AVAILABLE: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -1330,59 +1192,6 @@ pub(crate) fn native_async_first_poll_lag(class: &'static str, duration: std::ti
         .observe(duration.as_secs_f64());
 }
 
-pub(crate) fn publish_worker_context_reservation(
-    used: usize,
-    limit: usize,
-    last_published_unix_seconds: u64,
-) {
-    BACKEND_WORKER_CONTEXT_RESERVATIONS
-        .with_label_values(&["used"])
-        .set(used as i64);
-    BACKEND_WORKER_CONTEXT_RESERVATIONS
-        .with_label_values(&["limit"])
-        .set(limit as i64);
-    BACKEND_WORKER_CONTEXT_RESERVATIONS
-        .with_label_values(&["waiting"])
-        .set(0);
-    BACKEND_WORKER_RESERVATION_LAST_PUBLISHED
-        .set(last_published_unix_seconds.min(i64::MAX as u64) as i64);
-    BACKEND_SATURATION_SOURCE_AVAILABLE
-        .with_label_values(&["worker_context_reservation"])
-        .set(1);
-}
-
-fn publish_worker_registry_lock(snapshot: novarocks_worker::RegistryLockSnapshot) {
-    for (phase, samples, total_nanos, max_nanos) in [
-        (
-            "wait",
-            snapshot.wait_samples,
-            snapshot.wait_nanoseconds,
-            snapshot.wait_max_nanoseconds,
-        ),
-        (
-            "hold",
-            snapshot.hold_samples,
-            snapshot.hold_nanoseconds,
-            snapshot.hold_max_nanoseconds,
-        ),
-    ] {
-        for (statistic, value) in [
-            ("samples", samples),
-            ("total_nanoseconds", total_nanos),
-            ("max_nanoseconds", max_nanos),
-        ] {
-            BACKEND_WORKER_REGISTRY_LOCK
-                .with_label_values(&[phase, statistic])
-                .set(value.min(i64::MAX as u64) as i64);
-        }
-    }
-    BACKEND_WORKER_REGISTRY_LOCK_SAMPLE_AGE.set(
-        snapshot
-            .sample_age_nanoseconds
-            .map_or(-1, |age| age.min(i64::MAX as u64) as i64),
-    );
-}
-
 fn publish_process_memory(
     gauges: &ProcessMemoryGauges,
     counted: AttributionSnapshot,
@@ -1528,12 +1337,7 @@ fn refresh_backend_gauges() {
 /// Make the documented BE metric families observable before their first event
 /// without resetting values already published by their application owner.
 fn ensure_backend_metric_label_families() {
-    for source in [
-        "native_ingress",
-        "worker_context_reservation",
-        "exchange_slot",
-        "memory_charge",
-    ] {
+    for source in ["native_ingress", "exchange_slot", "memory_charge"] {
         let _ = BACKEND_SATURATION_SOURCE_AVAILABLE.get_metric_with_label_values(&[source]);
     }
     for lane in crate::native_lane::NativeLane::ALL {

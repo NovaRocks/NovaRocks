@@ -28,11 +28,18 @@ pub(crate) mod context_ready;
 pub(crate) mod control_internal;
 pub(crate) mod control_request;
 pub(crate) mod control_ticket;
+pub(crate) mod dynamic_filters;
 pub(crate) mod establish_executors;
 pub(crate) mod establish_ingress;
 pub(crate) mod establish_route;
+pub(crate) mod node;
+pub(crate) mod node_api;
+pub(crate) mod node_bootstrap;
+pub(crate) mod node_geometry;
+pub(crate) mod node_metrics;
 pub(crate) mod process_control;
 pub(crate) mod request_endpoint;
+pub(crate) mod request_observation;
 pub(crate) mod request_ready;
 pub(crate) mod service;
 
@@ -45,6 +52,7 @@ pub(crate) mod preparation;
 pub(crate) mod preparation_refusal;
 
 pub(crate) mod task;
+pub(crate) mod task_capacity;
 pub(crate) mod task_publication;
 
 pub(crate) mod causal;

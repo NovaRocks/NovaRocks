@@ -96,6 +96,20 @@ pub struct StorageNeed {
     pub requests: usize,
 }
 
+/// The extra actual Root data body. Its request author and Source pair are
+/// already paid by the original R; retained data adds no input or Source.
+pub(crate) const ROOT_READ_DATA_STORAGE: StorageNeed = StorageNeed {
+    inputs: 0,
+    batches: 0,
+    effects: 0,
+    cuts: 0,
+    replies: 0,
+    completions: 1,
+    captures: 1,
+    work: 1,
+    requests: 0,
+};
+
 impl StorageNeed {
     pub fn checked_sub(self, other: Self) -> Result<Self, PolicyError> {
         Ok(Self {
@@ -218,6 +232,12 @@ impl StorageNeed {
     /// itself can retain one callback/input capture and one reliable exit.
     /// Each candidate additionally owns its original cleanup Work and report;
     /// a cleanup effect alone cannot account for its opaque source destructor.
+    /// One actual shared R can carry an incoming Task cut and one independent
+    /// planned-domain feedback cut. Context compare/application use the same
+    /// maximum with two distinct direct returns, never another R position.
+    pub(crate) fn domain_request() -> Result<Self, PolicyError> {
+        Self::role(true).checked_add(Self::role(false))
+    }
     pub fn role(reply: bool) -> Self {
         Self {
             inputs: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
@@ -228,7 +248,11 @@ impl StorageNeed {
             replies: usize::from(reply),
             requests: usize::from(reply),
             completions: 3,
-            captures: 3,
+            // Reply R owns the in-flight, pending and external replacement
+            // notification captures in addition to its original Source2.
+            captures: 3
+                + (3 + crate::control_runtime::request_observation::REQUEST_OBSERVATION_CAPTURES)
+                    * usize::from(reply),
             work: 3,
         }
     }
@@ -259,16 +283,31 @@ pub enum TaskLifecycleRole {
     WallTime,
     TerminalPublisher,
     TerminalAction,
+    QuiesceClose,
     ContextClose,
 }
 impl TaskLifecycleRole {
     pub(crate) const COUNT: usize = Self::ContextClose as usize + 1;
-    const LOADING: [Self; 2] = [Self::InputLoaded, Self::LoaderExited];
+    pub(crate) const CONTEXT_CLOSE: [Self; 2] = [Self::QuiesceClose, Self::ContextClose];
+    pub(crate) const LOADING: [Self; 4] = [
+        Self::InputLoaded,
+        Self::LoaderExited,
+        Self::QuiesceClose,
+        Self::ContextClose,
+    ];
+    pub(crate) fn is_context_close(self) -> bool {
+        Self::CONTEXT_CLOSE.contains(&self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlRuntimePolicy {
     pub ingress: IngressRoleLimits,
+    /// Independently admitted Root RPCs, outside the operation-batch gates.
+    pub root_request_positions: usize,
+    /// Long-lived status streams use their actual independent transport lane,
+    /// without monopolizing ordinary operation setup positions.
+    pub observation_request_positions: usize,
     pub request_roles: usize,
     pub task_base: StorageNeed,
     /// Creating owns these original positions before any input getter runs.
@@ -284,7 +323,24 @@ pub struct ControlRuntimePolicy {
 
 impl ControlRuntimePolicy {
     pub fn try_new(ingress: IngressRoleLimits) -> Result<Self, PolicyError> {
-        let request_roles = ingress.request_roles()?;
+        Self::try_new_with_root_requests(ingress, 0)
+    }
+    pub fn try_new_with_root_requests(
+        ingress: IngressRoleLimits,
+        root_request_positions: usize,
+    ) -> Result<Self, PolicyError> {
+        Self::try_new_with_request_sources(ingress, root_request_positions, 0)
+    }
+    pub fn try_new_with_request_sources(
+        ingress: IngressRoleLimits,
+        root_request_positions: usize,
+        observation_request_positions: usize,
+    ) -> Result<Self, PolicyError> {
+        let request_roles = ingress
+            .request_roles()?
+            .checked_add(root_request_positions)
+            .and_then(|positions| positions.checked_add(observation_request_positions))
+            .ok_or(PolicyError::Overflow)?;
         // Preparation owns four original unwind/publication roles plus its
         // fixed cleanup steps. Their counts share the actual role definitions.
         let fixed_roles = TaskLifecycleRole::COUNT
@@ -316,10 +372,16 @@ impl ControlRuntimePolicy {
                 crate::control_runtime::preparation_refusal::HOST_REFUSAL_CAPTURE_POSITIONS,
             )
             .ok_or(PolicyError::Overflow)?;
+        // The original Task disposal holds one observer capture until its
+        // physical retained-event callback and capture destruction return.
+        task_base.captures = task_base
+            .captures
+            .checked_add(1)
+            .ok_or(PolicyError::Overflow)?;
         let mut loading = StorageNeed::role(false)
             .checked_mul(TaskLifecycleRole::LOADING.len())?
             .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?;
-        // Loading's two real producer/input holders have their own original
+        // Loading's two real producer/input holders and both finite close authors have original
         // Work/report geometry. Keep the candidate positions of their actual
         // cuts, and fund the Task's open/consuming candidates before exposing
         // even its first port. Accepted acquires only the remaining inventory.
@@ -329,10 +391,12 @@ impl ControlRuntimePolicy {
             .and_then(|cuts| cuts.checked_add(4))
             .ok_or(PolicyError::Overflow)?;
         loading.work = crate::control_runtime::loading::LOADING_WORK_POSITIONS
-            .checked_add(loading_sources)
+            .checked_add(TaskLifecycleRole::CONTEXT_CLOSE.len()) // Both close authors predate Accepted.
+            .and_then(|work| work.checked_add(loading_sources))
             .ok_or(PolicyError::Overflow)?;
         loading.completions = crate::control_runtime::loading::LOADING_REPORT_POSITIONS
-            .checked_add(loading_sources)
+            .checked_add(TaskLifecycleRole::CONTEXT_CLOSE.len()) // Each has its original exit report.
+            .and_then(|reports| reports.checked_add(loading_sources))
             .ok_or(PolicyError::Overflow)?;
         loading.captures = loading
             .captures
@@ -354,20 +418,28 @@ impl ControlRuntimePolicy {
         // Stop and execution-borrow retirement are host calls, not causal
         // input authors. Both must exist before exposing the first Task port.
         loading = loading.checked_add(host_calls)?;
+        // Rejected preparation can reach terminal retention before Accepted;
+        // its same physical disposal observer must be funded from first exposure.
+        loading.captures = loading
+            .captures
+            .checked_add(1)
+            .ok_or(PolicyError::Overflow)?;
         let accepted = task_base.checked_sub(loading)?;
         let max_task_cuts = fixed_roles
-            .checked_add(request_roles)
+            .checked_add(request_roles.checked_mul(2).ok_or(PolicyError::Overflow)?)
             .and_then(|n| n.checked_add(ingress.root_read_holders))
             .ok_or(PolicyError::Overflow)?;
         Ok(Self {
             ingress,
+            root_request_positions,
+            observation_request_positions,
             request_roles,
             task_base,
             loading,
             accepted,
             max_task_cuts,
-            request_pool: StorageNeed::role(true).checked_mul(request_roles)?,
-            root_read_pool_per_root: StorageNeed::role(false)
+            request_pool: StorageNeed::domain_request()?.checked_mul(request_roles)?,
+            root_read_pool_per_root: ROOT_READ_DATA_STORAGE
                 .checked_mul(ingress.root_read_holders)?,
         })
     }
@@ -393,7 +465,9 @@ impl ControlRuntimePolicy {
         // Periodic data uses one original input per live Task, independently
         // of how many RPC positions happen to be busy. Move its already paid
         // position between classes rather than adding another storage charge.
-        let task_ordinary = crate::control_runtime::operator_statistics::STATISTICS_INPUT_POSITIONS;
+        let task_ordinary = crate::control_runtime::operator_statistics::STATISTICS_INPUT_POSITIONS
+            .checked_add(crate::control_runtime::dynamic_filters::RF_INPUT_POSITIONS)
+            .ok_or(PolicyError::Overflow)?;
         let lifecycle = self
             .task_base
             .inputs
@@ -401,7 +475,11 @@ impl ControlRuntimePolicy {
             .ok_or(PolicyError::InvalidStorageGeometry)?
             .checked_add(self.root_read_pool_per_root.inputs)
             .and_then(|n| n.checked_mul(max_live_tasks))
-            .and_then(|n| n.checked_add(self.request_roles))
+            .and_then(|n| {
+                self.request_roles
+                    .checked_mul(3)
+                    .and_then(|r| n.checked_add(r))
+            })
             .ok_or(PolicyError::Overflow)?;
         let ordinary = task_ordinary
             .checked_mul(max_live_tasks)
@@ -611,7 +689,7 @@ mod tests {
         assert_eq!(policy.loading.cuts, 2);
         assert_eq!(policy.loading.work, 13);
         assert_eq!(policy.loading.completions, 12);
-        assert_eq!(policy.loading.captures, 12);
+        assert_eq!(policy.loading.captures, 13);
         assert_eq!(
             policy.loading.checked_add(policy.accepted).unwrap(),
             policy.task_base

@@ -61,6 +61,7 @@ pub(crate) enum SettlementDispatchError {
     Runtime(RuntimeError),
     Continuation(novarocks_control_runtime::continuation::ContinuationError),
     FailureSnapshotMissing,
+    Ordering(crate::control_runtime::effect_dispatch::DispatchError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SettlementRun {
@@ -113,6 +114,8 @@ pub(crate) struct SettlementRole {
     committed_input: Arc<Mutex<Weak<Snapshot>>>,
     slot: ContinuationSlot<InvocationInput>,
     health: Arc<ExecutionHealth>,
+    original_effect: Arc<Mutex<Option<EffectTicket<WorkerAction>>>>,
+    effect_runtime: Arc<Mutex<Option<ActorRuntime<WorkerActor>>>>,
 }
 impl SettlementRole {
     pub(crate) fn from_admitted(
@@ -143,6 +146,8 @@ impl SettlementRole {
                 committed_input: Arc::new(Mutex::new(Weak::new())),
                 slot,
                 health,
+                original_effect: Arc::new(Mutex::new(None)),
+                effect_runtime: Arc::new(Mutex::new(None)),
             },
             permit,
         )
@@ -187,6 +192,59 @@ impl SettlementRole {
         runtime
             .commit_reply(ticket, &self.barrier, Arc::new(port.accepted()))
             .map_err(|(error, _snapshot)| SettlementDispatchError::Driver(error))
+    }
+    pub(crate) fn handoff_original_barrier(
+        &self,
+        runtime: &ActorRuntime<WorkerActor>,
+        dispatch: &mut crate::control_runtime::effect_dispatch::EffectDispatch,
+        ticket: EffectTicket<WorkerAction>,
+        port: &TaskRuntimePort,
+    ) -> Result<(), (SettlementDispatchError, EffectTicket<WorkerAction>)> {
+        if let Err(error) = self.commit_barrier(runtime, &ticket, port) {
+            return Err((error, ticket));
+        }
+        // The real barrier publication releases only Task ordering. Its
+        // original ticket/report remain held through physical callback exit.
+        if let Err(error) = dispatch.publication_committed(runtime, &ticket) {
+            return Err((SettlementDispatchError::Ordering(error), ticket));
+        }
+        let mut effect = self
+            .original_effect
+            .lock()
+            .expect("original settlement effect");
+        assert!(effect.is_none(), "one original settlement barrier");
+        *effect = Some(ticket);
+        *self.effect_runtime.lock().expect("original effect runtime") = Some(runtime.clone());
+        Ok(())
+    }
+    /// Called after the actual callback/input captures have returned. Panic
+    /// and generation deferral retain the same original ticket in this role.
+    pub(crate) fn complete_original_barrier(&self) -> Result<(), SettlementDispatchError> {
+        if !self.actual_call_exited() {
+            return Ok(());
+        }
+        let ticket = self
+            .original_effect
+            .lock()
+            .expect("original settlement effect")
+            .take();
+        if let Some(ticket) = ticket {
+            let runtime = self
+                .effect_runtime
+                .lock()
+                .expect("original effect runtime")
+                .as_ref()
+                .expect("same original runtime")
+                .clone();
+            if let Err(refusal) = runtime.effect_completed(ticket) {
+                *self
+                    .original_effect
+                    .lock()
+                    .expect("refused original settlement effect") = Some(refusal.ticket);
+                return Err(SettlementDispatchError::Driver(refusal.error));
+            }
+        }
+        Ok(())
     }
     /// The supervisor publishes OwnerFailed (or preserves an existing
     /// conclusion) before granting an uncommitted role's barrier. Its original

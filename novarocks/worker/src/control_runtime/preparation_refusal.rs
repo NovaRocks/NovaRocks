@@ -186,6 +186,79 @@ impl RefusalCustody {
     }
 }
 
+/// The source's canonical occurrence, including aliases made before attachment,
+/// owns this one funded child. There is no strong edge back to that source from
+/// RefusalCustody: its self-retention holds only the original role and Unknown.
+struct RefusalSourceRetention {
+    custody: Arc<RefusalCustody>,
+    started: bool,
+}
+impl std::fmt::Debug for RefusalSourceRetention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefusalSourceRetention")
+            .field("task", &self.custody.task)
+            .field("started", &self.started)
+            .finish_non_exhaustive()
+    }
+}
+impl novarocks_execution_contract::SourceRetentionCapability for RefusalSourceRetention {}
+
+/// Finish only the original source holder after its real canonical last Drop.
+/// Keeping this borrowed preserves the complete original role on every error.
+fn finish_retained_role(role: &mut AdmittedCompletionRole) -> Result<bool, RuntimeError> {
+    role.work.body_exited_with_report(&role.report)?;
+    role.work.captures_exited()?;
+    role.report.body_exited()?;
+    role.report.captures_exited()?;
+    role.report.consume(HOST)?;
+    if !role.report.try_retire()? {
+        return Ok(false);
+    }
+    let resources = role.capacity.resources()?;
+    role.capacity.release(&resources)?;
+    Ok(true)
+}
+impl Drop for RefusalSourceRetention {
+    fn drop(&mut self) {
+        if !self.started || std::thread::panicking() {
+            // A source destructor can unwind before releasing this marker.
+            // A later normal alias must never turn that Unknown into exit.
+            self.custody.unresolved();
+            return;
+        }
+        let mut role = {
+            let mut state = self.custody.state.lock().expect("canonical refusal role");
+            state
+                .role
+                .take()
+                .expect("one original canonical source role")
+        };
+        // No custody/publication lock surrounds source exit or raw panic
+        // custody. Common errors also preserve this exact role, not a retry.
+        let exited = catch_unwind(AssertUnwindSafe(|| finish_retained_role(&mut role)));
+        match exited {
+            Ok(Ok(true)) => {
+                drop(role);
+                self.custody.pending.pending();
+                self.custody.release_retention();
+            }
+            result => {
+                let mut state = self
+                    .custody
+                    .state
+                    .lock()
+                    .expect("canonical refusal Unknown");
+                state.role = Some(role);
+                if let Err(panic) = result {
+                    state.panic = Some(ManuallyDrop::new(panic));
+                }
+                drop(state);
+                self.custody.unresolved();
+            }
+        }
+    }
+}
+
 #[must_use = "The original refusal source retains preparation work until transfer or actual disposal"]
 pub(crate) struct HostPreparationRefusal {
     neutral: OperationDomainFailure,
@@ -203,6 +276,55 @@ impl HostPreparationRefusal {
     }
     pub(crate) fn is_closed_queue(&self) -> bool {
         self.closed_queue
+    }
+    /// Move the original rich source into its canonical source node, together
+    /// with this exact already paid preparation child. No second error clone
+    /// is retained by the Task. Aliases of an inner shared cause keep the same
+    /// marker until that canonical cause's actual last destructor returns.
+    ///
+    /// A start refusal or unwinding source remains Unknown in the original
+    /// self-retained custody; dropping a marker cannot invent a positive exit.
+    pub(crate) fn into_retained_source(mut self) -> ExecutionFailure {
+        let (rejection, mut role) = {
+            let mut state = self
+                .custody
+                .state
+                .lock()
+                .expect("original canonical refusal transfer");
+            (
+                state.rejection.take().expect("original refusal source"),
+                state
+                    .role
+                    .take()
+                    .expect("original refusal preparation child"),
+            )
+        };
+        let start = catch_unwind(AssertUnwindSafe(|| role.work.start()));
+        let started = matches!(&start, Ok(Ok(())));
+        {
+            let mut state = self
+                .custody
+                .state
+                .lock()
+                .expect("original canonical refusal role");
+            state.role = Some(role);
+            if let Err(panic) = start {
+                state.panic = Some(ManuallyDrop::new(panic));
+            }
+        }
+        self.active = false;
+        if !started {
+            self.custody.unresolved();
+        }
+        // Move and attach outside every metadata/custody lock. The shared
+        // source author's attachment forwards through known canonical owners;
+        // it neither allocates another Work nor manufactures a source ID.
+        let source = ManuallyDrop::into_inner(rejection).into_failure();
+        source.retain_source_lifetime(Box::new(RefusalSourceRetention {
+            custody: self.custody.clone(),
+            started,
+        }));
+        source
     }
     /// Transfers both original artifacts to the real source/disposal owner.
     /// The receiver must keep the work until its source capture actually exits;

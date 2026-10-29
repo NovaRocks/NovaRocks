@@ -105,6 +105,11 @@ pub(crate) struct InputDisposalJob {
 }
 pub(crate) enum LoaderOutcome {
     Measured(Result<CreationCost, AdmissionRefusal>),
+    Loaded {
+        result: Result<CreationCost, AdmissionRefusal>,
+        shape: novarocks_worker_protocol::context::TaskShape,
+        initial_domains: Vec<novarocks_worker_protocol::domain::TaskDomainInput>,
+    },
     Canceled,
     StartRefused(ExitRoleError),
     Unresolved,
@@ -344,16 +349,76 @@ impl LoaderJob {
                         .take_sources()
                         .expect("one original loading source holder");
                     let result = catch_unwind(AssertUnwindSafe(|| {
-                        crate::task_creation_cost::measure(
+                        let result = crate::task_creation_cost::measure(
                             &sources.request,
                             &sources.input,
                             self.custody.0.ingress_retained_bytes,
-                        )
+                        );
+                        // Neutral projection belongs to the same admitted loader call.
+                        // Codec getters never run on a metadata poller.
+                        use novarocks_execution_contract::TaskDomainUpdate;
+                        use novarocks_worker_protocol::{
+                            context::TaskShape, domain::TaskDomainInput,
+                        };
+                        let descriptor = sources.request.descriptor();
+                        let shape = TaskShape {
+                            split_nodes: descriptor.split_plan_nodes().iter().copied().collect(),
+                            edges: descriptor.topology().edge_ids().collect(),
+                            destinations: descriptor
+                                .topology()
+                                .outbound()
+                                .iter()
+                                .flat_map(|edge| {
+                                    edge.destinations().iter().map(move |destination| {
+                                        (edge.edge_id(), destination.task())
+                                    })
+                                })
+                                .collect(),
+                        };
+                        let initial_domains = sources
+                            .request
+                            .initial_domains()
+                            .iter()
+                            .map(|update| match update {
+                                TaskDomainUpdate::SplitAssignment(intent) => {
+                                    TaskDomainInput::Split {
+                                        node: intent.node(),
+                                        offer: intent.offer(),
+                                    }
+                                }
+                                TaskDomainUpdate::TaskDynamicFilter { version, payload } => {
+                                    TaskDomainInput::Filter {
+                                        version: *version,
+                                        fingerprint: payload.fingerprint(),
+                                    }
+                                }
+                                TaskDomainUpdate::OpenExchangeEdges { version, edges } => {
+                                    TaskDomainInput::Open {
+                                        version: *version,
+                                        edges: edges.clone(),
+                                    }
+                                }
+                                TaskDomainUpdate::CloseExchangeDestination {
+                                    version,
+                                    edge,
+                                    destination,
+                                } => TaskDomainInput::Close {
+                                    version: *version,
+                                    edge: *edge,
+                                    destination: *destination,
+                                },
+                            })
+                            .collect();
+                        LoaderOutcome::Loaded {
+                            result,
+                            shape,
+                            initial_domains,
+                        }
                     }));
                     self.custody.restore_sources(sources);
-                    result.map(|cost| {
+                    result.map(|outcome| {
                         self.custody.0.measured.store(true, Ordering::Release);
-                        LoaderOutcome::Measured(cost)
+                        outcome
                     })
                 }
             }

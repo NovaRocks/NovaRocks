@@ -100,7 +100,11 @@ pub mod task_execution_observation;
 pub mod task_protocol;
 #[cfg(novarocks_dev_controls)]
 pub mod task_protocol_fault;
+#[cfg(test)]
 pub mod task_protocol_ingress;
+pub mod worker_node_ingress;
+mod worker_node_observation;
+mod worker_node_projection;
 pub mod task_query_context_options;
 pub mod task_result_diagnostics;
 pub mod task_shared_facts;

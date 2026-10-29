@@ -73,7 +73,6 @@ pub enum TaskProtocolEvent {
     TaskTerminalRetained {
         identity: TaskIdentity,
         state: TaskState,
-        bytes: usize,
     },
     ContextAbortApplied {
         context: QueryContextRef,
@@ -153,16 +152,8 @@ impl TaskProtocolEvent {
         }
     }
 
-    pub const fn task_terminal_retained(
-        identity: TaskIdentity,
-        state: TaskState,
-        bytes: usize,
-    ) -> Self {
-        Self::TaskTerminalRetained {
-            identity,
-            state,
-            bytes,
-        }
+    pub const fn task_terminal_retained(identity: TaskIdentity, state: TaskState) -> Self {
+        Self::TaskTerminalRetained { identity, state }
     }
 
     /// Maps an abort receipt to the one operation that delivered cancellation.

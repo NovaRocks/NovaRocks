@@ -212,12 +212,15 @@ impl Model {
             };
             let input = match &effect {
                 ContextEffect::ContinueClose { .. } => Some(ContextInput::ContinueClose),
-                ContextEffect::ApplyTaskClose { task, generation } => {
-                    Some(ContextInput::ApplyTaskClose {
-                        task: *task,
-                        generation: *generation,
-                    })
-                }
+                ContextEffect::ApplyTaskClose {
+                    task,
+                    generation,
+                    intent,
+                } => Some(ContextInput::ApplyTaskClose {
+                    task: *task,
+                    generation: *generation,
+                    intent: *intent,
+                }),
                 _ => None,
             };
             observed.push(effect);

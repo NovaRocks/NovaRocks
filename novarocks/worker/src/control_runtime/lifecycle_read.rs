@@ -672,11 +672,16 @@ mod tests {
                 statistics,
                 open_summary,
                 causal,
+                production,
             } = self
                 .host
                 .take()
                 .expect("one real elected lifetime")
                 .into_resources();
+            assert!(
+                production.is_none(),
+                "component fixture never created a production runtime/root owner"
+            );
             assert!(lifecycle_inputs.is_empty());
             assert!(statistics.is_none());
             assert!(

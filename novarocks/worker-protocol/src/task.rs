@@ -45,7 +45,11 @@ pub struct TaskRecord {
     pub pending_reply_outcome: Option<OperationOutcome>,
     /// Original entity decision time, shared only by its actual Create waiters.
     pub creation_decided_at: Option<crate::lease::MonotonicInstant>,
+    pub creation_reply: Option<std::sync::Arc<crate::context::ContextReplyBody>>,
+    pub initial_domain_receipts:
+        std::sync::Arc<Vec<novarocks_execution_contract::TaskDomainReceipt>>,
     pub creation_refusal: Option<AdmissionRefusal>,
+    pub(crate) initial_creation: Option<crate::context::InitialCreation>,
     pub state: TaskState,
     pub version: u64,
     pub installed: bool,
@@ -74,9 +78,13 @@ pub struct TaskRecord {
     pub convergence: TaskConvergence,
     pub resources_converged: bool,
     pub root_idle: bool,
+    pub root_transferred: bool,
     pub applied_close_generation: Generation,
     /// A scheduled protocol cut, not an additional Work/exit authority.
     pub scheduled_close_generation: Option<Generation>,
+    /// Normal close is a separate once-only causal author, including after Abort starts.
+    pub scheduled_quiesce_generation: Option<Generation>,
+    pub applied_quiesce_generation: Option<Generation>,
     pub conclusion: ConclusionState,
     pub diagnostics: Diagnostics,
     pub proposals: ProposalSummary,
@@ -102,7 +110,10 @@ impl TaskRecord {
             waiting_replies: [request].into_iter().collect(),
             pending_reply_outcome: None,
             creation_decided_at: None,
+            creation_reply: None,
+            initial_domain_receipts: std::sync::Arc::new(Vec::new()),
             creation_refusal: None,
+            initial_creation: None,
             state: TaskState::Planned,
             version: 1,
             installed: false,
@@ -127,8 +138,11 @@ impl TaskRecord {
             convergence: TaskConvergence::new(),
             resources_converged: false,
             root_idle: false,
+            root_transferred: false,
             applied_close_generation: generation,
             scheduled_close_generation: None,
+            scheduled_quiesce_generation: None,
+            applied_quiesce_generation: None,
             conclusion: ConclusionState::default(),
             diagnostics: Diagnostics::default(),
             proposals: ProposalSummary::default(),
@@ -138,9 +152,8 @@ impl TaskRecord {
         self.loader_exited
             && self.preparation_exited
             && self.actual_stopped
-            && self.output_released
             && self.resources_converged
-            && self.root_idle
+            && ((self.output_released && self.root_idle) || self.root_transferred)
     }
     pub fn retirement_ready(&self) -> bool {
         (self.state.is_terminal() || self.phase == CreationPhase::Rejected)

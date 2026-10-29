@@ -245,7 +245,9 @@ impl FrontendRoleProducts {
         deadline: Instant,
     ) -> Result<(), FrontendApplicationError> {
         let mut first_error = None;
+        crate::application::trace_shutdown_stage("role_products_started");
         self.mv_product_service.begin_stopping();
+        crate::application::trace_shutdown_stage("statistics_worker_join_started");
         if let Err(error) = self
             .statistics_application
             .shutdown_worker_until(deadline)
@@ -255,6 +257,8 @@ impl FrontendRoleProducts {
                 "shutdown statistics analyze worker failed: {error}"
             )));
         }
+        crate::application::trace_shutdown_stage("statistics_worker_join_returned");
+        crate::application::trace_shutdown_stage("mv_workers_join_started");
         if let Err(error) = self
             .mv_service
             .shutdown_background_workers_until(deadline)
@@ -266,6 +270,8 @@ impl FrontendRoleProducts {
                 ))
             });
         }
+        crate::application::trace_shutdown_stage("mv_workers_join_returned");
+        crate::application::trace_shutdown_stage("maintenance_join_started");
         if let Err(error) = self.maintenance_service.shutdown_until(deadline).await {
             first_error.get_or_insert_with(|| {
                 FrontendApplicationError::server(format!(
@@ -273,6 +279,8 @@ impl FrontendRoleProducts {
                 ))
             });
         }
+        crate::application::trace_shutdown_stage("maintenance_join_returned");
+        crate::application::trace_shutdown_stage("product_catalog_join_started");
         if let Err(error) = self.catalog_runtime.shutdown_until(deadline).await {
             first_error.get_or_insert_with(|| {
                 FrontendApplicationError::server(format!(
@@ -280,6 +288,7 @@ impl FrontendRoleProducts {
                 ))
             });
         }
+        crate::application::trace_shutdown_stage("product_catalog_join_returned");
         first_error.map_or(Ok(()), Err)
     }
 
@@ -864,7 +873,10 @@ async fn shutdown_frontend_role_products_to_convergence(
         .shutdown_background_workers_until(Instant::now() + attempt_timeout)
         .await
     {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            crate::application::trace_shutdown_stage("role_products_joined");
+            return Ok(());
+        }
         Err(error) => error,
     };
     tracing::warn!(
@@ -905,7 +917,10 @@ pub async fn shutdown_frontend_application_to_convergence(
         .shutdown_until(std::time::Instant::now() + attempt_timeout)
         .await
     {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            crate::application::trace_shutdown_stage("host_joined");
+            return Ok(());
+        }
         Err(error) => error,
     };
     tracing::warn!(
@@ -1149,14 +1164,17 @@ where
         config.frontend_cleanup_timeout,
     )
     .await;
+    crate::application::trace_shutdown_stage("mysql_serving_returned");
     let product_shutdown = shutdown_frontend_role_products_to_convergence(
         &mut products,
         config.frontend_cleanup_timeout,
     )
     .await;
+    crate::application::trace_shutdown_stage("report_listener_stop_started");
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
+    crate::application::trace_shutdown_stage("report_listener_stop_returned");
     combine_server_and_shutdown(
         combine_server_and_shutdown(server_result, product_shutdown),
         stop_result,
@@ -1273,14 +1291,18 @@ where
     tokio::select! {
         result = &mut mysql_server => result.map_err(FrontendApplicationError::server),
         _ = shutdown => {
+            crate::application::trace_shutdown_stage("shutdown_signal_observed");
             host.begin_serving_drain(drain_timeout);
+            crate::application::trace_shutdown_stage("mysql_drain_started");
             let _ = drain_tx.send(true);
             let graceful = tokio::time::timeout(
                 drain_timeout,
                 host.workload_observation().wait_until_no_root_responsibilities(),
             )
             .await;
+            crate::application::trace_shutdown_stage("mysql_root_grace_returned");
             if graceful.is_err() {
+                crate::application::trace_shutdown_stage("mysql_root_cleanup_started");
                 host.cancel_governed_work_at_drain_deadline();
                 // Keep the admitted protocol tasks alive long enough to
                 // observe the first-wins deadline cancellation and return
@@ -1292,12 +1314,16 @@ where
                     host.workload_observation().wait_until_no_root_responsibilities(),
                 )
                 .await;
+                crate::application::trace_shutdown_stage("mysql_root_cleanup_returned");
             }
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
             host.serving_lifecycle().mark_stopping();
             let _ = finalize_tx.send(true);
-            mysql_server.await.map_err(FrontendApplicationError::server)
+            crate::application::trace_shutdown_stage("mysql_listener_join_started");
+            let result = mysql_server.await.map_err(FrontendApplicationError::server);
+            crate::application::trace_shutdown_stage("mysql_listener_join_returned");
+            result
         }
         error = wait_for_frontend_listener_failure(report_server, management_server, host) => {
             host.begin_serving_drain(drain_timeout);

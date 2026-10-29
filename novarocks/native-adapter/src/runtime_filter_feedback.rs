@@ -56,12 +56,12 @@ use novarocks_worker::runtime_filter::domain::{
     BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication, BackendFrontendFeedbackSink,
 };
 
-use novarocks_worker::TaskStatusReporter;
+use novarocks_worker::{DynamicFilterSubmission, TaskDynamicFilterWriter};
 
 /// Publishes one query context's terminal logical feedback through one task.
 pub struct TaskRuntimeFilterFeedbackEgress {
     carrier: TaskIdentity,
-    reporter: TaskStatusReporter,
+    producer: TaskDynamicFilterWriter,
     /// The next domain version this carrier will advertise.
     ///
     /// Minted here rather than taken from the channel: a channel's own logical
@@ -77,10 +77,10 @@ pub struct TaskRuntimeFilterFeedbackEgress {
 }
 
 impl TaskRuntimeFilterFeedbackEgress {
-    pub fn new(carrier: TaskIdentity, reporter: TaskStatusReporter) -> Self {
+    pub fn new(carrier: TaskIdentity, producer: TaskDynamicFilterWriter) -> Self {
         Self {
             carrier,
-            reporter,
+            producer,
             next_version: AtomicU64::new(DomainVersion::FIRST.get()),
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
@@ -211,28 +211,39 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
                 return;
             }
         };
-        let advance =
-            self.reporter
-                .advertise_dynamic_filters(version, 1, wire_task_dynamic_filter(envelope));
-        if advance.published_version().is_none() {
-            // The carrier reached its terminal before this domain was reduced.
-            // Nothing can be advertised on a terminal task, and its retained
-            // record holds no payload, so the frontend will widen this channel.
-            tracing::debug!(
-                task = %self.carrier,
-                channel_id = channel_id.get(),
-                advance = ?advance,
-                "dynamic filter domain could not be advertised on its carrier task"
-            );
-            return;
-        }
         #[cfg(novarocks_dev_controls)]
-        emit_advertised_marker(
-            self.observation_controls.as_deref(),
-            self.carrier,
-            channel_id,
-            version,
+        let notice = self.observation_controls.clone().map(|controls| {
+            Box::new(FeedbackCommittedNotice {
+                controls,
+                carrier: self.carrier,
+                channel: channel_id,
+            }) as Box<dyn novarocks_worker::TaskDynamicFilterCommittedNotice>
+        });
+        #[cfg(not(novarocks_dev_controls))]
+        let notice = None;
+        let advance = self
+            .producer
+            .submit(version, 1, wire_task_dynamic_filter(envelope), notice);
+        if advance != DynamicFilterSubmission::Pending {
+            tracing::debug!(task=%self.carrier,channel_id=channel_id.get(),?advance,"dynamic filter candidate was not admitted by its original carrier");
+        }
+    }
+}
+
+#[cfg(novarocks_dev_controls)]
+struct FeedbackCommittedNotice {
+    controls: std::sync::Arc<crate::test_observation_controls::NativeObservationControls>,
+    carrier: TaskIdentity,
+    channel: RuntimeFilterChannelId,
+}
+#[cfg(novarocks_dev_controls)]
+impl novarocks_worker::TaskDynamicFilterCommittedNotice for FeedbackCommittedNotice {
+    fn committed(self: Box<Self>, task: TaskIdentity, version: DomainVersion) {
+        assert_eq!(
+            task, self.carrier,
+            "original RF publication receipt identity"
         );
+        emit_advertised_marker(Some(&self.controls), task, self.channel, version);
     }
 }
 

@@ -1715,12 +1715,10 @@ impl TaskExecutionRegistry {
                 state.active_tasks = state.active_tasks.saturating_sub(1);
             }
         }
-        if let Some((bytes, state)) = terminal_retained {
+        if let Some((_bytes, state)) = terminal_retained {
             self.ports.retire_task_result(identity);
             self.ports
-                .observe(TaskProtocolEvent::task_terminal_retained(
-                    identity, state, bytes,
-                ));
+                .observe(TaskProtocolEvent::task_terminal_retained(identity, state));
         } else {
             self.counters
                 .creations_rolled_back
@@ -4060,7 +4058,6 @@ impl TaskExecutionRegistry {
                     .observe(TaskProtocolEvent::task_terminal_retained(
                         identity,
                         terminal_state,
-                        bytes,
                     ));
                 retired += 1;
             }

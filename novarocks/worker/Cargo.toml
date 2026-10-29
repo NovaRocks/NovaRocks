@@ -35,7 +35,11 @@ uuid = { workspace = true, features = ["v4"] }
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-connector-contract.workspace = true
 novarocks-functions.workspace = true
+novarocks-local-compiler.workspace = true
+novarocks-local-program.workspace = true
+novarocks-physical-plan.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

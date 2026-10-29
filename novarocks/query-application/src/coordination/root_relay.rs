@@ -23,8 +23,9 @@
 //! * `next_wanted` -- the next item this Frontend asks for;
 //! * validated -- data accepted and handed to delivery, at most
 //!   [`ROOT_RELAY_WINDOW`] items ahead of consumption;
-//! * `consumed_through` -- the last item whose delivery receipt completed,
-//!   which is the cumulative ACK sent on the next read.
+//! * `consumed_through` -- the last data item whose delivery receipt completed,
+//!   which bounds data ACKs. Once End is known and all earlier receipts complete,
+//!   the final ACK also includes that consumed End's own sequence.
 //!
 //! ClientRows bodies are validated whole before any byte is delivered: row
 //! prefixes and lengths are checked against the frozen profile, a new prefix
@@ -225,11 +226,13 @@ impl RootRelayFrontier {
     /// acknowledged.
     pub fn next_read(&self) -> Option<RootRelayRead> {
         if self.end.is_some() {
-            // After End, only an optional final ACK of the consumed prefix.
-            if self.end_consumed().is_some() && !self.acknowledged_end {
+            // All earlier data receipts must complete before acknowledging End.
+            if let Some(end) = self.end_consumed()
+                && !self.acknowledged_end
+            {
                 return Some(RootRelayRead {
                     wanted: None,
-                    consumed: self.consumed_through,
+                    consumed: end.sequence.get(),
                 });
             }
             return None;
@@ -536,12 +539,12 @@ mod tests {
         assert_eq!(frontier.end_consumed(), None);
         frontier.receipt(seq(2)).unwrap();
         assert_eq!(frontier.end_consumed().map(|end| end.output_rows), Some(1));
-        // One optional ACK-only read retires the consumed prefix.
+        // One ACK-only read retires the consumed data and End.
         assert_eq!(
             frontier.next_read(),
             Some(RootRelayRead {
                 wanted: None,
-                consumed: 2
+                consumed: 3
             })
         );
         assert_eq!(

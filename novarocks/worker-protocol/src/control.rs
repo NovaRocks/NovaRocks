@@ -22,8 +22,9 @@ use crate::{
         AcquisitionIdentity, AdmissionCore, AdmissionTicketConfig, AdmissionTicketRedemption,
     },
     context::{
-        ContextEstablishment, ContextEstablishmentDecision, CoreError, DomainRefusal,
-        EstablishReplayRequest, RequestResult, RequestSettlement,
+        ContextAcknowledgement, ContextEstablishment, ContextEstablishmentDecision,
+        ContextReplyBody, CoreError, DomainRefusal, EstablishReplayRequest, RequestResult,
+        RequestSettlement,
     },
     creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId, RequestContext},
     lease::MonotonicInstant,
@@ -33,11 +34,14 @@ use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationI
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, AdmissionTicketId, EstablishSemanticIdentity,
     LeaseValidFor, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef,
-    QueryContextState, TaskOperationId,
+    QueryContextState, TaskIdentity, TaskOperationId,
 };
 use novarocks_execution_contract::{ContentFingerprint, CredentialEpoch, CredentialLeaseId};
 use novarocks_types::identity::{FrontendProcessId, QueryExecutionId};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ControlConfig {
@@ -127,10 +131,11 @@ struct DirectoryRecord {
     generation: Generation,
     waiters: BTreeSet<TaskOperationId>,
     reservation: ReservationId,
-    reply: Option<(Result<OperationOutcome, DomainRefusal>, MonotonicInstant)>,
+    reply: Option<(ControlReplyBody, MonotonicInstant)>,
     // Retention may end before the original bounded reply fanout. Keep that
     // obligation in this same paid row until its last operation moves to R.
     removal_pending: bool,
+    removal_requested: bool,
 }
 #[derive(Debug)]
 pub enum ControlInput {
@@ -149,6 +154,12 @@ pub enum ControlInput {
         semantics: EstablishSemanticFacts,
         generation: Generation,
     },
+    /// The original admitted Root R observed no actual Context address.
+    /// This is readiness observation, never Task admission or a new Context.
+    CreateWithoutContextAddress {
+        context: QueryContextRef,
+        task: TaskIdentity,
+    },
     /// The actual ingress getter failed before this RPC submitted its command.
     /// Only handle_request may settle the same original admitted token.
     IngressOwnerFailed {
@@ -158,6 +169,7 @@ pub enum ControlInput {
         context: QueryContextRef,
         request: RequestContext,
         result: Result<OperationOutcome, DomainRefusal>,
+        acknowledgement: Option<ContextAcknowledgement>,
         decided_at: MonotonicInstant,
     },
     EstablishmentDecided {
@@ -186,6 +198,13 @@ pub enum ControlInput {
         frontend: FrontendProcessId,
     },
     ContinueFence,
+    /// Same original process owner closes new elections and drains actual
+    /// Context/ticket owners; this is not a frontend process fence.
+    ProcessDrain,
+    /// The real external listeners have stopped and their bodies have left.
+    /// Only process-local neutral replay retention may now end early.
+    ProcessIngressClosed,
+    ContinueProcessDrain,
     /// Advance one currently actionable internal class. Addresses and decisions
     /// remain in their original bounded Core inventories.
     NextInternal,
@@ -257,6 +276,10 @@ pub struct ControlStep {
 /// cache after another request with that operation has already been decided.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlReplyBody {
+    CreateContext(Arc<ContextReplyBody>),
+    Context(ContextAcknowledgement),
+    TicketObservation(crate::admission::AdmissionTicketObservation),
+    PreflightExpired(Option<OperationOutcome>),
     Admission(Result<QueryContextAdmissionTicketReceipt, OperationOutcome>),
     Domain(DomainRefusal),
     Verdict(RequestResult),
@@ -264,6 +287,11 @@ pub enum ControlReplyBody {
 impl ControlReplyBody {
     pub fn matches(&self, result: RequestResult) -> bool {
         match self {
+            Self::CreateContext(body) => body.matches(result),
+            Self::Context(ack) => result == RequestResult::Outcome(ack.outcome),
+            Self::TicketObservation(_) | Self::PreflightExpired(_) => {
+                result == RequestResult::Outcome(OperationOutcome::Accepted)
+            }
             Self::Admission(Ok(_)) => result == RequestResult::Outcome(OperationOutcome::Accepted),
             Self::Admission(Err(outcome)) => result == RequestResult::Outcome(*outcome),
             Self::Domain(refusal) => result == RequestResult::Outcome(refusal.outcome.outcome()),
@@ -272,6 +300,11 @@ impl ControlReplyBody {
     }
     fn result(&self) -> RequestResult {
         match self {
+            Self::CreateContext(body) => body.result(),
+            Self::Context(ack) => RequestResult::Outcome(ack.outcome),
+            Self::TicketObservation(_) | Self::PreflightExpired(_) => {
+                RequestResult::Outcome(OperationOutcome::Accepted)
+            }
             Self::Admission(result) => RequestResult::Outcome(
                 result
                     .as_ref()
@@ -370,6 +403,12 @@ pub struct ControlCore {
     internal_cursor: usize,
     request_cursor: Option<TaskOperationId>,
     context_cursor: Option<QueryContextRef>,
+    process_draining: bool,
+    process_ingress_closed: bool,
+    process_drain_cursor: Option<QueryContextRef>,
+    process_drain_scanned: bool,
+    process_drain_ticket_next: bool,
+    maintenance_drain_next: bool,
 }
 impl ControlCore {
     pub const MAX_STEP_WORK: usize = 15;
@@ -418,6 +457,12 @@ impl ControlCore {
             internal_cursor: 0,
             request_cursor: None,
             context_cursor: None,
+            process_draining: false,
+            process_ingress_closed: false,
+            process_drain_cursor: None,
+            process_drain_scanned: true,
+            process_drain_ticket_next: true,
+            maintenance_drain_next: true,
         })
     }
     pub fn admission(&self) -> &AdmissionCore {
@@ -451,8 +496,82 @@ impl ControlCore {
             || !self.reply_contexts.is_empty()
             || self.fencing.is_some()
             || !self.pending_fences.is_empty()
+            || self.has_process_drain_work()
             || self.next_deadline().is_some_and(|at| at <= self.now)
     }
+    fn has_process_drain_work(&self) -> bool {
+        self.process_draining && (!self.process_drain_scanned || self.admission.has_unredeemed())
+    }
+    fn advance_process_drain(&mut self, step: &mut ControlStep) -> Result<(), CoreError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if !self.process_draining {
+            return Err(CoreError::IllegalFact);
+        }
+        // Alternate the finite Context pass with one original unused ticket.
+        // The frozen election gate means no new Context can appear behind it.
+        if self.admission.has_unredeemed()
+            && (self.process_drain_ticket_next || self.process_drain_scanned)
+        {
+            let reservation = self
+                .admission
+                .revoke_next_unredeemed(self.now)
+                .expect("actual issued ticket frontier");
+            self.process_drain_ticket_next = false;
+            step.records_visited += 1;
+            step.effects
+                .push(ControlEffect::RetireReservation(reservation));
+            return Ok(());
+        }
+        if self.process_drain_scanned {
+            return Ok(());
+        }
+        let next = match self.process_drain_cursor {
+            Some(cursor) => self.directory.range((Excluded(cursor), Unbounded)).next(),
+            None => self.directory.first_key_value(),
+        }
+        .map(|(&context, _)| context);
+        let Some(context) = next else {
+            self.process_drain_scanned = true;
+            return Ok(());
+        };
+        self.process_drain_cursor = Some(context);
+        self.process_drain_ticket_next = true;
+        step.records_visited += 1;
+        let record = self
+            .directory
+            .get_mut(&context)
+            .expect("original drain Context");
+        if record.state == QueryContextState::TerminalRetained {
+            if self.process_ingress_closed {
+                if self.retained.contains(context) {
+                    self.retained
+                        .remove(context)
+                        .expect("same retained Context");
+                }
+                self.request_host_removal(context, step)?;
+            }
+        } else if !matches!(
+            record.state,
+            QueryContextState::Aborting | QueryContextState::Releasing
+        ) {
+            record.state = QueryContextState::Aborting;
+            record.generation = record
+                .generation
+                .next()
+                .expect("process close generation exhausted");
+            step.effects.push(ControlEffect::Route {
+                context,
+                state: record.state,
+                generation: record.generation,
+            });
+            step.effects.push(ControlEffect::AbortContext {
+                context,
+                generation: record.generation,
+            });
+        }
+        Ok(())
+    }
+
     fn next_internal(&self) -> Option<(InternalClass, ControlInput, usize)> {
         use std::ops::Bound::{Excluded, Unbounded};
         for offset in 0..InternalClass::ALL.len() {
@@ -478,10 +597,14 @@ impl ControlCore {
                 }
                 InternalClass::Fence => (self.fencing.is_some() || !self.pending_fences.is_empty())
                     .then_some(ControlInput::ContinueFence),
-                InternalClass::Maintenance => self
-                    .next_deadline()
-                    .is_some_and(|at| at <= self.now)
-                    .then_some(ControlInput::Tick),
+                InternalClass::Maintenance => {
+                    let due = self.next_deadline().is_some_and(|at| at <= self.now);
+                    if self.has_process_drain_work() && (self.maintenance_drain_next || !due) {
+                        Some(ControlInput::ContinueProcessDrain)
+                    } else {
+                        due.then_some(ControlInput::Tick)
+                    }
+                }
             };
             if let Some(input) = input {
                 return Some((class, input, offset + 1));
@@ -501,6 +624,7 @@ impl ControlCore {
         }
         let operation = match &input {
             ControlInput::Acquire { request, .. } => request.envelope().operation_id(),
+            ControlInput::CreateWithoutContextAddress { .. } => request.operation,
             ControlInput::Establish { request, .. }
             | ControlInput::IngressOwnerFailed { request } => *request,
             _ => return Err(CoreError::WrongIdentity),
@@ -509,6 +633,63 @@ impl ControlCore {
             return Err(CoreError::WrongIdentity);
         }
         self.now = now;
+        if let ControlInput::CreateWithoutContextAddress { context, task } = &input {
+            // A first Create can overtake the physical Establish handoff.
+            // Numeric absence grants neither Task ownership nor a permanent
+            // failure. The Root's original identity/fence facts still win.
+            let record = self.directory.get(context);
+            let outcome = if self.fenced.contains(&context.frontend_process_id())
+                || self.gone.contains(*context)
+            {
+                OperationOutcome::Gone
+            } else if self
+                .owners
+                .get(&context.query_execution_id())
+                .is_some_and(|owner| *owner != context.frontend_process_id())
+                || task.verify_query_context(*context).is_err()
+            {
+                OperationOutcome::IdentityMismatch
+            } else if record
+                .and_then(|record| record.reply.as_ref())
+                .is_some_and(|(body, _)| {
+                    body.result() == RequestResult::Outcome(OperationOutcome::OwnerFailed)
+                })
+            {
+                OperationOutcome::OwnerFailed
+            } else {
+                match record.map(|record| record.state) {
+                    Some(QueryContextState::Gone) => OperationOutcome::Gone,
+                    Some(
+                        QueryContextState::Quiescing
+                        | QueryContextState::Releasing
+                        | QueryContextState::Aborting
+                        | QueryContextState::TerminalRetained,
+                    ) => OperationOutcome::ContextTerminalReceipt,
+                    None
+                    | Some(
+                        QueryContextState::Absent
+                        | QueryContextState::Establishing
+                        | QueryContextState::Active,
+                    ) => {
+                        if now.has_reached(request.deadline) {
+                            OperationOutcome::OperationTimedOut
+                        } else {
+                            OperationOutcome::NotReady
+                        }
+                    }
+                }
+            };
+            return Ok(ControlStep {
+                records_visited: 1,
+                requests: vec![ControlRequestSettlement::new(
+                    request,
+                    ControlReplyBody::CreateContext(Arc::new(ContextReplyBody::Verdict(
+                        RequestResult::Outcome(outcome),
+                    ))),
+                )],
+                ..ControlStep::default()
+            });
+        }
         if matches!(input, ControlInput::IngressOwnerFailed { .. }) {
             // No business command was submitted for this token. Its failure
             // cannot join, flush or replace another token's operation latch.
@@ -746,6 +927,8 @@ impl ControlCore {
                     self.request_cursor = Some(*operation)
                 }
                 ControlInput::ContinueReplies { context } => self.context_cursor = Some(*context),
+                ControlInput::ContinueProcessDrain => self.maintenance_drain_next = false,
+                ControlInput::Tick => self.maintenance_drain_next = true,
                 _ => {}
             }
             let mut step = self.handle(now, input, capacity)?;
@@ -767,13 +950,25 @@ impl ControlCore {
             ..ControlStep::default()
         };
         match input {
-            ControlInput::IngressOwnerFailed { .. } => return Err(CoreError::WrongIdentity),
+            ControlInput::IngressOwnerFailed { .. }
+            | ControlInput::CreateWithoutContextAddress { .. } => {
+                return Err(CoreError::WrongIdentity);
+            }
             ControlInput::RoutedEstablishFinished {
                 context,
                 request,
                 result,
+                acknowledgement,
                 decided_at,
             } => {
+                if let Some(ack) = &acknowledgement {
+                    if result != Ok(ack.outcome)
+                        || ack.receipt.context() != context
+                        || ack.receipt.lease().is_none()
+                    {
+                        return Err(CoreError::IllegalFact);
+                    }
+                }
                 if decided_at > now || result == Ok(OperationOutcome::Accepted) {
                     return Err(CoreError::IllegalFact);
                 }
@@ -795,9 +990,10 @@ impl ControlCore {
                         ControlReplyBody::Verdict(RequestResult::TimeoutWhileAccepted)
                     } else {
                         match result {
-                            Ok(outcome) => {
-                                ControlReplyBody::Verdict(RequestResult::Outcome(outcome))
-                            }
+                            Ok(outcome) => acknowledgement.map_or_else(
+                                || ControlReplyBody::Verdict(RequestResult::Outcome(outcome)),
+                                ControlReplyBody::Context,
+                            ),
                             Err(refusal) => ControlReplyBody::Domain(refusal),
                         }
                     };
@@ -890,6 +1086,11 @@ impl ControlCore {
                     // An existing entity requires an exact RPC route. Bare
                     // administrative input cannot adjudicate its business state.
                     return Err(CoreError::WrongIdentity);
+                } else if self.process_draining {
+                    step.effects.push(ControlEffect::Reply {
+                        request,
+                        outcome: OperationOutcome::Gone,
+                    });
                 } else if self.directory.len() >= self.config.max_contexts {
                     step.effects.push(ControlEffect::Reply {
                         request,
@@ -931,6 +1132,7 @@ impl ControlCore {
                                             reservation,
                                             reply: None,
                                             removal_pending: false,
+                                            removal_requested: false,
                                         },
                                     );
                                     self.owners.insert(
@@ -1006,6 +1208,8 @@ impl ControlCore {
                     ContextEstablishmentDecision {
                         state: QueryContextState::Aborting,
                         outcome,
+                        acknowledgement: None,
+                        decided_at: self.now,
                     },
                     &mut step,
                 )?;
@@ -1043,6 +1247,15 @@ impl ControlCore {
                         self.frontend_members.remove(&frontend);
                     }
                 }
+                // The live route reader must observe the same Gone decision
+                // before the original directory payer leaves the host. Only
+                // this core authors the state; the driver does not infer it
+                // from a missing host address or a retired reservation.
+                step.effects.push(ControlEffect::Route {
+                    context,
+                    state: QueryContextState::Gone,
+                    generation: record.generation,
+                });
                 step.effects
                     .push(ControlEffect::RetireReservation(record.reservation));
             }
@@ -1064,6 +1277,25 @@ impl ControlCore {
                 }
             }
             ControlInput::ContinueFence => self.fence(&mut step),
+            ControlInput::ProcessDrain => {
+                if !self.process_draining {
+                    self.process_draining = true;
+                    self.process_drain_cursor = None;
+                    self.process_drain_scanned = false;
+                    self.admission.begin_process_drain();
+                }
+            }
+            ControlInput::ProcessIngressClosed => {
+                if !self.process_draining {
+                    return Err(CoreError::IllegalFact);
+                }
+                if !self.process_ingress_closed {
+                    self.process_ingress_closed = true;
+                    self.process_drain_cursor = None;
+                    self.process_drain_scanned = false;
+                }
+            }
+            ControlInput::ContinueProcessDrain => self.advance_process_drain(&mut step)?,
             ControlInput::NextInternal => unreachable!("selected before ordinary dispatch"),
             ControlInput::Tick => {
                 self.expire_request(&mut step);
@@ -1095,11 +1327,38 @@ impl ControlCore {
         for (operation, body) in ready {
             if self.request_operations.contains_key(&operation) {
                 let decided_at = self.request_ready_at(operation).unwrap_or(now);
+                let body = self.active_request_body(operation).unwrap_or(body);
                 self.ready.entry(operation).or_insert((body, decided_at));
                 self.flush_request(operation, &mut step);
             }
         }
         Ok(step)
+    }
+    /// Read-only preflight only where actual ticket expiry will be the next
+    /// Root decision. Existing entity, retention, owner and fence priorities
+    /// remain authoritative; absence alone proves no terminal verdict.
+    pub fn preflight_expired_establish(
+        &self,
+        context: QueryContextRef,
+        ticket: AdmissionTicketId,
+        now: MonotonicInstant,
+    ) -> Option<OperationOutcome> {
+        if self.directory.contains_key(&context)
+            || self.directory.len() >= self.config.max_contexts
+            || self.gone.contains(context)
+            || self.fenced.contains(&context.frontend_process_id())
+            || self
+                .owners
+                .get(&context.query_execution_id())
+                .is_some_and(|owner| *owner != context.frontend_process_id())
+        {
+            return None;
+        }
+        matches!(
+            self.admission.observe(ticket, context, now),
+            crate::admission::AdmissionTicketObservation::Expired
+        )
+        .then_some(OperationOutcome::InvalidStateOrRequest)
     }
     fn remove_request(&mut self, token: InputId) -> RequestContext {
         let original = self.requests.remove(&token).expect("indexed request");
@@ -1156,11 +1415,8 @@ impl ControlCore {
             .or_else(|| {
                 let context = self.establish_reply_owners.get(&operation)?;
                 let record = self.directory.get(context)?;
-                let (outcome, _) = record.reply.as_ref()?;
-                Some(match outcome {
-                    Ok(outcome) => ControlReplyBody::Verdict(RequestResult::Outcome(*outcome)),
-                    Err(refusal) => ControlReplyBody::Domain(refusal.clone()),
-                })
+                let (body, _) = record.reply.as_ref()?;
+                Some(body.clone())
             })
     }
     fn request_ready_at(&self, operation: TaskOperationId) -> Option<MonotonicInstant> {
@@ -1216,16 +1472,18 @@ impl ControlCore {
             return Err(CoreError::IllegalFact);
         }
         if let Some(request) = r.waiters.pop_first() {
-            let (outcome, _) = r.reply.as_ref().expect("original directory decision");
-            step.effects.push(match outcome {
-                Ok(outcome) => ControlEffect::Reply {
-                    request,
-                    outcome: *outcome,
-                },
-                Err(refusal) => ControlEffect::DomainFailureReply {
+            let (body, _) = r.reply.as_ref().expect("original directory decision");
+            step.effects.push(match body {
+                ControlReplyBody::Domain(refusal) => ControlEffect::DomainFailureReply {
                     request,
                     refusal: refusal.clone(),
                 },
+                _ => {
+                    let RequestResult::Outcome(outcome) = body.result() else {
+                        return Err(CoreError::IllegalFact);
+                    };
+                    ControlEffect::Reply { request, outcome }
+                }
             });
         }
         if !r.waiters.is_empty() {
@@ -1233,7 +1491,10 @@ impl ControlCore {
                 .push(ControlEffect::ContinueReplies { context });
         } else if r.removal_pending {
             r.removal_pending = false;
-            step.effects.push(ControlEffect::RemoveHost { context });
+            if !r.removal_requested {
+                r.removal_requested = true;
+                step.effects.push(ControlEffect::RemoveHost { context });
+            }
         }
         self.refresh_reply_context(context);
         Ok(())
@@ -1248,7 +1509,11 @@ impl ControlCore {
             .directory
             .get_mut(&context)
             .ok_or(CoreError::WrongIdentity)?;
+        if record.removal_requested {
+            return Ok(());
+        }
         if record.reply.is_some() && record.waiters.is_empty() {
+            record.removal_requested = true;
             step.effects.push(ControlEffect::RemoveHost { context });
         } else {
             record.removal_pending = true;
@@ -1287,9 +1552,13 @@ impl ControlCore {
             self.retained.remove(oldest).expect("oldest exists");
             self.request_host_removal(oldest, step)?;
         }
-        self.retained
-            .insert(context, self.now.saturating_add(self.config.retention), 0)
-            .map_err(|_| CoreError::IllegalFact)?;
+        if self.process_draining && self.process_ingress_closed {
+            self.request_host_removal(context, step)?;
+        } else {
+            self.retained
+                .insert(context, self.now.saturating_add(self.config.retention), 0)
+                .map_err(|_| CoreError::IllegalFact)?;
+        }
         Ok(())
     }
     fn establishment_decided(
@@ -1313,7 +1582,26 @@ impl ControlCore {
             self.retain_context(context, step)?;
         }
         let record = self.directory.get_mut(&context).expect("known context");
-        let ContextEstablishmentDecision { state, mut outcome } = decision;
+        let ContextEstablishmentDecision {
+            state,
+            mut outcome,
+            mut acknowledgement,
+            mut decided_at,
+        } = decision;
+        if decided_at > self.now {
+            return Err(CoreError::IllegalFact);
+        }
+        if let Some(ack) = &acknowledgement {
+            if outcome != Ok(ack.outcome)
+                || ack.receipt.context() != context
+                || ack.receipt.state() != state
+                || ack.receipt.lease().is_none()
+            {
+                return Err(CoreError::IllegalFact);
+            }
+        } else if outcome == Ok(OperationOutcome::Accepted) {
+            return Err(CoreError::IllegalFact);
+        }
         // Root fencing can outrun the Context's success return. It blocks only
         // reopening; it cannot erase a typed failure or a lease verdict.
         let fenced_active = state == QueryContextState::Active
@@ -1322,6 +1610,10 @@ impl ControlCore {
             && (record.state != QueryContextState::Establishing || fenced_active)
         {
             outcome = Ok(OperationOutcome::ContextTerminalReceipt);
+            // This is the Root's later fence refusal, not the Context's old
+            // successful receipt. Never rewrite that receipt's state/lease.
+            acknowledgement = None;
+            decided_at = self.now;
         }
         record.state = match (record.state, state) {
             (QueryContextState::TerminalRetained, _) | (_, QueryContextState::TerminalRetained) => {
@@ -1332,7 +1624,14 @@ impl ControlCore {
             _ if fenced_active => QueryContextState::Aborting,
             _ => state,
         };
-        record.reply = Some((outcome, self.now));
+        let body = match outcome {
+            Ok(outcome) => acknowledgement.map_or_else(
+                || ControlReplyBody::Verdict(RequestResult::Outcome(outcome)),
+                ControlReplyBody::Context,
+            ),
+            Err(refusal) => ControlReplyBody::Domain(refusal),
+        };
+        record.reply = Some((body, decided_at));
         if record.state != QueryContextState::TerminalRetained {
             step.effects.push(ControlEffect::Route {
                 context,

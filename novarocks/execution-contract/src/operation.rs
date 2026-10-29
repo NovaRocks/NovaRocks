@@ -463,14 +463,28 @@ impl QueryContextDomainReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateTaskReceipt {
     identity: TaskIdentity,
-    domains: Vec<TaskDomainReceipt>,
+    domains: Arc<Vec<TaskDomainReceipt>>,
     current_status: TaskStatus,
 }
 
 impl CreateTaskReceipt {
-    pub const fn new(
+    pub fn new(
         identity: TaskIdentity,
         domains: Vec<TaskDomainReceipt>,
+        current_status: TaskStatus,
+    ) -> Self {
+        Self {
+            identity,
+            domains: Arc::new(domains),
+            current_status,
+        }
+    }
+
+    /// Share the original bounded receipt vector without traversing its
+    /// members in a single protocol actor step.
+    pub fn from_shared(
+        identity: TaskIdentity,
+        domains: Arc<Vec<TaskDomainReceipt>>,
         current_status: TaskStatus,
     ) -> Self {
         Self {
@@ -862,6 +876,10 @@ pub struct UpdateTask {
 }
 
 impl UpdateTask {
+    /// Transfer the original domain vector without cloning its rich members.
+    pub fn into_parts(self) -> (OperationEnvelope, TaskIdentity, Vec<TaskDomainUpdate>) {
+        (self.envelope, self.identity, self.domains)
+    }
     pub fn try_new(
         operation_id: TaskOperationId,
         identity: TaskIdentity,
@@ -1136,6 +1154,10 @@ pub struct AdvanceQueryContextDomain {
 }
 
 impl AdvanceQueryContextDomain {
+    /// Transfer the original shared-domain capability to its admitted owner.
+    pub fn into_parts(self) -> (OperationEnvelope, QueryContextRef, QueryContextDomainUpdate) {
+        (self.envelope, self.context, self.domain)
+    }
     pub fn new(
         operation_id: TaskOperationId,
         context: QueryContextRef,

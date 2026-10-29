@@ -29,7 +29,7 @@ use novarocks_control_runtime::{
         TimerSourceState,
     },
     lease::{CapacityBundle, WorkLease},
-    transaction::RuntimeError,
+    transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
     identity::{ActorId, InputId},
@@ -93,6 +93,7 @@ pub(crate) enum InternalAdvance {
 
 #[must_use = "Drain the internal source before sealing its actor"]
 pub(crate) struct ControlInternal {
+    ledger: RuntimeLedger,
     runtime: ActorRuntime<WorkerActor>,
     registration: ActorRegistration,
     actor: ActorId,
@@ -100,6 +101,8 @@ pub(crate) struct ControlInternal {
     capacity: CapacityBundle,
     role: InputRole<WorkerActor>,
     pending: bool,
+    process_drain_pending: bool,
+    ingress_closed_pending: bool,
     body_exited: bool,
     captures_exited: bool,
     role_closed: bool,
@@ -168,6 +171,7 @@ impl ControlInternal {
             });
         }
         Ok(Self {
+            ledger: root.ledger().clone(),
             runtime: root.runtime().clone(),
             registration: root.registration().clone(),
             actor: root.actor(),
@@ -175,10 +179,35 @@ impl ControlInternal {
             capacity: partial.capacity,
             role: partial.role.take().expect("actual input role converted"),
             pending: false,
+            process_drain_pending: false,
+            ingress_closed_pending: false,
             body_exited: false,
             captures_exited: false,
             role_closed: false,
         })
+    }
+
+    /// Called only after this same Root's external Work gate has closed.
+    /// The original paid role serializes this with its in-flight continuation.
+    pub(crate) fn request_process_drain(&mut self) -> Result<(), ControlInternalError> {
+        if self.role_closed || self.body_exited {
+            return Err(ControlInternalError::Closed);
+        }
+        self.process_drain_pending = true;
+        self.runtime
+            .notify_host_actor(&self.registration)
+            .map_err(ControlInternalError::Driver)
+    }
+    /// An explicit caller acknowledgement of actual listener/body exit, not a
+    /// flag inferred from a timer or a request to begin shutting down.
+    pub(crate) fn confirm_ingress_closed(&mut self) -> Result<(), ControlInternalError> {
+        if self.role_closed || self.body_exited {
+            return Err(ControlInternalError::Closed);
+        }
+        self.ingress_closed_pending = true;
+        self.runtime
+            .notify_host_actor(&self.registration)
+            .map_err(ControlInternalError::Driver)
     }
 
     /// Acceptance moves only a known scheduling hint into its paid bool cell.
@@ -233,24 +262,38 @@ impl ControlInternal {
                 Err(error) => return Err(ControlInternalError::Driver(error)),
             }
         }
-        if !self.pending {
+        let command = if self.process_drain_pending {
+            ControlInput::ProcessDrain
+        } else if self.ingress_closed_pending {
+            ControlInput::ProcessIngressClosed
+        } else if self.pending {
+            ControlInput::NextInternal
+        } else {
             return Ok(InternalAdvance::Idle);
-        }
+        };
+        let process_drain = matches!(&command, ControlInput::ProcessDrain);
+        let ingress_closed = matches!(&command, ControlInput::ProcessIngressClosed);
         let message = WorkerMessage::Control(ControlMessage::Command {
             work: self.work.id(),
             request: None,
-            command: ControlInput::NextInternal,
+            command,
         });
         let input = match self.role.fill(message) {
             Ok(input) => input,
             Err((error, _same_neutral_hint)) => return Err(ControlInternalError::Driver(error)),
         };
-        self.pending = false;
+        if process_drain {
+            self.process_drain_pending = false;
+        } else if ingress_closed {
+            self.ingress_closed_pending = false;
+        } else {
+            self.pending = false;
+        }
         Ok(InternalAdvance::Submitted(input))
     }
 
-    /// The caller has stopped source production. Pending work and every
-    /// in-flight batch must really drain; close never substitutes for them.
+    /// Component callers retain the original owner when a bounded closing
+    /// step still has ready metadata to reap.
     pub(crate) fn close_after_drain(&mut self) -> Result<(), ControlInternalError> {
         if self
             .runtime
@@ -260,8 +303,30 @@ impl ControlInternal {
         {
             return Err(ControlInternalError::TimerStillOpen);
         }
-        if self.pending {
+        if self.pending || self.process_drain_pending || self.ingress_closed_pending {
             return Err(ControlInternalError::Pending);
+        }
+        if self.advance_close_after_drain()? {
+            Ok(())
+        } else {
+            Err(ControlInternalError::Pending)
+        }
+    }
+
+    /// Only the original stopped source can close its unused metadata body.
+    /// Pending hints and real in-flight batches keep their original role. The
+    /// paid Work units remain held until that exact header is actually reaped.
+    pub(crate) fn advance_close_after_drain(&mut self) -> Result<bool, ControlInternalError> {
+        if self
+            .runtime
+            .timer_source_state(self.actor)
+            .map_err(ControlInternalError::Driver)?
+            != TimerSourceState::ClosedDrained
+            || self.pending
+            || self.process_drain_pending
+            || self.ingress_closed_pending
+        {
+            return Ok(false);
         }
         if !self.role_closed {
             if let Some(input) = self
@@ -269,9 +334,15 @@ impl ControlInternal {
                 .in_flight()
                 .map_err(ControlInternalError::Driver)?
             {
-                self.runtime
-                    .retire_input(self.actor, input)
-                    .map_err(ControlInternalError::Driver)?;
+                match self.runtime.retire_input(self.actor, input) {
+                    Ok(()) => {}
+                    Err(
+                        DriverError::InputStillQueued
+                        | DriverError::EffectsRemain
+                        | DriverError::ReservationsRemain,
+                    ) => return Ok(false),
+                    Err(error) => return Err(ControlInternalError::Driver(error)),
+                }
             }
             if !self.body_exited {
                 self.work
@@ -290,6 +361,18 @@ impl ControlInternal {
                 .map_err(ControlInternalError::Driver)?;
             self.role_closed = true;
         }
+        if !self.work.retirement_observer().is_retired() {
+            self.ledger
+                .reap_scope_ready(self.work.scope().id(), 1)
+                .map_err(ControlInternalError::Runtime)?;
+            if !self.work.retirement_observer().is_retired() {
+                // A finite ready-header tail, never an I/O poll or a false exit.
+                self.runtime
+                    .notify_host_actor(&self.registration)
+                    .map_err(ControlInternalError::Driver)?;
+                return Ok(false);
+            }
+        }
         if !self.capacity.is_released() {
             let resources = self
                 .capacity
@@ -299,6 +382,6 @@ impl ControlInternal {
                 .release(&resources)
                 .map_err(ControlInternalError::Runtime)?;
         }
-        Ok(())
+        Ok(true)
     }
 }

@@ -18,6 +18,8 @@
 //! Bounded weak request addresses and coalesced readiness. This index holds
 //! neither request bodies nor work, reply or resource-exit authority.
 
+mod capacity;
+
 use super::{actors::WorkerActor, control_request::ControlRequestError};
 use novarocks_control_runtime::{
     driver::{ActorRegistration, ActorRuntime, DriverError},
@@ -29,10 +31,10 @@ use novarocks_control_runtime_core::identity::{ActorId, InputId, WorkId};
 use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, Weak, atomic::AtomicU64},
 };
 
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Address {
     Control(InputId),
     // A Context's actual registration owns its scope-local Work addresses.
@@ -50,12 +52,15 @@ struct ReadyState {
     control_ready: BTreeMap<u64, InputId>,
     context_ready: BTreeMap<ActorId, BTreeMap<u64, WorkId>>,
     next_ready: u64,
+    capacity: BTreeMap<ActorId, capacity::CapacityWaiters>,
 }
 struct ReadyShared {
     limit: NonZeroUsize,
     state: Mutex<ReadyState>,
     changed: Notify,
     runtime: ActorRuntime<WorkerActor>,
+    source_capacity_revision: AtomicU64,
+    source_capacity_owner: Mutex<Option<ActorRegistration>>,
 }
 /// One actual R limit covers both address domains. Registration grants no
 /// funds, authorizes no work and records no second lifecycle decision.
@@ -76,9 +81,12 @@ impl ControlRequestReady {
                     control_ready: BTreeMap::new(),
                     context_ready: BTreeMap::new(),
                     next_ready: 0,
+                    capacity: BTreeMap::new(),
                 }),
                 changed: Notify::default(),
                 runtime,
+                source_capacity_revision: AtomicU64::new(0),
+                source_capacity_owner: Mutex::new(None),
             }),
         }
     }
@@ -102,6 +110,7 @@ impl ControlRequestReady {
         input: InputId,
         owner: &ActorRegistration,
     ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
+        self.bind_source_capacity_owner(owner)?;
         self.register(Address::Control(input), owner)
     }
     pub(crate) fn register_context(
@@ -171,6 +180,7 @@ impl ControlRequestReady {
             .slots
             .remove(&slot.address)
             .expect("original registered slot");
+        capacity::remove_capacity_locked(&mut state, registered.owner.actor(), slot.address);
         if let Some(ordinal) = registered.queued {
             match slot.address {
                 Address::Control(_) => {

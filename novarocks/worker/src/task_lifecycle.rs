@@ -22,7 +22,11 @@
 use novarocks_execution_contract::{
     AbortCause, CancelReason, OperationOutcome, TaskIdentity, TaskStatusVersion,
 };
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 /// The dormant start's unique, already admitted Running input. Read handles
 /// and reporter clones cannot mint or duplicate this original authority.
@@ -143,6 +147,7 @@ pub struct TaskTerminalPermit {
     identity: TaskIdentity,
     author: Option<crate::control_runtime::causal_input::InputAuthor>,
     bound: bool,
+    preparation_return: Option<Arc<PreparationTerminalReturn>>,
 }
 impl std::fmt::Debug for TaskTerminalPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -166,6 +171,7 @@ impl TaskTerminalPermit {
             identity: author.task(),
             author: Some(author),
             bound: false,
+            preparation_return: None,
         }
     }
     pub const fn identity(&self) -> TaskIdentity {
@@ -205,13 +211,33 @@ impl TaskTerminalPermit {
     /// Only the original completion owner, after proving it never invoked
     /// this callback, can revoke a bound observation without fabricating it.
     pub(crate) fn withdraw_uninvoked(mut self) {
+        if self.return_to_preparation() {
+            return;
+        }
         if let Some(author) = self.author.take() {
             let _reported = author.withdraw();
         }
     }
+    fn return_to_preparation(&mut self) -> bool {
+        let Some(owner) = self.preparation_return.take() else {
+            return false;
+        };
+        if let Some(author) = self.author.take() {
+            owner.return_terminal(Self {
+                identity: self.identity,
+                author: Some(author),
+                bound: self.bound,
+                preparation_return: None,
+            });
+        }
+        true
+    }
 }
 impl Drop for TaskTerminalPermit {
     fn drop(&mut self) {
+        if !self.bound && self.return_to_preparation() {
+            return;
+        }
         if let Some(author) = self.author.take() {
             if self.bound {
                 author.unresolved();
@@ -252,6 +278,7 @@ pub struct CompletionExitNotice {
     identity: TaskIdentity,
     capability: Option<Box<dyn CompletionExitCapability>>,
     bound: bool,
+    preparation_return: Option<Arc<PreparationTerminalReturn>>,
 }
 impl std::fmt::Debug for CompletionExitNotice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -272,6 +299,7 @@ impl CompletionExitNotice {
             identity,
             capability: Some(capability),
             bound: false,
+            preparation_return: None,
         }
     }
     pub const fn identity(&self) -> TaskIdentity {
@@ -289,6 +317,9 @@ impl CompletionExitNotice {
             .exited();
     }
     pub(crate) fn withdrawn(mut self) {
+        if self.return_to_preparation() {
+            return;
+        }
         let capability = self
             .capability
             .take()
@@ -305,9 +336,26 @@ impl CompletionExitNotice {
             .expect("one original unresolved completion")
             .unresolved();
     }
+    fn return_to_preparation(&mut self) -> bool {
+        let Some(owner) = self.preparation_return.take() else {
+            return false;
+        };
+        if let Some(capability) = self.capability.take() {
+            owner.return_exit(Self {
+                identity: self.identity,
+                capability: Some(capability),
+                bound: self.bound,
+                preparation_return: None,
+            });
+        }
+        true
+    }
 }
 impl Drop for CompletionExitNotice {
     fn drop(&mut self) {
+        if !self.bound && self.return_to_preparation() {
+            return;
+        }
         if let Some(capability) = self.capability.take() {
             if self.bound {
                 capability.unresolved();
@@ -318,12 +366,193 @@ impl Drop for CompletionExitNotice {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparationTerminalReturnError {
+    WrongIdentity,
+    WrongScope,
+    AlreadyBound,
+    AlreadyTaken,
+    Unresolved,
+}
+#[derive(Default)]
+struct PreparationTerminalReturnState {
+    bound: bool,
+    taken: bool,
+    unresolved: bool,
+    terminal: Option<TaskTerminalPermit>,
+    exit: Option<CompletionExitNotice>,
+}
+/// The original preparation owns exactly one return position for each of its
+/// two terminal originals. Returned holders contain no link back to this owner.
+/// Nothing here invokes a callback, signs exit or creates another authority.
+pub(crate) struct PreparationTerminalReturn {
+    scope: Arc<crate::task_preparation::TaskPreparationScope>,
+    pending: Arc<dyn crate::task_port::TaskPendingNotice>,
+    state: Mutex<PreparationTerminalReturnState>,
+}
+impl PreparationTerminalReturn {
+    pub(crate) fn new(
+        scope: Arc<crate::task_preparation::TaskPreparationScope>,
+        pending: Arc<dyn crate::task_port::TaskPendingNotice>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            scope,
+            pending,
+            state: Mutex::new(PreparationTerminalReturnState::default()),
+        })
+    }
+    /// The original issuer attaches this before either holder reaches a host.
+    /// Refusal leaves both exact originals with that same caller.
+    pub(crate) fn bind_original(
+        self: &Arc<Self>,
+        terminal: &mut TaskTerminalPermit,
+        exit: &mut CompletionExitNotice,
+    ) -> Result<(), PreparationTerminalReturnError> {
+        if terminal.identity != self.scope.identity() || exit.identity != self.scope.identity() {
+            return Err(PreparationTerminalReturnError::WrongIdentity);
+        }
+        if terminal.bound
+            || exit.bound
+            || terminal.author.is_none()
+            || exit.capability.is_none()
+            || terminal.preparation_return.is_some()
+            || exit.preparation_return.is_some()
+        {
+            return Err(PreparationTerminalReturnError::AlreadyBound);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("original preparation terminal return");
+        if state.bound {
+            return Err(PreparationTerminalReturnError::AlreadyBound);
+        }
+        terminal.preparation_return = Some(self.clone());
+        exit.preparation_return = Some(self.clone());
+        state.bound = true;
+        Ok(())
+    }
+    /// Only the same scope's positive rollback proof can release the whole
+    /// original pair. Rebinding is now preparation-owned, not a second runtime
+    /// callback or a replacement completion authority.
+    pub(crate) fn take_after_rollback(
+        self: &Arc<Self>,
+        proof: &crate::task_preparation::NeverAdoptedPreparationExit<'_>,
+    ) -> Result<Option<(TaskTerminalPermit, CompletionExitNotice)>, PreparationTerminalReturnError>
+    {
+        if !proof.same_scope(self.scope.as_ref()) {
+            return Err(PreparationTerminalReturnError::WrongScope);
+        }
+        if proof.identity() != self.scope.identity() {
+            return Err(PreparationTerminalReturnError::WrongIdentity);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("original preparation terminal return");
+        if state.unresolved {
+            return Err(PreparationTerminalReturnError::Unresolved);
+        }
+        if state.taken {
+            return Err(PreparationTerminalReturnError::AlreadyTaken);
+        }
+        if state.terminal.is_none() || state.exit.is_none() {
+            return Ok(None);
+        }
+        let mut terminal = state
+            .terminal
+            .take()
+            .expect("same returned terminal original");
+        let mut exit = state
+            .exit
+            .take()
+            .expect("same returned completion original");
+        state.taken = true;
+        drop(state);
+        terminal.bound = false;
+        exit.bound = false;
+        // Neither original remains in this owner's slots. These external links
+        // therefore form no cycle, but reject a lost recovered original as
+        // Unknown instead of reverting to unused withdrawal after Taken.
+        terminal.preparation_return = Some(self.clone());
+        exit.preparation_return = Some(self.clone());
+        Ok(Some((terminal, exit)))
+    }
+    fn return_terminal(&self, original: TaskTerminalPermit) {
+        let mut original = Some(original);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("original preparation terminal return");
+            if state.bound && !state.taken && state.terminal.is_none() {
+                state.terminal = original.take();
+            } else {
+                state.unresolved = true;
+            }
+        }
+        if let Some(mut original) = original {
+            // A duplicate/invalid return is unknown, never unused withdrawal.
+            original.bound = true;
+            drop(original);
+        }
+        self.pending.pending();
+    }
+    fn return_exit(&self, original: CompletionExitNotice) {
+        let mut original = Some(original);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("original preparation terminal return");
+            if state.bound && !state.taken && state.exit.is_none() {
+                state.exit = original.take();
+            } else {
+                state.unresolved = true;
+            }
+        }
+        if let Some(mut original) = original {
+            original.bound = true;
+            drop(original);
+        }
+        self.pending.pending();
+    }
+}
+impl Drop for PreparationTerminalReturn {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .expect("original preparation terminal return");
+        // No mutex guard spans either original's unknown-exit handling. Loss of
+        // the original preparation owner cannot turn stored roles into refunds.
+        let terminal = state.terminal.take();
+        let exit = state.exit.take();
+        if let Some(mut terminal) = terminal {
+            terminal.bound = true;
+            drop(terminal);
+        }
+        if let Some(mut exit) = exit {
+            exit.bound = true;
+            drop(exit);
+        }
+    }
+}
+
 /// An EOF answer is available only after the actual owner has adjudicated the
 /// original drain and committed its required result/status publications.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskRootDrainOutcome {
-    EndPublished { version: TaskStatusVersion },
+    EndPublished {
+        version: TaskStatusVersion,
+    },
+    AlreadyTerminal {
+        state: novarocks_execution_contract::TaskState,
+    },
     AwaitTerminalControl,
+    OwnerFailed {
+        fact: novarocks_execution_contract::failure::FailureFact,
+    },
     Refused(OperationOutcome),
 }
 pub type TaskRootDrainFuture = Pin<Box<dyn Future<Output = TaskRootDrainOutcome> + Send + 'static>>;
@@ -346,7 +575,7 @@ impl std::fmt::Debug for TaskRootDrainPermit {
     }
 }
 impl TaskRootDrainPermit {
-    pub fn from_admitted_role(
+    pub(crate) fn from_admitted_role(
         identity: TaskIdentity,
         capability: Box<dyn TaskRootDrainCapability>,
     ) -> Self {

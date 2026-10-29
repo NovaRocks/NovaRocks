@@ -70,7 +70,7 @@ impl FailureProjection for TaskPreparationChildRegistrationFailure {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Preparing,
     Rollback,
@@ -137,6 +137,33 @@ pub(crate) struct TaskPreparationScope {
     // This separate, private loan lock never spans foreign destruction.
     input: Mutex<Option<ManuallyDrop<novarocks_execution_contract::TaskCreationInput>>>,
     state: Mutex<State>,
+}
+
+/// Positive evidence from the same original scope: its physical preparation
+/// returned, every rollback callback/child exited, and runtime adoption never
+/// began. This is neither a whole-preparation report nor source/Work exit.
+/// The borrow preserves the exact original scope without another owner or grant.
+pub(crate) struct NeverAdoptedPreparationExit<'a> {
+    scope: &'a TaskPreparationScope,
+}
+impl NeverAdoptedPreparationExit<'_> {
+    pub(crate) fn identity(&self) -> TaskIdentity {
+        self.scope.identity
+    }
+    pub(crate) fn same_scope(&self, scope: &TaskPreparationScope) -> bool {
+        std::ptr::eq(self.scope, scope)
+    }
+    /// The original host never registered its whole child owner. Registration
+    /// is permanently closed by the already-proved rollback and physical exit;
+    /// this is stronger than observing an empty child after its destruction.
+    pub(crate) fn never_registered_child(&self) -> bool {
+        !self
+            .scope
+            .state
+            .lock()
+            .expect("original child registration fact")
+            .registered
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -555,9 +582,41 @@ impl TaskPreparationScope {
             }
         }
     }
+    /// Read only positive observations already completed by the original
+    /// physical rollback owner. In particular this never calls poll_exit or
+    /// drops a child on a metadata/poller thread. Rollback permanently rejects
+    /// subsequent adoption/registration; the original Adopt phase distinguishes
+    /// never-adopted from an adopted runtime that later entered rollback.
+    pub(crate) fn never_adopted_rollback_exit(&self) -> Option<NeverAdoptedPreparationExit<'_>> {
+        let state = self.state.lock().expect("preparation child scope lock");
+        if state.mode != Mode::Rollback
+            || state.phases[Step::Adopt as usize] != Phase::NotStarted
+            || !state.body_exited
+            || !Self::body_obligations_exited(&state)
+            || !Self::started_actions_exited(&state)
+            || state.child.is_some()
+            || [
+                Step::Cancel,
+                Step::Inbound,
+                Step::Receiver,
+                Step::Poll,
+                Step::ChildDrop,
+            ]
+            .iter()
+            .any(|step| state.phases[*step as usize] != Phase::Exited)
+        {
+            return None;
+        }
+        Some(NeverAdoptedPreparationExit { scope: self })
+    }
     pub(crate) fn adopt_runtime(&self) -> bool {
         let child = {
             let mut state = self.state.lock().expect("preparation child scope lock");
+            tracing::debug!(pid = std::process::id(), task = ?self.identity,
+                mode = ?state.mode, body_exited = state.body_exited,
+                admission_exited = state.admission_exited,
+                child_present = state.child.is_some(),
+                "Original preparation received its physical activation attempt");
             if !state.body_exited || !state.admission_exited {
                 return false;
             }

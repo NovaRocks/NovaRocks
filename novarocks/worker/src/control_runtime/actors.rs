@@ -58,6 +58,7 @@ pub(crate) enum ContextMessage {
 )]
 #[derive(Clone, Debug)]
 pub(crate) enum WorkerAction {
+    AdmissionEpoch(novarocks_execution_contract::AdmissionEpochCapability),
     Context(ContextEffect),
     Control {
         effect: novarocks_worker_protocol::control::ControlEffect,
@@ -224,6 +225,7 @@ impl Actor for ContextActor {
                 | ContextEffect::PublishTaskConvergence { task, .. }
                 | ContextEffect::SummaryConsumed { task, .. }
                 | ContextEffect::RetireTask { task, .. }
+                | ContextEffect::FinalizeTaskExecution { task }
                 | ContextEffect::PublishConclusion { task, .. } => {
                     if let Some(previous) = publications.get(task) {
                         dependencies.push(*previous);
@@ -259,6 +261,7 @@ impl Actor for ContextActor {
                 | ContextEffect::PublishTaskConvergence { task, .. }
                 | ContextEffect::SummaryConsumed { task, .. }
                 | ContextEffect::RetireTask { task, .. }
+                | ContextEffect::FinalizeTaskExecution { task }
                 | ContextEffect::PublishConclusion { task, .. } => {
                     publications.insert(*task, id);
                 }

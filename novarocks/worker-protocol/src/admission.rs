@@ -258,6 +258,7 @@ pub struct AdmissionCore {
     config: AdmissionTicketConfig,
     issuer: [u8; 8],
     next_stamp: u64,
+    process_draining: bool,
     reclaim_frontier: u64,
     tickets: BTreeMap<AdmissionTicketId, TicketRecord>,
     contexts: BTreeMap<QueryContextRef, AdmissionTicketId>,
@@ -272,6 +273,7 @@ impl AdmissionCore {
             config,
             issuer,
             next_stamp: 1,
+            process_draining: false,
             reclaim_frontier: 0,
             tickets: BTreeMap::new(),
             contexts: BTreeMap::new(),
@@ -319,6 +321,9 @@ impl AdmissionCore {
                     None => Err(AdmissionTicketAcquisitionRejection::SealedEpoch),
                 },
             };
+        }
+        if self.process_draining {
+            return Err(AdmissionTicketAcquisitionRejection::SealedEpoch);
         }
         let capability = request.admission_epoch_capability();
         if capability.issuer() != self.issuer
@@ -417,6 +422,9 @@ impl AdmissionCore {
         if r.receipt.context() != context {
             return Err(AdmissionTicketRedemptionRejection::ForeignContext);
         }
+        if self.process_draining {
+            return Err(AdmissionTicketRedemptionRejection::Closed);
+        }
         match r.state {
             AdmissionTicketState::Issued if now.has_reached(r.expires_at) => {
                 Err(AdmissionTicketRedemptionRejection::Expired)
@@ -433,6 +441,32 @@ impl AdmissionCore {
     }
     /// Closing new admission revokes an unused ticket only. A redeemed
     /// reservation remains owned by its actual context until physical release.
+    /// Process drain closes new grant/election rights. Existing decisions
+    /// remain observable; actual reservations retire only through their owner.
+    pub(crate) fn begin_process_drain(&mut self) {
+        self.process_draining = true;
+    }
+    pub(crate) fn has_unredeemed(&self) -> bool {
+        !self.expiries.is_empty()
+    }
+    /// The expiry index contains only actual issued, never redeemed tickets.
+    /// Revoke one original without fabricating elapsed time or scanning rows.
+    pub(crate) fn revoke_next_unredeemed(
+        &mut self,
+        now: MonotonicInstant,
+    ) -> Option<ReservationId> {
+        let (_, ticket) = self.expiries.first().copied()?;
+        assert_eq!(
+            self.tickets
+                .get(&ticket)
+                .expect("indexed issued ticket")
+                .state,
+            AdmissionTicketState::Issued,
+            "only issued tickets retain an expiry index"
+        );
+        self.terminal(ticket, AdmissionTicketState::Closed, now)
+    }
+
     pub fn revoke_unredeemed(
         &mut self,
         context: QueryContextRef,

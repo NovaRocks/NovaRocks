@@ -29,6 +29,7 @@ pub struct TaskConvergenceSnapshot {
     conclusion_stable: bool,
     actual_stopped: bool,
     output_released: bool,
+    output_transferred: bool,
     resources_converged: bool,
     retired: bool,
 }
@@ -50,6 +51,11 @@ impl TaskConvergenceSnapshot {
         self.output_released
     }
 
+    /// The original Context now owns retained output; no physical release is implied.
+    pub const fn output_transferred(self) -> bool {
+        self.output_transferred
+    }
+
     pub const fn resources_converged(self) -> bool {
         self.resources_converged
     }
@@ -63,7 +69,7 @@ impl TaskConvergenceSnapshot {
     pub const fn retirement_ready(self) -> bool {
         self.conclusion_stable
             && self.actual_stopped
-            && self.output_released
+            && (self.output_released || self.output_transferred)
             && self.resources_converged
             && !self.retired
     }
@@ -102,6 +108,7 @@ enum ConvergenceFact {
     ConclusionStable,
     ActualStopped,
     OutputReleased,
+    OutputTransferred,
     ResourcesConverged,
     Retired,
 }
@@ -114,6 +121,7 @@ impl TaskConvergence {
                 conclusion_stable: false,
                 actual_stopped: false,
                 output_released: false,
+                output_transferred: false,
                 resources_converged: false,
                 retired: false,
             },
@@ -140,6 +148,12 @@ impl TaskConvergence {
         &mut self,
     ) -> Result<TaskConvergenceAdvance, TaskConvergenceRejection> {
         self.advance(ConvergenceFact::OutputReleased)
+    }
+
+    pub fn note_output_transferred(
+        &mut self,
+    ) -> Result<TaskConvergenceAdvance, TaskConvergenceRejection> {
+        self.advance(ConvergenceFact::OutputTransferred)
     }
 
     pub fn note_resources_converged(
@@ -172,6 +186,7 @@ impl TaskConvergence {
             ConvergenceFact::ConclusionStable => self.snapshot.conclusion_stable,
             ConvergenceFact::ActualStopped => self.snapshot.actual_stopped,
             ConvergenceFact::OutputReleased => self.snapshot.output_released,
+            ConvergenceFact::OutputTransferred => self.snapshot.output_transferred,
             ConvergenceFact::ResourcesConverged => self.snapshot.resources_converged,
             ConvergenceFact::Retired => self.snapshot.retired,
         };
@@ -189,6 +204,7 @@ impl TaskConvergence {
             ConvergenceFact::ConclusionStable => self.snapshot.conclusion_stable = true,
             ConvergenceFact::ActualStopped => self.snapshot.actual_stopped = true,
             ConvergenceFact::OutputReleased => self.snapshot.output_released = true,
+            ConvergenceFact::OutputTransferred => self.snapshot.output_transferred = true,
             ConvergenceFact::ResourcesConverged => self.snapshot.resources_converged = true,
             ConvergenceFact::Retired => self.snapshot.retired = true,
         }

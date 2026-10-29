@@ -841,10 +841,12 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
             actor_config: ActorConfig {
                 mailbox: [4, 4, 4, 1],
                 max_batches: 8,
-                max_effects_per_step: ControlCore::MAX_STEP_WORK,
-                max_dependencies_per_effect: ControlCore::MAX_STEP_WORK,
-                turn_budget: 64,
-                max_step_work: ControlCore::MAX_STEP_WORK,
+                max_effects_per_step:
+                    crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                max_dependencies_per_effect:
+                    crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS,
+                turn_budget: crate::control_runtime::actors::ControlActor::TURN_BUDGET,
+                max_step_work: crate::control_runtime::actors::ControlActor::MAX_STEP_WORK,
             },
             admission_storage: AdmissionStorage {
                 loading: ResourceVector::default(),
