@@ -45,6 +45,10 @@ pub struct BackendMetricsRegistry {
     preparation_snapshot_available: IntGauge,
     root_ownership_gauges: IntGaugeVec,
     root_ownership_snapshot_available: IntGauge,
+    control_plane_gauges: IntGaugeVec,
+    control_plane_snapshot_available: IntGauge,
+    execution_quiescence_gauges: IntGaugeVec,
+    execution_quiescence_snapshot_available: IntGauge,
     process_memory: Option<(ProcessMemoryObservation, ProcessMemoryGauges)>,
     scrape_lock: std::sync::Mutex<()>,
 }
@@ -438,6 +442,39 @@ impl BackendMetricsRegistry {
         registry
             .register(Box::new(root_ownership_snapshot_available.clone()))
             .map_err(|error| format!("register original Root availability: {error}"))?;
+        let control_plane_gauges = IntGaugeVec::new(
+            Opts::new(
+                "novarocks_backend_control_plane_pollers",
+                "Independent raw samples of actual poller slots. Phase: 0 initializing, 1 timer, 2 Core, 3 host, 4 idle, 5 loop exited (not joined). Timestamps use the original Worker monotonic nanoseconds, not Unix time. Indexed due lateness excludes pending/deferred Tick delivery. No health threshold, coherent snapshot or physical-exit receipt is implied.",
+            ),
+            &["worker", "resource"],
+        ).map_err(|error| format!("construct original control-plane metrics: {error}"))?;
+        registry
+            .register(Box::new(control_plane_gauges.clone()))
+            .map_err(|error| format!("register original control-plane metrics: {error}"))?;
+        let control_plane_snapshot_available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_control_plane_snapshot_available",
+            "Whether this scrape has the original pool's representable raw sample. Missing timestamps/timer samples are omitted; zero Tick is a valid sampled time. Availability is not a health verdict.",
+        )).map_err(|error| format!("construct original control-plane availability: {error}"))?;
+        registry
+            .register(Box::new(control_plane_snapshot_available.clone()))
+            .map_err(|error| format!("register original control-plane availability: {error}"))?;
+        let execution_quiescence_gauges = IntGaugeVec::new(
+            Opts::new(
+                "novarocks_backend_execution_quiescence",
+                "Original execution custody and physical Root borrows over a bounded interval; context_records/root_channels/root_metadata_bytes are cold diagnostic inventory, not an exit receipt or a release of their original fees.",
+            ), &["resource"],
+        ).map_err(|error| format!("construct execution quiescence metrics: {error}"))?;
+        registry
+            .register(Box::new(execution_quiescence_gauges.clone()))
+            .map_err(|error| format!("register execution quiescence metrics: {error}"))?;
+        let execution_quiescence_snapshot_available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_execution_quiescence_snapshot_available",
+            "Whether this scrape sampled all original execution custodians. Unavailable omits the whole family, never a stale or default zero observation.",
+        )).map_err(|error| format!("construct execution quiescence availability: {error}"))?;
+        registry
+            .register(Box::new(execution_quiescence_snapshot_available.clone()))
+            .map_err(|error| format!("register execution quiescence availability: {error}"))?;
         let preparation_gauges = IntGaugeVec::new(
             Opts::new("novarocks_backend_task_preparation", "Actual preparation charges and independently sampled original physical fair-queue occupancy. Charges include retained/exiting holders; queue/worker counts do not prove whole exit."),
             &["resource", "dimension"],
@@ -510,6 +547,10 @@ impl BackendMetricsRegistry {
             preparation_snapshot_available,
             root_ownership_gauges,
             root_ownership_snapshot_available,
+            control_plane_gauges,
+            control_plane_snapshot_available,
+            execution_quiescence_gauges,
+            execution_quiescence_snapshot_available,
             process_memory: None,
             scrape_lock: std::sync::Mutex::new(()),
         })
@@ -645,6 +686,41 @@ impl BackendMetricsRegistry {
                     .set(i64::try_from(used).expect("checked original Root metric"));
             }
         }
+        let control_plane = self
+            .worker_node
+            .as_ref()
+            .and_then(|owner| owner.try_control_plane_snapshot())
+            .and_then(control_plane_values);
+        self.control_plane_snapshot_available
+            .set(i64::from(control_plane.is_some()));
+        if let Some(rows) = &control_plane {
+            // Optional raw fields may disappear on a later scan. Clear the
+            // previous label set so a missing deadline never becomes stale data.
+            self.control_plane_gauges.reset();
+            for (worker, resource, value) in rows {
+                self.control_plane_gauges
+                    .with_label_values(&[worker, resource])
+                    .set(*value);
+            }
+        }
+        let execution = self
+            .worker_node
+            .as_ref()
+            .and_then(|owner| owner.try_execution_quiescence_snapshot())
+            .filter(|sample| {
+                execution_quiescence_values(*sample)
+                    .iter()
+                    .all(|(_, used)| i64::try_from(*used).is_ok())
+            });
+        self.execution_quiescence_snapshot_available
+            .set(i64::from(execution.is_some()));
+        if let Some(sample) = execution {
+            for (resource, used) in execution_quiescence_values(sample) {
+                self.execution_quiescence_gauges
+                    .with_label_values(&[resource])
+                    .set(i64::try_from(used).expect("checked execution quiescence metric"));
+            }
+        }
         let preparation = match &self.worker_node {
             Some(owner) => owner
                 .try_preparation_snapshot()
@@ -711,11 +787,92 @@ impl BackendMetricsRegistry {
         if roots.is_none() {
             families.retain(|family| family.get_name() != "novarocks_backend_root_ownership");
         }
+        if control_plane.is_none() {
+            families
+                .retain(|family| family.get_name() != "novarocks_backend_control_plane_pollers");
+        }
+        if execution.is_none() {
+            families.retain(|family| family.get_name() != "novarocks_backend_execution_quiescence");
+        }
         if preparation.is_none() {
             families.retain(|family| family.get_name() != "novarocks_backend_task_preparation");
         }
         Ok(families)
     }
+}
+
+/// Encode only the original bounded atomic records; no owner locks or
+/// inferred stall/health decision participates in this projection.
+fn control_plane_values(
+    snapshot: novarocks_worker::WorkerControlPlaneSnapshot,
+) -> Option<Vec<(String, &'static str, i64)>> {
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(snapshot.workers.len().checked_mul(11)?)
+        .ok()?;
+    for worker in snapshot.workers {
+        let timer = worker.timer;
+        let values = [
+            ("phase", Some(worker.phase as u64)),
+            ("entered_at_ns", worker.entered_at.map(|at| at.0)),
+            ("completed_at_ns", worker.completed_at.map(|at| at.0)),
+            ("completed_iterations", Some(worker.completed_iterations)),
+            ("core_turns", Some(worker.core_turns)),
+            ("host_turns", Some(worker.host_turns)),
+            ("timer_sampled_at_ns", timer.map(|scan| scan.observed_at.0)),
+            (
+                "earliest_indexed_deadline_ns",
+                timer
+                    .and_then(|scan| scan.earliest_indexed_deadline)
+                    .map(|at| at.0),
+            ),
+            (
+                "indexed_due_lateness_ns",
+                timer.and_then(|scan| scan.indexed_due_lateness_ns),
+            ),
+            ("pending_ticks", timer.map(|scan| scan.pending_ticks)),
+            (
+                "registered_deadlines",
+                timer.map(|scan| scan.registered_deadlines),
+            ),
+        ];
+        let label = worker.worker.to_string();
+        for (resource, value) in values {
+            if let Some(value) = value {
+                rows.push((label.clone(), resource, i64::try_from(value).ok()?));
+            }
+        }
+    }
+    Some(rows)
+}
+
+/// Pure scalar projection; the original owner supplied every field.
+fn execution_quiescence_values(
+    sample: novarocks_worker::WorkerExecutionQuiescenceSnapshot,
+) -> [(&'static str, u64); 16] {
+    [
+        ("active_tasks", sample.active_tasks),
+        ("preparing_tasks", sample.preparing_tasks),
+        ("preparing_bytes", sample.preparing_bytes),
+        ("requests", sample.requests),
+        ("tickets", sample.tickets),
+        (
+            "contexts_with_execution_custody",
+            sample.contexts_with_execution_custody,
+        ),
+        ("root_producers_running", sample.root_producers_running),
+        ("root_data_positions", sample.root_data_positions),
+        ("root_payload_bytes", sample.root_payload_bytes),
+        ("root_segments", sample.root_segments),
+        ("root_deliveries", sample.root_deliveries),
+        (
+            "root_retained_reservations",
+            sample.root_retained_reservations,
+        ),
+        ("root_metadata_holders", sample.root_metadata_holders),
+        ("context_records", sample.context_records),
+        ("root_channels", sample.root_channels),
+        ("root_metadata_bytes", sample.root_metadata_bytes),
+    ]
 }
 
 /// Fixed scalar projection only; no Root/Task source, alias or callback escapes.

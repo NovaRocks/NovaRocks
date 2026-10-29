@@ -35,6 +35,7 @@ pub(crate) use teardown::ContextTeardownRefusal;
 mod internal;
 mod owner_control;
 pub(crate) use internal::ContextInternalAdvance;
+mod execution_observation;
 mod progress;
 mod root_census;
 pub(crate) use owner_control::OwnerFenceDelivery;

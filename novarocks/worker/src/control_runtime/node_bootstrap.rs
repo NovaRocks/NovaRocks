@@ -551,7 +551,18 @@ impl OwnedNodeRuntime {
             state.config.clock.clone(),
             state.config.workers.pollers.get(),
         ) {
-            Ok(owner) => state.pollers = Some(owner),
+            Ok(owner) => {
+                let observation = owner.observation();
+                // Store the original stop/join owner before the metadata bind.
+                // Even a composition refusal retains its actual pool cleanup.
+                state.pollers = Some(owner);
+                if node.bind_control_plane_observation(observation).is_err() {
+                    return Err(state.refuse(
+                        NodeBootstrapPhase::Pollers,
+                        NodeBootstrapError::OriginalOwner,
+                    ));
+                }
+            }
             Err(error) => {
                 return Err(state.refuse(
                     NodeBootstrapPhase::Pollers,

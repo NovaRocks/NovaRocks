@@ -790,6 +790,18 @@ impl ContextHostJobs {
         self.0.pending.version()
     }
 
+    /// Observe the original M/R callbacks without invoking their host or exit gates.
+    pub(super) fn try_execution_callbacks_quiescent(&self) -> Option<bool> {
+        let state = self.0.state.try_lock().ok()?;
+        // Retired includes the actual role/report/input/header tail. A missing
+        // call or an unknown/panicking return never supplies this positive fact.
+        Some(
+            state.fault.is_none()
+                && state.m.retired
+                && state.r.retired
+                && matches!(state.r.returned, Some(ContextHostReturned::Released { .. })),
+        )
+    }
     /// H owns the moved Root inventory until its actual disposal/report tail ends.
     /// The empty Context map during that interval is not a zero Root census.
     pub(super) fn try_root_census_ready(&self) -> bool {

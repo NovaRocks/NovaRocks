@@ -17,6 +17,13 @@
 
 //! Production pollers and deterministic drivers execute the same bounded turn.
 
+mod poller_observation;
+#[cfg(not(loom))]
+pub use poller_observation::{
+    PollerObservation, PollerObservationSnapshot, PollerPhase, PollerTimerSnapshot,
+    PollerWorkerSnapshot,
+};
+
 use crate::{
     actor::{Actor, ActorConfig, ActorFailurePolicy, StepContext, StepEnvelope},
     notify::Notify,
@@ -1619,10 +1626,24 @@ impl<A: Actor> ActorRuntime<A> {
     }
     /// Both drivers call the same timer conversion. A delayed clock read cannot move process time backwards.
     pub fn advance_time(&self, observed: Tick, budget: usize) -> Result<usize, DriverError> {
+        self.advance_time_sampled(observed, budget, &mut None)
+    }
+    fn advance_time_sampled(
+        &self,
+        observed: Tick,
+        budget: usize,
+        sample: &mut Option<poller_observation::TimerScan>,
+    ) -> Result<usize, DriverError> {
         let (actors, now) = {
             let mut state = self.shared.state.lock().expect("runtime scheduler lock");
             let now = observed.max(state.now);
             state.now = now;
+            *sample = Some(poller_observation::TimerScan {
+                observed_at: now,
+                earliest_indexed_deadline: state.timers.next_deadline(),
+                pending_ticks: state.timers.pending_count(),
+                registered_deadlines: state.timers.deadline_count(),
+            });
             if let Some(history) = &self.shared.history {
                 history.observe_time(now);
             }
@@ -3224,6 +3245,7 @@ impl Clock for ProcessClock {
 #[cfg(not(loom))]
 pub struct PollerPool<A: Actor> {
     runtime: ActorRuntime<A>,
+    observation: PollerObservation,
     stop: Arc<crate::sync::AtomicBool>,
     workers: Vec<std::thread::JoinHandle<()>>,
     stopped: bool,
@@ -3272,6 +3294,7 @@ impl<A: Actor> PollerPool<A> {
                 "control poller count must be positive",
             ));
         }
+        let observation = PollerObservation::new(workers)?;
         let stop = Arc::new(crate::sync::AtomicBool::new(false));
         let host = Arc::new(host);
         let mut threads = Vec::new();
@@ -3280,36 +3303,52 @@ impl<A: Actor> PollerPool<A> {
             let worker_stop = stop.clone();
             let worker_clock = clock.clone();
             let worker_host = host.clone();
+            let worker_observation = observation.writer(index);
             let worker = std::thread::Builder::new()
                 .name(format!("control-poller-{index}"))
                 .spawn(move || {
                     let result = catch_unwind(AssertUnwindSafe(|| {
                         while !worker_stop.load(crate::sync::Ordering::Acquire) {
+                            worker_observation.enter(PollerPhase::Timer, worker_clock.now());
                             let version = worker_runtime.change_version();
                             let now = worker_clock.now();
+                            let mut timer_scan = None;
                             worker_runtime
-                                .advance_time(now, 64)
+                                .advance_time_sampled(now, 64, &mut timer_scan)
                                 .unwrap_or_else(|error| {
                                     eprintln!("Control poller timer advance failed: {error:?}");
                                     std::process::abort();
                                 });
+                            if let Some(scan) = timer_scan {
+                                worker_observation.timer(scan);
+                            }
+                            worker_observation.complete(worker_clock.now());
+                            worker_observation.enter(PollerPhase::Core, worker_clock.now());
                             let core_progressed = worker_runtime
                                 .poll_one_with_clock(worker_clock.as_ref())
                                 .unwrap_or_else(|error| {
                                     eprintln!("Control poller Core turn failed: {error:?}");
                                     std::process::abort();
                                 });
+                            worker_observation.complete(worker_clock.now());
+                            worker_observation.enter(PollerPhase::Host, worker_clock.now());
                             // A continuously ready protocol actor must not starve
                             // host handoffs or retirement. Each queue gets one
                             // finite opportunity before another turn begins.
                             let host_progressed = worker_host(&worker_runtime, worker_clock.now());
+                            worker_observation.complete(worker_clock.now());
+                            worker_observation.iteration(core_progressed, host_progressed);
                             if core_progressed || host_progressed {
                                 continue;
                             }
                             if worker_stop.load(crate::sync::Ordering::Acquire) {
                                 break;
                             }
-                            if let Some(deadline) = worker_runtime.next_deadline() {
+                            worker_observation.enter(PollerPhase::Timer, worker_clock.now());
+                            let deadline = worker_runtime.next_deadline();
+                            worker_observation.complete(worker_clock.now());
+                            worker_observation.enter(PollerPhase::Idle, worker_clock.now());
+                            if let Some(deadline) = deadline {
                                 let delay = std::time::Duration::from_nanos(
                                     deadline.0.saturating_sub(worker_clock.now().0),
                                 );
@@ -3321,6 +3360,8 @@ impl<A: Actor> PollerPool<A> {
                                 worker_runtime.wait_after(version);
                             }
                         }
+                        worker_observation.enter(PollerPhase::Exited, worker_clock.now());
+                        worker_observation.complete(worker_clock.now());
                     }));
                     // Protocol-core panic is isolated inside poll_one. Reaching this boundary
                     // means the shared driver or its fixed failure projection lost an invariant.
@@ -3343,10 +3384,15 @@ impl<A: Actor> PollerPool<A> {
         }
         Ok(Self {
             runtime,
+            observation,
             stop,
             workers: threads,
             stopped: false,
         })
+    }
+    /// The original pool's neutral metadata only, without stop/join authority.
+    pub fn observation(&self) -> PollerObservation {
+        self.observation.clone()
     }
     pub fn runtime(&self) -> &ActorRuntime<A> {
         &self.runtime

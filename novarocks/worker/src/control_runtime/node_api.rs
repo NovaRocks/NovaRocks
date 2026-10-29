@@ -942,3 +942,25 @@ impl WorkerTaskControl {
         self.node.try_root_ownership_snapshot()
     }
 }
+
+impl WorkerTaskControl {
+    /// Independent raw samples of the original production poller slots. None
+    /// means unavailable; no duration, phase or timestamp grants a health,
+    /// scheduling, termination, physical-exit or resource-retirement verdict.
+    pub fn try_control_plane_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerControlPlaneSnapshot> {
+        self.node.try_control_plane_snapshot()
+    }
+}
+
+impl WorkerTaskControl {
+    /// Current original execution custody and physical Root borrows. Cold
+    /// retention does not grant capacity reuse or prove final Scope removal.
+    /// Busy, incomplete, poisoned or overflowing owners are unavailable.
+    pub fn try_execution_quiescence_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerExecutionQuiescenceSnapshot> {
+        self.node.try_execution_quiescence_snapshot()
+    }
+}

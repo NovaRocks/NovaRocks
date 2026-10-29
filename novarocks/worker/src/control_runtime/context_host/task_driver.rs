@@ -242,6 +242,23 @@ impl TaskDriverState {
             && self.publication_refusal.is_none()
             && self.notices.is_empty()
     }
+    pub(super) fn try_is_idle(&self) -> Option<bool> {
+        let ready = self.ready.try_lock().ok()?;
+        Some(
+            self.sources.is_empty()
+                && self.domain_feedback_cuts.is_empty()
+                && self.domain_requests.is_empty()
+                && self.domain_wakes.is_empty()
+                && self.domain_wake_order.is_empty()
+                && ready.is_empty()
+                && self.jobs.is_empty()
+                && self.physical_pending.is_empty()
+                && self.retirements.is_empty()
+                && self.retiring_tasks.is_empty()
+                && self.publication_refusal.is_none()
+                && self.notices.is_empty(),
+        )
+    }
 }
 impl ContextHostRecord {
     pub(crate) fn trace_drain_inventory(&self, budget: usize) {

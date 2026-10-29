@@ -669,9 +669,8 @@ impl ContextHostRecord {
         if task.verify_query_context(self.identity).is_err() {
             return Err(RootReadError::WrongOwner);
         }
-        let (work, handle, shared) = self
-            .admit_deferred_root_request(ready, task, operation, deadline)
-            .map_err(RootReadError::Request)?;
+        let (work, handle, shared) =
+            self.admit_deferred_root_request(ready, task, operation, deadline)?;
         let holder = match self.admit_root_read_data(work) {
             Ok(holder) => holder,
             Err(error) => {

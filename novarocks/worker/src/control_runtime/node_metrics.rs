@@ -109,3 +109,73 @@ impl WorkerPreparationSnapshot {
         }))
     }
 }
+
+// These types are the same original Common metadata projection. No Worker
+// counter, status algorithm, runtime owner or resource permission is copied.
+pub use novarocks_control_runtime::driver::{
+    PollerObservationSnapshot as WorkerControlPlaneSnapshot,
+    PollerPhase as WorkerControlPlanePhase, PollerTimerSnapshot as WorkerControlPlaneTimerSnapshot,
+    PollerWorkerSnapshot as WorkerControlPlaneWorkerSnapshot,
+};
+
+/// Execution responsibility and physical Root borrows sampled from original
+/// owners. Cold directory/channel/core metadata are diagnostic, not busy work.
+/// This bounded observation interval is not a cross-owner instant or an exit receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerExecutionQuiescenceSnapshot {
+    pub active_tasks: u64,
+    pub preparing_tasks: u64,
+    pub preparing_bytes: u64,
+    pub requests: u64,
+    pub tickets: u64,
+    pub contexts_with_execution_custody: u64,
+    pub root_producers_running: u64,
+    pub root_data_positions: u64,
+    pub root_payload_bytes: u64,
+    pub root_segments: u64,
+    pub root_deliveries: u64,
+    pub root_retained_reservations: u64,
+    pub root_metadata_holders: u64,
+    pub context_records: u64,
+    pub root_channels: u64,
+    pub root_metadata_bytes: u64,
+}
+impl WorkerExecutionQuiescenceSnapshot {
+    pub(super) fn sample(
+        ledger: &RuntimeLedger,
+        contexts_with_execution_custody: u64,
+        root: crate::root_result_channel::RootOwnershipSnapshot,
+    ) -> Option<Self> {
+        let charges = ledger
+            .try_capacity_usage(
+                [
+                    Dimension::ActiveTasks.id(),
+                    Dimension::PreparingTasks.id(),
+                    Dimension::PreparingBytes.id(),
+                    Dimension::Requests.id(),
+                    Dimension::Tickets.id(),
+                    Dimension::Contexts.id(),
+                ],
+                Dimension::PreparingTasks.id(),
+            )
+            .ok()??;
+        Some(Self {
+            active_tasks: charges.used[0],
+            preparing_tasks: charges.used[1],
+            preparing_bytes: charges.used[2],
+            requests: charges.used[3],
+            tickets: charges.used[4],
+            context_records: charges.used[5],
+            contexts_with_execution_custody,
+            root_producers_running: u64::try_from(root.producers_running).ok()?,
+            root_data_positions: u64::try_from(root.data_positions).ok()?,
+            root_payload_bytes: u64::try_from(root.payload_bytes).ok()?,
+            root_segments: u64::try_from(root.segments).ok()?,
+            root_deliveries: u64::try_from(root.deliveries).ok()?,
+            root_retained_reservations: u64::try_from(root.retained_reservations).ok()?,
+            root_metadata_holders: u64::try_from(root.metadata_holders).ok()?,
+            root_channels: u64::try_from(root.channels).ok()?,
+            root_metadata_bytes: u64::try_from(root.metadata_bytes).ok()?,
+        })
+    }
+}

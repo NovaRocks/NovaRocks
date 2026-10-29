@@ -25,7 +25,9 @@ mod endpoint;
 pub(crate) mod observation;
 mod task_funding;
 mod task_route;
-use super::root_read::{DeferredRootRequest, RootReadData, RootReadDataGuard, RootReadShared};
+use super::root_read::{
+    DeferredRootRequest, RootReadData, RootReadDataGuard, RootReadError, RootReadShared,
+};
 pub(super) use task_funding::TaskRequestFunding;
 
 use endpoint::ContextRequestEndpoint;
@@ -868,8 +870,8 @@ impl ContextRequestCustody {
                 command: ContextInput::RootEndAcknowledged { task },
             }) => {
                 // Every field of this exact variant is Copy neutral metadata;
-                // none owns a callback, payload, guard, Work or Source. Owned
-                // destructuring also prevents silently accepting custom Drop.
+                // none owns a callback, payload, guard, Work or Source. This
+                // selected message has no custom Drop in the current types.
                 let _original_fields = (work, metadata, task, refused.error);
             }
             message => {
@@ -1709,13 +1711,12 @@ impl ContextHostRecord {
         task: TaskIdentity,
         operation: TaskOperationId,
         deadline: MonotonicInstant,
-    ) -> Result<
-        (WorkId, TaskContextRequestHandle, Arc<RootReadShared>),
-        ContextRequestAdmissionRefusal,
-    > {
-        let reject = |error| ContextRequestAdmissionRefusal {
-            error,
-            partial: None,
+    ) -> Result<(WorkId, TaskContextRequestHandle, Arc<RootReadShared>), RootReadError> {
+        let reject = |error| {
+            RootReadError::Request(ContextRequestAdmissionRefusal {
+                error,
+                partial: None,
+            })
         };
         if !ready.same_runtime(&self.control_runtime) {
             return Err(reject(ContextRequestError::WrongRuntime));
@@ -1756,6 +1757,14 @@ impl ContextHostRecord {
             );
             return Err(reject(ContextRequestError::AdmissionClosed));
         }
+        // The original read seal follows physical Task/prefix retirement and
+        // transfer of any installed Root into this Context. Under the still-open
+        // Root/Context gates above, this sealed Task can no longer install one.
+        if self.has_retired_task_read(task) && !self.resources.root_reads.has_root(task) {
+            return Err(RootReadError::Task(
+                crate::control_runtime::task::TaskRootReadError::NoRoot,
+            ));
+        }
         let retained = self.resources.root_reads.has_retained(task);
         // The installed Context Root owns reads independently of the closing
         // Task RPC issuer. Only actual Task retirement below permits the EOF
@@ -1781,15 +1790,18 @@ impl ContextHostRecord {
             );
             return Err(reject(ContextRequestError::TaskNotReady));
         }
-        let funding = self.reserve_task_request_funding()?;
+        let funding = self
+            .reserve_task_request_funding()
+            .map_err(RootReadError::Request)?;
         let work = funding.author.work.id();
         let work_retirement = funding.author.work.retirement_observer();
         let report = funding.author.report.clone();
         if self.resources.root_reads.reserve(task, work).is_err() {
             let partial = ContextRequestPartial::from_task_funding(funding, self.ledger.clone());
-            return Err(
-                self.retain_request_partial(ContextRequestError::RootReadCapacity, Some(partial))
-            );
+            return Err(RootReadError::Request(self.retain_request_partial(
+                ContextRequestError::RootReadCapacity,
+                Some(partial),
+            )));
         }
         let slot = match ready.register_context(self.scope(), work, self.registration()) {
             Ok(slot) => slot,
@@ -1797,9 +1809,10 @@ impl ContextHostRecord {
                 self.resources.root_reads.release(task, work);
                 let partial =
                     ContextRequestPartial::from_task_funding(funding, self.ledger.clone());
-                return Err(
-                    self.retain_request_partial(ContextRequestError::Ready(error), Some(partial))
-                );
+                return Err(RootReadError::Request(self.retain_request_partial(
+                    ContextRequestError::Ready(error),
+                    Some(partial),
+                )));
             }
         };
         let (notification, observer) =

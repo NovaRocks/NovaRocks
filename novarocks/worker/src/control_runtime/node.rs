@@ -34,7 +34,9 @@ use crate::{
     control_runtime_policy::ControlRuntimePolicy,
 };
 use novarocks_control_runtime::{
-    driver::{ActorHostTurn, ActorRegistration, ActorRuntime, Clock, PollerPool},
+    driver::{
+        ActorHostTurn, ActorRegistration, ActorRuntime, Clock, PollerObservation, PollerPool,
+    },
     publication::PublishedSnapshot,
 };
 use novarocks_control_runtime_core::identity::{ActorId, Generation, ReservationId, Tick};
@@ -49,7 +51,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     num::NonZeroU64,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -164,6 +166,7 @@ pub(crate) struct WorkerNodeHost {
     root_registration: ActorRegistration,
     root: RootHostCell,
     metrics_ledger: novarocks_control_runtime::transaction::RuntimeLedger,
+    poller_observation: OnceLock<PollerObservation>,
     root_ready_scan: AtomicUsize,
     draining: AtomicBool,
     directory: ContextDirectory,
@@ -543,6 +546,7 @@ impl WorkerNodeHost {
             directory: root.service().directory(),
             requests: root.request_ready().clone(),
             metrics_ledger: root.ledger().clone(),
+            poller_observation: OnceLock::new(),
             root: RootHostCell::new(root),
             root_ready_scan: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
@@ -1524,5 +1528,47 @@ impl WorkerNodeHost {
         self.directory
             .census_addresses_unchanged(&addresses)
             .then_some(total)
+    }
+}
+
+impl WorkerNodeHost {
+    /// The sole bootstrap owner binds its actual pool before exposing a facade.
+    /// Refusal returns only neutral metadata; the caller still owns its pool.
+    pub(crate) fn bind_control_plane_observation(
+        &self,
+        observation: PollerObservation,
+    ) -> Result<(), PollerObservation> {
+        self.poller_observation.set(observation)
+    }
+    pub(crate) fn try_control_plane_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerControlPlaneSnapshot> {
+        self.poller_observation.get()?.snapshot()
+    }
+}
+
+impl WorkerNodeHost {
+    pub(crate) fn try_execution_quiescence_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerExecutionQuiescenceSnapshot> {
+        let addresses = self
+            .directory
+            .try_census_addresses(self.config.max_contexts)?;
+        let mut roots = crate::root_result_channel::RootOwnershipSnapshot::default();
+        let mut active_contexts = 0u64;
+        for address in &addresses {
+            let host = address.try_lock()?;
+            let (idle, root) = host.try_execution_observation()?;
+            active_contexts = active_contexts.checked_add(u64::from(!idle))?;
+            roots.try_add(root)?;
+        }
+        let sample = super::node_metrics::WorkerExecutionQuiescenceSnapshot::sample(
+            &self.metrics_ledger,
+            active_contexts,
+            roots,
+        )?;
+        self.directory
+            .census_addresses_unchanged(&addresses)
+            .then_some(sample)
     }
 }

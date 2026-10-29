@@ -153,7 +153,9 @@ pub use control_runtime::node_bootstrap::{
 };
 pub use control_runtime::node_geometry::{NodeGeometry, NodeGeometryError, NodeGeometryInputs};
 pub use control_runtime::node_metrics::{
-    WorkerNodeMetricsSnapshot, WorkerPreparationObservationError, WorkerPreparationSnapshot,
+    WorkerControlPlanePhase, WorkerControlPlaneSnapshot, WorkerControlPlaneTimerSnapshot,
+    WorkerControlPlaneWorkerSnapshot, WorkerExecutionQuiescenceSnapshot, WorkerNodeMetricsSnapshot,
+    WorkerPreparationObservationError, WorkerPreparationSnapshot,
 };
 pub use control_runtime::operator_statistics::{
     StatisticsSubmission, TaskStatisticsFinalizer, TaskStatisticsProducer,
