@@ -42,12 +42,17 @@ pub(super) struct UnitReceiverOwner {
     streams: Vec<ExchangeStreamIdentity>,
 }
 
+#[cfg(test)]
+type EndProjectionPause = Box<dyn FnOnce(&Receiver, ExchangeUnitReceipt) + Send>;
+
 #[derive(Default)]
 pub(super) struct UnitQueue {
     pending: BTreeMap<(ExchangeStreamIdentity, u64), Vec<Chunk>>,
     enqueued: BTreeMap<ExchangeStreamIdentity, u64>,
     ends: BTreeMap<ExchangeStreamIdentity, ExchangeUnitSequence>,
     boundaries: VecDeque<UnitBoundary>,
+    #[cfg(test)]
+    before_end_projection: Option<EndProjectionPause>,
 }
 
 impl UnitQueue {
@@ -342,6 +347,22 @@ impl ExecutionExchangeRegistry {
             .slots
             .begin_admission(stream, frame.item)
             .map_err(ExchangeFailure::from)?;
+        #[cfg(test)]
+        if matches!(frame.item, ExchangeUnitItem::End(_))
+            && let ExchangeSlotAdmission::Observed(receipt) = &admission
+        {
+            let pause = receiver
+                .mu
+                .lock()
+                .expect("exchange receiver lock")
+                .units
+                .before_end_projection
+                .take();
+            if let Some(pause) = pause {
+                // The receiver-local test rendezvous owns no slot/queue lock.
+                pause(&receiver, *receipt);
+            }
+        }
         let observed_end = owner
             .slots
             .stream_snapshot(stream)
@@ -358,6 +379,10 @@ impl ExecutionExchangeRegistry {
         }
         match admission {
             ExchangeSlotAdmission::Observed(receipt) => {
+                // End is already visible in the queue before this fresh read.
+                // A decode finishing later sees that End; one finishing earlier
+                // is covered here. Admission facts can predate both transitions.
+                let facts = owner.slots.facts(stream).map_err(ExchangeFailure::from)?;
                 let mut state = receiver.mu.lock().expect("exchange receiver lock");
                 if matches!(frame.item, ExchangeUnitItem::End(_))
                     && receipt.verdict
@@ -365,7 +390,7 @@ impl ExecutionExchangeRegistry {
                 {
                     state.recv_request_count = state.recv_request_count.saturating_add(1);
                 }
-                state.expose_unit_prefix(stream, receipt.facts);
+                state.expose_unit_prefix(stream, facts);
                 drop(state);
                 receiver.observable.defer_notify().arm();
                 Ok(receipt)
@@ -534,6 +559,14 @@ mod tests {
 
     impl Fixture {
         fn new(slots: usize) -> Self {
+            let limits =
+                ExchangeFlowLimits::try_new(slots, slots, 0, 2, Duration::from_secs(30)).unwrap();
+            Self::with_registry(Arc::new(ExecutionExchangeRegistry::with_flow_limits(
+                limits,
+            )))
+        }
+
+        fn with_registry(registry: Arc<ExecutionExchangeRegistry>) -> Self {
             let task = Owner::new();
             let destination = task.identity();
             let key = ExchangeKey {
@@ -561,9 +594,6 @@ mod tests {
             )
             .unwrap();
             let schema = super::super::tests::plain_declaration(&schema);
-            let limits =
-                ExchangeFlowLimits::try_new(slots, slots, 0, 2, Duration::from_secs(30)).unwrap();
-            let registry = Arc::new(ExecutionExchangeRegistry::with_flow_limits(limits));
             registry
                 .try_register_expected_chunk_schema_with_binding(
                     key,
@@ -654,6 +684,172 @@ mod tests {
                 .values()
                 .to_vec()
         }
+    }
+
+    #[test]
+    fn end_admitted_during_decode_finishes_real_source_without_a_future_producer_wake() {
+        use crate::exec::operators::ExchangeSourceFactory;
+        use crate::exec::pipeline::{
+            binding::ExchangeBinding,
+            operator_factory::OperatorFactory,
+            step::NextStep,
+            step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork},
+        };
+        use crate::runtime::execution_runtime::{ExecutionRuntime, test_execution_runtime};
+        use crate::runtime::fragment::io::ExecutionRuntimeExchangeReceiverPort;
+        use crate::runtime::runtime_state::RuntimeState;
+
+        let base = test_execution_runtime();
+        let runtime = Arc::new(
+            ExecutionRuntime::new_with_exchange_flow_limits(
+                base.config().clone(),
+                base.function_set().clone(),
+                base.memory_authority().clone(),
+                ExchangeFlowLimits::try_new(1, 1, 0, 2, Duration::from_secs(30)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let f = Fixture::with_registry(runtime.exchange_registry());
+        let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
+            f.task.view(TaskFailurePhase::Execution),
+        )));
+        let state = RuntimeState::new(
+            None,
+            None,
+            Some(f.task.identity().query_execution_id().query_id()),
+            Some(UniqueId::new(f.key.finst_id_hi, f.key.finst_id_lo)),
+            Some(0),
+            Some(MemTracker::new_root("late End real Source")),
+            Some(runtime.clone()),
+            control,
+        );
+        let factory = ExchangeSourceFactory::new_compiled(
+            f.key.node_id,
+            ExchangeBinding {
+                key: f.key,
+                expected_senders: 1,
+                receiver_port: Arc::new(ExecutionRuntimeExchangeReceiverPort::new(runtime)),
+            },
+        );
+        let mut source = factory.create(1, 0);
+        source.bind_runtime_state(&state).unwrap();
+        source.prepare().unwrap();
+        let mut drive = || {
+            let errors = state.error_state();
+            let mut work = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
+            let mut values = novarocks_value_arrays::decode::ValueConversionContext::default();
+            source
+                .drive(&mut StepContext::new(&errors, &mut work, &mut values))
+                .unwrap()
+        };
+        let NextStep::Wait(before) = drive().next else {
+            panic!("the original empty Source must really wait");
+        };
+        assert!(!before.is_ready());
+
+        let data = f.frame(1, &[41, 42], false);
+        f.register(&data);
+        let mut end = data.clone();
+        end.item = ExchangeUnitItem::End(ExchangeUnitSequence::try_new(2).unwrap());
+        end.payload = Bytes::new();
+        let (entered, decoding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let registry = f.registry.clone();
+        let key = f.key;
+        let decoder = std::thread::spawn(move || {
+            registry.receive_unit_with(key, data, |sender, payload| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                registry.decode_chunks_for_sender(key, sender, payload)
+            })
+        });
+        decoding.recv().unwrap();
+        let receiver = f
+            .registry
+            .receivers
+            .lock()
+            .unwrap()
+            .get(&f.key)
+            .unwrap()
+            .clone();
+        let stream = f.stream;
+        receiver.mu.lock().unwrap().units.before_end_projection =
+            Some(Box::new(move |receiver, admission| {
+                let released = release.send(());
+                let decoded = decoder.join();
+                released.unwrap();
+                let decoded = decoded.unwrap().unwrap();
+                assert_eq!(admission.facts.custody_through, 0);
+                assert_eq!(
+                    admission.verdict,
+                    crate::runtime::fragment::io::exchange_unit::ExchangeAdmissionVerdict::Applied
+                );
+                assert_eq!(decoded.facts.custody_through, 2);
+                let snapshot = receiver
+                    .unit_owner()
+                    .unwrap()
+                    .slots
+                    .stream_snapshot(stream)
+                    .unwrap();
+                assert_eq!(
+                    snapshot.observed_end,
+                    Some(ExchangeUnitSequence::try_new(2).unwrap())
+                );
+                assert_eq!(snapshot.facts.custody_through, 2);
+                assert_eq!(snapshot.decoding_positions, 0);
+                let queue = receiver.mu.lock().unwrap();
+                assert!(queue.units.ends.is_empty());
+                assert!(queue.finished.is_empty());
+                assert_eq!(queue.chunks.len(), 1);
+            }));
+        let admitted = f.registry.receive_unit(f.key, end).unwrap();
+        assert_eq!(
+            admitted.facts.custody_through, 0,
+            "preserve the actual admission ACK facts"
+        );
+        assert!(
+            before.is_ready(),
+            "the original Source receives real ingress notifications"
+        );
+        assert_eq!(
+            f.registry.stream_close_facts(f.key, &[stream]).unwrap()[0].disposition,
+            ExchangeCloseDisposition::Withdrawn,
+            "custody ACK does not author Consumed"
+        );
+
+        // Both ingress calls and the original decoder have actually returned.
+        // No producer, test wake or forced kernel poll can rescue a stale End.
+        let data = drive();
+        assert!(matches!(data.next, NextStep::Runnable));
+        let chunk = data.output.expect("the original source hands off Data1");
+        let values = chunk
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[41, 42]);
+        drop(chunk);
+        let end = drive();
+        assert!(end.output.is_none());
+        assert!(
+            matches!(end.next, NextStep::Finished),
+            "an already admitted exact End must finish, not freeze an unready Wait: {:?}",
+            end.next
+        );
+        assert_eq!(
+            f.registry.stream_close_facts(f.key, &[stream]).unwrap()[0].disposition,
+            ExchangeCloseDisposition::Consumed {
+                final_sequence: ExchangeUnitSequence::try_new(2).unwrap()
+            }
+        );
+        assert!(state.error().is_none());
+        assert!(f.task.accepted().is_none());
+        let slots = f.registry.unit_slots.get(receiver_key(f.key)).unwrap();
+        assert_eq!(slots.snapshot().in_use, 0);
+        assert_eq!(slots.snapshot().decoding, 0);
+        f.registry.remove_exchange_key(f.key);
+        assert_eq!(f.registry.unit_slots.snapshot().registered_instances, 0);
     }
 
     #[test]

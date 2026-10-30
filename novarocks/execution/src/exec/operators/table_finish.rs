@@ -6553,4 +6553,138 @@ mod tests {
         }
         assert_eq!((summaries, artifacts), (1, 2));
     }
+    #[test]
+    fn logical_change_summary_finish_preloaded_separate_end_requires_no_future_producer_wake() {
+        use crate::exec::operators::{
+            logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        use crate::exec::pipeline::step_context::{DEFAULT_TURN_WORK_UNITS, TurnWork};
+        for units in [1, DEFAULT_TURN_WORK_UNITS] {
+            let (fixture, state, schema) = composite_fixture(2, 1, 1);
+            let shared = UnionAllSharedState::new_with_limits(1, 905, 1, 1);
+            let state = IngressFixture::task_state(&state);
+            let ingress = IngressFixture::new(1, &state);
+            shared
+                .push_chunk(
+                    None,
+                    composite_rows(
+                        &schema,
+                        vec![
+                            (
+                                WriterRowKind::AggregatePartial.to_wire(),
+                                0,
+                                None,
+                                None,
+                                vec![Some(b"group-zero".to_vec())],
+                            ),
+                            (
+                                WriterRowKind::AggregatePartial.to_wire(),
+                                1,
+                                None,
+                                None,
+                                vec![Some(b"group-one".to_vec())],
+                            ),
+                            (
+                                WriterRowKind::RowCount.to_wire(),
+                                0,
+                                Some(5),
+                                None,
+                                vec![None],
+                            ),
+                            (
+                                WriterRowKind::RowCount.to_wire(),
+                                1,
+                                Some(7),
+                                None,
+                                vec![None],
+                            ),
+                        ],
+                    ),
+                )
+                .unwrap();
+            shared.producer_finished();
+            ingress.send(
+                0,
+                1,
+                Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
+                false,
+            );
+            ingress.send(0, 2, None, true);
+            // Every producer publication, including the distinct End Unit, precedes
+            // Source preparation/subscription. No producer emits another wake below.
+            let mut source = fixture
+                .inner
+                .with_logical_input(shared, ingress.input())
+                .create(1, 0);
+            prepare_logical_finish(source.as_mut(), &state);
+            let errors = state.error_state();
+            let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            assert!(matches!(
+                source
+                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .unwrap()
+                    .next,
+                NextStep::Yield
+            ));
+            let mut chunks = Vec::new();
+            let mut done = false;
+            for _ in 0..1024 {
+                work.begin_turn(units).unwrap();
+                let step = source
+                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .unwrap();
+                if let NextStep::Wait(wait) = &step.next {
+                    assert!(
+                        wait.is_ready(),
+                        "preloaded data and separate End parked without future producer work: units={units}, wait={wait:?}"
+                    );
+                }
+                assert!(
+                    !matches!(step.next, NextStep::NeedInput),
+                    "the real Source wrapper cannot request an upstream input"
+                );
+                chunks.extend(step.output);
+                if matches!(step.next, NextStep::Finished) {
+                    done = true;
+                    break;
+                }
+            }
+            assert!(
+                done,
+                "real final aggregate and grouped Unpivot must receive their quantum"
+            );
+            let mut summaries = 0;
+            let mut artifacts = 0;
+            for chunk in &chunks {
+                let (kinds, _, counts, _) = finish_columns(chunk);
+                for row in 0..chunk.len() {
+                    if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                        summaries += 1;
+                        assert_eq!(counts.value(row), 9);
+                    } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {
+                        artifacts += 1;
+                    }
+                }
+            }
+            assert_eq!((summaries, artifacts), (1, 2));
+            assert!(matches!(source.initial_step(), NextStep::Finished));
+            assert!(state.error().is_none());
+            let closes = ingress
+                .registry
+                .stream_close_facts(ingress.key, &ingress.streams)
+                .unwrap();
+            assert_eq!(closes.len(), ingress.streams.len());
+            for (close, expected) in closes.iter().zip(ingress.streams.iter()) {
+                assert_eq!(close.stream, *expected);
+                assert!(
+                    matches!(close.disposition,
+                novarocks_execution_contract::ExchangeCloseDisposition::Consumed { final_sequence }
+                if final_sequence.get() == 2),
+                    "finish must consume this exact source's distinct End sequence"
+                );
+            }
+        }
+    }
 }

@@ -39,7 +39,7 @@ CLI package 为 `novarocks-system-test-cli`，原 package `novarocks-system-test
 
 UEA-5F 的六个 `exchange/` 场景在真实 1FE+3BE 上覆盖 gather/broadcast/shuffle 的有序背压、多查询 probe/build 进展、接纳后丢 Unit 应答与准确重放、grant 订阅新 generation、超传输期限的真实 Source 停泊、以及压力下短查询和 KILL QUERY。它们使用原受管 runtime 的私有 Hadoop Iceberg warehouse 和普通 SQL 写入种子数据，不调用共享 fixture 维护或 benchmark producer。
 
-这六场景显式使用 floor1/max2/floating1/window2、单次传输 1000ms、既有 256KiB 共享发送预算及 32KiB batch target（不是新的消息拒绝边界）；没有修改生产默认值。`connector/distributed-writer-row-level-small-slots` 单独保留原 row-level 数据、oracle、DOP 和期限，仅使用 floor1/max2/floating0/window1 与原 authenticated writer append hold；原 `connector/distributed-writer-row-level` 继续使用默认配置。发现与影响声明是原 Scenario 集合的事实，注册存在不代表运行通过。
+这六场景显式使用 floor1/max2/floating1/window2、单次传输 1000ms、既有 256KiB 共享发送预算及 8KiB batch target（不是新的消息拒绝边界）；没有修改生产默认值。种子保留六个各 4096 行的独立 Parquet 文件，并检查原文件大小的最小 split weight 前提；实际等权放置和单文件 page 边界共同保证 shuffle 流有第二个 Data Unit。`connector/distributed-writer-row-level-small-slots` 单独保留原 row-level 数据、oracle、DOP 和期限，仅使用 floor1/max2/floating0/window1 与原 authenticated writer append hold；原 `connector/distributed-writer-row-level` 继续使用默认配置。发现与影响声明是原 Scenario 集合的事实，注册存在不代表运行通过。
 
 故障走原受认证的 BE→BE H2 actor：预转发 hold 与接纳后丢应答分开记录，场景用真实 statement nomination、BE process roster、stream/sequence/请求摘要精化候选。长等要求同 receiver node、fragment instance、driver 和 block epoch 的实际 `InputEmpty` park/wake；缺失 build Unit 与 probe 输入背压分别观察，不冒称 probe driver 的 dependency 事件。重放必须到原接收作者的 Idempotent 计数；订阅重建必须保留原需求 stream 并取得完整新代 snapshot。
 
