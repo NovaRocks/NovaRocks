@@ -19,7 +19,7 @@
 //! column combination and canonical numeric domains, never byte decoding or a
 //! second byte hash. Ordinary exchange keeps its original partition mapping.
 
-use std::{alloc::Layout, mem::size_of};
+use std::{alloc::Layout, mem::size_of, ops::Range};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
@@ -649,6 +649,60 @@ pub(crate) struct CanonicalTupleView<'a> {
     arrays: &'a [ArrayRef],
     storage: &'a CanonicalTupleStorage,
 }
+struct RootNullComponent<'a> {
+    array: &'a ArrayRef,
+    len: usize,
+    decoded: Option<&'a DecodedBytes>,
+    row_map: Option<&'a [usize]>,
+}
+impl RootNullComponent<'_> {
+    fn row(&self, row: usize) -> ExecutionResult<usize> {
+        let row = match self.row_map {
+            Some(rows) => *rows
+                .get(row)
+                .filter(|&&row| row != usize::MAX)
+                .ok_or_else(|| invariant(ValueViolation::Bounds))?,
+            None => row,
+        };
+        if row >= self.len {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        Ok(row)
+    }
+    fn is_null(&self, row: usize) -> ExecutionResult<bool> {
+        let row = self.row(row)?;
+        match self.decoded {
+            Some(decoded) => decoded
+                .value(row)
+                .map_err(ExecutionFailure::from_domain)
+                .map(|value| value.is_none()),
+            None => Ok(normalized_root_is_null(self.array.as_ref(), row)),
+        }
+    }
+}
+
+/// Only coordinate mapping and the already-bound component's original NULL
+/// access run per occurrence. This allocates no row or value representation.
+fn or_component_root_nulls(
+    rows: &[usize],
+    ordinals: &[usize],
+    output: &mut [bool],
+    mut is_null: impl FnMut(usize) -> ExecutionResult<bool>,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    for (index, (&ordinal, result)) in ordinals.iter().zip(output).enumerate() {
+        if index.is_multiple_of(256) {
+            checkpoint()?;
+        }
+        if !*result {
+            let row = *rows
+                .get(ordinal)
+                .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+            *result = is_null(row)?;
+        }
+    }
+    Ok(())
+}
 pub(crate) struct CanonicalTupleBatch<'a> {
     arrays: &'a [ArrayRef],
     storage: CanonicalTupleStorage,
@@ -677,6 +731,80 @@ impl CanonicalTupleBatch<'_> {
     }
 }
 impl<'a> CanonicalTupleView<'a> {
+    fn root_null_component(&self, column: usize) -> ExecutionResult<RootNullComponent<'a>> {
+        let (array, row_map) = self.physical_component(column)?;
+        let decoded = self
+            .storage
+            .bytes
+            .get(column)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?
+            .as_ref();
+        Ok(RootNullComponent {
+            array,
+            len: array.len(),
+            decoded,
+            row_map,
+        })
+    }
+
+    /// The source row/ordinal mapping is borrowed from the original captured
+    /// input. Bind a component once, then observe its existing decoded or
+    /// physical root NULL over the requested occurrence batch.
+    pub(crate) fn component_range_root_nulls_observed(
+        &self,
+        components: Range<usize>,
+        rows: &[usize],
+        ordinals: &[usize],
+        output: &mut [bool],
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        checkpoint()?;
+        if components.start > components.end
+            || components.end > self.arrays.len()
+            || output.len() != ordinals.len()
+        {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        for (index, result) in output.iter_mut().enumerate() {
+            if index.is_multiple_of(256) {
+                checkpoint()?;
+            }
+            *result = false;
+        }
+        for column in components {
+            checkpoint()?;
+            let component = self.root_null_component(column)?;
+            match component.decoded {
+                Some(decoded) => or_component_root_nulls(
+                    rows,
+                    ordinals,
+                    output,
+                    |row| {
+                        decoded
+                            .value(component.row(row)?)
+                            .map_err(ExecutionFailure::from_domain)
+                            .map(|value| value.is_none())
+                    },
+                    checkpoint,
+                )?,
+                None => or_component_root_nulls(
+                    rows,
+                    ordinals,
+                    output,
+                    |row| {
+                        Ok(normalized_root_is_null(
+                            component.array.as_ref(),
+                            component.row(row)?,
+                        ))
+                    },
+                    checkpoint,
+                )?,
+            }
+        }
+        checkpoint()?;
+        Ok(())
+    }
+
     pub(crate) fn physical_component(
         &self,
         column: usize,
@@ -721,36 +849,11 @@ impl<'a> CanonicalTupleView<'a> {
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<bool> {
         checkpoint()?;
-        for (column, ((array, decoded), normalized)) in self
-            .arrays
-            .iter()
-            .zip(&self.storage.bytes)
-            .zip(&self.storage.normalized)
-            .enumerate()
-        {
+        for column in 0..self.arrays.len() {
             if column.is_multiple_of(256) {
                 checkpoint()?;
             }
-            let (array, row) = if let Some(normalized) = normalized {
-                (
-                    &normalized.array,
-                    *normalized
-                        .row_map
-                        .get(row)
-                        .filter(|&&row| row != usize::MAX)
-                        .ok_or_else(|| invariant(ValueViolation::Bounds))?,
-                )
-            } else {
-                (array, row)
-            };
-            let null = match decoded {
-                Some(decoded) => decoded
-                    .value(row)
-                    .map_err(ExecutionFailure::from_domain)?
-                    .is_none(),
-                None => normalized_root_is_null(array.as_ref(), row),
-            };
-            if null {
+            if self.root_null_component(column)?.is_null(row)? {
                 return Ok(true);
             }
         }

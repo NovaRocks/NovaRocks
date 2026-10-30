@@ -510,6 +510,11 @@ pub(crate) struct SealedCapture {
     sizing: SizingPayload,
 }
 impl SealedCapture {
+    /// Exact physical input occurrences already checked by the original seal.
+    /// This is neither an indexable-row count nor a distinct-key estimate.
+    pub(crate) fn input_rows(&self) -> usize {
+        self.counts.input_rows()
+    }
     #[cfg(test)]
     pub(super) fn pages(&self) -> &SealedPages {
         &self.directory

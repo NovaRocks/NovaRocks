@@ -37,7 +37,7 @@ use novarocks_value_arrays::{
     decode::ValueConversionContext,
     reachability::{ReachableRows, SelectionSet},
 };
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 /// SQL matching policy, independent of the signed nullable input declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -361,6 +361,39 @@ impl KeyInput {
         storage
             .view(self.arrays())
             .row_has_null_observed(row, checkpoint)
+    }
+    /// Observe only the requested static component range, in original
+    /// occurrence order. Output is one root-NULL OR per occurrence; an empty
+    /// component range is false. No source preparation or value copy occurs.
+    pub(crate) fn component_range_root_nulls_observed(
+        &self,
+        components: Range<usize>,
+        occurrences: Range<usize>,
+        output: &mut [bool],
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        checkpoint()?;
+        let ordinals = self
+            .0
+            .ordinals
+            .get(occurrences)
+            .filter(|ordinals| ordinals.len() == output.len())
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        let storage = self
+            .0
+            .preparation
+            .as_ref()
+            .and_then(|p| p.projected.as_ref())
+            .map_or(&self.0.tuples, |(storage, _)| storage);
+        storage
+            .view(self.arrays())
+            .component_range_root_nulls_observed(
+                components,
+                &self.0.rows,
+                ordinals,
+                output,
+                checkpoint,
+            )
     }
     pub(crate) fn arrays(&self) -> &[ArrayRef] {
         &self.0.arrays
