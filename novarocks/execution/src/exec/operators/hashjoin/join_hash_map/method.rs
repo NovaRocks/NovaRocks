@@ -22,9 +22,9 @@ use crate::{
     exec::hash_table::{
         allocation::AggregateVec,
         key_index::{
-            BulkClaim, BulkDomain, BulkInput, BulkTask, BulkTaskGraph, BulkWork, CaptureBuilder,
-            CaptureWork, CompleteInput, EvaluatedPage, IndexPurpose, IndexView, KeyInput, KeySpec,
-            NullPolicy, PreparedKeyBatch,
+            BulkClaim, BulkDomain, BulkInput, BulkTask, BulkTaskAdvance, BulkTaskGraph, BulkWork,
+            CaptureBuilder, CaptureWork, CompleteInput, EvaluatedPage, IndexPurpose, IndexView,
+            KeyInput, KeySpec, NullPolicy, PreparedKeyBatch,
         },
     },
     runtime::fragment::{ExecutionFailure, ExecutionResult},
@@ -274,7 +274,8 @@ impl JoinKeyBuild {
                 if tasks[index].advance(
                     novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize,
                     work,
-                )? {
+                )? == BulkTaskAdvance::Done
+                {
                     let task = tasks.swap_remove(index);
                     let mut completion = task.finish()?;
                     graph.complete(&mut completion, work)?;

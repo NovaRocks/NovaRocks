@@ -79,7 +79,10 @@ pub(crate) use bulk_tasks::BulkReady;
     reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
 )]
 pub(crate) use bulk_tasks::Completion as BulkCompletion;
-pub(crate) use bulk_tasks::{BulkAssignments, BulkTaskGraph, Claim as BulkClaim, Task as BulkTask};
+pub(crate) use bulk_tasks::{
+    BulkAssignments, BulkTaskGraph, Claim as BulkClaim, Task as BulkTask,
+    TaskAdvance as BulkTaskAdvance,
+};
 #[expect(
     unused_imports,
     reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."

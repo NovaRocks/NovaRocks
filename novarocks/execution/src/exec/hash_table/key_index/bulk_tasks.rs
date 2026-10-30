@@ -31,7 +31,10 @@ use super::{
     vector,
 };
 use crate::{
-    exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},
+    exec::{
+        phased_work::{PhasedRangeWork, RangeLease},
+        pipeline::operator::{ConstructionFailure, InputConstructionOwner},
+    },
     runtime::fragment::{ExecutionFailure, ExecutionResult},
 };
 use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl};
@@ -125,15 +128,11 @@ struct ShardFacts {
 }
 struct State {
     phase: Phase,
-    next_shard: usize,
     ranges: InputRanges,
     exhausted: bool,
-    issued: usize,
-    completed: usize,
-    inflight: usize,
     shards: Vec<ShardFacts>,
     nonnull_classes: usize,
-    assignments: Option<Arc<AssignmentNode>>,
+    assignments: Option<AssignmentDirectory>,
     hash: Option<hash::HashState>,
     view: Option<Arc<IndexView>>,
 }
@@ -143,6 +142,7 @@ struct Shared {
     store: Option<Arc<direct_int::Storage>>,
     purpose: IndexPurpose,
     workers: usize,
+    phases: Arc<PhasedRangeWork<ExecutionFailure, ValueTypeStorageLifetime>>,
     state: Mutex<State>,
     _storage: ValueTypeStorageLifetime,
 }
@@ -159,6 +159,7 @@ impl Shared {
     }
     fn check(&self, work: &DirectWork<'_>) -> ExecutionResult<()> {
         self.domain.check_failure()?;
+        self.phases.check()?;
         if let Some(store) = &self.store {
             store.check_failure()?;
         }
@@ -166,7 +167,8 @@ impl Shared {
     }
     fn latch<T>(&self, result: ExecutionResult<T>) -> ExecutionResult<T> {
         if let Err(cause) = &result {
-            self.domain.latch(cause.clone());
+            let cause = self.phases.latch(cause.clone());
+            self.domain.latch(cause);
         }
         result
     }
@@ -254,6 +256,16 @@ impl BulkTaskGraph {
                 }
             };
             let (runs, _) = input.into_parts();
+            let assignments = AssignmentDirectory::new(runs.len(), work)?;
+            let phases = shared(
+                work.owner,
+                PhasedRangeWork::with_retention(
+                    invariant(ValueViolation::RowTransaction),
+                    arithmetic(),
+                    work.owner.storage_lifetime(),
+                ),
+            )?;
+            begin_phase(&phases, phase, shards.len())?;
             let shared = shared(
                 work.owner,
                 Shared {
@@ -262,17 +274,14 @@ impl BulkTaskGraph {
                     store,
                     purpose,
                     workers: workers.get(),
+                    phases,
                     state: Mutex::new(State {
                         phase,
-                        next_shard: 0,
                         ranges: InputRanges::new(),
                         exhausted: false,
-                        issued: 0,
-                        completed: 0,
-                        inflight: 0,
                         shards,
                         nonnull_classes: 0,
-                        assignments: None,
+                        assignments: Some(assignments),
                         hash,
                         view,
                     }),
@@ -309,10 +318,11 @@ impl BulkTaskGraph {
                 // A retained route cursor is data custody, not another CPU
                 // position. Let eager merges use the same caller allowance.
                 if state.phase != Phase::HashRoute
-                    && (state.inflight == self.0.workers || state.exhausted)
+                    && (self.0.phases.inflight()? == self.0.workers || state.exhausted)
                 {
                     return Ok(Claim::Pending);
                 }
+                let mut claimed = None;
                 let seed = match state.phase {
                     Phase::HashRoute => {
                         let State {
@@ -326,7 +336,7 @@ impl BulkTaskGraph {
                             .ok_or_else(|| invariant(ValueViolation::Layout))?
                             .claim_route(ranges, exhausted, self.0.workers, work)?
                         else {
-                            if state.exhausted && state.inflight == 0 {
+                            if state.exhausted && self.0.phases.inflight()? == 0 {
                                 continue;
                             }
                             return Ok(Claim::Pending);
@@ -352,12 +362,12 @@ impl BulkTaskGraph {
                         Seed::Hash(seed)
                     }
                     Phase::Init | Phase::Count | Phase::Prefix | Phase::Fill => {
-                        if state.next_shard == state.shards.len() {
+                        let Some(token) = self.0.phases.claim()? else {
                             state.exhausted = true;
                             continue;
-                        }
-                        let shard = state.next_shard;
-                        state.next_shard += 1;
+                        };
+                        let shard = token.range().start;
+                        claimed = Some(token);
                         match state.phase {
                             Phase::Init => Seed::Init(shard),
                             Phase::Count => Seed::Count(shard),
@@ -394,20 +404,39 @@ impl BulkTaskGraph {
                         }
                     }
                     Phase::Null => {
+                        let Some(token) = self.0.phases.claim()? else {
+                            state.exhausted = true;
+                            continue;
+                        };
+                        claimed = Some(token);
                         state.exhausted = true;
                         Seed::Null(state.nonnull_classes)
                     }
                     Phase::Ready | Phase::Published => unreachable!(),
                 };
-                let ordinal = state.issued;
-                state.issued = state.issued.checked_add(1).ok_or_else(arithmetic)?;
-                state.inflight = state.inflight.checked_add(1).ok_or_else(arithmetic)?;
+                let token = match claimed {
+                    Some(token) => token,
+                    None => self.0.phases.claim_one()?,
+                };
+                let ordinal = token.ordinal();
+                if let Seed::Assign(range) = &seed {
+                    let result = state
+                        .assignments
+                        .as_mut()
+                        .ok_or_else(|| invariant(ValueViolation::RowTransaction))
+                        .and_then(|directory| directory.claim(ordinal, range, work));
+                    if let Err(cause) = result {
+                        self.0.phases.latch(cause.clone());
+                        self.0.domain.latch(cause.clone());
+                        return Err(cause);
+                    }
+                }
                 break (
                     Lease {
                         shared: Arc::clone(&self.0),
                         phase: state.phase,
                         ordinal,
-                        settled: false,
+                        token,
                     },
                     seed,
                 );
@@ -446,6 +475,7 @@ impl BulkTaskGraph {
             Err(cause) => {
                 // Preserve the actual refusal before the unfinished lease's
                 // Drop records abandonment of this exact task.
+                self.0.phases.latch(cause.clone());
                 self.0.domain.latch(cause.clone());
                 return Err(cause);
             }
@@ -481,14 +511,10 @@ impl BulkTaskGraph {
                 return Err(invariant(ValueViolation::RowTransaction));
             }
             let mut state = self.0.state()?;
-            if lease.phase != state.phase
-                || lease.ordinal >= state.issued
-                || lease.settled
-                || state.inflight == 0
-                || state.completed >= state.issued
-            {
+            if lease.phase != state.phase || lease.token.is_settled() {
                 return Err(invariant(ValueViolation::RowTransaction));
             }
+            self.0.phases.validate(&lease.token)?;
             match (state.phase, output) {
                 (
                     Phase::HashRoute
@@ -528,29 +554,29 @@ impl BulkTaskGraph {
                     }
                     facts.prefixed = Some(prefix);
                 }
-                (Phase::Assign, Output::Assigned(mut node)) => {
-                    let entry = Arc::get_mut(&mut node)
-                        .ok_or_else(|| invariant(ValueViolation::RowTransaction))?;
-                    entry.next = state.assignments.take();
-                    state.assignments = Some(node);
+                (Phase::Assign, Output::Assigned(node)) => {
+                    state
+                        .assignments
+                        .as_mut()
+                        .ok_or_else(|| invariant(ValueViolation::RowTransaction))?
+                        .install(lease.ordinal, node)?;
                 }
                 _ => return Err(invariant(ValueViolation::RowTransaction)),
             }
-            state.inflight -= 1;
-            state.completed += 1;
-            lease.settled = true;
+            self.0.phases.complete(&mut lease.token)?;
             self.cross_barrier(&mut state, work)
         })();
         // In particular, drop any unconsumed cursor/output before the failed
         // token publishes its abandonment fact; never refund an active worker.
         if let Err(cause) = &result {
+            lease.shared.phases.latch(cause.clone());
             lease.shared.domain.latch(cause.clone());
         }
         result
     }
 
     fn cross_barrier(&self, state: &mut State, work: &DirectWork<'_>) -> ExecutionResult<()> {
-        if !state.exhausted || state.inflight != 0 {
+        if !state.exhausted || self.0.phases.inflight()? != 0 {
             return Ok(());
         }
         // Enumeration EOF does not consume queued, as-yet unclaimed merges.
@@ -564,7 +590,20 @@ impl BulkTaskGraph {
         {
             return Ok(());
         }
-        if state.completed != state.issued {
+        if matches!(
+            state.phase,
+            Phase::HashRoute
+                | Phase::HashInit
+                | Phase::HashBuild
+                | Phase::HashMaterialize
+                | Phase::HashPublish
+                | Phase::HashRetire
+                | Phase::Mark
+                | Phase::Assign
+        ) {
+            self.0.phases.seal()?;
+        }
+        if !self.0.phases.barrier()? {
             return Err(invariant(ValueViolation::RowTransaction));
         }
         self.0.check(work)?;
@@ -627,11 +666,9 @@ impl BulkTaskGraph {
             )?);
         }
         state.phase = next;
-        state.next_shard = 0;
         state.ranges = InputRanges::new();
         state.exhausted = false;
-        state.issued = 0;
-        state.completed = 0;
+        begin_phase(&self.0.phases, next, state.shards.len())?;
         Ok(())
     }
 
@@ -646,7 +683,10 @@ impl BulkTaskGraph {
             self.0.check(work)?;
             state.phase = Phase::Published;
             Ok(Some(BulkReady {
-                assignments: state.assignments.take(),
+                assignments: state
+                    .assignments
+                    .take()
+                    .ok_or_else(|| invariant(ValueViolation::RowTransaction))?,
                 view: state
                     .view
                     .take()
@@ -676,11 +716,11 @@ struct Lease {
     shared: Arc<Shared>,
     phase: Phase,
     ordinal: usize,
-    settled: bool,
+    token: RangeLease<ExecutionFailure, ValueTypeStorageLifetime>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if !self.settled {
+        if !self.token.is_settled() {
             self.shared
                 .domain
                 .latch(invariant(ValueViolation::RowTransaction));
@@ -715,6 +755,21 @@ enum Output {
     },
     Assigned(Arc<AssignmentNode>),
 }
+/// A finite turn either completes, makes actual data progress, or spends no
+/// quota because its dependency is unavailable. Scheduling belongs to caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskAdvance {
+    Done,
+    Progressed,
+    Blocked,
+}
+impl TaskAdvance {
+    #[cfg(test)]
+    pub(crate) fn is_done(self) -> bool {
+        self == Self::Done
+    }
+}
+
 pub(crate) struct Task {
     body: Option<Body>,
     output: Option<Output>,
@@ -731,17 +786,26 @@ impl Task {
     }
     /// Quota is the caller's existing synchronous turn allowance, not a new
     /// resource authorization. Zero cannot run even the small NULL task.
-    pub(crate) fn advance(&mut self, quota: usize, work: &DirectWork<'_>) -> ExecutionResult<bool> {
+    pub(crate) fn advance(
+        &mut self,
+        quota: usize,
+        work: &DirectWork<'_>,
+    ) -> ExecutionResult<TaskAdvance> {
         let origin = Arc::clone(&self.lease.as_ref().expect("unconsumed task").shared);
         let result = self.advance_inner(quota, work);
         if let Err(cause) = &result {
             self.body.take();
             self.output.take();
+            origin.phases.latch(cause.clone());
             origin.domain.latch(cause.clone());
         }
         result
     }
-    fn advance_inner(&mut self, quota: usize, work: &DirectWork<'_>) -> ExecutionResult<bool> {
+    fn advance_inner(
+        &mut self,
+        quota: usize,
+        work: &DirectWork<'_>,
+    ) -> ExecutionResult<TaskAdvance> {
         let lease = self.lease.as_ref().expect("unconsumed task");
         lease.shared.check(work)?;
         let body = self
@@ -749,16 +813,18 @@ impl Task {
             .as_mut()
             .ok_or_else(|| invariant(ValueViolation::RowTransaction))?;
         if quota == 0 {
-            return Ok(false);
+            return Ok(TaskAdvance::Blocked);
         }
         if let Body::Hash(body) = body {
-            let Some(output) = hash::HashBody::advance(body, &lease.shared, quota, work)? else {
-                return Ok(false);
+            let output = match hash::HashBody::advance(body, &lease.shared, quota, work)? {
+                hash::HashAdvance::Done(output) => output,
+                hash::HashAdvance::Progressed => return Ok(TaskAdvance::Progressed),
+                hash::HashAdvance::Blocked => return Ok(TaskAdvance::Blocked),
             };
             self.body.take();
             lease.shared.check(work)?;
             self.output = Some(Output::Hash(output));
-            return Ok(true);
+            return Ok(TaskAdvance::Done);
         }
         let done = match body {
             Body::Hash(_) => unreachable!(),
@@ -792,13 +858,18 @@ impl Task {
             lease.shared.check(work)?;
             self.output = Some(output);
         }
-        Ok(done)
+        Ok(if done {
+            TaskAdvance::Done
+        } else {
+            TaskAdvance::Progressed
+        })
     }
     pub(crate) fn finish(mut self) -> ExecutionResult<Completion> {
         let lease = self.lease.as_ref().expect("unconsumed task");
         lease.shared.domain.check_failure()?;
         let Some(output) = self.output.take() else {
             let cause = invariant(ValueViolation::RowTransaction);
+            lease.shared.phases.latch(cause.clone());
             lease.shared.domain.latch(cause.clone());
             return Err(cause);
         };
@@ -889,7 +960,6 @@ impl AssignCursor {
             page: self.page,
             input: self.input,
             assignment: self.output,
-            next: None,
             _storage: owner.storage_lifetime(),
         })
     }
@@ -899,37 +969,188 @@ struct AssignmentNode {
     page: CapturedPageId,
     input: KeyInput,
     assignment: AssignmentPage,
-    next: Option<Arc<AssignmentNode>>,
     _storage: ValueTypeStorageLifetime,
 }
-impl Drop for AssignmentNode {
-    fn drop(&mut self) {
-        // A large input may have arbitrarily many output chunks. Release a
-        // unique chain iteratively instead of recursively consuming the stack.
-        let mut next = self.next.take();
-        while let Some(node) = next {
-            match Arc::try_unwrap(node) {
-                Ok(mut node) => next = node.next.take(),
-                Err(_) => break,
-            }
+struct AssignmentPageIndex {
+    id: CapturedPageId,
+    first: usize,
+    ranges: usize,
+}
+struct AssignmentRun {
+    pages: Vec<AssignmentPageIndex>,
+    _storage: ValueTypeStorageLifetime,
+}
+struct AssignmentDirectory {
+    slots: Vec<Option<Arc<AssignmentNode>>>,
+    runs: Vec<AssignmentRun>,
+    _slots_storage: ValueTypeStorageLifetime,
+    _runs_storage: ValueTypeStorageLifetime,
+}
+// A reallocation is paired to its real new creator. Old backing is released
+// inside reserve before its original hold is replaced, including post-control
+// failure. An unchanged allocation retains its original creator.
+fn grow_directory<T>(
+    values: &mut Vec<T>,
+    storage: &mut ValueTypeStorageLifetime,
+    work: &DirectWork<'_>,
+) -> ExecutionResult<()> {
+    let before = values.capacity();
+    let result = super::reserve_push(values, work.owner, &|| {
+        work.control.checkpoint(0).map_err(ExecutionFailure::from)
+    });
+    if values.capacity() != before {
+        *storage = work.owner.storage_lifetime();
+    }
+    result
+}
+impl AssignmentDirectory {
+    fn new(runs: usize, work: &DirectWork<'_>) -> ExecutionResult<Self> {
+        let mut directory = vector(work.owner, runs)?;
+        for run in 0..runs {
+            super::checkpoint_at(run, &|| {
+                work.control.checkpoint(0).map_err(ExecutionFailure::from)
+            })?;
+            directory.push(AssignmentRun {
+                pages: Vec::new(),
+                _storage: work.owner.storage_lifetime(),
+            });
         }
+        Ok(Self {
+            slots: Vec::new(),
+            runs: directory,
+            _slots_storage: work.owner.storage_lifetime(),
+            _runs_storage: work.owner.storage_lifetime(),
+        })
+    }
+    /// Enumeration, not completion order, fixes every public range coordinate.
+    /// One claim inspects one page header and admits one output slot. It never
+    /// traverses the input rows or creates a coordinator-wide B-page scan.
+    fn claim(
+        &mut self,
+        ordinal: usize,
+        range: &InputRange,
+        work: &DirectWork<'_>,
+    ) -> ExecutionResult<()> {
+        if ordinal != self.slots.len() || !range.occurrences.start.is_multiple_of(INPUT_RANGE_ROWS)
+        {
+            return Err(invariant(ValueViolation::RowTransaction));
+        }
+        let run = self
+            .runs
+            .get_mut(range.page.run.index())
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        if range.page.page == run.pages.len() {
+            if range.occurrences.start != 0 {
+                return Err(invariant(ValueViolation::Bounds));
+            }
+            grow_directory(&mut run.pages, &mut run._storage, work)?;
+            run.pages.push(AssignmentPageIndex {
+                id: range.page,
+                first: ordinal,
+                ranges: 0,
+            });
+        }
+        let page = run
+            .pages
+            .get_mut(range.page.page)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        if page.id != range.page || range.occurrences.start / INPUT_RANGE_ROWS != page.ranges {
+            return Err(invariant(ValueViolation::RowTransaction));
+        }
+        grow_directory(&mut self.slots, &mut self._slots_storage, work)?;
+        self.slots.push(None);
+        page.ranges = page.ranges.checked_add(1).ok_or_else(arithmetic)?;
+        Ok(())
+    }
+    fn install(&mut self, ordinal: usize, node: Arc<AssignmentNode>) -> ExecutionResult<()> {
+        let page = self
+            .runs
+            .get(node.page.run.index())
+            .and_then(|r| r.pages.get(node.page.page))
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        if page.id != node.page || page.first + node.assignment.start / INPUT_RANGE_ROWS != ordinal
+        {
+            return Err(invariant(ValueViolation::RowTransaction));
+        }
+        let slot = self
+            .slots
+            .get_mut(ordinal)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        if slot.is_some() {
+            return Err(invariant(ValueViolation::RowTransaction));
+        }
+        *slot = Some(node);
+        Ok(())
+    }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Checked input-coordinate assignment lookup is the B3 finalize handoff."
+        )
+    )]
+    fn get(&self, page: CapturedPageId, start: usize) -> ExecutionResult<AssignmentChunk<'_>> {
+        if !start.is_multiple_of(INPUT_RANGE_ROWS) {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        let index = self
+            .runs
+            .get(page.run.index())
+            .and_then(|r| r.pages.get(page.page))
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        let range = start / INPUT_RANGE_ROWS;
+        if index.id != page || range >= index.ranges {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        self.range(index.first + range)
+    }
+    fn range(&self, ordinal: usize) -> ExecutionResult<AssignmentChunk<'_>> {
+        self.slots
+            .get(ordinal)
+            .and_then(Option::as_deref)
+            .map(AssignmentChunk)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))
+    }
+    fn iter(&self) -> Assignments<'_> {
+        Assignments(self.slots.iter())
     }
 }
 
 /// Only the all-task barrier constructs this readonly holder. It cannot expose
 /// mark/intern or be manufactured from one successful low-level cursor.
 pub(crate) struct BulkReady {
-    assignments: Option<Arc<AssignmentNode>>,
+    assignments: AssignmentDirectory,
     view: Arc<IndexView>,
     #[cfg(test)]
     direct: Option<Arc<direct_int::Storage>>,
 }
 /// The caller may finish its row-chain/CSR work and drop this original source
 /// custody independently of the immutable index. No new task or proof is made.
-pub(crate) struct BulkAssignments(Option<Arc<AssignmentNode>>);
+pub(crate) struct BulkAssignments(AssignmentDirectory);
 impl BulkAssignments {
+    /// Stable input-range ordinal, independent of worker completion order.
+    pub(crate) fn range_count(&self) -> usize {
+        self.0.slots.len()
+    }
+    pub(crate) fn range(&self, ordinal: usize) -> ExecutionResult<AssignmentChunk<'_>> {
+        self.0.range(ordinal)
+    }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Checked input-coordinate assignment lookup is the B3 finalize handoff."
+        )
+    )]
+    pub(crate) fn get(
+        &self,
+        page: CapturedPageId,
+        start: usize,
+    ) -> ExecutionResult<AssignmentChunk<'_>> {
+        self.0.get(page, start)
+    }
     pub(crate) fn iter(&self) -> Assignments<'_> {
-        Assignments(self.0.as_deref())
+        self.0.iter()
     }
 }
 impl BulkReady {
@@ -1047,17 +1268,17 @@ impl BulkReady {
         )
     )]
     pub(crate) fn assignments(&self) -> Assignments<'_> {
-        Assignments(self.assignments.as_deref())
+        self.assignments.iter()
     }
 }
-pub(crate) struct Assignments<'a>(Option<&'a AssignmentNode>);
+pub(crate) struct Assignments<'a>(std::slice::Iter<'a, Option<Arc<AssignmentNode>>>);
 pub(crate) struct AssignmentChunk<'a>(&'a AssignmentNode);
 impl<'a> Iterator for Assignments<'a> {
     type Item = AssignmentChunk<'a>;
     fn next(&mut self) -> Option<Self::Item> {
-        let node = self.0.take()?;
-        self.0 = node.next.as_deref();
-        Some(AssignmentChunk(node))
+        self.0
+            .next()
+            .map(|node| AssignmentChunk(node.as_deref().expect("complete assignment barrier")))
     }
 }
 impl AssignmentChunk<'_> {
@@ -1090,3 +1311,20 @@ mod hash;
 #[cfg(test)]
 #[path = "bulk_tasks_tests.rs"]
 mod tests;
+
+// The neutral author owns every linear barrier and all specialized leases.
+// Only K enumerates source pages and hash dependency seeds.
+fn begin_phase(
+    phases: &PhasedRangeWork<ExecutionFailure, ValueTypeStorageLifetime>,
+    phase: Phase,
+    shards: usize,
+) -> ExecutionResult<()> {
+    match phase {
+        Phase::Init | Phase::Count | Phase::Prefix | Phase::Fill => {
+            phases.begin(shards, NonZeroUsize::new(1).unwrap())
+        }
+        Phase::Null => phases.begin(1, NonZeroUsize::new(1).unwrap()),
+        Phase::Ready | Phase::Published => Ok(()),
+        _ => phases.begin_open(),
+    }
+}

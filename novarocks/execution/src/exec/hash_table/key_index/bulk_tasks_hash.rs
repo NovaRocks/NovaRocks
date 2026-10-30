@@ -591,15 +591,20 @@ impl HashSeed {
         })
     }
 }
+pub(super) enum HashAdvance {
+    Done(HashOutput),
+    Progressed,
+    Blocked,
+}
 impl HashBody {
-    /// `None` is dependency pending or a finite unfinished data turn. The
+    /// Dependencies are distinct from an actual finite data turn. The
     /// caller must keep this same task and spend no extra CPU position.
     pub(super) fn advance(
         body: &mut Option<Self>,
         shared: &Shared,
         quota: usize,
         work: &DirectWork<'_>,
-    ) -> ExecutionResult<Option<HashOutput>> {
+    ) -> ExecutionResult<HashAdvance> {
         let active = body
             .as_mut()
             .ok_or_else(|| invariant(ValueViolation::RowTransaction))?;
@@ -613,7 +618,9 @@ impl HashBody {
                         .ok_or_else(|| invariant(ValueViolation::Layout))?
                         .reserve_frontier()
                 };
-                let Some(slot) = slot else { return Ok(None) };
+                let Some(slot) = slot else {
+                    return Ok(HashAdvance::Blocked);
+                };
                 let result = cursor.advance(quota, &route_work(work))?;
                 let (partial, done) = match result {
                     RouteAdvance::Progress => (None, false),
@@ -641,7 +648,7 @@ impl HashBody {
             _ => true,
         };
         if !done {
-            return Ok(None);
+            return Ok(HashAdvance::Progressed);
         }
         let active = body.take().expect("advanced original hash body");
         let output = match active {
@@ -742,6 +749,6 @@ impl HashBody {
             }
         };
         work.control.checkpoint(0)?;
-        Ok(Some(output))
+        Ok(HashAdvance::Done(output))
     }
 }

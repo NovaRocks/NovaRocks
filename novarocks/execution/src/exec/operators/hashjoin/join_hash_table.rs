@@ -111,8 +111,9 @@ impl JoinHashTable {
         let groups = partition_offsets.last().copied().unwrap();
         let mut counts = fill(work, groups, 0usize)?;
         let mut row_groups = fill(work, row_count, usize::MAX)?;
-        for chunk in assignments.iter() {
+        for ordinal in 0..assignments.range_count() {
             work.control.checkpoint(0)?;
+            let chunk = assignments.range(ordinal)?;
             let page = chunk.page();
             if page.run_index() != 0 {
                 return Err(map_contract("serial join capture has a foreign run"));

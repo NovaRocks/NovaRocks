@@ -162,7 +162,7 @@ fn drive(
                         let (owner, tracker) = fixture();
                         let ports = work(owner.as_ref(), &tracker, &Control);
                         let before = BYTE_HASH_INITS.with(|n| n.get());
-                        let done = task.advance(17, &ports).unwrap();
+                        let done = task.advance(17, &ports).unwrap().is_done();
                         assert_eq!(BYTE_HASH_INITS.with(|n| n.get()), before,
                             "captured bytes must never be rehashed by a build/assignment turn");
                         let result = if done { Step::Complete(task.finish().unwrap()) }
@@ -354,8 +354,8 @@ fn queued_merge_after_enumeration_eof_is_pending_work_not_a_broken_barrier() {
     .unwrap();
     let mut first = task(&graph, &ports);
     let mut second = task(&graph, &ports);
-    assert!(!first.advance(256, &ports).unwrap());
-    assert!(!second.advance(256, &ports).unwrap());
+    assert!(!first.advance(256, &ports).unwrap().is_done());
+    assert!(!second.advance(256, &ports).unwrap().is_done());
     // Both final partials are queued for p0. Keep its first merge busy while
     // final route cursors exit and enumeration discovers the actual EOF.
     let merge = task(&graph, &ports);
@@ -364,7 +364,7 @@ fn queued_merge_after_enumeration_eof_is_pending_work_not_a_broken_barrier() {
         Some(Body::Hash(Some(hash::HashBody::Merge { .. })))
     ));
     for mut route in [first, second] {
-        assert!(route.advance(256, &ports).unwrap());
+        assert!(route.advance(256, &ports).unwrap().is_done());
         let mut complete = route.finish().unwrap();
         graph.complete(&mut complete, &ports).unwrap();
     }
@@ -407,7 +407,7 @@ fn full_frontier_stops_route_data_without_stopping_eager_merge_progress() {
     .unwrap();
     let mut routes = [task(&graph, &ports), task(&graph, &ports)];
     for route in &mut routes {
-        assert!(!route.advance(256, &ports).unwrap());
+        assert_eq!(route.advance(256, &ports).unwrap(), TaskAdvance::Progressed);
     }
     assert_eq!(
         graph
@@ -422,7 +422,7 @@ fn full_frontier_stops_route_data_without_stopping_eager_merge_progress() {
     );
     for _ in 0..5 {
         for route in &mut routes {
-            assert!(!route.advance(256, &ports).unwrap());
+            assert_eq!(route.advance(256, &ports).unwrap(), TaskAdvance::Blocked);
         }
     }
     assert_eq!(
@@ -462,7 +462,7 @@ fn full_frontier_stops_route_data_without_stopping_eager_merge_progress() {
         (1, 1, 0)
     );
     for mut route in routes {
-        assert!(route.advance(256, &ports).unwrap());
+        assert!(route.advance(256, &ports).unwrap().is_done());
         let mut complete = route.finish().unwrap();
         graph.complete(&mut complete, &ports).unwrap();
     }
@@ -474,7 +474,7 @@ fn full_frontier_stops_route_data_without_stopping_eager_merge_progress() {
         Some(Body::Hash(Some(hash::HashBody::Merge { .. })))
     ));
     let mut next_route = task(&graph, &ports);
-    assert!(!next_route.advance(256, &ports).unwrap());
+    assert!(!next_route.advance(256, &ports).unwrap().is_done());
     assert_eq!(
         graph
             .0
@@ -491,7 +491,7 @@ fn full_frontier_stops_route_data_without_stopping_eager_merge_progress() {
     assert!(matches!(graph.claim(&ports).unwrap(), Claim::Pending));
     let mut complete = finish(held_merge, &ports);
     graph.complete(&mut complete, &ports).unwrap();
-    assert!(next_route.advance(256, &ports).unwrap());
+    assert!(next_route.advance(256, &ports).unwrap().is_done());
     let mut complete = next_route.finish().unwrap();
     graph.complete(&mut complete, &ports).unwrap();
     assert!(drive(&graph, &ports, None).0.is_some());
