@@ -101,6 +101,9 @@ struct JoinFinalizeSource {
 }
 impl JoinFinalizeSource {
     fn frame(&self) -> ExecutionResult<&Arc<JoinBuildFrame>> {
+        if let Some(cause) = &self.prepare_failure {
+            return Err(cause.clone());
+        }
         self.frame
             .as_ref()
             .ok_or_else(|| ConstructionFailure::MissingOwner.into())

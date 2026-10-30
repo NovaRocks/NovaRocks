@@ -343,13 +343,15 @@ impl CompiledHashJoinPlan {
 mod build;
 mod finalize;
 mod frame;
+mod input;
 mod probe;
 
 pub(crate) use build::CompiledHashJoinBuildSinkFactory;
 pub(crate) use finalize::CompiledHashJoinFinalizeSourceFactory;
 pub(crate) use frame::CompiledJoinFrame;
 #[cfg(test)]
-pub(crate) use frame::frame_fixture_inputs;
+pub(crate) use frame::{frame_fixture_chunks, frame_fixture_inputs};
+pub(crate) use input::CompiledHashJoinInputSinkFactory;
 pub(crate) use probe::CompiledHashJoinProbeProcessorFactory;
 
 /// The scope retains the probe then build slots and complete frozen fields.

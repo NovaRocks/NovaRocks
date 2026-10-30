@@ -2910,3 +2910,329 @@ pub(crate) fn ordered_scan_with_numeric_membership_fixture(
     )?;
     Ok((rebuilt, scan, installed))
 }
+
+#[test]
+fn b3_each_actual_input_contributes_and_the_empty_input_closes_its_own_rf_partition() {
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinInputSinkFactory, CompiledHashJoinPlan, CompiledJoinFrame,
+            frame_fixture_chunks,
+        },
+        native_runtime_filter::NativeRuntimeFilterProducerFactory,
+    };
+    use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
+    use crate::runtime::mem_tracker::MemTracker;
+    use std::num::NonZeroUsize;
+    for (null_safe, null_semantics, complete_empty) in [
+        (false, FilterNullSemantics::NeverMatches, true),
+        (true, FilterNullSemantics::NullSafeEqual, true),
+        (false, FilterNullSemantics::NeverMatches, false),
+    ] {
+        let mut packages = packages(&super::join_tests::single_plan_with_dop(
+            hash_spec(null_safe),
+            &LEFT_ROWS,
+            &RIGHT_ROWS,
+            3,
+        ));
+        let base = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+        let producer = membership_producer(11, null_semantics);
+        let StaticFilterContract::Membership { canonical, .. } = producer.contract().clone() else {
+            unreachable!()
+        };
+        let program = join_with_producers(&base, vec![(0, producer.clone())]).unwrap();
+        let recording = Arc::new(RecordingProducer::default());
+        let installed = execution::RuntimeFilterProducerContract::membership(
+            execution::RuntimeFilterBindingId::new(11),
+            execution::RuntimeFilterChannelId::new(11),
+            declared_membership_contract(
+                FunctionValueType::new(DataType::Int64, true),
+                execution::RuntimeFilterNullSemantics::from_canonical(null_semantics),
+            ),
+        )
+        .unwrap();
+        let session = Arc::new(FakeSession {
+            producers: BTreeMap::from([(11, Arc::clone(&recording))]),
+            installed_producers: BTreeMap::from([(11, installed)]),
+            ..FakeSession::default()
+        });
+        let capable: execution::RuntimeFilterSessionRef = session.clone();
+        let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, join_node(&program)).unwrap());
+        let rf = Arc::new(
+            NativeRuntimeFilterProducerFactory::from_compiled(
+                &[(0, super::runtime_filter_producer(&producer).unwrap())],
+                plan.eq_null_safe(),
+                |_| Ok(DataType::Int64),
+                capable,
+                2,
+            )
+            .unwrap(),
+        );
+        let declaration = Arc::new(CompiledJoinFrame::new(
+            Arc::clone(&program),
+            plan,
+            JoinParticipants {
+                inputs: 2,
+                finalizers: NonZeroUsize::new(3).unwrap(),
+                probes: 2,
+                tails: 0,
+            },
+            None,
+        ));
+        let runtime = RuntimeState::default();
+        let error = runtime.error_state();
+        let tracker = MemTracker::new_root("B3 exact E runtime-filter partitions");
+        let construction = super::aggregate_fixture::runtime_construction_factory(
+            Arc::clone(&tracker),
+            Arc::clone(&error),
+        );
+        let factory = CompiledHashJoinInputSinkFactory::new(
+            Arc::clone(&declaration),
+            Arc::clone(&error),
+            Some(rf),
+        );
+        let mut inputs: Vec<_> = (0..2).map(|id| factory.create(2, id)).collect();
+        for input in &mut inputs {
+            input.set_mem_tracker(Arc::clone(&tracker));
+            input.set_construction_factory(Arc::clone(&construction));
+            input.prepare().unwrap();
+            input.bind_runtime_state(&runtime).unwrap();
+            assert!(
+                session.opened.lock().unwrap().is_empty(),
+                "prepare leaves RF producer capabilities dormant"
+            );
+        }
+        for input in &mut inputs {
+            input.activate(&runtime).unwrap();
+        }
+        assert_eq!(session.opened.lock().unwrap().len(), 2);
+        assert!(
+            session
+                .opened
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.local_partition_count() == 2)
+        );
+        let chunks = frame_fixture_chunks(&program, &construction).unwrap();
+        let mut data = TestDriver::new(inputs[0].as_mut(), &runtime);
+        data.accept_without_output(chunks.into_iter().next().unwrap())
+            .unwrap();
+        data.signal_eos().unwrap();
+        assert!(matches!(
+            data.advance_to_boundary().unwrap().next,
+            NextStep::Finished
+        ));
+        drop(data);
+        assert!(
+            !recording
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, ProducerEvent::Close { partition: 1, .. })),
+            "unstarted E cannot become empty completion"
+        );
+        if !complete_empty {
+            let frame = declaration.prepared().unwrap();
+            frame.completion.withdraw(0).unwrap();
+            frame.completion.withdraw(1).unwrap();
+            for input in &mut inputs {
+                input.begin_exit().unwrap();
+                input.close().unwrap();
+            }
+            let events = recording.events.lock().unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProducerEvent::Close { partition: 1, .. }))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        ProducerEvent::Fail(
+                            execution::RuntimeFilterProducerFailure::UpstreamUnavailable
+                        )
+                    ))
+                    .count(),
+                1
+            );
+            assert!(frame.completion.published().unwrap().is_none());
+            assert!(runtime.error().is_none());
+            continue;
+        }
+        let mut empty = TestDriver::new(inputs[1].as_mut(), &runtime);
+        empty.signal_eos().unwrap();
+        assert!(matches!(
+            empty.advance_to_boundary().unwrap().next,
+            NextStep::Finished
+        ));
+        drop(empty);
+        let events = recording.events.lock().unwrap();
+        let mut values = BTreeSet::new();
+        let mut contains_null = false;
+        for event in events.iter() {
+            if let ProducerEvent::Submit {
+                partition,
+                sequence,
+                contribution,
+            } = event
+            {
+                assert_eq!((*partition, *sequence), (0, 0));
+                let decoded = execution::contribution::decode_contribution(
+                    contribution.canonical_bytes(),
+                    &contribution.contract_digest(),
+                    execution::contribution::ContributionCodecExpectation::membership(
+                        &DataType::Int64,
+                        canonical.digest(),
+                    ),
+                    usize::MAX,
+                )
+                .unwrap();
+                let execution::contribution::RuntimeFilterContribution::Membership(domain) =
+                    decoded
+                else {
+                    panic!("original membership contribution");
+                };
+                let execution::contribution::MembershipValues::Int64(submitted) = domain.values()
+                else {
+                    panic!("original signed Int64 keys");
+                };
+                values.extend(submitted.iter().copied());
+                contains_null |= domain.contains_null();
+            }
+        }
+        assert_eq!(values, (0..17).collect());
+        assert!(contains_null);
+        let mut closes = events
+            .iter()
+            .filter_map(|event| match event {
+                ProducerEvent::Close {
+                    partition,
+                    sequence,
+                } => Some((*partition, *sequence)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        closes.sort();
+        assert_eq!(closes, vec![(0, 1), (1, 0)]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProducerEvent::Fail(_)))
+        );
+        drop(events);
+        assert!(
+            declaration
+                .prepared()
+                .unwrap()
+                .completion
+                .published()
+                .unwrap()
+                .is_none(),
+            "E/RF completion does not manufacture K Ready"
+        );
+        for input in &mut inputs {
+            input.begin_exit().unwrap();
+            input.close().unwrap();
+        }
+        assert!(runtime.error().is_none());
+    }
+}
+
+#[test]
+fn b3_input_keeps_required_key_row_failure_and_fails_rf_without_empty_completion() {
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinInputSinkFactory, CompiledHashJoinPlan, CompiledJoinFrame,
+            frame_fixture_chunks,
+        },
+        native_runtime_filter::NativeRuntimeFilterProducerFactory,
+    };
+    use crate::exec::pipeline::{operator::ExitProgress, test_driver::TestDriver};
+    use crate::runtime::mem_tracker::MemTracker;
+    use std::num::NonZeroUsize;
+    let mut packages = packages(&overflow_plan(Overflow::BuildKey));
+    let base = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+    let producer = membership_producer(11, FilterNullSemantics::NeverMatches);
+    let program = join_with_producers(&base, vec![(0, producer.clone())]).unwrap();
+    let recording = Arc::new(RecordingProducer::default());
+    let session = FakeSession::producers(&[(11, &recording)]);
+    let capable: execution::RuntimeFilterSessionRef = session.clone();
+    let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, join_node(&program)).unwrap());
+    let rf = Arc::new(
+        NativeRuntimeFilterProducerFactory::from_compiled(
+            &[(0, super::runtime_filter_producer(&producer).unwrap())],
+            plan.eq_null_safe(),
+            |_| Ok(DataType::Int64),
+            capable,
+            1,
+        )
+        .unwrap(),
+    );
+    let declaration = Arc::new(CompiledJoinFrame::new(
+        Arc::clone(&program),
+        plan,
+        JoinParticipants {
+            inputs: 1,
+            finalizers: NonZeroUsize::MIN,
+            probes: 1,
+            tails: 0,
+        },
+        None,
+    ));
+    let runtime = RuntimeState::default();
+    let error = runtime.error_state();
+    let tracker = MemTracker::new_root("B3 original required key error and RF failure");
+    let construction = super::aggregate_fixture::runtime_construction_factory(
+        Arc::clone(&tracker),
+        Arc::clone(&error),
+    );
+    let factory = CompiledHashJoinInputSinkFactory::new(
+        Arc::clone(&declaration),
+        Arc::clone(&error),
+        Some(rf),
+    );
+    let mut input = factory.create(1, 0);
+    input.set_mem_tracker(Arc::clone(&tracker));
+    input.set_construction_factory(Arc::clone(&construction));
+    input.prepare().unwrap();
+    input.bind_runtime_state(&runtime).unwrap();
+    input.activate(&runtime).unwrap();
+    let frame = declaration.prepared().unwrap();
+    let source = frame_fixture_chunks(&program, &construction)
+        .unwrap()
+        .remove(0);
+    let mut driver = TestDriver::new(input.as_mut(), &runtime);
+    let original = driver.input_without_output(source).unwrap_err();
+    assert!(
+        matches!(
+            original.cause(),
+            crate::runtime::fragment::ExecutionFailureCause::RequiredRow(_)
+        ),
+        "{original:?}"
+    );
+    assert!(
+        original.to_string().contains("Arithmetic overflow"),
+        "{original}"
+    );
+    drop(driver);
+    input.begin_exit().unwrap();
+    assert!(matches!(
+        input.observe_exit().progress,
+        ExitProgress::Exited
+    ));
+    input.close().unwrap();
+    assert_eq!(frame.completion.check().unwrap_err(), original);
+    assert_eq!(runtime.error().unwrap(), original);
+    assert_eq!(
+        *recording.events.lock().unwrap(),
+        vec![ProducerEvent::Fail(
+            execution::RuntimeFilterProducerFailure::ExecutionFailed
+        )]
+    );
+    assert!(frame.completion.published().is_err());
+}

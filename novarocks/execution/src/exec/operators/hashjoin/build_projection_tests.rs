@@ -170,3 +170,52 @@ fn normal_global_withdrawal_retires_real_csr_cursors_without_ready_or_failure() 
     assert!(build.take_ready().unwrap().is_none());
     assert!(matches!(&*build.phase().unwrap(), Phase::Retired));
 }
+
+#[test]
+fn withdrawing_retained_k_work_preserves_control_and_any_earlier_failure() {
+    let (owner, tracker) = fixture();
+    let work = work(owner.as_ref(), &tracker, &Control);
+    for failed_before_withdrawal in [false, true] {
+        let pages = vec![(0..4001).map(|i| Some(i % 51)).collect()];
+        let (graph, rows) = captured_graph(&pages, false, &work);
+        let build = ProjectionBuild::from_graph(
+            graph,
+            rows,
+            ProjectionKind::Ordinary,
+            NonZeroUsize::new(3).unwrap(),
+            Arc::new(Observable::new()),
+            &work,
+        )
+        .unwrap();
+        let graph = match &*build.phase().unwrap() {
+            Phase::Keys(graph) => Arc::clone(graph),
+            _ => panic!("the original K graph is installed"),
+        };
+        let mut worker = ProjectionWorker::new(&work);
+        let mut turn = TurnWork::new(NonZeroU64::MIN, 2);
+        worker.step(&build, &mut turn, &work).unwrap();
+        assert!(worker.keys.retained() > 0);
+        let original: ExecutionFailure = KernelFailure::DeadlineExceeded.into();
+        if failed_before_withdrawal {
+            assert_eq!(graph.fail(original.clone()), original);
+            assert_eq!(build.retire().unwrap_err(), original);
+        } else {
+            build.retire().unwrap();
+            worker.retire_owned(&build).unwrap();
+        }
+        drop(worker);
+        let actual = graph
+            .take_ready(&work)
+            .err()
+            .expect("K did not publish Ready");
+        if failed_before_withdrawal {
+            assert_eq!(actual, original);
+        } else {
+            assert!(matches!(
+                actual.cause(),
+                ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+            ));
+            assert!(build.take_ready().unwrap().is_none());
+        }
+    }
+}

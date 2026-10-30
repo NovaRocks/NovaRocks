@@ -32,10 +32,11 @@ use crate::{
         pipeline::step_context::TurnWork,
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
+        fragment::{ExecutionFailure, ExecutionFailureCause, ExecutionResult},
         observable::Observable,
     },
 };
+use novarocks_functions::KernelFailure;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 use std::{
     num::NonZeroUsize,
@@ -186,8 +187,21 @@ impl ProjectionBuild {
             }
             std::mem::replace(&mut *phase, Phase::Retiring)
         };
-        if let Phase::Csr { build, .. } = &old {
-            build.retire()?;
+        match &old {
+            Phase::Keys(graph) => {
+                // Global demand withdrawal cancels these original K cursors.
+                // Latch that actual control cause before their lease drops;
+                // an intentional withdrawal is not an abandoned-work defect.
+                let first = graph.fail(KernelFailure::Cancelled.into());
+                if !matches!(
+                    first.cause(),
+                    ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+                ) {
+                    return Err(self.fail(first));
+                }
+            }
+            Phase::Csr { build, .. } => build.retire()?,
+            _ => {}
         }
         drop(old);
         {

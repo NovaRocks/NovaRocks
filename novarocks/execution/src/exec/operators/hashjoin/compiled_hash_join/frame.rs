@@ -167,8 +167,51 @@ impl CompiledJoinFrame {
     }
 }
 
-/// Direct Int64 E fixture for the F operator test. It uses real capture/page
-/// authors and makes no claim about expression evaluation or RF lifecycle.
+/// Direct Int64 component data with the real compiled build declaration.
+/// Plain Arrow fixture payload is outside the header construction observation.
+#[cfg(test)]
+pub(crate) fn frame_fixture_chunks(
+    program: &LocalProgram,
+    factory: &Arc<dyn InputConstructionFactory>,
+) -> ExecutionResult<Vec<Chunk>> {
+    let layout = program
+        .graph()
+        .nodes()
+        .iter()
+        .find_map(|node| match node.kind() {
+            ProgramNodeKind::Join { right_layout, .. } => Some(right_layout),
+            _ => None,
+        })
+        .ok_or_else(|| build_contract("join fixture has no original build layout"))?;
+    let schema = factory.create_compiled_chunk_schema(layout)?;
+    let mut chunks = Vec::new();
+    for _ in 0..2 {
+        let owner = factory.begin_typed_construction(&schema)?;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(arrow::array::Int64Array::from(
+                (0..300)
+                    .map(|i| if i % 13 == 0 { None } else { Some(i % 17) })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(arrow::array::Int64Array::from(
+                (0..300).map(Some).collect::<Vec<_>>(),
+            )),
+        ];
+        chunks.push(Chunk::try_new_typed_with_columns_owned_observed::<
+            ConstructionFailure,
+            _,
+        >(
+            schema.clone(),
+            columns,
+            300,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )?);
+    }
+    Ok(chunks)
+}
+/// F-source fixture uses the same actual E capture/page author, without claiming
+/// expression evaluation or RF lifecycle. Input operator tests exercise those.
 #[cfg(test)]
 pub(crate) fn frame_fixture_inputs(
     frame: &JoinBuildFrame,
@@ -181,24 +224,17 @@ pub(crate) fn frame_fixture_inputs(
         build_capture::{EvaluatedJoinKeyPage, EvaluatedKeyProjection, InputRunWriter},
         build_pages::B3RunId,
     };
-    let layout = program
-        .graph()
-        .nodes()
-        .iter()
-        .find_map(|node| match node.kind() {
-            ProgramNodeKind::Join { right_layout, .. } => Some(right_layout),
-            _ => None,
-        })
-        .ok_or_else(|| build_contract("join fixture has no original build layout"))?;
-    let schema = factory.create_compiled_chunk_schema(layout)?;
     let control = RuntimeKernelControl::new(Arc::clone(error));
     let ProjectionDomains::Ordinary { keys, .. } = &frame.domains else {
         return Err(build_contract(
             "direct Int64 fixture requires ordinary keys",
         ));
     };
-    for slot in 0..2 {
-        let owner = factory.begin_typed_construction(&schema)?;
+    for (slot, chunk) in frame_fixture_chunks(program, factory)?
+        .into_iter()
+        .enumerate()
+    {
+        let owner = factory.begin_typed_construction(chunk.chunk_schema())?;
         let work = BulkWork {
             owner: owner.as_ref(),
             allocator: AggregateAllocator::new(Arc::clone(tracker)),
@@ -207,23 +243,6 @@ pub(crate) fn frame_fixture_inputs(
             )),
             control: &control,
         };
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(arrow::array::Int64Array::from(
-                (0..300)
-                    .map(|i| if i % 13 == 0 { None } else { Some(i % 17) })
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(arrow::array::Int64Array::from(
-                (0..300).map(Some).collect::<Vec<_>>(),
-            )),
-        ];
-        let chunk = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
-            schema.clone(),
-            columns,
-            300,
-            owner.storage_lifetime(),
-            |step| owner.observe(0, &[], step),
-        )?;
         let mut writer = InputRunWriter::new(
             &frame.domains,
             B3RunId::from_input_slot(slot, 2)?,
