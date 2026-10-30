@@ -112,12 +112,29 @@ impl JoinOrientation {
             )
         )
     }
+    const fn build_only(self) -> bool {
+        matches!(
+            self.kind,
+            LocalJoinKind::Hash(JoinType::RightSemi | JoinType::RightAnti)
+        )
+    }
+    const fn null_extends_probe(self) -> bool {
+        matches!(
+            self.kind,
+            LocalJoinKind::Hash(JoinType::RightOuter | JoinType::FullOuter)
+                | LocalJoinKind::NestLoop(
+                    NestedLoopJoinType::RightOuter | NestedLoopJoinType::FullOuter
+                )
+        )
+    }
     /// The build side is NULL-extended for unmatched probe rows.
     const fn null_extends_build(self) -> bool {
         matches!(
             self.kind,
-            LocalJoinKind::Hash(JoinType::LeftOuter)
-                | LocalJoinKind::NestLoop(NestedLoopJoinType::LeftOuter)
+            LocalJoinKind::Hash(JoinType::LeftOuter | JoinType::FullOuter)
+                | LocalJoinKind::NestLoop(
+                    NestedLoopJoinType::LeftOuter | NestedLoopJoinType::FullOuter
+                )
         )
     }
 }
@@ -140,22 +157,10 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
     match &node.kind {
         NodeKind::HashJoin {
             kind,
-            condition,
             build_side,
             distribution,
             ..
         } => {
-            if condition.is_null_aware()
-                && (condition.keys().len() != 1
-                    || condition.keys().iter().any(|key| key.null_safe)
-                    || condition.scope_keys().is_some_and(|keys| !keys.is_empty())
-                    || condition.residual().is_some())
-            {
-                return Err(unsupported(
-                    node,
-                    "null-aware candidate evaluation requires the B3 runtime",
-                ));
-            }
             let (probe_input, local) = match build_side {
                 JoinSide::Right => (
                     0,
@@ -165,15 +170,10 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                         JoinKind::LeftSemi => JoinType::LeftSemi,
                         JoinKind::LeftAnti => JoinType::LeftAnti,
                         JoinKind::NullAwareLeftAnti => JoinType::NullAwareLeftAnti,
-                        JoinKind::RightOuter
-                        | JoinKind::FullOuter
-                        | JoinKind::RightSemi
-                        | JoinKind::RightAnti => {
-                            return Err(unsupported(
-                                node,
-                                "build-preserving hash join kind (merged build match flags)",
-                            ));
-                        }
+                        JoinKind::RightOuter => JoinType::RightOuter,
+                        JoinKind::FullOuter => JoinType::FullOuter,
+                        JoinKind::RightSemi => JoinType::RightSemi,
+                        JoinKind::RightAnti => JoinType::RightAnti,
                         JoinKind::Cross => {
                             return Err(FragmentCompileError::Invalid(
                                 "cross join cannot use the hash-join node",
@@ -181,7 +181,7 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                         }
                     },
                 ),
-                // The mirror of a build-left join keeps the probe preserved.
+                // Mirror physical sides while retaining the exact preservation role.
                 JoinSide::Left => (
                     1,
                     match kind {
@@ -195,15 +195,10 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                                 "null-aware anti join with a left build side has no mirror",
                             ));
                         }
-                        JoinKind::LeftOuter
-                        | JoinKind::FullOuter
-                        | JoinKind::LeftSemi
-                        | JoinKind::LeftAnti => {
-                            return Err(unsupported(
-                                node,
-                                "build-preserving hash join kind (merged build match flags)",
-                            ));
-                        }
+                        JoinKind::LeftOuter => JoinType::RightOuter,
+                        JoinKind::FullOuter => JoinType::FullOuter,
+                        JoinKind::LeftSemi => JoinType::RightSemi,
+                        JoinKind::LeftAnti => JoinType::RightAnti,
                         JoinKind::Cross => {
                             return Err(FragmentCompileError::Invalid(
                                 "cross join cannot use the hash-join node",
@@ -212,6 +207,20 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                     },
                 ),
             };
+            if *distribution == JoinDistribution::BroadcastBuild
+                && matches!(
+                    local,
+                    JoinType::RightOuter
+                        | JoinType::FullOuter
+                        | JoinType::RightSemi
+                        | JoinType::RightAnti
+                )
+            {
+                return Err(unsupported(
+                    node,
+                    "replicated build cannot publish preserved build rows",
+                ));
+            }
             // Cross-instance null-key knowledge is not representable when
             // each instance holds only its partition of the build.
             if local == JoinType::NullAwareLeftAnti
@@ -231,10 +240,7 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
             })
         }
         NodeKind::NestLoopJoin {
-            kind,
-            distribution,
-            predicate,
-            ..
+            kind, distribution, ..
         } => {
             let (probe_input, local) = match kind {
                 JoinKind::Cross => (0, NestedLoopJoinType::Cross),
@@ -242,15 +248,8 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                 JoinKind::LeftOuter => (0, NestedLoopJoinType::LeftOuter),
                 JoinKind::LeftSemi => (0, NestedLoopJoinType::LeftSemi),
                 JoinKind::LeftAnti => (0, NestedLoopJoinType::LeftAnti),
-                // Its key conjuncts are not separated from its residual in the
-                // physical contract; recovering them from expression shape
-                // would be a guess.
-                JoinKind::NullAwareLeftAnti if predicate.is_some() => {
-                    return Err(unsupported(
-                        node,
-                        "nested-loop null-aware anti join with a predicate",
-                    ));
-                }
+                // The original complete predicate owns NAA guard/demand;
+                // the runtime never reconstructs C/E from its shape.
                 JoinKind::NullAwareLeftAnti => (0, NestedLoopJoinType::NullAwareLeftAnti),
                 // Only a singleton placement may swap: a broadcast right side
                 // would become the preserved side and duplicate its rows.
@@ -272,12 +271,16 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                         "nested-loop right semi or anti join over a broadcast right side",
                     ));
                 }
-                JoinKind::RightOuter | JoinKind::FullOuter => {
+                JoinKind::RightOuter | JoinKind::FullOuter
+                    if *distribution == NestLoopJoinDistribution::BroadcastRight =>
+                {
                     return Err(unsupported(
                         node,
-                        "build-preserving nested-loop join kind (merged build match flags)",
+                        "replicated right input cannot publish preserved build rows",
                     ));
                 }
+                JoinKind::RightOuter => (0, NestedLoopJoinType::RightOuter),
+                JoinKind::FullOuter => (0, NestedLoopJoinType::FullOuter),
             };
             Ok(JoinOrientation {
                 probe_input,
@@ -437,7 +440,16 @@ pub(crate) fn shape_join_with_creation<H>(
         Ok(columns.len())
     };
     let mut canonical_types = Vec::new();
-    let probe_width = child_types(probe, false, &mut canonical_types, work)?;
+    let probe_width = if orientation.build_only() {
+        0
+    } else {
+        child_types(
+            probe,
+            orientation.null_extends_probe(),
+            &mut canonical_types,
+            work,
+        )?
+    };
     if !orientation.probe_only() {
         child_types(
             build,
@@ -454,23 +466,25 @@ pub(crate) fn shape_join_with_creation<H>(
             .ok_or(FragmentCompileError::Invalid("missing join output value"))?;
         let canonical = match definition.origin {
             ValueOrigin::NullExtended { node: owner, of } if owner == node.id => {
-                if !orientation.null_extends_build() {
-                    return Err((FragmentCompileError::Invalid(
-                        "join kind publishes no NULL extension",
-                    ))
-                    .into());
+                match (probe_port.get(&of), build_port.get(&of)) {
+                    (Some(&ordinal), None) if orientation.null_extends_probe() => ordinal,
+                    (None, Some(&ordinal)) if orientation.null_extends_build() => probe_width
+                        .checked_add(ordinal)
+                        .ok_or(CompileControlError::ResourceExhausted)?,
+                    _ => {
+                        return Err(FragmentCompileError::Invalid(
+                            "NULL extension source is not on the join's extended side",
+                        )
+                        .into());
+                    }
                 }
-                let ordinal = *build_port.get(&of).ok_or(FragmentCompileError::Invalid(
-                    "NULL extension source is not on the build side",
-                ))?;
-                probe_width
-                    .checked_add(ordinal)
-                    .ok_or(CompileControlError::ResourceExhausted)?
             }
             _ => match (probe_port.get(value), build_port.get(value)) {
-                (Some(&ordinal), None) => ordinal,
-                // Only Inner publishes original build values: an outer join
-                // publishes its build side through NULL extensions.
+                (Some(&ordinal), None)
+                    if !orientation.build_only() && !orientation.null_extends_probe() =>
+                {
+                    ordinal
+                }
                 (None, Some(&ordinal))
                     if !orientation.probe_only() && !orientation.null_extends_build() =>
                 {
@@ -479,9 +493,9 @@ pub(crate) fn shape_join_with_creation<H>(
                         .ok_or(CompileControlError::ResourceExhausted)?
                 }
                 _ => {
-                    return Err((FragmentCompileError::Invalid(
+                    return Err(FragmentCompileError::Invalid(
                         "join output value is not valid for its local join kind",
-                    ))
+                    )
                     .into());
                 }
             },
@@ -1209,7 +1223,7 @@ fn lower_core_with_creation<H>(
                 left: probe.node,
                 right: build.node,
                 join_type,
-                distribution_mode: JoinDistributionMode::Broadcast,
+                distribution_mode: JoinDistributionMode::SharedBuild,
                 left_layout: probe.layout.clone(),
                 right_layout: build.layout.clone(),
                 join_scope_layout: scope,

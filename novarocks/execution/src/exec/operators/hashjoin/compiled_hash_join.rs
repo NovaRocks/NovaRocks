@@ -202,52 +202,6 @@ pub(crate) struct CompiledHashJoinPlan {
 
 impl CompiledHashJoinPlan {
     pub(crate) fn try_new(program: &LocalProgram, node: ProgramNodeId) -> ExecutionResult<Self> {
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(node.index())
-            .ok_or_else(|| hash_join_contract("compiled join node is absent"))?;
-        let ProgramNodeKind::Join {
-            join_type,
-            condition,
-            ..
-        } = graph_node.kind()
-        else {
-            return Err(hash_join_contract("compiled node is not a hash join"));
-        };
-        if !matches!(
-            join_type,
-            novarocks_local_program::JoinType::Inner
-                | novarocks_local_program::JoinType::LeftOuter
-                | novarocks_local_program::JoinType::LeftSemi
-                | novarocks_local_program::JoinType::LeftAnti
-                | novarocks_local_program::JoinType::NullAwareLeftAnti
-        ) {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                "build-preserving join requires the phased runtime",
-            ));
-        }
-        let keys = condition.keys();
-        if condition.is_null_aware()
-            && (keys.len() != 1
-                || keys.iter().any(|key| key.null_safe)
-                || !condition.scope_keys().is_empty()
-                || condition.residual_predicate().is_some())
-        {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                "null-aware candidate evaluation requires the B3 runtime",
-            ));
-        }
-        Self::from_frozen_node(program, node)
-    }
-    /// Frozen metadata for the installed E/F/Q/T factories. The legacy builder
-    /// above keeps its old capability gate until production composition switches.
-    pub(crate) fn from_frozen_node(
-        program: &LocalProgram,
-        node: ProgramNodeId,
-    ) -> ExecutionResult<Self> {
         let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
             program_binding_failure(
                 PlanBindingKind::MissingAssignment,
@@ -281,7 +235,7 @@ impl CompiledHashJoinPlan {
             novarocks_local_program::JoinType::RightSemi => JoinType::RightSemi,
             novarocks_local_program::JoinType::RightAnti => JoinType::RightAnti,
         };
-        if *distribution_mode != JoinDistributionMode::Broadcast {
+        if *distribution_mode != JoinDistributionMode::SharedBuild {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
                 format!(

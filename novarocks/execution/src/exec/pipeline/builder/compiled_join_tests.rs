@@ -262,7 +262,15 @@ pub(super) fn oracle(spec: Spec, left: &[Row], right: &[Row]) -> Rows {
                 let keep = if right.is_empty() {
                     true
                 } else if matches!(spec.family, Family::NestLoop) {
-                    false
+                    // The complete NL predicate is TRUE/UNKNOWN for a
+                    // suppressing pair; it has no inferred eligibility role.
+                    !right.iter().any(|r| {
+                        !spec.residual
+                            || match (l.1, r.1) {
+                                (Some(x), Some(y)) => x < y,
+                                _ => true,
+                            }
+                    })
                 } else if !spec.residual {
                     l.0.is_some() && right.iter().all(|r| r.0.is_some() && r.0 != l.0)
                 } else if l.0.is_none() {
@@ -396,6 +404,9 @@ fn add_join(
         (JoinKind::LeftOuter, false) => vec![l[0], l[1], extend(r[0]), extend(r[1])],
         (JoinKind::LeftOuter, true) => vec![extend(r[1]), l[0]],
         (JoinKind::RightOuter, false) => vec![extend(l[0]), extend(l[1]), r[0], r[1]],
+        (JoinKind::FullOuter, false) => {
+            vec![extend(l[0]), extend(l[1]), extend(r[0]), extend(r[1])]
+        }
         (JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti, false) => {
             l.to_vec()
         }
@@ -1154,7 +1165,7 @@ fn semi_and_anti_joins_including_mirrored_right_kinds_match_the_oracle() {
         join_kind(&program),
         ProgramNodeKind::Join {
             join_type: JoinType::LeftSemi,
-            distribution_mode: JoinDistributionMode::Broadcast,
+            distribution_mode: JoinDistributionMode::SharedBuild,
             ..
         }
     ));
@@ -1505,7 +1516,7 @@ fn partitioned_join_runs_each_instance_over_its_colocated_partition() {
         assert!(matches!(
             join_kind(&run.join),
             ProgramNodeKind::Join {
-                distribution_mode: JoinDistributionMode::Broadcast,
+                distribution_mode: JoinDistributionMode::SharedBuild,
                 ..
             }
         ));
@@ -2963,3 +2974,348 @@ fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
 
 #[path = "compiled_phased_join_tests.rs"]
 mod phased;
+
+#[derive(Clone, Copy)]
+enum NaaEligibilityFixture {
+    None,
+    True,
+    Unknown,
+    LateOverflow,
+}
+fn authored_naa_plan(
+    left: &[Row],
+    right: &[Row],
+    value_columns: &[(usize, bool)],
+    scope_columns: &[(usize, bool)],
+    eligibility: NaaEligibilityFixture,
+    pipeline_dop: u32,
+) -> PhysicalPlan {
+    let mut builder = FragmentBuilder::new(SINGLE);
+    let left_node = builder.reserve_node_id().unwrap();
+    let l = values(
+        &mut builder,
+        left_node,
+        &[int64(true), int64(true)],
+        &literal_rows(left),
+    );
+    let right_node = builder.reserve_node_id().unwrap();
+    let r = values(
+        &mut builder,
+        right_node,
+        &[int64(true), int64(true)],
+        &literal_rows(right),
+    );
+    let join = builder.reserve_node_id().unwrap();
+    let mut keys = |columns: &[(usize, bool)]| {
+        columns
+            .iter()
+            .map(|&(column, null_safe)| JoinKey {
+                left: builder
+                    .add_expression(join, int64(true), ExprKind::Value(l[column]))
+                    .unwrap(),
+                right: builder
+                    .add_expression(join, int64(true), ExprKind::Value(r[column]))
+                    .unwrap(),
+                null_safe,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    };
+    let value_equal_keys = keys(value_columns);
+    let scope_keys = keys(scope_columns);
+    let late_overflow = matches!(eligibility, NaaEligibilityFixture::LateOverflow);
+    let eligibility = match eligibility {
+        NaaEligibilityFixture::None => None,
+        NaaEligibilityFixture::True => Some(
+            builder
+                .add_expression(
+                    join,
+                    FunctionValueType::new(DataType::Boolean, false),
+                    ExprKind::Literal(LiteralValue::Boolean(true)),
+                )
+                .unwrap(),
+        ),
+        NaaEligibilityFixture::Unknown => Some(
+            builder
+                .add_expression(
+                    join,
+                    FunctionValueType::new(DataType::Boolean, true),
+                    ExprKind::Literal(LiteralValue::Null),
+                )
+                .unwrap(),
+        ),
+        NaaEligibilityFixture::LateOverflow => {
+            let build = overflowing(&mut builder, join, r[0]);
+            let probe = builder
+                .add_expression(join, int64(true), ExprKind::Value(l[1]))
+                .unwrap();
+            Some(
+                builder
+                    .add_expression(
+                        join,
+                        FunctionValueType::new(DataType::Boolean, true),
+                        ExprKind::Binary {
+                            left: build,
+                            op: BinaryOperator::Gt,
+                            right: probe,
+                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                            allow_throw_exception: None,
+                        },
+                    )
+                    .unwrap(),
+            )
+        }
+    };
+    let required =
+        [left_node, right_node].map(|node| builder.node_output_properties(node).unwrap().clone());
+    builder
+        .add_join(
+            join,
+            [left_node, right_node],
+            Box::from(required),
+            l.clone().into_boxed_slice(),
+            Distribution::Singleton,
+            NodeKind::HashJoin {
+                kind: JoinKind::NullAwareLeftAnti,
+                build_side: JoinSide::Right,
+                distribution: JoinDistribution::Singleton,
+                null_extended: Box::default(),
+                condition: novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                    value_equal_keys,
+                    scope_keys,
+                    eligibility,
+                },
+            },
+        )
+        .unwrap();
+    let fragment = builder
+        .finish_definition(
+            join,
+            FragmentSink::Result,
+            dop(pipeline_dop),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
+    let mut plan = PlanBuilder::new(version());
+    if late_overflow {
+        plan = plan.with_semantic_parameters(
+            SemanticParameters::try_new([(
+                ALLOW.id,
+                SemanticParameterValue::AllowThrowException(true),
+            )])
+            .unwrap(),
+        );
+    }
+    plan.add_fragment(fragment).unwrap();
+    plan.set_result_port(result_port(SINGLE, join, &l)).unwrap();
+    plan.finish_observed(&FixtureControl).unwrap()
+}
+fn run_authored_naa(plan: &PhysicalPlan, dop: usize) -> Rows {
+    let mut packages = packages(plan);
+    let program = compile(packages.remove(&SINGLE).unwrap(), dop, true);
+    let output = ResultSinkHandle::new();
+    try_run(
+        &program,
+        result_sink(&program, SINGLE_FINST, &output),
+        ExchangeBindings::default(),
+        SINGLE_FINST,
+    )
+    .unwrap();
+    sorted(int64_rows(&output.take_chunks()))
+}
+#[test]
+fn b3_production_right_full_and_both_orientations_match_physical_occurrence_oracles() {
+    for side in [JoinSide::Right, JoinSide::Left] {
+        for kind in [
+            JoinKind::Inner,
+            JoinKind::LeftOuter,
+            JoinKind::RightOuter,
+            JoinKind::FullOuter,
+            JoinKind::LeftSemi,
+            JoinKind::RightSemi,
+            JoinKind::LeftAnti,
+            JoinKind::RightAnti,
+        ] {
+            for residual in [false, true] {
+                let spec = Spec {
+                    family: Family::Hash {
+                        build_side: side,
+                        null_safe: false,
+                    },
+                    kind,
+                    residual,
+                    permuted: false,
+                };
+                for (left, right) in [
+                    (&LEFT_ROWS[..], &RIGHT_ROWS[..]),
+                    (&[][..], &RIGHT_ROWS[..]),
+                    (&LEFT_ROWS[..], &[][..]),
+                    (&LEFT_ROWS[..], &[(None, Some(1)), (None, None)][..]),
+                ] {
+                    let mut packages = packages(&single_plan_with_dop(spec, left, right, 4));
+                    let program = compile(packages.remove(&SINGLE).unwrap(), 4, true);
+                    let output = ResultSinkHandle::new();
+                    try_run(
+                        &program,
+                        result_sink(&program, SINGLE_FINST, &output),
+                        ExchangeBindings::default(),
+                        SINGLE_FINST,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        sorted(int64_rows(&output.take_chunks())),
+                        oracle(spec, left, right),
+                        "{spec:?}"
+                    );
+                }
+            }
+        }
+    }
+    for kind in [JoinKind::RightOuter, JoinKind::FullOuter] {
+        let spec = Spec::nested(kind, true);
+        assert_eq!(
+            run_single(spec, &LEFT_ROWS, &RIGHT_ROWS),
+            oracle(spec, &LEFT_ROWS, &RIGHT_ROWS)
+        );
+        assert_eq!(
+            run_single(spec, &LEFT_ROWS, &[]),
+            oracle(spec, &LEFT_ROWS, &[])
+        );
+        assert_eq!(
+            run_single(spec, &[], &RIGHT_ROWS),
+            oracle(spec, &[], &RIGHT_ROWS)
+        );
+    }
+}
+#[test]
+fn b3_production_composite_scope_mixed_and_eligibility_truth_keep_original_naa_roles() {
+    let probes = [
+        (None, Some(1)),
+        (Some(2), Some(1)),
+        (Some(2), Some(9)),
+        (Some(1), None),
+        (None, None),
+    ];
+    let builds = [
+        (Some(2), Some(2)),
+        (Some(2), Some(1)),
+        (None, Some(1)),
+        (Some(1), Some(4)),
+        (None, None),
+    ];
+    for scope in [false, true] {
+        for safe in [false, true] {
+            for eligibility in [
+                NaaEligibilityFixture::None,
+                NaaEligibilityFixture::True,
+                NaaEligibilityFixture::Unknown,
+            ] {
+                let values = if scope {
+                    vec![(1, false)]
+                } else {
+                    vec![(0, false), (1, safe)]
+                };
+                let scopes = if scope { vec![(0, safe)] } else { vec![] };
+                let cmp = |a: Option<i64>, b: Option<i64>, safe: bool| match (a, b) {
+                    (Some(a), Some(b)) => Some(a == b),
+                    _ if safe => Some(a == b),
+                    _ => None,
+                };
+                let expected = probes
+                    .iter()
+                    .filter(|left| {
+                        !builds.iter().any(|right| {
+                            let columns = [left.0, left.1];
+                            let other = [right.0, right.1];
+                            if scopes.iter().any(|&(column, safe)| {
+                                cmp(columns[column], other[column], safe) != Some(true)
+                            }) {
+                                return false;
+                            }
+                            let c_false = values.iter().any(|&(column, safe)| {
+                                cmp(columns[column], other[column], safe) == Some(false)
+                            });
+                            !c_false && !matches!(eligibility, NaaEligibilityFixture::Unknown)
+                        })
+                    })
+                    .map(|row| vec![row.0, row.1])
+                    .collect::<Rows>();
+                assert_eq!(
+                    run_authored_naa(
+                        &authored_naa_plan(&probes, &builds, &values, &scopes, eligibility, 4),
+                        4
+                    ),
+                    sorted(expected)
+                );
+            }
+        }
+    }
+    let nonnull = (0..2048).map(|i| (Some(2), Some(i))).collect::<Vec<_>>();
+    assert_eq!(
+        run_authored_naa(
+            &authored_naa_plan(
+                &[(None, Some(1)), (None, Some(-1))],
+                &nonnull,
+                &[(0, false), (1, false)],
+                &[],
+                NaaEligibilityFixture::None,
+                4
+            ),
+            4
+        ),
+        vec![vec![None, Some(-1)]]
+    );
+}
+#[test]
+fn b3_naa_required_eligibility_error_keeps_sparse_original_pair_row_after_earlier_suppression() {
+    let plan = authored_naa_plan(
+        &[(None, Some(1))],
+        &[(Some(1), Some(2)), (Some(0), Some(1)), (Some(1), Some(1))],
+        &[(0, false), (1, false)],
+        &[],
+        NaaEligibilityFixture::LateOverflow,
+        1,
+    );
+    let mut packages = packages(&plan);
+    let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+    let prepared = prepare_compiled_program_pipeline_execution(
+        program.clone(),
+        Duration::from_millis(10),
+        Box::new(ResultSinkFactory::new(ResultSinkHandle::new())),
+        ExchangeBindings::default(),
+        None,
+        1,
+        Arc::new(RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "NAA original sparse E row",
+            )),
+            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        )),
+        Arc::new(NoopFragmentEventSink),
+    )
+    .unwrap();
+    let failure = prepared
+        .start()
+        .join()
+        .expect_err("later E must remain required after suppression");
+    let ExecutionFailureCause::RequiredRow(required) = failure.cause() else {
+        panic!("original E row error: {failure:?}");
+    };
+    assert_eq!(
+        required.root(),
+        ProgramExpressionRootSite::Node {
+            node: program.graph().root(),
+            role: ProgramNodeExpressionRole::NaaEligibility
+        }
+    );
+    assert_eq!(
+        required.batch_row(),
+        2,
+        "C FALSE skipped row0; E keeps the original candidate-page row"
+    );
+}

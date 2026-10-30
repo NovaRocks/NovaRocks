@@ -33,7 +33,9 @@ use crate::exec::{
         BulkMatch, BulkPresenceBatch, BulkProbeBatch, BulkWork, IndexPurpose, KeyInput, KeySpec,
         PreparedKeyBatch,
     },
-    operators::compiled_expression::{evaluate_chunk_all, evaluate_projected_chunk_all},
+    operators::compiled_expression::{
+        evaluate_chunk_all, evaluate_projected_chunk_all, evaluate_projected_chunk_rows,
+    },
     pipeline::{operator::OperatorLifecycle, shape::ControlStep, step_context::TurnWork},
 };
 use novarocks_functions::KernelEvaluationControl;
@@ -979,15 +981,13 @@ fn advance_probe(
             let gather = residual.ok_or_else(|| {
                 build_contract("join predicate has no original minimal projection")
             })?;
-            let mut selected = funded_vec(work.owner, eligible.len())?;
-            for &position in &eligible {
-                selected.push(pairs[position]);
-            }
+            // Keep the original pair-page row domain. Sparse eligibility
+            // changes demand, not the batch-row identity of a required error.
             let input = gather
                 .gather(
                     &cursor.input,
                     &loaded.data.rows,
-                    &selected,
+                    &pairs,
                     work.owner,
                     &work.host,
                     control,
@@ -996,14 +996,26 @@ fn advance_probe(
             let instance = roots
                 .last_mut()
                 .ok_or_else(|| build_contract("join predicate has no original root instance"))?;
-            Some(evaluate_projected_chunk_all(
-                instance,
-                site,
-                &input,
-                gather.declared(),
-                gather.projection(),
-                control,
-            )?)
+            Some(if eligible.len() == pairs.len() {
+                evaluate_projected_chunk_all(
+                    instance,
+                    site,
+                    &input,
+                    gather.declared(),
+                    gather.projection(),
+                    control,
+                )?
+            } else {
+                evaluate_projected_chunk_rows(
+                    instance,
+                    site,
+                    &input,
+                    gather.declared(),
+                    gather.projection(),
+                    &eligible,
+                    control,
+                )?
+            })
         }
     } else {
         None

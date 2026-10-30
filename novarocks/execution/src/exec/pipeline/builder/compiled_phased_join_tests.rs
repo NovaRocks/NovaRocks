@@ -371,17 +371,13 @@ fn b3_independent_t_sources_wait_for_q_and_last_page_handoff_with_partial_consum
             JoinKind::FullOuter
         };
         let mut packages = packages(&single_plan(
-            Spec::hash(JoinKind::Inner, true),
+            Spec::hash(physical, true),
             &LEFT_ROWS,
             &RIGHT_ROWS,
         ));
-        let base = compile(packages.remove(&SINGLE).unwrap(), 1, true);
-        // All four original source fields are nullable in this component;
-        // changing preservation requires no invented schema/NULL extension.
-        let program = super::super::runtime_filter_tests::component_join_kind(&base, kind);
-        let plan = Arc::new(
-            CompiledHashJoinPlan::from_frozen_node(&program, program.graph().root()).unwrap(),
-        );
+        let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+        let plan =
+            Arc::new(CompiledHashJoinPlan::try_new(&program, program.graph().root()).unwrap());
         let handoff = LocalExchanger::new_handoff(6, 2, 1);
         let declaration = Arc::new(CompiledJoinFrame::new(
             program.clone(),

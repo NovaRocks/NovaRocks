@@ -301,8 +301,10 @@ impl ProgramJoinCondition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinDistributionMode {
-    Broadcast,
-    Partitioned,
+    /// One local instance shares its immutable build across all probe drivers.
+    SharedBuild,
+    /// A distinct local co-partitioned layout, not an index partition count.
+    PartitionedBuild,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

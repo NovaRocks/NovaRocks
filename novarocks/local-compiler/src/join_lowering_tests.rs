@@ -991,6 +991,13 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
         (JoinKind::LeftAnti, NestedLoopJoinType::LeftAnti, LEFT),
         (JoinKind::RightSemi, NestedLoopJoinType::LeftSemi, RIGHT),
         (JoinKind::RightAnti, NestedLoopJoinType::LeftAnti, RIGHT),
+        (JoinKind::RightOuter, NestedLoopJoinType::RightOuter, LEFT),
+        (JoinKind::FullOuter, NestedLoopJoinType::FullOuter, LEFT),
+        (
+            JoinKind::NullAwareLeftAnti,
+            NestedLoopJoinType::NullAwareLeftAnti,
+            LEFT,
+        ),
     ] {
         let source = fixture(Case {
             family: Family::NestLoop { kind: physical },
@@ -1037,42 +1044,10 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
 #[test]
 fn unsupported_kinds_and_orientations_are_explicit_refusals() {
     let refused = [
-        // No mirror keeps a left-build null-aware anti join probe-preserving.
+        // NAA still has no build-left mirror; no role is reconstructed.
         Case {
             family: hash(JoinKind::NullAwareLeftAnti, JoinSide::Left),
             residual: Residual::None,
-            output: Output::Natural,
-        },
-        // Build-preserving kinds need merged build match flags.
-        Case {
-            family: hash(JoinKind::RightOuter, JoinSide::Right),
-            residual: Residual::None,
-            output: Output::Natural,
-        },
-        Case {
-            family: hash(JoinKind::FullOuter, JoinSide::Right),
-            residual: Residual::None,
-            output: Output::Natural,
-        },
-        Case {
-            family: hash(JoinKind::LeftSemi, JoinSide::Left),
-            residual: Residual::None,
-            output: Output::Natural,
-        },
-        // The key conjuncts of a nested-loop null-aware anti join are not
-        // separated from its residual.
-        Case {
-            family: Family::NestLoop {
-                kind: JoinKind::NullAwareLeftAnti,
-            },
-            residual: Residual::Separate,
-            output: Output::Natural,
-        },
-        Case {
-            family: Family::NestLoop {
-                kind: JoinKind::FullOuter,
-            },
-            residual: Residual::Separate,
             output: Output::Natural,
         },
     ];
@@ -1168,6 +1143,50 @@ fn every_join_compiler_control_prefix_refuses_with_its_own_cause() {
                 Err(FragmentCompileError::Control(actual)) if actual == cause
             ));
             assert_eq!(*control.events.lock().unwrap(), expected[..=at]);
+        }
+    }
+}
+
+#[test]
+fn build_preserving_hash_kinds_keep_frozen_output_types_in_both_orientations() {
+    for (physical, side, expected) in [
+        (JoinKind::RightOuter, JoinSide::Right, JoinType::RightOuter),
+        (JoinKind::FullOuter, JoinSide::Right, JoinType::FullOuter),
+        (JoinKind::RightSemi, JoinSide::Right, JoinType::RightSemi),
+        (JoinKind::RightAnti, JoinSide::Right, JoinType::RightAnti),
+        (JoinKind::LeftOuter, JoinSide::Left, JoinType::RightOuter),
+        (JoinKind::FullOuter, JoinSide::Left, JoinType::FullOuter),
+        (JoinKind::LeftSemi, JoinSide::Left, JoinType::RightSemi),
+        (JoinKind::LeftAnti, JoinSide::Left, JoinType::RightAnti),
+    ] {
+        for residual in [Residual::None, Residual::Separate] {
+            let source = fixture(Case {
+                family: hash(physical, side),
+                residual,
+                output: Output::Natural,
+            });
+            let program = compile(&source.package);
+            let (_, kind) = join_node(&program);
+            let ProgramNodeKind::Join {
+                join_type,
+                left_layout,
+                right_layout,
+                ..
+            } = kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(*join_type, expected);
+            let root = &program.graph().nodes()[program.graph().root().index()];
+            let actual = root.output_layout().schema();
+            assert_eq!(actual.fields().len(), source.output.len());
+            for (field, value) in actual.fields().iter().zip(&source.output) {
+                let expected = &source.package.fragment().values()[value].ty;
+                assert_eq!(field.data_type(), expected.data_type());
+                assert_eq!(field.is_nullable(), expected.nullable());
+            }
+            assert_eq!(left_layout.slots().len(), 2);
+            assert_eq!(right_layout.slots().len(), 2);
         }
     }
 }

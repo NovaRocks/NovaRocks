@@ -291,6 +291,36 @@ pub(crate) fn evaluate_projected_chunk_all(
 /// and return one value per selected row, in selection order. Unselected rows
 /// are never evaluated, so they raise no row error; a selected row's error is
 /// a required error reported at its batch row.
+pub(crate) fn evaluate_projected_chunk_rows(
+    instance: &mut CompiledExpressionInstance,
+    site: ProgramExpressionRootSite,
+    input: &Chunk,
+    declared: &ChunkSchema,
+    projection: &Arc<crate::exec::expr::compiled_program::input_source::InputColumnProjection>,
+    rows: &[usize],
+    control: &RuntimeKernelControl,
+) -> ExecutionResult<ArrayRef> {
+    let selection = Selection::try_sparse(input.len(), rows).map_err(|_| {
+        ExecutionFailure::from(KernelFailure::Internal(KernelDiagnostic::new(
+            "compiled root selection is not ordered within its batch",
+        )))
+    })?;
+    let loan = CompiledInputLoan::from_projected_chunk(input, declared, projection, control)?;
+    evaluate_selection(
+        instance,
+        site,
+        loan,
+        selection,
+        if rows.is_empty() {
+            novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        } else {
+            novarocks_functions::ScalarInvocationActivation::Activated
+        },
+        control,
+    )
+}
+
+/// The same original sparse selection author for a complete RecordBatch port.
 pub(crate) fn evaluate_selected(
     instance: &mut CompiledExpressionInstance,
     site: ProgramExpressionRootSite,

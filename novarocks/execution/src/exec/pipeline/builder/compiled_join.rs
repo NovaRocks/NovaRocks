@@ -32,7 +32,6 @@ use super::super::program_failure;
 use super::*;
 use crate::exec::fragment::error::FragmentBindingErrorKind;
 use crate::exec::operators::compiled_expression::root_value_type;
-use crate::exec::operators::compiled_nljoin::CompiledNlJoinPlan;
 use crate::exec::operators::hashjoin::compiled_hash_join::{
     CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
     CompiledJoinInputSinkFactory, CompiledJoinProbeProcessorFactory, CompiledJoinTailSourceFactory,
@@ -174,8 +173,6 @@ pub(super) fn build_nested_loop_join(
     error: &Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineBuildResult> {
-    // The legacy capability gate remains until the compiler/runtime cutover.
-    CompiledNlJoinPlan::try_new(program, id)?;
     let probe_build = build_node(program, probe, ctx, error, ordered)?;
     let build_build = build_node(program, build, ctx, error, ordered)?;
     assemble(
