@@ -202,6 +202,10 @@ pub(crate) fn build_effective_launch_config_evidence(
                 "backend_indices":root.backend_indices,
                 "controller":"shared-one-target-slot-global-connection-stream-owned-buffer-bounds",
                 "actor":root.bounds.semantics(),
+                "exchange_authorization":"original-test-session-and-exact-live-backend-subject-process-roster",
+                "exchange_target_admission":"runner-matches-selected-statement-task-stream-sequence-or-subscription-generation",
+                "exchange_hold":"all-exact-unit-retries-before-upstream-dispatch-until-explicit-release",
+                "exchange_ack_loss":"only-after-real-custody-receipt-never-synthetic-admission",
                 "control_tcp_budget":"original_backend_retained_byte_limit_separate_from_actor"
             })
         }),

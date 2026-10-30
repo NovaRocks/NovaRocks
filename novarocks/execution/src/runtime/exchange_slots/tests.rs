@@ -112,6 +112,108 @@ fn retire(instance: &ExchangeSlotInstance, streams: &[ExchangeStreamIdentity]) {
 }
 
 #[test]
+fn flow_observation_keeps_retired_decoding_positions_until_actual_lease_exit() {
+    let registry = ExchangeSlotRegistry::new(limits(1, 2, 1));
+    let config = registration(900, 1, 1);
+    let stream = config.streams[0];
+    let instance = registry.register(config.clone()).unwrap();
+    instance.register_demand(stream, demand(1)).unwrap();
+    instance.register_demand(stream, demand(2)).unwrap();
+    let before = registry.try_flow_snapshot().unwrap();
+    assert_eq!(
+        (
+            before.in_use,
+            before.max_instance_in_use,
+            before.floating_in_use
+        ),
+        (2, 2, 1)
+    );
+    let lease = claim(&instance, stream, 1, false);
+    assert!(matches!(
+        instance.begin_admission(stream, unit(1, false)).unwrap(),
+        ExchangeSlotAdmission::Observed(ExchangeUnitReceipt {
+            verdict: ExchangeAdmissionVerdict::Idempotent,
+            ..
+        })
+    ));
+    retire(&instance, &config.streams);
+    drop(instance);
+    assert_eq!(registry.snapshot().registered_instances, 0);
+    let retained = registry.try_flow_snapshot().unwrap();
+    assert_eq!(
+        (
+            retained.live_instances,
+            retained.closed_instances,
+            retained.in_use,
+            retained.decoding
+        ),
+        (1, 1, 1, 1)
+    );
+    assert_eq!(retained.replayed_items, 1);
+    drop(lease);
+    let exited = registry.try_flow_snapshot().unwrap();
+    assert_eq!(
+        (
+            exited.live_instances,
+            exited.in_use,
+            exited.decoding,
+            exited.floating_in_use,
+            exited.pending_demands
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert_eq!(exited.replayed_items, 1);
+}
+
+#[test]
+fn a_busy_original_ledger_is_unavailable_without_waiting_or_zeroing_usage() {
+    let registry = ExchangeSlotRegistry::new(limits(1, 1, 0));
+    let config = registration(901, 1, 1);
+    let instance = registry.register(config.clone()).unwrap();
+    instance
+        .register_demand(config.streams[0], demand(1))
+        .unwrap();
+    let state = instance.instance.state.lock().unwrap();
+    assert!(registry.try_flow_snapshot().is_none());
+    drop(state);
+    assert_eq!(registry.try_flow_snapshot().unwrap().in_use, 1);
+    retire(&instance, &config.streams);
+    drop(instance);
+    assert_eq!(registry.try_flow_snapshot().unwrap().live_instances, 0);
+}
+
+#[test]
+fn the_last_observation_pin_does_not_wait_for_a_busy_index() {
+    let registry = ExchangeSlotRegistry::new(limits(1, 1, 0));
+    let config = registration(902, 1, 1);
+    let instance = registry.register(config.clone()).unwrap();
+    let pin = Arc::clone(&instance.instance);
+    retire(&instance, &config.streams);
+    drop(instance);
+    let observed = registry.core.observed_instances.lock().unwrap();
+    drop(pin);
+    assert!(
+        observed
+            .values()
+            .all(|instance| instance.upgrade().is_none())
+    );
+    drop(observed);
+    assert_eq!(registry.try_flow_snapshot().unwrap().live_instances, 0);
+    assert!(registry.core.observed_instances.lock().unwrap().is_empty());
+
+    // Registrations also reclaim missed removals when no metrics are scraped.
+    let instance = registry.register(config.clone()).unwrap();
+    retire(&instance, &config.streams);
+    let observed = registry.core.observed_instances.lock().unwrap();
+    drop(instance);
+    drop(observed);
+    let next = registry.register(registration(903, 1, 1)).unwrap();
+    assert_eq!(registry.core.observed_instances.lock().unwrap().len(), 1);
+    assert_eq!(registry.try_flow_snapshot().unwrap().live_instances, 1);
+    drop(next);
+}
+
+#[test]
 fn registration_is_atomic_and_each_instance_progresses_without_floating_slots() {
     let registry = ExchangeSlotRegistry::new(limits(2, 3, 0));
     let first = registration(1, 1, 1);

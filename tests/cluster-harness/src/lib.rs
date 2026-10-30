@@ -4572,6 +4572,42 @@ impl CrossProcessServerHandle {
             .ok_or_else(|| anyhow::anyhow!("RootReply fault actor is not enabled for BE[{index}]"))
     }
 
+    /// Enable BE message faults only inside an existing authenticated test session.
+    /// Live membership binds both the advertised subject and the exact process.
+    pub fn native_exchange_fault(&self, index: usize) -> Result<RootReplyFaultControl> {
+        let session_deadline = self
+            .test_sessions
+            .as_ref()
+            .context("Exchange faults require an original test session")?
+            .deadline();
+        ensure!(
+            session_deadline > Instant::now(),
+            "Exchange fault test session has expired"
+        );
+        let control = self.native_root_reply_fault(index)?;
+        let mut peers = Vec::with_capacity(self.runtime.be.len());
+        for backend in 0..self.runtime.be.len() {
+            let endpoint = NativeEndpoint::from_host_port(
+                self.native_trust_fixture.fixture.advertise_host(),
+                self.be_grpc_ports[backend],
+            )
+            .map_err(anyhow::Error::msg)?;
+            peers.push((
+                backend,
+                NativeCallerSubject::parse(format!("be@{endpoint}")).map_err(anyhow::Error::msg)?,
+                self.backend_process_id(backend)?,
+            ));
+        }
+        control.bind_exchange_peers(peers, session_deadline)?;
+        Ok(control)
+    }
+
+    /// Read the original backend registry without synthesizing missing samples.
+    pub fn backend_exchange_flow_metrics(&self, index: usize) -> Result<String> {
+        self.ensure_be_index(index)?;
+        scrape_prometheus_metrics(self.runtime.be[index].http)
+    }
+
     /// Control only the actual Data proxy for domain-isolation scenarios.
     pub fn native_data_fault_proxy(&self, index: usize) -> Result<NativeFaultProxyControl> {
         self.ensure_be_index(index)?;

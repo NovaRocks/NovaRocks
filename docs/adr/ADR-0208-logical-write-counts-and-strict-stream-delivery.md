@@ -5,6 +5,7 @@ domain: [pipeline-execution, frontend-dml]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0209]
 date: 2026-10-23
 provenance:
   - "discussion: 2026-10-22 logical write summaries, independent routes and complete delivery"

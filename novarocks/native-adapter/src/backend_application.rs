@@ -1068,6 +1068,7 @@ impl BackendApplicationHost {
                 .map_err(|error| {
                     BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
                 })?
+                .with_exchange_flow(Arc::clone(&services.execution_runtime))
                 .with_native_query_resources(Arc::new(|| {
                     novarocks_worker::query_context::query_context_manager()
                         .native_execution_resource_snapshot()

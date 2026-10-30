@@ -217,6 +217,10 @@ impl Default for ExecutionExchangeRegistry {
 }
 
 impl ExecutionExchangeRegistry {
+    pub fn try_flow_snapshot(&self) -> Option<super::exchange_slots::ExchangeFlowSnapshot> {
+        self.unit_slots.try_flow_snapshot()
+    }
+
     pub fn with_flow_limits(limits: super::execution_runtime::ExchangeFlowLimits) -> Self {
         Self {
             unit_slots: super::exchange_slots::ExchangeSlotRegistry::new(limits),

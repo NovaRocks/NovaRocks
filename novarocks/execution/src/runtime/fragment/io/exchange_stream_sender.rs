@@ -21,6 +21,8 @@
 //! transport activity and survives cancellation until that activity exits.
 //! Neither state lock is held across a transport or observer callback.
 
+// Design: ADR-0209 (docs/adr/ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md)
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
@@ -214,6 +216,15 @@ impl ExchangeUnitSendScheduler {
             calls: state.calls,
             waiting_streams: state.queued.len(),
         }
+    }
+
+    pub fn try_snapshot(&self) -> Option<ExchangeSendActivitySnapshot> {
+        let state = self.state.try_lock().ok()?;
+        Some(ExchangeSendActivitySnapshot {
+            bytes: state.bytes,
+            calls: state.calls,
+            waiting_streams: state.queued.len(),
+        })
     }
 
     fn request(self: &Arc<Self>, sender: &Arc<ExchangeStreamSender>) {

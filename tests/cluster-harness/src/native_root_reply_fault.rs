@@ -47,6 +47,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 
+#[path = "native_exchange_fault.rs"]
+mod exchange_fault;
+pub use exchange_fault::{
+    ExchangeFaultAction, ExchangeFaultAttempt, ExchangeFaultCandidate, ExchangeFaultObservation,
+    ExchangeFaultSelector, ExchangeFaultTarget,
+};
+
 const ROOT_PATH: &str = "/novarocks.NovaRocksGrpc/FetchRootResult";
 const COVERED_STATUS_PATH: &str = "/novarocks.NovaRocksGrpc/SubscribeTaskStatus";
 const REQUEST_BYTES: usize = RootProfileV1::ENVELOPE_BYTES;
@@ -119,8 +126,16 @@ impl RootReplyFaultBounds {
 
     pub(crate) fn semantics(&self) -> serde_json::Value {
         serde_json::json!({
-            "mode":"authenticated-plaintext-root-reply-message-v1", "bounds":self,
-            "target_slots":1, "maximum_data_listeners":3, "one_shot_per_actor_group":true,
+            "mode":"authenticated-plaintext-native-message-v2", "bounds":self,
+            "exchange_methods":["DeliverExchangeUnit","RegisterExchangeDemand","SubscribeExchangeGrants"],
+            "exchange_auth":"exact-live-backend-subject-and-process-original-signed-request",
+            "exchange_target":"one-exact-stream-and-sequence-or-pair-generation",
+            "exchange_replay":"hold-original-containing-custody-batch-until-real-idempotent-replay-response",
+            "exchange_rebuild":"hold-same-stream-unit-before-forward-until-new-generation-complete-snapshot-and-positive-grant",
+            "exchange_successor":"observe-next-sequence-without-mutation-in-existing-attempt-positions",
+            "exchange_decoded_message_bytes":novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+            "target_slots":1, "maximum_data_listeners":3, "one_shot_root_capture_per_actor_group":true,
+            "exchange_target_reuse":"only-after-original-target-stream-futures-exited-and-release-or-one-shot-fault",
             "maximum_target_attempts":MAX_TARGET_ATTEMPTS, "target_attempt_evidence_positions":MAX_TARGET_ATTEMPTS,
             "not_ready_transparency":true,
             "capture_deadline":"single-absolute-never-reset",
@@ -236,6 +251,7 @@ struct Slot {
 }
 #[derive(Default)]
 struct State {
+    exchange: exchange_fault::ExchangeState,
     used_capture: bool,
     lifecycle_closed: bool,
     preapplication_closes: PreapplicationCloseLedger,
@@ -328,7 +344,10 @@ impl RootReplyFaultControl {
         );
         let mut state = self.core.state.lock().expect("root fault state lock");
         ensure!(
-            !state.used_capture && state.failures.is_empty() && !state.failure_overflow,
+            !state.used_capture
+                && !state.exchange.occupied()
+                && state.failures.is_empty()
+                && !state.failure_overflow,
             "root fault actor cannot capture again or after failure"
         );
         state.used_capture = true;
@@ -412,7 +431,9 @@ impl RootReplyFaultControl {
                 - self.core.connection_positions.available_permits(),
             stream_positions: self.core.bounds.maximum_active_streams
                 - self.core.stream_positions.available_permits(),
-            target_slots: usize::from(state.pending_capture || state.slot.is_some()),
+            target_slots: usize::from(
+                state.pending_capture || state.slot.is_some() || state.exchange.occupied(),
+            ),
             owned_buffer_bytes: self.core.bytes.load(Ordering::Acquire),
             peak_owned_buffer_bytes: self.core.peak_bytes.load(Ordering::Acquire),
             claimed: state.claimed,
@@ -737,7 +758,10 @@ async fn capture_expiry(core: Arc<Core>) {
         let changed = core.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        let deadline = core.state.lock().expect("root fault state lock").deadline;
+        let deadline = {
+            let state = core.state.lock().expect("root fault state lock");
+            state.deadline.or_else(|| state.exchange.pending_deadline())
+        };
         if let Some(deadline) = deadline {
             tokio::select! {
                 _ = &mut changed => {},
@@ -747,10 +771,10 @@ async fn capture_expiry(core: Arc<Core>) {
                         if state.deadline == Some(deadline) && state.claimed == 0 {
                             state.deadline = None;
                             true
-                        } else { false }
+                        } else { state.exchange.expire(deadline) }
                     };
                     if expired {
-                        core.failure("capture absolute deadline expired without mutated Data1");
+                        core.failure("capture absolute deadline expired without completing the selected message fault");
                         return;
                     }
                 }
@@ -2009,6 +2033,7 @@ fn classify_frozen_read(
     match (state.frozen_root, state.frozen_backend_index) {
         (Some(frozen), Some(_)) if frozen == (root, caller) => StreamClass::Target,
         (Some(_), Some(_)) => StreamClass::NonTarget,
+        _ if state.exchange.occupied() => StreamClass::NonTarget,
         _ => StreamClass::Unknown,
     }
 }
@@ -2123,7 +2148,14 @@ async fn recover_covered_status_cancel(
     else {
         return false;
     };
-    if class != StreamClass::CoveredStatusSubscription {
+    let exchange_non_target = class == StreamClass::NonTarget
+        && core
+            .state
+            .lock()
+            .expect("root fault state lock")
+            .exchange
+            .occupied();
+    if class != StreamClass::CoveredStatusSubscription && !exchange_non_target {
         return false;
     }
     // One nonblocking poll, using the same request stream after its EOF/trailers.
@@ -2157,9 +2189,15 @@ async fn recover_covered_status_cancel(
         _ => return false,
     };
     let mut state = core.state.lock().expect("root fault state lock");
-    state.status_subscription_peer_cancels =
-        state.status_subscription_peer_cancels.saturating_add(1);
-    state.last_status_subscription_peer_cancel = Some(digest);
+    if exchange_non_target {
+        state.non_target_peer_cancels = state.non_target_peer_cancels.saturating_add(1);
+    } else {
+        state.status_subscription_peer_cancels =
+            state.status_subscription_peer_cancels.saturating_add(1);
+        state.last_status_subscription_peer_cancel = Some(digest);
+    }
+    drop(state);
+    core.changed.notify_waiters();
     true
 }
 
@@ -2170,6 +2208,9 @@ async fn forward_stream(
     backend_index: usize,
     core: Arc<Core>,
 ) -> Result<()> {
+    if exchange_fault::enabled_method(&core, &request) {
+        return exchange_fault::forward(request, response, sender, backend_index, core).await;
+    }
     let rpc_path = request.uri().path();
     let rpc_label = if rpc_path.len() <= 128 {
         rpc_path.to_owned()
@@ -2188,7 +2229,7 @@ async fn forward_stream(
     });
     let inspect = normal.is_some() && {
         let state = core.state.lock().expect("root fault state lock");
-        state.deadline.is_some() || state.frozen_root.is_some()
+        state.deadline.is_some() || state.frozen_root.is_some() || state.exchange.occupied()
     };
     let deadline = capture.map(|(_, deadline)| deadline).unwrap_or_else(|| {
         Instant::now() + Duration::from_millis(core.bounds.forward_timeout_millis)
@@ -2356,7 +2397,20 @@ async fn forward_stream(
             upstream_send.send_data(Bytes::new(), true)?;
             let upstream_response = upstream_response.await?;
             inject_reply(upstream_response, response, read, deadline, core.clone()).await
-        } else if let Some(body) = saved_status {
+        } else if let Some(body) = saved_status.or_else(|| {
+            if stream_class == StreamClass::NonTarget
+                && core
+                    .state
+                    .lock()
+                    .expect("root fault state lock")
+                    .exchange
+                    .occupied()
+            {
+                saved_request.as_ref().map(|(body, _)| body.clone())
+            } else {
+                None
+            }
+        }) {
             let request_forward = async {
                 send_bytes(&mut upstream_send, body).await?;
                 upstream_send.send_data(Bytes::new(), true)?;
@@ -2413,6 +2467,7 @@ async fn forward_stream(
         Err(error) if harmless_non_target_cancel(stream_class, &error) => {
             let mut state = core.state.lock().expect("root fault state lock");
             state.non_target_peer_cancels = state.non_target_peer_cancels.saturating_add(1);
+            drop(state);core.changed.notify_waiters();
             Ok(())
         }
         outcome => outcome.with_context(|| format!("root RPC (path={rpc_label}, downstream_stream={downstream_stream}, authenticated_root={}, class={stream_class:?})", normal.is_some())),
@@ -2897,7 +2952,7 @@ mod tests {
         assert!(!bad.preface_valid);
     }
 
-    fn core() -> Arc<Core> {
+    pub(super) fn core() -> Arc<Core> {
         let bounds = RootReplyFaultBounds::default();
         let subject = NativeCallerSubject::parse("fe@127.0.0.1:9080").unwrap();
         let trust = NativeTrust::new(

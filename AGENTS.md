@@ -395,6 +395,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 - `novarocks/native-adapter/src/{exchange_data_plane.rs,exchange_transmitter.rs,fragment_exchange_receiver.rs}`
   Native 三方法的线路投影与传输，准确路由始终由 Worker `with_claimed_stream` 作者准入。
 
+- `novarocks/native-adapter/src/backend_metrics.rs`
+  从角色实际使用的同一个 `ExecutionRuntime` 读取原 slot ledger 与发送 scheduler；
+  `exchange_flow_snapshot_available=0` 表示 Busy/Unavailable，不把旧值归零。
+  退休实例仍有真实 decode lease 时保留可见；观察用 Weak 不取得路由或容量权。
+  接收与发送分别采样，不可相加为原子退出或内存上界。授予、有序重放、End 不占 slot、
+  严格消费与共享等待图边界见 [ADR-0209](docs/adr/ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md)。
+
 - `novarocks/worker/src/result_buffer.rs`
   BE-local result buffering, retained budget and fetch behavior.
 

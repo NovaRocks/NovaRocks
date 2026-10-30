@@ -30,6 +30,8 @@
 //! do not erase an input's own admission gate. Shared fragment roots and local
 //! node identities remain shared on every branch.
 
+// Design: ADR-0209 (docs/adr/ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md)
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 

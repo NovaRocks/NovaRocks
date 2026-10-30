@@ -31,8 +31,11 @@
 //! perform I/O or wait for external capacity. Decode work runs outside that
 //! section and keeps its non-cloneable lease until actual exit.
 
+// Design: ADR-0209 (docs/adr/ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md)
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_execution_contract::ordered_retained_stream::exchange::{
@@ -164,6 +167,22 @@ struct SlotInstance {
     identity: InstanceIdentity,
     grantable_unit_bytes: u64,
     state: Mutex<InstanceLedger>,
+    observation_owner: Weak<RegistryCore>,
+}
+
+impl Drop for SlotInstance {
+    fn drop(&mut self) {
+        if let Some(core) = self.observation_owner.upgrade() {
+            if let Ok(mut observed) = core.observed_instances.try_lock() {
+                observed.remove(&(self as *const Self as usize));
+            } else {
+                // A sampler may own the last temporary pin. Its destructor
+                // must not wait on another sampler or a registration.
+                core.observation_cleanup_needed
+                    .store(true, Ordering::Release);
+            }
+        }
+    }
 }
 
 struct InstanceLedger {
@@ -296,9 +315,23 @@ struct RegistryCore {
     directory: Mutex<HashMap<ExchangeReceiverKey, Arc<SlotInstance>>>,
     pool: Mutex<ProcessPool>,
     listener: Mutex<Option<Arc<dyn ExchangeUnitStateListener>>>,
+    // Observation only: retired instances remain visible while real leases or
+    // owners retain them. These weak references grant no routing or capacity.
+    observed_instances: Mutex<HashMap<usize, Weak<SlotInstance>>>,
+    observation_cleanup_needed: AtomicBool,
+    replayed_items: AtomicU64,
 }
 
 impl RegistryCore {
+    fn clean_observed_instances(&self, observed: &mut HashMap<usize, Weak<SlotInstance>>) {
+        if self
+            .observation_cleanup_needed
+            .swap(false, Ordering::AcqRel)
+        {
+            observed.retain(|_, instance| instance.strong_count() != 0);
+        }
+    }
+
     fn publish(&self, changes: Vec<ExchangeStreamObservation>) {
         let listener = self
             .listener
@@ -415,6 +448,20 @@ pub struct ExchangeSlotPoolSnapshot {
     pub waiting_instances: usize,
 }
 
+/// A nonblocking census of the original ledgers, including retired decode work.
+/// `in_use` includes grants awaiting a Unit, not just retained payloads.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExchangeFlowSnapshot {
+    pub live_instances: usize,
+    pub closed_instances: usize,
+    pub in_use: usize,
+    pub max_instance_in_use: usize,
+    pub decoding: usize,
+    pub pending_demands: usize,
+    pub floating_in_use: usize,
+    pub replayed_items: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExchangeSlotStreamSnapshot {
     pub facts: ExchangeStreamFacts,
@@ -441,6 +488,9 @@ impl ExchangeSlotRegistry {
                 directory: Mutex::new(HashMap::new()),
                 pool: Mutex::new(ProcessPool::default()),
                 listener: Mutex::new(None),
+                observed_instances: Mutex::new(HashMap::new()),
+                observation_cleanup_needed: AtomicBool::new(false),
+                replayed_items: AtomicU64::new(0),
             }),
         }
     }
@@ -501,6 +551,7 @@ impl ExchangeSlotRegistry {
             let instance = Arc::new(SlotInstance {
                 identity,
                 grantable_unit_bytes: registration.grantable_unit_bytes,
+                observation_owner: Arc::downgrade(&self.core),
                 state: Mutex::new(InstanceLedger {
                     streams,
                     demand: VecDeque::new(),
@@ -511,6 +562,14 @@ impl ExchangeSlotRegistry {
                 }),
             });
             directory.insert(identity.key, Arc::clone(&instance));
+            let mut observed = self
+                .core
+                .observed_instances
+                .lock()
+                .expect("exchange observation lock");
+            self.core.clean_observed_instances(&mut observed);
+            observed.insert(Arc::as_ptr(&instance) as usize, Arc::downgrade(&instance));
+            drop(observed);
             handles.push(ExchangeSlotInstance {
                 core: Arc::clone(&self.core),
                 instance,
@@ -604,6 +663,40 @@ impl ExchangeSlotRegistry {
             floating_in_use: pool.floating_in_use,
             waiting_instances: pool.queued.len(),
         }
+    }
+
+    /// Busy ledgers are unavailable, never zero. No payloads are cloned, and
+    /// sampling never waits on an executing transition. Instance -> pool is
+    /// the same lock order as admission and actual lease release.
+    pub fn try_flow_snapshot(&self) -> Option<ExchangeFlowSnapshot> {
+        // Declare the pins before the index guard: every return, including a
+        // busy ledger, unlocks the index before dropping its last instance pin.
+        let instances: Vec<Arc<SlotInstance>>;
+        let mut observed = self.core.observed_instances.try_lock().ok()?;
+        self.core.clean_observed_instances(&mut observed);
+        instances = observed.values().filter_map(Weak::upgrade).collect();
+        let ledgers = instances
+            .iter()
+            .map(|instance| instance.state.try_lock())
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let pool = self.core.pool.try_lock().ok()?;
+        let mut snapshot = ExchangeFlowSnapshot {
+            live_instances: instances.len(),
+            floating_in_use: pool.floating_in_use,
+            replayed_items: self.core.replayed_items.load(Ordering::Relaxed),
+            ..Default::default()
+        };
+        for state in &ledgers {
+            snapshot.closed_instances += usize::from(state.closed);
+            snapshot.in_use = snapshot.in_use.checked_add(state.in_use)?;
+            snapshot.max_instance_in_use = snapshot.max_instance_in_use.max(state.in_use);
+            snapshot.pending_demands = snapshot.pending_demands.checked_add(state.queued.len())?;
+            for stream in state.streams.values() {
+                snapshot.decoding = snapshot.decoding.checked_add(stream.decoding_positions())?;
+            }
+        }
+        Some(snapshot)
     }
 }
 
@@ -736,12 +829,16 @@ impl ExchangeSlotInstance {
                 }))
             }
             ExchangeAdmissionStart::Observed(verdict) => {
+                if verdict == ExchangeAdmissionVerdict::Idempotent {
+                    self.core.replayed_items.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(ExchangeSlotAdmission::Observed(ExchangeUnitReceipt {
                     verdict,
                     facts: observation.facts,
                 }))
             }
             ExchangeAdmissionStart::Closed => {
+                self.core.replayed_items.fetch_add(1, Ordering::Relaxed);
                 Ok(ExchangeSlotAdmission::Observed(ExchangeUnitReceipt {
                     verdict: ExchangeAdmissionVerdict::Idempotent,
                     facts: observation.facts,
