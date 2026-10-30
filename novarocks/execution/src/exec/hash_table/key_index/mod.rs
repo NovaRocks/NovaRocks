@@ -83,10 +83,6 @@ pub(crate) use bulk_tasks::{
     BulkAssignments, BulkTaskGraph, Claim as BulkClaim, Task as BulkTask,
     TaskAdvance as BulkTaskAdvance,
 };
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
-)]
 pub(crate) use capture::CapturedPageId;
 pub(crate) use capture::{
     BulkDomain, BulkInput, CaptureBuilder, CaptureWork, EvaluatedPage, SealedCapture,

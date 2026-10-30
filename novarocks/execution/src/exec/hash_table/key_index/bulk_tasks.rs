@@ -189,6 +189,14 @@ pub(crate) enum Claim {
 }
 
 impl BulkTaskGraph {
+    /// The scheduling owner preserves its original control/allocation cause
+    /// before dropping retained cursors. No abandoned lease may replace it.
+    pub(crate) fn fail(&self, cause: ExecutionFailure) -> ExecutionFailure {
+        let cause = self.0.phases.latch(cause);
+        self.0.domain.latch(cause.clone());
+        self.0.domain.check_failure().err().unwrap_or(cause)
+    }
+
     /// Strategy selection precedes any routing or layout allocation. The
     /// caller supplies its actual worker positions and live-sketch preference.
     pub(crate) fn begin(

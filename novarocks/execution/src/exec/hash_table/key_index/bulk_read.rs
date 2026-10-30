@@ -205,6 +205,28 @@ impl IndexView {
     pub(crate) fn purpose(&self) -> IndexPurpose {
         self.purpose
     }
+
+    /// Immutable local coordinates selected by this original K build. These
+    /// metadata reads do not enumerate input rows or mint new class IDs.
+    pub(crate) fn partition_count(&self) -> usize {
+        match &self.backend {
+            Backend::Empty { .. } | Backend::Direct(_) => 1,
+            Backend::Hash { partitions, .. } => partitions.len(),
+        }
+    }
+
+    pub(crate) fn key_count(&self, partition: usize) -> ExecutionResult<usize> {
+        self.ids()?;
+        match &self.backend {
+            Backend::Empty { .. } if partition == 0 => Ok(0),
+            Backend::Direct(store) if partition == 0 => store.id_count_after_fill(),
+            Backend::Hash { partitions, .. } => partitions
+                .get(partition)
+                .map(|index| index.len())
+                .ok_or_else(|| invariant(ValueViolation::Bounds)),
+            _ => Err(invariant(ValueViolation::Bounds)),
+        }
+    }
     fn validate(&self, input: &PreparedKeyBatch<'_>) -> ExecutionResult<()> {
         if !self.spec.same_instance(&input.spec) {
             return Err(invariant(ValueViolation::Layout));
