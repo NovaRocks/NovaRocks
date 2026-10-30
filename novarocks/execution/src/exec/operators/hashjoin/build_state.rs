@@ -27,6 +27,30 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::hash_table::key_index::{BulkDomain, IndexPurpose};
+use novarocks_type_contract::ValueTypeStorageLifetime;
+use std::ops::Range;
+
+/// Original K instances shared by the installed input producers. Full NAA
+/// keys retain SQL scope followed by value components. The grouping projection
+/// is explicit: an admitted linear specialization may additionally group by
+/// required value components without changing their SQL expression roles.
+/// Each producer captures the same evaluated arrays in these original domains.
+pub(crate) enum ProjectionDomains {
+    Ordinary {
+        keys: BulkDomain,
+        purpose: IndexPurpose,
+    },
+    Naa {
+        group: Option<BulkDomain>,
+        full: BulkDomain,
+        group_full_components: Vec<usize>,
+        value_components: Range<usize>,
+        full_purpose: IndexPurpose,
+        _storage: ValueTypeStorageLifetime,
+    },
+}
+
 #[derive(Debug)]
 struct JoinBuildStateContract(novarocks_failure_contract::BoundedDetail);
 impl std::fmt::Display for JoinBuildStateContract {

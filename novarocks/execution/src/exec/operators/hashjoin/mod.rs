@@ -27,6 +27,7 @@
 pub(crate) mod broadcast_join_shared;
 mod build_artifact;
 mod build_collection;
+mod build_match_bitmap;
 mod build_requirements;
 pub(crate) mod build_state;
 pub(crate) mod compiled_hash_join;
